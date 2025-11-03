@@ -1,5 +1,6 @@
 use crate::commit::Commit;
 use redb::{Database, TableDefinition};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -40,8 +41,7 @@ pub struct CommitStore {
 impl CommitStore {
     /// Create or open a commit store at the given path
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, StoreError> {
-        let db = Database::create(path)
-            .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+        let db = Database::create(path).map_err(|e| StoreError::DatabaseError(e.to_string()))?;
 
         Ok(Self {
             db: Arc::new(RwLock::new(db)),
@@ -141,12 +141,48 @@ impl CommitStore {
         Ok(result)
     }
 
+    /// Get all commits for a document with timestamps greater than or equal to `since`
+    pub async fn get_commits_since(
+        &self,
+        doc_id: &str,
+        since: u64,
+    ) -> Result<Vec<(String, Commit)>, StoreError> {
+        let Some(head_cid) = self.get_document_head(doc_id).await? else {
+            return Ok(Vec::new());
+        };
+
+        let mut stack = vec![head_cid];
+        let mut visited = HashSet::new();
+        let mut commits = Vec::new();
+
+        while let Some(cid) = stack.pop() {
+            if !visited.insert(cid.clone()) {
+                continue;
+            }
+
+            let commit = self.get_commit(&cid).await?;
+
+            if commit.timestamp >= since {
+                commits.push((cid.clone(), commit.clone()));
+            }
+
+            for parent in &commit.parents {
+                stack.push(parent.clone());
+            }
+        }
+
+        commits.sort_by_key(|(_, commit)| commit.timestamp);
+
+        Ok(commits)
+    }
+
     /// Check if a commit is an ancestor of another
     pub fn is_ancestor<'a>(
         &'a self,
         ancestor_cid: &'a str,
         descendent_cid: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, StoreError>> + 'a + Send>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, StoreError>> + 'a + Send>>
+    {
         Box::pin(async move {
             if ancestor_cid == descendent_cid {
                 return Ok(true);

@@ -10,19 +10,41 @@ use std::sync::Arc;
 
 use crate::commit::Commit;
 use crate::document::{ContentType, DocumentStore};
+use crate::events::{CommitBroadcaster, CommitNotification};
 use crate::store::CommitStore;
 
 #[derive(Clone)]
 pub struct ApiState {
     pub doc_store: Arc<DocumentStore>,
     pub commit_store: Option<Arc<CommitStore>>,
+    pub commit_broadcaster: Option<CommitBroadcaster>,
 }
 
-pub fn router(commit_store: Option<CommitStore>) -> Router {
-    let doc_store = Arc::new(DocumentStore::new());
+fn broadcast_commit(state: &ApiState, doc_id: &str, commit_id: &str, timestamp: u64) {
+    if let Some(broadcaster) = state.commit_broadcaster.as_ref() {
+        broadcaster.notify(CommitNotification {
+            doc_id: doc_id.to_string(),
+            commit_id: commit_id.to_string(),
+            timestamp,
+        });
+    }
+}
+
+fn broadcast_commits(state: &ApiState, doc_id: &str, commits: &[(String, u64)]) {
+    for (commit_id, timestamp) in commits {
+        broadcast_commit(state, doc_id, commit_id, *timestamp);
+    }
+}
+
+pub fn router(
+    doc_store: Arc<DocumentStore>,
+    commit_store: Option<Arc<CommitStore>>,
+    commit_broadcaster: Option<CommitBroadcaster>,
+) -> Router {
     let state = ApiState {
         doc_store,
-        commit_store: commit_store.map(Arc::new),
+        commit_store,
+        commit_broadcaster,
     };
 
     Router::new()
@@ -49,8 +71,8 @@ async fn create_document(
         .unwrap_or("application/json");
 
     // Parse content type
-    let content_type = ContentType::from_mime(content_type_str)
-        .ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
+    let content_type =
+        ContentType::from_mime(content_type_str).ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
 
     // Create document
     let id = state.doc_store.create_document(content_type).await;
@@ -70,10 +92,7 @@ async fn get_document(
 
     // Return content with appropriate Content-Type header
     Ok((
-        [(
-            axum::http::header::CONTENT_TYPE,
-            doc.content_type.to_mime(),
-        )],
+        [(axum::http::header::CONTENT_TYPE, doc.content_type.to_mime())],
         doc.content,
     )
         .into_response())
@@ -145,6 +164,8 @@ async fn create_commit(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let mut notifications: Vec<(String, u64)> = Vec::new();
+
     let (commit_cid, merge_cid) = if let Some(parent_cid) = req.parent_cid {
         // Case 4b: Create edit commit + merge commit
 
@@ -155,17 +176,24 @@ async fn create_commit(
             author.clone(),
             req.message.clone(),
         );
+        let edit_timestamp = edit_commit.timestamp;
 
         let edit_cid = commit_store
             .store_commit(&edit_commit)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        notifications.push((edit_cid.clone(), edit_timestamp));
 
         // Then create a merge commit with both the edit and current head as parents
         let merge_parents = if let Some(head_cid) = current_head.as_ref() {
             vec![edit_cid.clone(), head_cid.clone()]
         } else {
             // If there's no current head, just make the edit commit the head
+            commit_store
+                .set_document_head(&doc_id, &edit_cid)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            broadcast_commits(&state, &doc_id, &notifications);
             return Ok(Json(CreateCommitResponse {
                 cid: edit_cid,
                 merge_cid: None,
@@ -178,11 +206,13 @@ async fn create_commit(
             author,
             Some("Merge commit".to_string()),
         );
+        let merge_timestamp = merge_commit.timestamp;
 
         let merge_cid = commit_store
             .store_commit(&merge_commit)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        notifications.push((merge_cid.clone(), merge_timestamp));
 
         // Validate monotonic descent for the merge commit
         commit_store
@@ -204,6 +234,7 @@ async fn create_commit(
         let parents = current_head.clone().into_iter().collect();
 
         let commit = Commit::new(parents, req.value, author, req.message);
+        let commit_timestamp = commit.timestamp;
 
         let cid = commit_store
             .store_commit(&commit)
@@ -222,8 +253,12 @@ async fn create_commit(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+        notifications.push((cid.clone(), commit_timestamp));
+
         (cid, None)
     };
+
+    broadcast_commits(&state, &doc_id, &notifications);
 
     Ok(Json(CreateCommitResponse {
         cid: commit_cid,

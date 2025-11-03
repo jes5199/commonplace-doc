@@ -29,7 +29,7 @@ This is a Rust server for managing documents with support for multiple content t
 - `src/main.rs` - Server initialization and routing
 - `src/api.rs` - REST API endpoints (/docs)
 - `src/document.rs` - DocumentStore with ContentType enum and in-memory storage
-- `src/sse.rs` - Server-Sent Events endpoints (placeholder implementation)
+- `src/sse.rs` - Server-Sent Events endpoints
 
 The server runs on `localhost:3000` by default.
 
@@ -42,7 +42,7 @@ The server runs on `localhost:3000` by default.
 - `GET /health` - Health check
 
 #### SSE (planned)
-- `GET /sse/documents/:id` - Subscribe to document updates
+- `GET /documents/:id/stream` - Subscribe to document updates
 
 ### Document Storage
 

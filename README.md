@@ -6,7 +6,7 @@ A Rust server for managing documents with REST and Server-Sent Events (SSE) APIs
 
 - **REST API** for document CRUD operations
 - Support for multiple content types: JSON, XML, and plain text
-- **SSE** for real-time document updates (planned)
+- **SSE** for real-time document updates with history replay
 - Built with [Axum](https://github.com/tokio-rs/axum) web framework
 - In-memory document storage
 
@@ -105,9 +105,14 @@ GET /health
 
 Returns "OK" if the server is running.
 
-### SSE
+### SSE and Change History APIs
 
-- `GET /sse/documents/:id` - Subscribe to document updates (placeholder implementation)
+- `GET /documents/:id/changes?since=<timestamp>` - Fetch commit history for a document since an optional UNIX timestamp (milliseconds).
+- `GET /documents/changes?doc_ids=<id1,id2,...>&since=<timestamp>` - Fetch commit history for multiple documents.
+- `GET /documents/:id/stream?since=<timestamp>` - Stream commit history for a document, beginning at `since` and continuing with live updates via SSE.
+- `GET /documents/stream?doc_ids=<id1,id2,...>&since=<timestamp>` - Stream commit history across multiple documents via SSE.
+
+Commit notifications include canonical URLs of the form `commonplace://document/{doc_id}/commit/{commit_id}` that uniquely identify each commit within a document.
 
 ## Architecture
 
@@ -115,7 +120,7 @@ The server is organized into three main modules:
 
 - `api.rs` - REST API endpoints for document management
 - `document.rs` - Document storage with content type support
-- `sse.rs` - Server-Sent Events for real-time updates (placeholder)
+- `sse.rs` - Server-Sent Events for real-time updates and subscriptions
 - `main.rs` - Server initialization and routing
 
 Documents are stored in-memory using a `DocumentStore`. Each document has:
