@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use yrs::types::ToJson;
 use yrs::updates::decoder::Decode;
 use yrs::GetString;
 use yrs::Transact;
+use yrs::WriteTxn;
 
 #[derive(Clone, Debug)]
 pub enum ContentType {
@@ -43,8 +45,7 @@ impl ContentType {
 pub struct Document {
     pub content: String,
     pub content_type: ContentType,
-    /// For `ContentType::Text`, this holds the Yrs document that powers collaborative edits.
-    /// For other content types this is `None`.
+    /// Yrs document that powers collaborative edits. This is a `Y.Text` named `content`.
     pub ydoc: Option<yrs::Doc>,
 }
 
@@ -52,8 +53,18 @@ pub struct DocumentStore {
     documents: Arc<RwLock<HashMap<String, Document>>>,
 }
 
+impl Default for DocumentStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DocumentStore {
     const TEXT_ROOT_NAME: &'static str = "content";
+    const DEFAULT_YDOC_CLIENT_ID: u64 = 1;
+    const XML_HEADER: &'static str = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
+    const XML_ROOT_START: &'static str = "<root>";
+    const XML_ROOT_END: &'static str = "</root>";
 
     pub fn new() -> Self {
         Self {
@@ -63,22 +74,25 @@ impl DocumentStore {
 
     pub async fn create_document(&self, content_type: ContentType) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        let doc = match content_type {
+        let ydoc = yrs::Doc::with_client_id(Self::DEFAULT_YDOC_CLIENT_ID);
+        match content_type {
             ContentType::Text => {
-                let ydoc = yrs::Doc::new();
                 ydoc.get_or_insert_text(Self::TEXT_ROOT_NAME);
-
-                Document {
-                    content: String::new(),
-                    content_type: ContentType::Text,
-                    ydoc: Some(ydoc),
-                }
             }
-            other => Document {
-                content: other.default_content(),
-                content_type: other,
-                ydoc: None,
-            },
+            ContentType::Json => {
+                ydoc.get_or_insert_map(Self::TEXT_ROOT_NAME);
+            }
+            ContentType::Xml => {
+                ydoc.get_or_insert_xml_fragment(Self::TEXT_ROOT_NAME);
+            }
+        }
+
+        let content = content_type.default_content();
+
+        let doc = Document {
+            content,
+            content_type,
+            ydoc: Some(ydoc),
         };
 
         let mut documents = self.documents.write().await;
@@ -97,32 +111,56 @@ impl DocumentStore {
         documents.remove(id).is_some()
     }
 
-    pub async fn apply_text_update(&self, id: &str, update: &[u8]) -> Result<(), ApplyError> {
+    pub async fn apply_yjs_update(&self, id: &str, update: &[u8]) -> Result<(), ApplyError> {
         let mut documents = self.documents.write().await;
         let doc = documents.get_mut(id).ok_or(ApplyError::NotFound)?;
-
-        if !matches!(doc.content_type, ContentType::Text) {
-            return Err(ApplyError::WrongContentType);
-        }
 
         let ydoc = doc.ydoc.as_ref().ok_or(ApplyError::MissingYDoc)?.clone();
         let update =
             yrs::Update::decode_v1(update).map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
 
-        let text = ydoc.get_or_insert_text(Self::TEXT_ROOT_NAME);
         let mut txn = ydoc.transact_mut();
+        let content_type = doc.content_type.clone();
         txn.apply_update(update);
 
-        doc.content = text.get_string(&txn);
+        doc.content = match content_type {
+            ContentType::Text => {
+                let text = txn.get_or_insert_text(Self::TEXT_ROOT_NAME);
+                text.get_string(&txn)
+            }
+            ContentType::Json => {
+                let map = txn.get_or_insert_map(Self::TEXT_ROOT_NAME);
+                let any = map.to_json(&txn);
+                serde_json::to_string(&any).map_err(|e| ApplyError::Serialization(e.to_string()))?
+            }
+            ContentType::Xml => {
+                let fragment = txn.get_or_insert_xml_fragment(Self::TEXT_ROOT_NAME);
+                let inner = fragment.get_string(&txn);
+                Self::wrap_xml_root(&inner)
+            }
+        };
 
         Ok(())
+    }
+
+    fn wrap_xml_root(inner: &str) -> String {
+        if inner.is_empty() {
+            return format!("{}<root/>", Self::XML_HEADER);
+        }
+        format!(
+            "{}{}{}{}",
+            Self::XML_HEADER,
+            Self::XML_ROOT_START,
+            inner,
+            Self::XML_ROOT_END
+        )
     }
 }
 
 #[derive(Debug)]
 pub enum ApplyError {
     NotFound,
-    WrongContentType,
     MissingYDoc,
     InvalidUpdate(String),
+    Serialization(String),
 }

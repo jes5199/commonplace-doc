@@ -123,7 +123,7 @@ async fn create_commit(
         .ok_or(StatusCode::NOT_IMPLEMENTED)?;
 
     // Check if document exists
-    let doc = state
+    let _doc = state
         .doc_store
         .get_document(&doc_id)
         .await
@@ -140,14 +140,7 @@ async fn create_commit(
         req.author
     };
 
-    let update_bytes = if matches!(doc.content_type, ContentType::Text) {
-        Some(
-            b64::decode(&req.value)
-                .map_err(|_| StatusCode::BAD_REQUEST)?
-        )
-    } else {
-        None
-    };
+    let update_bytes = b64::decode(&req.value).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Get current head commit (if any)
     let current_head = commit_store
@@ -176,18 +169,16 @@ async fn create_commit(
             vec![edit_cid.clone(), head_cid.clone()]
         } else {
             // If there's no current head, just make the edit commit the head
-            if let Some(update_bytes) = update_bytes.as_ref() {
-                state
-                    .doc_store
-                    .apply_text_update(&doc_id, update_bytes)
-                    .await
-                    .map_err(|e| match e {
-                        ApplyError::NotFound => StatusCode::NOT_FOUND,
-                        ApplyError::WrongContentType => StatusCode::BAD_REQUEST,
-                        ApplyError::MissingYDoc => StatusCode::INTERNAL_SERVER_ERROR,
-                        ApplyError::InvalidUpdate(_) => StatusCode::BAD_REQUEST,
-                    })?;
-            }
+            state
+                .doc_store
+                .apply_yjs_update(&doc_id, &update_bytes)
+                .await
+                .map_err(|e| match e {
+                    ApplyError::NotFound => StatusCode::NOT_FOUND,
+                    ApplyError::MissingYDoc => StatusCode::INTERNAL_SERVER_ERROR,
+                    ApplyError::InvalidUpdate(_) => StatusCode::BAD_REQUEST,
+                    ApplyError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                })?;
 
             commit_store
                 .set_document_head(&doc_id, &edit_cid)
@@ -218,18 +209,16 @@ async fn create_commit(
             .await
             .map_err(|_| StatusCode::CONFLICT)?;
 
-        if let Some(update_bytes) = update_bytes.as_ref() {
-            state
-                .doc_store
-                .apply_text_update(&doc_id, update_bytes)
-                .await
-                .map_err(|e| match e {
-                    ApplyError::NotFound => StatusCode::NOT_FOUND,
-                    ApplyError::WrongContentType => StatusCode::BAD_REQUEST,
-                    ApplyError::MissingYDoc => StatusCode::INTERNAL_SERVER_ERROR,
-                    ApplyError::InvalidUpdate(_) => StatusCode::BAD_REQUEST,
-                })?;
-        }
+        state
+            .doc_store
+            .apply_yjs_update(&doc_id, &update_bytes)
+            .await
+            .map_err(|e| match e {
+                ApplyError::NotFound => StatusCode::NOT_FOUND,
+                ApplyError::MissingYDoc => StatusCode::INTERNAL_SERVER_ERROR,
+                ApplyError::InvalidUpdate(_) => StatusCode::BAD_REQUEST,
+                ApplyError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            })?;
 
         // Update document head to merge commit
         commit_store
@@ -257,18 +246,16 @@ async fn create_commit(
             .await
             .map_err(|_| StatusCode::CONFLICT)?;
 
-        if let Some(update_bytes) = update_bytes.as_ref() {
-            state
-                .doc_store
-                .apply_text_update(&doc_id, update_bytes)
-                .await
-                .map_err(|e| match e {
-                    ApplyError::NotFound => StatusCode::NOT_FOUND,
-                    ApplyError::WrongContentType => StatusCode::BAD_REQUEST,
-                    ApplyError::MissingYDoc => StatusCode::INTERNAL_SERVER_ERROR,
-                    ApplyError::InvalidUpdate(_) => StatusCode::BAD_REQUEST,
-                })?;
-        }
+        state
+            .doc_store
+            .apply_yjs_update(&doc_id, &update_bytes)
+            .await
+            .map_err(|e| match e {
+                ApplyError::NotFound => StatusCode::NOT_FOUND,
+                ApplyError::MissingYDoc => StatusCode::INTERNAL_SERVER_ERROR,
+                ApplyError::InvalidUpdate(_) => StatusCode::BAD_REQUEST,
+                ApplyError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            })?;
 
         // Update document head
         commit_store

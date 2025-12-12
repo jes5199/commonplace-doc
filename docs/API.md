@@ -85,7 +85,11 @@ Notes:
 
 - Only `"verb": "update"` is accepted today.
 - `"value"` is stored as `Commit.update` and is expected to be a base64-encoded Yjs update.
-- For `text/plain` documents, the server decodes and applies the update to the in-memory document body.
+- For `text/plain`, `application/json`, and `application/xml` documents, the server decodes and applies the update to the in-memory document body.
+- Root types by content type:
+  - `text/plain`: `Y.Text("content")`
+  - `application/json`: `Y.Map("content")`
+  - `application/xml`: `Y.XmlFragment("content")` (rendered under a fixed `<root>...</root>` wrapper)
 - If `parent_cid` is provided and there is an existing document head, the server will create a merge commit and advance the head to the merge.
 
 Response (JSON):

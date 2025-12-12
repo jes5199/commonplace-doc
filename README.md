@@ -7,7 +7,7 @@ A Rust server for managing documents with a small REST API, plus an (early/place
 - **REST API** for document CRUD operations (`/docs`)
 - Support for multiple content types: JSON, XML, and plain text
 - **Commit endpoint** (`/docs/:id/commit`) that persists content-addressed commits to a local `redb` database (enabled with `--database`)
-- For `text/plain` documents, commits are applied to the in-memory document body (so `GET /docs/:id` reflects committed edits)
+- For `text/plain`, `application/json`, and `application/xml` documents, commits are applied to the in-memory document body (so `GET /docs/:id` reflects committed edits)
 - **SSE** endpoint (currently heartbeats only)
 - Built with [Axum](https://github.com/tokio-rs/axum) web framework
 - In-memory document storage (document bodies are not persisted)

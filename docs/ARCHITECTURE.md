@@ -5,7 +5,13 @@ This repo is a small Axum-based HTTP server with two separate “tracks” of st
 - **Documents**: in-memory, created and fetched via `/docs`.
 - **Commits**: optional, persisted to a local `redb` file and created via `/docs/:id/commit`.
 
-For `text/plain` documents, commits are interpreted as Yjs (Yrs) updates and applied to the in-memory document body. For other content types, commits are stored but not applied to `Document.content` yet.
+For `text/plain`, `application/json`, and `application/xml` documents, commits are interpreted as Yjs (Yrs) updates and applied to the in-memory document body.
+
+Internally, each document uses a Yrs root type named `content`:
+
+- `text/plain`: `Y.Text("content")`
+- `application/json`: `Y.Map("content")` (serialized to JSON)
+- `application/xml`: `Y.XmlFragment("content")` (serialized as `<?xml...?><root>…</root>`)
 
 ## Code Map
 
@@ -77,6 +83,7 @@ Each `Document` has:
 
 - `content: String` (initialized to a default for the content type)
 - `content_type: ContentType` (JSON/XML/Text)
+- `ydoc: yrs::Doc` (Yrs document holding the collaborative state, rooted at `content`)
 
 Operations:
 
@@ -224,7 +231,7 @@ Important detail: `sse::router()` creates its own `DocumentStore` instance, sepa
 ## Known Limitations / Intentional Gaps
 
 - Document bodies are in-memory only (not persisted).
-- Only `text/plain` documents apply commits to the document body today.
-- Commit updates are expected to be base64-encoded Yjs updates; for `text/plain` they are decoded and applied via Yrs.
+- `text/plain`, `application/json`, and `application/xml` documents apply commits to the document body today.
+- Commit updates are expected to be base64-encoded Yjs updates.
 - SSE is heartbeats only and not wired to document/commit changes.
 - CID stability can be impacted if `extensions` is ever populated (unordered map).
