@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use yrs::updates::decoder::Decode;
+use yrs::GetString;
+use yrs::Transact;
 
 #[derive(Clone, Debug)]
 pub enum ContentType {
@@ -40,6 +43,9 @@ impl ContentType {
 pub struct Document {
     pub content: String,
     pub content_type: ContentType,
+    /// For `ContentType::Text`, this holds the Yrs document that powers collaborative edits.
+    /// For other content types this is `None`.
+    pub ydoc: Option<yrs::Doc>,
 }
 
 pub struct DocumentStore {
@@ -47,6 +53,8 @@ pub struct DocumentStore {
 }
 
 impl DocumentStore {
+    const TEXT_ROOT_NAME: &'static str = "content";
+
     pub fn new() -> Self {
         Self {
             documents: Arc::new(RwLock::new(HashMap::new())),
@@ -55,9 +63,22 @@ impl DocumentStore {
 
     pub async fn create_document(&self, content_type: ContentType) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        let doc = Document {
-            content: content_type.default_content(),
-            content_type,
+        let doc = match content_type {
+            ContentType::Text => {
+                let ydoc = yrs::Doc::new();
+                ydoc.get_or_insert_text(Self::TEXT_ROOT_NAME);
+
+                Document {
+                    content: String::new(),
+                    content_type: ContentType::Text,
+                    ydoc: Some(ydoc),
+                }
+            }
+            other => Document {
+                content: other.default_content(),
+                content_type: other,
+                ydoc: None,
+            },
         };
 
         let mut documents = self.documents.write().await;
@@ -75,4 +96,33 @@ impl DocumentStore {
         let mut documents = self.documents.write().await;
         documents.remove(id).is_some()
     }
+
+    pub async fn apply_text_update(&self, id: &str, update: &[u8]) -> Result<(), ApplyError> {
+        let mut documents = self.documents.write().await;
+        let doc = documents.get_mut(id).ok_or(ApplyError::NotFound)?;
+
+        if !matches!(doc.content_type, ContentType::Text) {
+            return Err(ApplyError::WrongContentType);
+        }
+
+        let ydoc = doc.ydoc.as_ref().ok_or(ApplyError::MissingYDoc)?.clone();
+        let update =
+            yrs::Update::decode_v1(update).map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
+
+        let text = ydoc.get_or_insert_text(Self::TEXT_ROOT_NAME);
+        let mut txn = ydoc.transact_mut();
+        txn.apply_update(update);
+
+        doc.content = text.get_string(&txn);
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum ApplyError {
+    NotFound,
+    WrongContentType,
+    MissingYDoc,
+    InvalidUpdate(String),
 }

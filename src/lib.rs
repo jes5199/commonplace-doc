@@ -1,4 +1,5 @@
 pub mod api;
+pub mod b64;
 pub mod cli;
 pub mod commit;
 pub mod document;

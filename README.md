@@ -1,14 +1,16 @@
 # Commonplace Doc Server
 
-A Rust server for managing documents with REST and Server-Sent Events (SSE) APIs.
+A Rust server for managing documents with a small REST API, plus an (early/placeholder) Server-Sent Events (SSE) endpoint.
 
 ## Features
 
-- **REST API** for document CRUD operations
+- **REST API** for document CRUD operations (`/docs`)
 - Support for multiple content types: JSON, XML, and plain text
-- **SSE** for real-time document updates (planned)
+- **Commit endpoint** (`/docs/:id/commit`) that persists content-addressed commits to a local `redb` database (enabled with `--database`)
+- For `text/plain` documents, commits are applied to the in-memory document body (so `GET /docs/:id` reflects committed edits)
+- **SSE** endpoint (currently heartbeats only)
 - Built with [Axum](https://github.com/tokio-rs/axum) web framework
-- In-memory document storage
+- In-memory document storage (document bodies are not persisted)
 
 ## Getting Started
 
@@ -24,6 +26,16 @@ cargo run
 ```
 
 The server will start on `http://localhost:3000`.
+
+### Running With Commit Storage
+
+Commit storage is disabled unless you pass a database path:
+
+```bash
+cargo run -- --database ./commonplace.redb
+```
+
+Without `--database`, `POST /docs/:id/commit` returns `501 Not Implemented`.
 
 ### Development
 
@@ -45,6 +57,8 @@ cargo clippy
 ```
 
 ## API Endpoints
+
+See `docs/API.md` for detailed request/response examples.
 
 ### REST API
 
@@ -111,11 +125,18 @@ Returns "OK" if the server is running.
 
 ## Architecture
 
-The server is organized into three main modules:
+More detailed documentation:
+
+- `docs/ARCHITECTURE.md`
+- `docs/API.md`
+- `docs/DEVELOPMENT.md`
+
+The server is organized into a few main modules:
 
 - `api.rs` - REST API endpoints for document management
 - `document.rs` - Document storage with content type support
-- `sse.rs` - Server-Sent Events for real-time updates (placeholder)
+- `commit.rs` / `store.rs` - Commit model and `redb`-backed commit storage (optional)
+- `sse.rs` - Server-Sent Events endpoint (placeholder)
 - `main.rs` - Server initialization and routing
 
 Documents are stored in-memory using a `DocumentStore`. Each document has:

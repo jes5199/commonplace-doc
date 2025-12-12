@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::commit::Commit;
 use crate::document::{ContentType, DocumentStore};
 use crate::store::CommitStore;
+use crate::{b64, document::ApplyError};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -122,7 +123,7 @@ async fn create_commit(
         .ok_or(StatusCode::NOT_IMPLEMENTED)?;
 
     // Check if document exists
-    state
+    let doc = state
         .doc_store
         .get_document(&doc_id)
         .await
@@ -137,6 +138,15 @@ async fn create_commit(
         "anonymous".to_string()
     } else {
         req.author
+    };
+
+    let update_bytes = if matches!(doc.content_type, ContentType::Text) {
+        Some(
+            b64::decode(&req.value)
+                .map_err(|_| StatusCode::BAD_REQUEST)?
+        )
+    } else {
+        None
     };
 
     // Get current head commit (if any)
@@ -166,6 +176,24 @@ async fn create_commit(
             vec![edit_cid.clone(), head_cid.clone()]
         } else {
             // If there's no current head, just make the edit commit the head
+            if let Some(update_bytes) = update_bytes.as_ref() {
+                state
+                    .doc_store
+                    .apply_text_update(&doc_id, update_bytes)
+                    .await
+                    .map_err(|e| match e {
+                        ApplyError::NotFound => StatusCode::NOT_FOUND,
+                        ApplyError::WrongContentType => StatusCode::BAD_REQUEST,
+                        ApplyError::MissingYDoc => StatusCode::INTERNAL_SERVER_ERROR,
+                        ApplyError::InvalidUpdate(_) => StatusCode::BAD_REQUEST,
+                    })?;
+            }
+
+            commit_store
+                .set_document_head(&doc_id, &edit_cid)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
             return Ok(Json(CreateCommitResponse {
                 cid: edit_cid,
                 merge_cid: None,
@@ -189,6 +217,19 @@ async fn create_commit(
             .validate_monotonic_descent(&doc_id, &merge_cid)
             .await
             .map_err(|_| StatusCode::CONFLICT)?;
+
+        if let Some(update_bytes) = update_bytes.as_ref() {
+            state
+                .doc_store
+                .apply_text_update(&doc_id, update_bytes)
+                .await
+                .map_err(|e| match e {
+                    ApplyError::NotFound => StatusCode::NOT_FOUND,
+                    ApplyError::WrongContentType => StatusCode::BAD_REQUEST,
+                    ApplyError::MissingYDoc => StatusCode::INTERNAL_SERVER_ERROR,
+                    ApplyError::InvalidUpdate(_) => StatusCode::BAD_REQUEST,
+                })?;
+        }
 
         // Update document head to merge commit
         commit_store
@@ -215,6 +256,19 @@ async fn create_commit(
             .validate_monotonic_descent(&doc_id, &cid)
             .await
             .map_err(|_| StatusCode::CONFLICT)?;
+
+        if let Some(update_bytes) = update_bytes.as_ref() {
+            state
+                .doc_store
+                .apply_text_update(&doc_id, update_bytes)
+                .await
+                .map_err(|e| match e {
+                    ApplyError::NotFound => StatusCode::NOT_FOUND,
+                    ApplyError::WrongContentType => StatusCode::BAD_REQUEST,
+                    ApplyError::MissingYDoc => StatusCode::INTERNAL_SERVER_ERROR,
+                    ApplyError::InvalidUpdate(_) => StatusCode::BAD_REQUEST,
+                })?;
+        }
 
         // Update document head
         commit_store

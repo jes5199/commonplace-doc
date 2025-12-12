@@ -4,10 +4,19 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use tower::util::ServiceExt;
+use yrs::Text;
+use yrs::Transact;
 
 // Helper to create test app
 fn create_app() -> axum::Router {
     commonplace_doc::create_router()
+}
+
+fn create_app_with_commit_store() -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("commits.redb");
+    let store = commonplace_doc::store::CommitStore::new(&path).unwrap();
+    (commonplace_doc::create_router_with_store(Some(store)), dir)
 }
 
 // Helper to get response body as string
@@ -330,4 +339,75 @@ async fn test_delete_nonexistent_document() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_text_document_yjs_commit_updates_document_body() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    // Create a text document
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/docs")
+                .header("content-type", "text/plain")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(create_response.status(), StatusCode::OK);
+    let create_body = body_to_string(create_response.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&create_body).unwrap();
+    let doc_id = json["id"].as_str().unwrap().to_string();
+
+    // Generate a Yrs update that inserts "hello" into the "content" text root.
+    let ydoc = yrs::Doc::new();
+    let text = ydoc.get_or_insert_text("content");
+    let mut txn = ydoc.transact_mut();
+    text.push(&mut txn, "hello");
+    let update = txn.encode_update_v1();
+    let update_b64 = commonplace_doc::b64::encode(&update);
+
+    // Commit update
+    let commit_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/docs/{}/commit", doc_id))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "verb": "update",
+                        "value": update_b64,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(commit_response.status(), StatusCode::OK);
+
+    // Verify document body reflects the committed update
+    let get_response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/docs/{}", doc_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(get_response.status(), StatusCode::OK);
+    assert_eq!(get_response.headers().get("content-type").unwrap(), "text/plain");
+    let body = body_to_string(get_response.into_body()).await;
+    assert_eq!(body, "hello");
 }
