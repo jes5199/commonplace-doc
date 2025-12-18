@@ -24,7 +24,7 @@ async fn health_check() -> &'static str {
 
 pub fn create_router_with_store(store: Option<CommitStore>) -> Router {
     let doc_store = Arc::new(DocumentStore::new());
-    let commit_store = store.map(|s| Arc::new(s));
+    let commit_store = store.map(Arc::new);
     let commit_broadcaster = commit_store.as_ref().map(|_| CommitBroadcaster::new(1024));
     let node_registry = Arc::new(NodeRegistry::new());
 

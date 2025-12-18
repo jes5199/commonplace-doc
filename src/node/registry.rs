@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Tracks a wiring between two nodes
+#[allow(dead_code)]
 struct NodeWiring {
     from: NodeId,
     to: NodeId,

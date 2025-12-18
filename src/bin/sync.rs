@@ -63,6 +63,7 @@ struct HeadResponse {
 
 /// Response from POST /nodes/:id/replace
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ReplaceResponse {
     cid: String,
     edit_cid: String,
@@ -70,6 +71,7 @@ struct ReplaceResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ReplaceSummary {
     chars_inserted: usize,
     chars_deleted: usize,
@@ -78,12 +80,14 @@ struct ReplaceSummary {
 
 /// SSE edit event data
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct EditEventData {
     source: String,
     commit: CommitData,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct CommitData {
     update: String,
     parents: Vec<String>,
