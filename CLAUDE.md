@@ -30,19 +30,29 @@ This is a Rust server for managing documents with support for multiple content t
 
 ### Code Structure
 
-- `src/main.rs` - Server initialization and routing
-- `src/api.rs` - REST API endpoints (/docs and /nodes)
-- `src/document.rs` - DocumentStore with ContentType enum and in-memory storage
-- `src/node/` - Node trait abstraction for reactive document processing
-  - `mod.rs` - Node trait definition with blue/red port methods
-  - `document_node.rs` - DocumentNode implementation (persistent)
-  - `connection_node.rs` - ConnectionNode for SSE clients (transient)
-  - `registry.rs` - NodeRegistry with cycle detection and lazy creation
-  - `types.rs` - Edit, Event, NodeId, Port types
-  - `subscription.rs` - BlueSubscription, RedSubscription, Subscription
-- `src/commit.rs` / `src/store.rs` - Commit model and redb-backed storage
-- `src/events.rs` - Commit broadcast for SSE change notifications
-- `src/sse.rs` - Server-Sent Events for node subscriptions and document change streams
+```
+src/
+├── lib.rs              # Library root, router setup
+├── bin/
+│   └── server.rs       # HTTP server binary (commonplace-server)
+├── api.rs              # REST API endpoints (/docs, /nodes)
+├── sse.rs              # Server-Sent Events for subscriptions
+├── document.rs         # DocumentStore, ContentType enum
+├── commit.rs           # Commit model (merkle-tree)
+├── store.rs            # CommitStore - redb persistence
+├── diff.rs             # Character-level diffing → Yjs updates
+├── replay.rs           # Commit DAG traversal, state reconstruction
+├── node/               # Reactive node graph
+│   ├── mod.rs          # Node trait (blue/red ports)
+│   ├── types.rs        # Edit, Event, NodeId, Port
+│   ├── document_node.rs # Persistent Yjs document wrapper
+│   ├── connection_node.rs # Transient SSE client nodes
+│   ├── registry.rs     # NodeRegistry with cycle detection
+│   └── subscription.rs # Blue/Red subscriptions
+├── events.rs           # CommitBroadcaster for SSE
+├── b64.rs              # Base64 utilities
+└── cli.rs              # CLI argument definitions
+```
 
 The server runs on `localhost:3000` by default.
 
@@ -95,12 +105,13 @@ Default content by type:
 
 ## Development Commands
 
-- `cargo build` - Build the project
-- `cargo run` - Run the server locally
+- `cargo build` - Build all binaries
+- `cargo run --bin commonplace-server` - Run the HTTP server
 - `cargo test` - Run tests
 - `cargo clippy` - Run linter
 - `cargo fmt` - Format code
-- `RUST_LOG=debug cargo run` - Run with debug logging
+- `RUST_LOG=debug cargo run --bin commonplace-server` - Run with debug logging
+- `cargo run --bin commonplace-server -- --database ./data.redb` - Run with persistence
 
 ## Git Configuration
 

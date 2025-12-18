@@ -8,8 +8,8 @@ name = "commonplace_doc"
 path = "src/lib.rs"
 
 [[bin]]
-name = "commonplace-doc"
-path = "src/main.rs"
+name = "commonplace-server"
+path = "src/bin/server.rs"
 
 [dependencies]
 axum = "0.7"
