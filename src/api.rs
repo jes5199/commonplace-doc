@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::commit::Commit;
-use crate::diff::compute_diff_update;
+use crate::diff::compute_diff_update_with_base;
 use crate::document::{ContentType, DocumentStore};
 use crate::events::{CommitBroadcaster, CommitNotification};
 use crate::node::{DocumentNode, Edit, Event, NodeError, NodeId, NodeRegistry};
@@ -67,6 +67,7 @@ pub fn router(
         .route("/nodes/:id", delete(delete_node))
         .route("/nodes/:id/edit", post(send_edit))
         .route("/nodes/:id/replace", post(replace_content))
+        .route("/nodes/:id/head", get(get_node_head))
         .route("/nodes/:id/event", post(send_event))
         .route("/nodes/:from/wire/:to", post(wire_nodes))
         .route("/nodes/:from/wire/:to", delete(unwire_nodes))
@@ -415,6 +416,59 @@ async fn get_node(
     }))
 }
 
+#[derive(Serialize)]
+struct NodeHeadResponse {
+    /// Current HEAD commit ID (None if no commits yet)
+    cid: Option<String>,
+    /// Document content at HEAD
+    content: String,
+}
+
+async fn get_node_head(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<NodeHeadResponse>, (StatusCode, String)> {
+    // 1. Check commit store is available
+    let commit_store = state.commit_store.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        "Commit store not enabled. Start server with --database flag.".to_string(),
+    ))?;
+
+    // 2. Verify node exists
+    let node_id = NodeId::new(&id);
+    let _node = state
+        .node_registry
+        .get(&node_id)
+        .await
+        .ok_or((StatusCode::NOT_FOUND, format!("Node {} not found", id)))?;
+
+    // 3. Get current HEAD
+    let head_cid = commit_store
+        .get_document_head(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // 4. If no HEAD, return empty content
+    let Some(cid) = head_cid else {
+        return Ok(Json(NodeHeadResponse {
+            cid: None,
+            content: String::new(),
+        }));
+    };
+
+    // 5. Replay content at HEAD
+    let replayer = CommitReplayer::new(commit_store.as_ref());
+    let content = replayer
+        .get_content_at_commit(&id, &cid, &ContentType::Text)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(NodeHeadResponse {
+        cid: Some(cid),
+        content,
+    }))
+}
+
 async fn delete_node(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -678,14 +732,14 @@ async fn replace_content(
         ));
     }
 
-    // 5. Reconstruct content at parent_cid
-    let old_content = replayer
-        .get_content_at_commit(&id, &query.parent_cid, &content_type)
+    // 5. Reconstruct content and state at parent_cid
+    let (old_content, base_state) = replayer
+        .get_content_and_state_at_commit(&id, &query.parent_cid, &content_type)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // 6. Compute diff and generate Yjs update
-    let diff_result = compute_diff_update(&old_content, &body)
+    // 6. Compute diff and generate Yjs update using actual base state
+    let diff_result = compute_diff_update_with_base(&base_state, &old_content, &body)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // 7. Get current HEAD

@@ -121,6 +121,62 @@ pub fn compute_diff_update(old_content: &str, new_content: &str) -> Result<DiffR
     })
 }
 
+/// Compute character-level diff using actual Yjs state as base.
+///
+/// Unlike `compute_diff_update`, this function uses the actual Yjs state
+/// (from parent commits) as the base, ensuring the resulting update is
+/// compatible when replayed with the original commits.
+///
+/// # Arguments
+/// * `base_state_bytes` - The Yjs state update bytes from replaying parent commits
+/// * `old_content` - The text content extracted from the base state
+/// * `new_content` - The desired new content
+///
+/// # Returns
+/// A `DiffResult` containing the Yjs update and statistics
+pub fn compute_diff_update_with_base(
+    base_state_bytes: &[u8],
+    old_content: &str,
+    new_content: &str,
+) -> Result<DiffResult, DiffError> {
+    // Create target doc and sync to actual base state
+    let target_doc = Doc::with_client_id(2);
+    let target_text = target_doc.get_or_insert_text(TEXT_ROOT_NAME);
+
+    // Apply the actual base state from parent commits
+    {
+        let update = yrs::Update::decode_v1(base_state_bytes)
+            .map_err(|e| DiffError::YrsOperationFailed(e.to_string()))?;
+        let mut txn = target_doc.transact_mut();
+        txn.apply_update(update);
+    }
+
+    // Compute character-level diff
+    let diff = TextDiff::from_chars(old_content, new_content);
+
+    let mut summary = DiffSummary::default();
+
+    // Collect operations for batch application
+    let ops = collect_diff_operations(&diff, &mut summary);
+    let operation_count = ops.len();
+
+    // Apply operations and encode update
+    let update_bytes = {
+        let mut txn = target_doc.transact_mut();
+        apply_diff_operations(&target_text, &mut txn, &ops);
+        txn.encode_update_v1()
+    };
+
+    let update_b64 = b64::encode(&update_bytes);
+
+    Ok(DiffResult {
+        update_bytes,
+        update_b64,
+        operation_count,
+        summary,
+    })
+}
+
 /// A batched diff operation
 #[derive(Debug)]
 enum DiffOp {

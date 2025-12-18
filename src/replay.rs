@@ -76,6 +76,25 @@ impl<'a> CommitReplayer<'a> {
         target_cid: &str,
         content_type: &ContentType,
     ) -> Result<String, ReplayError> {
+        let (content, _) = self
+            .get_content_and_state_at_commit(_doc_id, target_cid, content_type)
+            .await?;
+        Ok(content)
+    }
+
+    /// Get both the content and Yjs state at a specific commit.
+    ///
+    /// This is useful when you need both the text content and the actual Yjs
+    /// state bytes (for computing diffs that are compatible with the commit chain).
+    ///
+    /// # Returns
+    /// A tuple of (text content, Yjs state update bytes)
+    pub async fn get_content_and_state_at_commit(
+        &self,
+        _doc_id: &str,
+        target_cid: &str,
+        content_type: &ContentType,
+    ) -> Result<(String, Vec<u8>), ReplayError> {
         // Verify content type is Text (for now)
         if !matches!(content_type, ContentType::Text) {
             return Err(ReplayError::UnsupportedContentType(
@@ -110,12 +129,15 @@ impl<'a> CommitReplayer<'a> {
             txn.apply_update(update);
         }
 
-        // Extract final content
+        // Extract final content and state
         let txn = ydoc.transact();
         let text = txn
             .get_text(TEXT_ROOT_NAME)
             .ok_or_else(|| ReplayError::InvalidUpdate("Text root not found".to_string()))?;
-        Ok(text.get_string(&txn))
+        let content = text.get_string(&txn);
+        let state_bytes = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+
+        Ok((content, state_bytes))
     }
 
     /// Collect all commits from root to target in topological/chronological order.

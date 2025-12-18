@@ -791,3 +791,134 @@ async fn test_replace_invalid_parent_cid() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn test_get_node_head_empty() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    // Create a text node but don't add any content
+    let node_id = create_text_node(&app).await;
+
+    // Get head - should return null cid and empty content
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/nodes/{}/head", node_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    assert!(json["cid"].is_null());
+    assert_eq!(json["content"].as_str().unwrap(), "");
+}
+
+#[tokio::test]
+async fn test_get_node_head_with_content() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    let node_id = create_text_node(&app).await;
+
+    // Add content
+    let initial_update = create_yjs_text_update("hello world");
+    let cid = send_edit(&app, &node_id, &initial_update).await;
+
+    // Get head - should return the cid and content
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/nodes/{}/head", node_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    assert_eq!(json["cid"].as_str().unwrap(), cid);
+    assert_eq!(json["content"].as_str().unwrap(), "hello world");
+}
+
+#[tokio::test]
+async fn test_get_node_head_after_replace() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    let node_id = create_text_node(&app).await;
+
+    // Initialize with content
+    let initial_update = create_yjs_text_update("hello");
+    let cid = send_edit(&app, &node_id, &initial_update).await;
+
+    // Replace with new content
+    let replace_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/nodes/{}/replace?parent_cid={}&author=test",
+                    node_id, cid
+                ))
+                .header("content-type", "text/plain")
+                .body(Body::from("hello world"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(replace_response.status(), StatusCode::OK);
+    let replace_body = body_to_string(replace_response.into_body()).await;
+    let replace_json: serde_json::Value = serde_json::from_str(&replace_body).unwrap();
+    let new_cid = replace_json["cid"].as_str().unwrap();
+
+    // Get head - should return the new cid and updated content
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/nodes/{}/head", node_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    assert_eq!(json["cid"].as_str().unwrap(), new_cid);
+    assert_eq!(json["content"].as_str().unwrap(), "hello world");
+}
+
+#[tokio::test]
+async fn test_get_node_head_nonexistent_node() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/nodes/nonexistent-node/head")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
