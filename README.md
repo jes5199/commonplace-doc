@@ -1,14 +1,15 @@
 # Commonplace Doc Server
 
-A Rust server for managing documents with a small REST API, plus an (early/placeholder) Server-Sent Events (SSE) endpoint.
+A Rust server for managing documents with a small REST API, plus Server-Sent Events (SSE) for real-time updates.
 
 ## Features
 
 - **REST API** for document CRUD operations (`/docs`)
+- **Node API** for reactive document graph (`/nodes`) - nodes receive/emit edits and events, can be wired together
 - Support for multiple content types: JSON, XML, and plain text
 - **Commit endpoint** (`/docs/:id/commit`) that persists content-addressed commits to a local `redb` database (enabled with `--database`)
 - For `text/plain`, `application/json`, and `application/xml` documents, commits are applied to the in-memory document body (so `GET /docs/:id` reflects committed edits)
-- **SSE** endpoint (currently heartbeats only)
+- **SSE** endpoint for subscribing to node updates in real-time
 - Built with [Axum](https://github.com/tokio-rs/axum) web framework
 - In-memory document storage (document bodies are not persisted)
 
@@ -119,9 +120,101 @@ GET /health
 
 Returns "OK" if the server is running.
 
+### Node API
+
+The Node API provides a reactive abstraction where nodes can receive and emit edits (commits) and events (ephemeral JSON messages). Nodes can be wired together to create processing graphs.
+
+#### Create Node
+```bash
+POST /nodes
+Content-Type: application/json
+
+{"node_type": "document", "content_type": "application/json"}
+```
+
+Creates a new node. Currently only `"document"` type is supported. Returns:
+```json
+{"id": "uuid", "node_type": "document"}
+```
+
+#### List Nodes
+```bash
+GET /nodes
+```
+
+Returns all registered nodes with their status.
+
+#### Get Node Info
+```bash
+GET /nodes/{id}
+```
+
+Returns node details including subscriber count and health status.
+
+#### Delete Node
+```bash
+DELETE /nodes/{id}
+```
+
+Shuts down and removes a node.
+
+#### Send Edit to Node
+```bash
+POST /nodes/{id}/edit
+Content-Type: application/json
+
+{"update": "base64_yjs_update", "author": "alice", "message": "optional"}
+```
+
+Sends a Yjs update to the node. The node applies it and emits to subscribers.
+
+#### Send Event to Node
+```bash
+POST /nodes/{id}/event
+Content-Type: application/json
+
+{"event_type": "cursor", "payload": {"x": 100, "y": 200}}
+```
+
+Sends an ephemeral event to the node. Events are forwarded to subscribers but not persisted.
+
+#### Wire Nodes
+```bash
+POST /nodes/{from}/wire/{to}
+```
+
+Wires two nodes together. Edits and events emitted by `from` are sent to `to`. Returns:
+```json
+{"subscription_id": "uuid", "from": "node1", "to": "node2"}
+```
+
+Cycle detection prevents creating circular dependencies.
+
+#### Unwire Nodes
+```bash
+DELETE /nodes/{from}/wire/{to}
+```
+
+Removes the wiring between nodes.
+
 ### SSE
 
-- `GET /sse/documents/:id` - Subscribe to document updates (placeholder implementation)
+Subscribe to real-time updates from a node:
+
+```bash
+GET /sse/nodes/{id}
+```
+
+Streams Server-Sent Events:
+- `edit` events contain commit data (update, parents, timestamp, author, message)
+- Custom event types for ephemeral events (cursor, presence, etc.)
+- `warning` events if the subscription lags
+- `closed` event when the node shuts down
+
+**Example:**
+```bash
+curl -N http://localhost:3000/sse/nodes/{id}
+```
 
 ## Architecture
 
@@ -133,10 +226,16 @@ More detailed documentation:
 
 The server is organized into a few main modules:
 
-- `api.rs` - REST API endpoints for document management
+- `api.rs` - REST API endpoints for document and node management
 - `document.rs` - Document storage with content type support
+- `node/` - Node trait abstraction for reactive document processing
+  - `mod.rs` - Node trait definition
+  - `document_node.rs` - Document node implementation
+  - `registry.rs` - Node graph management with cycle detection
+  - `types.rs` - Edit, Event, NodeId, NodeMessage types
+  - `subscription.rs` - Subscription handling
 - `commit.rs` / `store.rs` - Commit model and `redb`-backed commit storage (optional)
-- `sse.rs` - Server-Sent Events endpoint (placeholder)
+- `sse.rs` - Server-Sent Events for real-time node subscriptions
 - `main.rs` - Server initialization and routing
 
 Documents are stored in-memory using a `DocumentStore`. Each document has:

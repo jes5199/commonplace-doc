@@ -9,11 +9,12 @@ This is a Rust server for managing documents with support for multiple content t
 ### Architecture
 
 - **Language**: Rust (edition 2021)
-- **Purpose**: Document management server with multi-format support
+- **Purpose**: Document management server with multi-format support and reactive node graph
 - **Web Framework**: Axum 0.7
 - **API Protocols**:
-  - REST API for document CRUD operations
-  - SSE (Server-Sent Events) for real-time updates (placeholder)
+  - REST API for document CRUD operations (`/docs`)
+  - Node API for reactive document graph (`/nodes`)
+  - SSE (Server-Sent Events) for real-time node subscriptions
 
 ### Key Dependencies
 
@@ -22,14 +23,24 @@ This is a Rust server for managing documents with support for multiple content t
 - `tower-http` - Middleware (CORS, tracing)
 - `serde` / `serde_json` - Serialization
 - `uuid` - Document ID generation
+- `yrs` - Yjs-compatible CRDT implementation
+- `async-trait` - Async trait support
 - `async-stream` - SSE stream support
+- `redb` - Persistent key-value storage (enabled with `--database`)
 
 ### Code Structure
 
 - `src/main.rs` - Server initialization and routing
-- `src/api.rs` - REST API endpoints (/docs)
+- `src/api.rs` - REST API endpoints (/docs and /nodes)
 - `src/document.rs` - DocumentStore with ContentType enum and in-memory storage
-- `src/sse.rs` - Server-Sent Events endpoints (placeholder implementation)
+- `src/node/` - Node trait abstraction for reactive document processing
+  - `mod.rs` - Node trait definition
+  - `document_node.rs` - DocumentNode implementation
+  - `registry.rs` - NodeRegistry with cycle detection
+  - `types.rs` - Edit, Event, NodeId, NodeMessage types
+  - `subscription.rs` - Subscription handling
+- `src/commit.rs` / `src/store.rs` - Commit model and redb-backed storage
+- `src/sse.rs` - Server-Sent Events for real-time node subscriptions
 
 The server runs on `localhost:3000` by default.
 
@@ -39,10 +50,21 @@ The server runs on `localhost:3000` by default.
 - `POST /docs` - Create a blank document (Content-Type header: application/json, application/xml, or text/plain)
 - `GET /docs/{uuid}` - Retrieve document content
 - `DELETE /docs/{uuid}` - Delete a document
+- `POST /docs/{uuid}/commit` - Persist a Yjs update and apply it to the document (requires `--database`)
 - `GET /health` - Health check
 
-#### SSE (planned)
-- `GET /sse/documents/:id` - Subscribe to document updates
+#### Node API
+- `POST /nodes` - Create a node (type: "document")
+- `GET /nodes` - List all nodes
+- `GET /nodes/{id}` - Get node info
+- `DELETE /nodes/{id}` - Delete a node
+- `POST /nodes/{id}/edit` - Send an edit (Yjs update) to a node
+- `POST /nodes/{id}/event` - Send an event (ephemeral JSON) to a node
+- `POST /nodes/{from}/wire/{to}` - Wire two nodes together
+- `DELETE /nodes/{from}/wire/{to}` - Remove wiring between nodes
+
+#### SSE
+- `GET /sse/nodes/{id}` - Subscribe to real-time updates from a node
 
 ### Document Storage
 

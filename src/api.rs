@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::commit::Commit;
 use crate::document::{ContentType, DocumentStore};
+use crate::node::{DocumentNode, Edit, Event, NodeError, NodeId, NodeRegistry};
 use crate::store::CommitStore;
 use crate::{b64, document::ApplyError};
 
@@ -17,20 +18,32 @@ use crate::{b64, document::ApplyError};
 pub struct ApiState {
     pub doc_store: Arc<DocumentStore>,
     pub commit_store: Option<Arc<CommitStore>>,
+    pub node_registry: Arc<NodeRegistry>,
 }
 
-pub fn router(commit_store: Option<CommitStore>) -> Router {
+pub fn router(commit_store: Option<CommitStore>, node_registry: Arc<NodeRegistry>) -> Router {
     let doc_store = Arc::new(DocumentStore::new());
     let state = ApiState {
         doc_store,
         commit_store: commit_store.map(Arc::new),
+        node_registry,
     };
 
     Router::new()
+        // Existing document endpoints (backward compatible)
         .route("/docs", post(create_document))
         .route("/docs/:id", get(get_document))
         .route("/docs/:id", delete(delete_document))
         .route("/docs/:id/commit", post(create_commit))
+        // New node endpoints
+        .route("/nodes", post(create_node))
+        .route("/nodes", get(list_nodes))
+        .route("/nodes/:id", get(get_node))
+        .route("/nodes/:id", delete(delete_node))
+        .route("/nodes/:id/edit", post(send_edit))
+        .route("/nodes/:id/event", post(send_event))
+        .route("/nodes/:from/wire/:to", post(wire_nodes))
+        .route("/nodes/:from/wire/:to", delete(unwire_nodes))
         .with_state(state)
 }
 
@@ -270,4 +283,256 @@ async fn create_commit(
         cid: commit_cid,
         merge_cid,
     }))
+}
+
+// ============================================================================
+// Node API endpoints
+// ============================================================================
+
+#[derive(Deserialize)]
+struct CreateNodeRequest {
+    /// Node type: "document" (future: "computed", "aggregator", "gateway")
+    node_type: String,
+    /// For document nodes: content type (application/json, application/xml, text/plain)
+    #[serde(default)]
+    content_type: Option<String>,
+    /// Optional custom ID (UUID generated if not provided)
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CreateNodeResponse {
+    id: String,
+    node_type: String,
+}
+
+async fn create_node(
+    State(state): State<ApiState>,
+    Json(req): Json<CreateNodeRequest>,
+) -> Result<Json<CreateNodeResponse>, StatusCode> {
+    match req.node_type.as_str() {
+        "document" => {
+            let content_type_str = req.content_type.as_deref().unwrap_or("application/json");
+            let content_type = ContentType::from_mime(content_type_str)
+                .ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
+
+            let id = req.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let node = Arc::new(DocumentNode::new(id.clone(), content_type));
+
+            state
+                .node_registry
+                .register(node)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            Ok(Json(CreateNodeResponse {
+                id,
+                node_type: "document".to_string(),
+            }))
+        }
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+#[derive(Serialize)]
+struct NodeInfo {
+    id: String,
+    node_type: String,
+    subscriber_count: usize,
+    is_healthy: bool,
+}
+
+async fn list_nodes(State(state): State<ApiState>) -> Json<Vec<NodeInfo>> {
+    let node_ids = state.node_registry.list_nodes().await;
+    let mut infos = Vec::new();
+
+    for node_id in node_ids {
+        if let Some(node) = state.node_registry.get(&node_id).await {
+            infos.push(NodeInfo {
+                id: node_id.0,
+                node_type: node.node_type().to_string(),
+                subscriber_count: node.subscriber_count(),
+                is_healthy: node.is_healthy(),
+            });
+        }
+    }
+
+    Json(infos)
+}
+
+async fn get_node(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<NodeInfo>, StatusCode> {
+    let node_id = NodeId::new(id);
+    let node = state
+        .node_registry
+        .get(&node_id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(NodeInfo {
+        id: node_id.0,
+        node_type: node.node_type().to_string(),
+        subscriber_count: node.subscriber_count(),
+        is_healthy: node.is_healthy(),
+    }))
+}
+
+async fn delete_node(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let node_id = NodeId::new(id);
+
+    // Shutdown the node first
+    if let Some(node) = state.node_registry.get(&node_id).await {
+        let _ = node.shutdown().await;
+    }
+
+    state
+        .node_registry
+        .unregister(&node_id)
+        .await
+        .map_err(|e| match e {
+            NodeError::NotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct SendEditRequest {
+    /// Yjs update as base64
+    update: String,
+    /// Optional parent commit IDs
+    #[serde(default)]
+    parents: Vec<String>,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SendEditResponse {
+    cid: String,
+}
+
+async fn send_edit(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<SendEditRequest>,
+) -> Result<Json<SendEditResponse>, StatusCode> {
+    let node_id = NodeId::new(id);
+    let node = state
+        .node_registry
+        .get(&node_id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let author = req.author.unwrap_or_else(|| "anonymous".to_string());
+    let commit = Commit::new(req.parents, req.update, author, req.message);
+    let cid = commit.calculate_cid();
+
+    let edit = Edit {
+        commit: Arc::new(commit),
+        source: NodeId::new("api"),
+    };
+
+    node.receive_edit(edit).await.map_err(|e| match e {
+        NodeError::InvalidEdit(_) => StatusCode::BAD_REQUEST,
+        NodeError::Shutdown => StatusCode::GONE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
+
+    Ok(Json(SendEditResponse { cid }))
+}
+
+#[derive(Deserialize)]
+struct SendEventRequest {
+    event_type: String,
+    payload: serde_json::Value,
+}
+
+async fn send_event(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<SendEventRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let node_id = NodeId::new(id);
+    let node = state
+        .node_registry
+        .get(&node_id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let event = Event {
+        event_type: req.event_type,
+        payload: req.payload,
+        source: NodeId::new("api"),
+    };
+
+    node.receive_event(event).await.map_err(|e| match e {
+        NodeError::Shutdown => StatusCode::GONE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct WireResponse {
+    subscription_id: String,
+    from: String,
+    to: String,
+}
+
+async fn wire_nodes(
+    State(state): State<ApiState>,
+    Path((from, to)): Path<(String, String)>,
+) -> Result<Json<WireResponse>, StatusCode> {
+    let from_id = NodeId::new(from.clone());
+    let to_id = NodeId::new(to.clone());
+
+    let subscription_id = state
+        .node_registry
+        .wire(&from_id, &to_id)
+        .await
+        .map_err(|e| match e {
+            NodeError::NotFound(_) => StatusCode::NOT_FOUND,
+            NodeError::CycleDetected(_) => StatusCode::CONFLICT,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+
+    Ok(Json(WireResponse {
+        subscription_id: subscription_id.to_string(),
+        from,
+        to,
+    }))
+}
+
+async fn unwire_nodes(
+    State(state): State<ApiState>,
+    Path((from, to)): Path<(String, String)>,
+) -> Result<StatusCode, StatusCode> {
+    let from_id = NodeId::new(from);
+    let to_id = NodeId::new(to);
+
+    // Find the wiring between these nodes
+    let wirings = state.node_registry.get_outgoing_wirings(&from_id).await;
+    let wiring = wirings
+        .into_iter()
+        .find(|(_, target)| target == &to_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    state
+        .node_registry
+        .unwire(&wiring.0)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(StatusCode::NO_CONTENT)
 }

@@ -1,9 +1,10 @@
 # Architecture
 
-This repo is a small Axum-based HTTP server with two separate “tracks” of state:
+This repo is a small Axum-based HTTP server with three main subsystems:
 
 - **Documents**: in-memory, created and fetched via `/docs`.
 - **Commits**: optional, persisted to a local `redb` file and created via `/docs/:id/commit`.
+- **Nodes**: reactive document graph via `/nodes` - nodes receive/emit edits and events, can be wired together.
 
 For `text/plain`, `application/json`, and `application/xml` documents, commits are interpreted as Yjs (Yrs) updates and applied to the in-memory document body.
 
@@ -18,11 +19,16 @@ Internally, each document uses a Yrs root type named `content`:
 - `src/main.rs`: CLI parsing, tracing setup, server bind + serve.
 - `src/lib.rs`: router construction (`create_router_with_store`).
 - `src/cli.rs`: CLI flags (`--database`, `--host`, `--port`).
-- `src/api.rs`: REST routes under `/docs`.
+- `src/api.rs`: REST routes under `/docs` and `/nodes`.
 - `src/document.rs`: `DocumentStore` + `ContentType`.
 - `src/commit.rs`: `Commit` model + CID calculation.
 - `src/store.rs`: `CommitStore` backed by `redb`.
-- `src/sse.rs`: `/sse/documents/:id` heartbeat stream (placeholder).
+- `src/sse.rs`: `/sse/nodes/:id` real-time event stream.
+- `src/node/mod.rs`: `Node` trait definition.
+- `src/node/types.rs`: `NodeId`, `Edit`, `Event`, `NodeMessage`, `NodeError`.
+- `src/node/subscription.rs`: `Subscription`, `SubscriptionId`.
+- `src/node/document_node.rs`: `DocumentNode` implementation.
+- `src/node/registry.rs`: `NodeRegistry` with cycle detection.
 
 ## Runtime Entry Points
 
@@ -41,8 +47,8 @@ Internally, each document uses a Yrs root type named `content`:
 `src/lib.rs:create_router_with_store` composes the app:
 
 - `GET /health` (simple liveness)
-- merge `api::router(store)` (document REST + commit endpoint)
-- nest `sse::router()` under `/sse`
+- merge `api::router(store, node_registry)` (document REST + node endpoints)
+- nest `sse::router(node_registry)` under `/sse`
 - permissive CORS (`CorsLayer::permissive()`)
 
 ```mermaid
@@ -52,13 +58,12 @@ flowchart LR
   subgraph App["commonplace-doc (Axum)"]
     Router["Router (lib.rs)"]
 
-    API["/docs routes (api.rs)"]
+    API["/docs + /nodes routes (api.rs)"]
     SSE["/sse routes (sse.rs)"]
 
     DocStore["DocumentStore (document.rs)"]
     CommitStore["CommitStore (store.rs, optional)"]
-
-    SseDocStore["DocumentStore (separate instance)"]
+    NodeRegistry["NodeRegistry (node/registry.rs)"]
   end
 
   Client --> Router
@@ -67,8 +72,9 @@ flowchart LR
 
   API --> DocStore
   API -. enabled with --database .-> CommitStore
+  API --> NodeRegistry
 
-  SSE --> SseDocStore
+  SSE --> NodeRegistry
 ```
 
 ## State and Concurrency Model
@@ -219,19 +225,113 @@ sequenceDiagram
   end
 ```
 
-## SSE Endpoint (Placeholder)
+## Node System
 
-`src/sse.rs` exposes `GET /sse/documents/:id` and currently:
+The Node system provides a reactive abstraction for document processing. Nodes receive and emit **edits** (commits) and **events** (ephemeral JSON messages).
 
-- emits a `heartbeat` event every 30 seconds
-- does not observe document state
+### Node Trait
 
-Important detail: `sse::router()` creates its own `DocumentStore` instance, separate from the API’s `DocumentStore`. Even if SSE were extended to read docs, it would currently be looking at a different in-memory store.
+`src/node/mod.rs` defines the `Node` trait:
+
+```rust
+#[async_trait]
+pub trait Node: Send + Sync {
+    fn id(&self) -> &NodeId;
+    fn node_type(&self) -> &'static str;
+
+    // Receiving
+    async fn receive_edit(&self, edit: Edit) -> Result<(), NodeError>;
+    async fn receive_event(&self, event: Event) -> Result<(), NodeError>;
+
+    // Subscribing
+    fn subscribe(&self) -> Subscription;
+    fn subscriber_count(&self) -> usize;
+
+    // Lifecycle
+    async fn shutdown(&self) -> Result<(), NodeError>;
+    fn is_healthy(&self) -> bool;
+}
+```
+
+### Core Types
+
+`src/node/types.rs` defines:
+
+- **`NodeId(String)`**: Unique node identifier
+- **`Edit`**: Wraps a `Commit` with source `NodeId`
+- **`Event`**: Ephemeral message with `event_type`, JSON `payload`, and source `NodeId`
+- **`NodeMessage`**: `Edit(Edit) | Event(Event)` - emitted to subscribers
+- **`NodeError`**: Error variants (NotFound, InvalidEdit, CycleDetected, Shutdown, etc.)
+
+### DocumentNode
+
+`src/node/document_node.rs` implements `Node` for documents:
+
+- Wraps a Yjs document with `content` and `content_type`
+- Uses `tokio::sync::broadcast` channel for emissions
+- On `receive_edit`: decodes base64 update, applies to Yjs doc, emits to subscribers
+- On `receive_event`: forwards to subscribers unchanged
+
+### NodeRegistry
+
+`src/node/registry.rs` manages the node graph:
+
+- `HashMap<NodeId, Arc<dyn Node>>` for node storage
+- `wire(from, to)`: Spawns a task that forwards messages from `from` to `to`
+- `unwire(subscription_id)`: Aborts the forwarding task
+- **Cycle detection**: Before wiring, DFS checks if `to` can reach `from` (would create cycle)
+
+```mermaid
+flowchart TD
+    subgraph NodeGraph["Node Graph"]
+        A[DocumentNode A]
+        B[DocumentNode B]
+        C[DocumentNode C]
+    end
+
+    Client1((Client))
+    Client2((Client))
+
+    A -->|wire| B
+    B -->|wire| C
+
+    Client1 -->|subscribe SSE| A
+    Client2 -->|subscribe SSE| C
+
+    A -.->|emit edit| Client1
+    C -.->|emit edit| Client2
+```
+
+### Node API Routes
+
+`src/api.rs` exposes:
+
+- `POST /nodes`: Create a node (type: "document")
+- `GET /nodes`: List all nodes
+- `GET /nodes/:id`: Get node info
+- `DELETE /nodes/:id`: Delete node
+- `POST /nodes/:id/edit`: Send edit to node
+- `POST /nodes/:id/event`: Send event to node
+- `POST /nodes/:from/wire/:to`: Wire nodes
+- `DELETE /nodes/:from/wire/:to`: Unwire nodes
+
+## SSE Endpoint
+
+`src/sse.rs` exposes `GET /sse/nodes/:id`:
+
+- Subscribes to a node via `node.subscribe()`
+- Streams `NodeMessage` as SSE events
+- Edit events have type `edit` with commit data
+- Events use their `event_type` as the SSE event name
+- Emits `warning` if subscription lags, `closed` when node shuts down
+
+The SSE router shares the same `NodeRegistry` as the API, so updates made via API endpoints are immediately streamed to SSE subscribers.
 
 ## Known Limitations / Intentional Gaps
 
 - Document bodies are in-memory only (not persisted).
 - `text/plain`, `application/json`, and `application/xml` documents apply commits to the document body today.
 - Commit updates are expected to be base64-encoded Yjs updates.
-- SSE is heartbeats only and not wired to document/commit changes.
 - CID stability can be impacted if `extensions` is ever populated (unordered map).
+- Node system is separate from the `/docs` endpoints (they use different storage).
+- Only `document` node type is currently implemented (future: computed, aggregator, gateway nodes).
