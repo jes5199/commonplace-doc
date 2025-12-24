@@ -173,7 +173,8 @@ impl DocumentNode {
         futures::executor::block_on(async { self.state.read().await.content_type.clone() })
     }
 
-    /// Set the content of this document (for forking)
+    /// Set the content of this document (for forking) - DEPRECATED
+    /// Use apply_state instead to preserve CRDT structure.
     pub fn set_content(&self, content: &str) {
         futures::executor::block_on(async {
             let mut state = self.state.write().await;
@@ -197,6 +198,15 @@ impl DocumentNode {
                 state.content = content.to_string();
             }
         })
+    }
+
+    /// Apply Yjs state bytes to this document (for forking with CRDT consistency)
+    ///
+    /// This applies a full state update (from encode_state_as_update_v1) to the
+    /// document, preserving CRDT structure so that future edits are compatible
+    /// with the source document's commit history.
+    pub fn apply_state(&self, state_bytes: &[u8]) -> Result<String, NodeError> {
+        futures::executor::block_on(async { self.apply_update(state_bytes).await })
     }
 }
 

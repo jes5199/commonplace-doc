@@ -948,14 +948,16 @@ async fn fork_node(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // 6. Replay content at fork point and apply to new node
-    let (content, _state) = replayer
+    // 6. Replay Yjs state at fork point and apply to new node
+    let (_content, state_bytes) = replayer
         .get_content_and_state_at_commit(&source_id, &fork_cid, &content_type)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Apply content to the new node's Yjs doc
-    new_node.set_content(&content);
+    // Apply Yjs state to the new node (preserves CRDT structure for future edits)
+    new_node
+        .apply_state(&state_bytes)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // 7. Set new node's HEAD to the same commit (shares the commit DAG)
     commit_store
