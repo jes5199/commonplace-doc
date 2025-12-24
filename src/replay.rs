@@ -446,12 +446,7 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let store = CommitStore::new(temp_file.path()).unwrap();
 
-        let c1 = Commit::new(
-            vec![],
-            create_text_update("{}"),
-            "alice".to_string(),
-            None,
-        );
+        let c1 = Commit::new(vec![], create_text_update("{}"), "alice".to_string(), None);
         let cid1 = store.store_commit(&c1).await.unwrap();
 
         let replayer = CommitReplayer::new(&store);
@@ -461,6 +456,9 @@ mod tests {
             .get_content_at_commit("doc", &cid1, &ContentType::Json)
             .await;
 
-        assert!(matches!(result, Err(ReplayError::UnsupportedContentType(_))));
+        assert!(matches!(
+            result,
+            Err(ReplayError::UnsupportedContentType(_))
+        ));
     }
 }

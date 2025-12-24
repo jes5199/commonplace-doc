@@ -266,7 +266,9 @@ impl NodeRegistry {
 
             Ok(())
         } else {
-            Err(NodeError::SubscriptionFailed("Wiring not found".to_string()))
+            Err(NodeError::SubscriptionFailed(
+                "Wiring not found".to_string(),
+            ))
         }
     }
 
@@ -359,7 +361,7 @@ mod tests {
         let wirings = registry.get_outgoing_wirings(&NodeId::new("doc1")).await;
         assert_eq!(wirings.len(), 1);
         assert_eq!(wirings[0].0, sub_id);
-        assert_eq!(wirings[0].1.0, "doc2");
+        assert_eq!(wirings[0].1 .0, "doc2");
     }
 
     #[tokio::test]

@@ -170,9 +170,7 @@ impl DocumentNode {
     /// Get the content type of this document
     pub fn content_type(&self) -> ContentType {
         // Safe to block briefly since we only read
-        futures::executor::block_on(async {
-            self.state.read().await.content_type.clone()
-        })
+        futures::executor::block_on(async { self.state.read().await.content_type.clone() })
     }
 
     /// Set the content of this document (for forking)

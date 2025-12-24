@@ -251,10 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
 
     // Start file watcher task
-    let watcher_handle = tokio::spawn(file_watcher_task(
-        args.file.clone(),
-        file_tx,
-    ));
+    let watcher_handle = tokio::spawn(file_watcher_task(args.file.clone(), file_tx));
 
     // Start file change handler task
     let upload_handle = tokio::spawn(upload_task(
@@ -316,7 +313,11 @@ async fn initial_sync(
     }
 
     match &head.cid {
-        Some(cid) => info!("Initial sync complete: {} bytes at {}", head.content.len(), cid),
+        Some(cid) => info!(
+            "Initial sync complete: {} bytes at {}",
+            head.content.len(),
+            cid
+        ),
         None => info!("Initial sync complete: empty document (no commits yet)"),
     }
 
@@ -324,10 +325,7 @@ async fn initial_sync(
 }
 
 /// Task that watches the local file for changes
-async fn file_watcher_task(
-    file_path: PathBuf,
-    tx: mpsc::Sender<FileEvent>,
-) {
+async fn file_watcher_task(file_path: PathBuf, tx: mpsc::Sender<FileEvent>) {
     // Create a channel for notify events
     let (notify_tx, mut notify_rx) = mpsc::channel::<Result<Event, notify::Error>>(100);
 
@@ -559,12 +557,7 @@ async fn sse_task(
                             match serde_json::from_str::<EditEventData>(&msg.data) {
                                 Ok(edit) => {
                                     handle_server_edit(
-                                        &client,
-                                        &server,
-                                        &node_id,
-                                        &file_path,
-                                        &state,
-                                        &edit,
+                                        &client, &server, &node_id, &file_path, &state, &edit,
                                     )
                                     .await;
                                 }

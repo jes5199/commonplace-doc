@@ -206,11 +206,17 @@ fn collect_diff_operations<'a>(
             ChangeTag::Equal => {
                 // Flush pending operations
                 if let Some(pos) = pending_delete_start.take() {
-                    ops.push(DiffOp::Delete { pos, len: pending_delete_len });
+                    ops.push(DiffOp::Delete {
+                        pos,
+                        len: pending_delete_len,
+                    });
                     pending_delete_len = 0;
                 }
                 if let Some(pos) = pending_insert_start.take() {
-                    ops.push(DiffOp::Insert { pos, text: std::mem::take(&mut pending_insert_text) });
+                    ops.push(DiffOp::Insert {
+                        pos,
+                        text: std::mem::take(&mut pending_insert_text),
+                    });
                 }
 
                 let len = change.value().len();
@@ -220,7 +226,10 @@ fn collect_diff_operations<'a>(
             ChangeTag::Delete => {
                 // Flush insert first (delete at same position should come first)
                 if let Some(pos) = pending_insert_start.take() {
-                    ops.push(DiffOp::Insert { pos, text: std::mem::take(&mut pending_insert_text) });
+                    ops.push(DiffOp::Insert {
+                        pos,
+                        text: std::mem::take(&mut pending_insert_text),
+                    });
                 }
 
                 // Start or continue delete batch
@@ -234,7 +243,10 @@ fn collect_diff_operations<'a>(
             ChangeTag::Insert => {
                 // Flush delete first
                 if let Some(pos) = pending_delete_start.take() {
-                    ops.push(DiffOp::Delete { pos, len: pending_delete_len });
+                    ops.push(DiffOp::Delete {
+                        pos,
+                        len: pending_delete_len,
+                    });
                     pending_delete_len = 0;
                 }
 
@@ -252,10 +264,16 @@ fn collect_diff_operations<'a>(
 
     // Flush remaining
     if let Some(pos) = pending_delete_start.take() {
-        ops.push(DiffOp::Delete { pos, len: pending_delete_len });
+        ops.push(DiffOp::Delete {
+            pos,
+            len: pending_delete_len,
+        });
     }
     if let Some(pos) = pending_insert_start.take() {
-        ops.push(DiffOp::Insert { pos, text: pending_insert_text });
+        ops.push(DiffOp::Insert {
+            pos,
+            text: pending_insert_text,
+        });
     }
 
     ops

@@ -619,15 +619,16 @@ async fn wire_nodes(
     let from_id = NodeId::new(from.clone());
     let to_id = NodeId::new(to.clone());
 
-    let subscription_id = state
-        .node_registry
-        .wire(&from_id, &to_id)
-        .await
-        .map_err(|e| match e {
-            NodeError::NotFound(_) => StatusCode::NOT_FOUND,
-            NodeError::CycleDetected(_) => StatusCode::CONFLICT,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        })?;
+    let subscription_id =
+        state
+            .node_registry
+            .wire(&from_id, &to_id)
+            .await
+            .map_err(|e| match e {
+                NodeError::NotFound(_) => StatusCode::NOT_FOUND,
+                NodeError::CycleDetected(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            })?;
 
     Ok(Json(WireResponse {
         subscription_id: subscription_id.to_string(),
@@ -700,13 +701,10 @@ async fn replace_content(
     body: String,
 ) -> Result<Json<ReplaceResponse>, (StatusCode, String)> {
     // 1. Check commit store is available
-    let commit_store = state
-        .commit_store
-        .as_ref()
-        .ok_or((
-            StatusCode::NOT_IMPLEMENTED,
-            "Commit store not enabled. Start server with --database flag.".to_string(),
-        ))?;
+    let commit_store = state.commit_store.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        "Commit store not enabled. Start server with --database flag.".to_string(),
+    ))?;
 
     // 2. Verify node exists
     let node_id = NodeId::new(&id);
@@ -885,11 +883,10 @@ async fn fork_node(
 
     // 2. Verify source node exists and get its content type
     let source_node_id = NodeId::new(&source_id);
-    let source_node = state
-        .node_registry
-        .get(&source_node_id)
-        .await
-        .ok_or((StatusCode::NOT_FOUND, format!("Node {} not found", source_id)))?;
+    let source_node = state.node_registry.get(&source_node_id).await.ok_or((
+        StatusCode::NOT_FOUND,
+        format!("Node {} not found", source_id),
+    ))?;
 
     // Get content type from the source node (DocumentNode stores it)
     let content_type = source_node
@@ -922,10 +919,7 @@ async fn fork_node(
             {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    format!(
-                        "Commit {} is not in the history of node {}",
-                        cid, source_id
-                    ),
+                    format!("Commit {} is not in the history of node {}", cid, source_id),
                 ));
             }
             cid

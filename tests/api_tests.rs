@@ -411,7 +411,10 @@ async fn test_text_document_yjs_commit_updates_document_body() {
         .unwrap();
 
     assert_eq!(get_response.status(), StatusCode::OK);
-    assert_eq!(get_response.headers().get("content-type").unwrap(), "text/plain");
+    assert_eq!(
+        get_response.headers().get("content-type").unwrap(),
+        "text/plain"
+    );
     let body = body_to_string(get_response.into_body()).await;
     assert_eq!(body, "hello");
 }
@@ -1018,8 +1021,7 @@ async fn test_fork_shares_commit_history() {
         .await
         .unwrap();
     let original_head_body = body_to_string(original_head.into_body()).await;
-    let original_head_json: serde_json::Value =
-        serde_json::from_str(&original_head_body).unwrap();
+    let original_head_json: serde_json::Value = serde_json::from_str(&original_head_body).unwrap();
 
     let fork_head = app
         .clone()
@@ -1163,7 +1165,10 @@ async fn test_forked_doc_can_commit_independently() {
         .unwrap();
     let fork_head_body = body_to_string(fork_head.into_body()).await;
     let fork_head_json: serde_json::Value = serde_json::from_str(&fork_head_body).unwrap();
-    assert_eq!(fork_head_json["content"].as_str().unwrap(), "forked content");
+    assert_eq!(
+        fork_head_json["content"].as_str().unwrap(),
+        "forked content"
+    );
 
     // Original should still have old content
     let original_head = app
@@ -1178,8 +1183,7 @@ async fn test_forked_doc_can_commit_independently() {
         .await
         .unwrap();
     let original_head_body = body_to_string(original_head.into_body()).await;
-    let original_head_json: serde_json::Value =
-        serde_json::from_str(&original_head_body).unwrap();
+    let original_head_json: serde_json::Value = serde_json::from_str(&original_head_body).unwrap();
     assert_eq!(original_head_json["content"].as_str().unwrap(), "original");
 }
 
@@ -1302,8 +1306,7 @@ async fn test_commits_to_fork_dont_affect_original() {
         .await
         .unwrap();
     let original_head_body = body_to_string(original_head.into_body()).await;
-    let original_head_json: serde_json::Value =
-        serde_json::from_str(&original_head_body).unwrap();
+    let original_head_json: serde_json::Value = serde_json::from_str(&original_head_body).unwrap();
 
     assert_eq!(original_head_json["cid"].as_str().unwrap(), base_cid);
     assert_eq!(
