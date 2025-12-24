@@ -898,20 +898,36 @@ async fn fork_node(
         .map(|dn| dn.content_type())
         .unwrap_or(ContentType::Text);
 
+    // Currently only text content type is supported for forking
+    if !matches!(content_type, ContentType::Text) {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!(
+                "Fork only supports text/plain documents. Node {} has content type {}",
+                source_id,
+                content_type.to_mime()
+            ),
+        ));
+    }
+
     // 3. Determine which commit to fork from
+    let replayer = CommitReplayer::new(commit_store.as_ref());
     let fork_cid = match query.at_commit {
         Some(cid) => {
-            // Validate the specified commit exists
-            commit_store
-                .get_commit(&cid)
+            // Validate the specified commit exists AND is in source's history
+            if !replayer
+                .verify_commit_in_history(&source_id, &cid)
                 .await
-                .map_err(|e| {
-                    if e.to_string().contains("not found") {
-                        (StatusCode::BAD_REQUEST, format!("Commit {} not found", cid))
-                    } else {
-                        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-                    }
-                })?;
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Commit {} is not in the history of node {}",
+                        cid, source_id
+                    ),
+                ));
+            }
             cid
         }
         None => {
@@ -939,7 +955,6 @@ async fn fork_node(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // 6. Replay content at fork point and apply to new node
-    let replayer = CommitReplayer::new(commit_store.as_ref());
     let (content, _state) = replayer
         .get_content_and_state_at_commit(&source_id, &fork_cid, &content_type)
         .await

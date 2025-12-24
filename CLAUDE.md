@@ -107,11 +107,14 @@ Default content by type:
 
 - `cargo build` - Build all binaries
 - `cargo run --bin commonplace-server` - Run the HTTP server
+- `cargo run --bin commonplace-sync` - Run the file sync client
 - `cargo test` - Run tests
-- `cargo clippy` - Run linter
+- `cargo clippy` - Run linter (required before commit)
 - `cargo fmt` - Format code
 - `RUST_LOG=debug cargo run --bin commonplace-server` - Run with debug logging
 - `cargo run --bin commonplace-server -- --database ./data.redb` - Run with persistence
+
+**Before committing:** Always run `cargo clippy` and `cargo test`. A pre-commit hook runs clippy automatically.
 
 ## Git Configuration
 
