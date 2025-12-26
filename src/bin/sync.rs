@@ -636,6 +636,39 @@ async fn run_directory_mode(
                             Err(_) => continue,
                         };
 
+                        // Check if file matches ignore patterns
+                        let file_name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let should_ignore = options.ignore_patterns.iter().any(|pattern| {
+                            if pattern == &file_name {
+                                true
+                            } else if pattern.contains('*') {
+                                let parts: Vec<&str> = pattern.split('*').collect();
+                                if parts.len() == 2 {
+                                    file_name.starts_with(parts[0]) && file_name.ends_with(parts[1])
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        });
+                        if should_ignore {
+                            debug!(
+                                "Ignoring new file (matches ignore pattern): {}",
+                                relative_path
+                            );
+                            continue;
+                        }
+
+                        // Skip hidden files unless configured to include them
+                        if !options.include_hidden && file_name.starts_with('.') {
+                            debug!("Ignoring hidden file: {}", relative_path);
+                            continue;
+                        }
+
                         // Check if we already have sync tasks for this file
                         let already_tracked = {
                             let states = file_states.read().await;
@@ -1505,10 +1538,6 @@ async fn handle_server_edit(
     state: &Arc<RwLock<SyncState>>,
     _edit: &EditEventData,
 ) {
-    // Detect if this file is binary
-    let content_info = detect_from_path(file_path);
-    let is_binary_file = content_info.is_binary;
-
     // Read current local file content as bytes
     let raw_content = match tokio::fs::read(file_path).await {
         Ok(c) => c,
@@ -1518,8 +1547,12 @@ async fn handle_server_edit(
         }
     };
 
+    // Detect if this file is binary (use both extension and content-based detection)
+    let content_info = detect_from_path(file_path);
+    let is_binary = content_info.is_binary || is_binary_content(&raw_content);
+
     // Convert to string (base64 for binary, UTF-8 for text)
-    let local_content = if is_binary_file || is_binary_content(&raw_content) {
+    let local_content = if is_binary {
         use base64::{engine::general_purpose::STANDARD, Engine};
         STANDARD.encode(&raw_content)
     } else {
@@ -1573,7 +1606,7 @@ async fn handle_server_edit(
     // Write to local file (atomic via temp file)
     // For binary files, decode base64 before writing
     let temp_path = file_path.with_extension("tmp");
-    let write_result = if is_binary_file {
+    let write_result = if is_binary {
         use base64::{engine::general_purpose::STANDARD, Engine};
         match STANDARD.decode(&head.content) {
             Ok(decoded) => tokio::fs::write(&temp_path, &decoded).await,
