@@ -524,6 +524,30 @@ impl FilesystemReconciler {
             return None;
         }
 
+        // Validate root is a directory - fall back to cached on invalid root
+        if let Some(ref root) = schema.root {
+            if !matches!(root, Entry::Dir(_)) {
+                self.emit_error(
+                    FsError::SchemaError("root must be a directory".to_string()),
+                    Some(base_path),
+                )
+                .await;
+                // Try to use cached schema for this node
+                let cache = self.last_valid_node_schemas.read().await;
+                if let Some(cached) = cache.get(node_id) {
+                    return self
+                        .collect_from_valid_node_schema(
+                            cached,
+                            base_path,
+                            node_backed_dirs,
+                            recursion_stack,
+                        )
+                        .await;
+                }
+                return None;
+            }
+        }
+
         // Cache this valid schema
         {
             let mut cache = self.last_valid_node_schemas.write().await;
