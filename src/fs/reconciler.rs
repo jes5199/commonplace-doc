@@ -109,17 +109,23 @@ impl FilesystemReconciler {
         // 4. For each entry, ensure node exists
         let mut known = self.known_nodes.write().await;
         for (path, node_id, content_type) in entries {
-            // Create node if new
-            if !known.contains(&node_id) {
-                let nid = NodeId::new(&node_id);
+            let nid = NodeId::new(&node_id);
+
+            // Check if node exists in registry (not just known_nodes)
+            // This handles the case where a node was deleted externally
+            let node_exists = self.registry.get(&nid).await.is_some();
+
+            if !node_exists {
                 self.registry
                     .get_or_create_document(&nid, content_type)
                     .await
                     .map_err(|e| FsError::NodeError(e.to_string()))?;
 
-                known.insert(node_id.clone());
                 tracing::debug!("Created fs node: {} -> {}", path, node_id);
             }
+
+            // Track in known_nodes regardless
+            known.insert(node_id.clone());
         }
 
         // 5. Update last valid schema
@@ -231,7 +237,7 @@ impl FilesystemReconciler {
     }
 
     /// Emit an error event on the fs-root's red port.
-    async fn emit_error(&self, error: FsError, path: Option<&str>) {
+    pub async fn emit_error(&self, error: FsError, path: Option<&str>) {
         let event = Event {
             event_type: "fs.error".to_string(),
             payload: error.to_event_payload(path),

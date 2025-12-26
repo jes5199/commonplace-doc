@@ -67,6 +67,8 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
                         Ok(content) if !content.is_empty() && content != "{}" => {
                             if let Err(e) = reconciler.reconcile(&content).await {
                                 tracing::warn!("Initial fs reconcile failed: {}", e);
+                                // Emit fs.error event so clients are notified
+                                reconciler.emit_error(e, None).await;
                             }
                         }
                         _ => {}

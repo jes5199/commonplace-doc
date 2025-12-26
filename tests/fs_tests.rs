@@ -267,6 +267,53 @@ async fn test_reconciler_nested_dirs() {
     );
 }
 
+/// Test that nodes are recreated if deleted externally.
+#[tokio::test]
+async fn test_reconciler_recreates_deleted_nodes() {
+    let registry = Arc::new(NodeRegistry::new());
+    let fs_root_id = NodeId::new("test-fs");
+
+    registry
+        .get_or_create_document(&fs_root_id, ContentType::Json)
+        .await
+        .unwrap();
+
+    let reconciler = Arc::new(FilesystemReconciler::new(
+        fs_root_id.clone(),
+        registry.clone(),
+    ));
+
+    let content = r#"{
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "file.txt": { "type": "doc" }
+            }
+        }
+    }"#;
+
+    // First reconcile creates the node
+    reconciler.reconcile(content).await.unwrap();
+
+    let file_id = NodeId::new("test-fs:file.txt");
+    assert!(registry.get(&file_id).await.is_some());
+
+    // Delete the node externally (simulating DELETE /nodes/:id)
+    registry.unregister(&file_id).await.ok();
+    assert!(
+        registry.get(&file_id).await.is_none(),
+        "node should be deleted"
+    );
+
+    // Re-reconcile should recreate the node
+    reconciler.reconcile(content).await.unwrap();
+    assert!(
+        registry.get(&file_id).await.is_some(),
+        "node should be recreated after external deletion"
+    );
+}
+
 /// Test that router with fs_root creates the fs-root node.
 #[tokio::test]
 async fn test_router_with_fs_root() {
