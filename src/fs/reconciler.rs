@@ -240,9 +240,13 @@ impl FilesystemReconciler {
 
     /// Update watchers for node-backed directories.
     /// Aborts old watchers and starts fresh ones to handle node recreation.
-    /// Triggers a post-restart reconcile to catch any edits during the transition.
+    /// Only triggers a post-restart reconcile if the watcher set changed.
     async fn update_dir_watchers(self: &Arc<Self>, discovered: HashSet<String>) {
         let mut handles = self.watcher_handles.write().await;
+
+        // Check if watcher set changed (need post-restart reconcile if so)
+        let old_dirs: HashSet<String> = handles.keys().cloned().collect();
+        let watcher_set_changed = old_dirs != discovered;
 
         // Abort all old watchers - they may be subscribed to stale nodes
         for (_, handle) in handles.drain() {
@@ -250,9 +254,9 @@ impl FilesystemReconciler {
         }
 
         // Start fresh watchers for all discovered node-backed dirs
-        for dir_id in discovered {
+        for dir_id in &discovered {
             let reconciler = self.clone();
-            let node_id = NodeId::new(&dir_id);
+            let node_id = NodeId::new(dir_id);
             let dir_id_for_handle = dir_id.clone();
 
             let handle = tokio::spawn(async move {
@@ -292,10 +296,12 @@ impl FilesystemReconciler {
         // Drop the write lock before triggering reconcile
         drop(handles);
 
-        // Trigger a post-restart reconcile to catch any edits that occurred
-        // during the watcher restart window
-        if let Some(ref tx) = *self.reconcile_trigger.read().await {
-            let _ = tx.send(()).await;
+        // Only trigger post-restart reconcile if watcher set changed
+        // (avoids infinite loop when watchers are restarted with same set)
+        if watcher_set_changed {
+            if let Some(ref tx) = *self.reconcile_trigger.read().await {
+                let _ = tx.send(()).await;
+            }
         }
     }
 
