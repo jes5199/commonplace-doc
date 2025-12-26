@@ -838,7 +838,9 @@ async fn push_schema_to_server(
             // Use replace endpoint
             let replace_url = format!(
                 "{}/nodes/{}/replace?parent_cid={}&author=sync-client",
-                server, fs_root_id, parent_cid
+                server,
+                encode_node_id(fs_root_id),
+                parent_cid
             );
             let resp = client
                 .post(&replace_url)
@@ -893,7 +895,9 @@ async fn push_file_content(
                 // Use replace endpoint
                 let replace_url = format!(
                     "{}/nodes/{}/replace?parent_cid={}&author=sync-client",
-                    server, node_id, parent_cid
+                    server,
+                    encode_node_id(node_id),
+                    parent_cid
                 );
                 let resp = client
                     .post(&replace_url)
@@ -1432,7 +1436,9 @@ async fn upload_task(
                 // Normal case: use replace endpoint
                 let replace_url = format!(
                     "{}/nodes/{}/replace?parent_cid={}&author=sync-client",
-                    server, node_id, parent
+                    server,
+                    encode_node_id(&node_id),
+                    parent
                 );
 
                 match client
