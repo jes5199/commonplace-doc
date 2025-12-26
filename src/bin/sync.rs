@@ -534,11 +534,20 @@ async fn run_directory_mode(
                             tokio::fs::write(&file_path, &head.content).await?;
                         }
                     }
-                    // For all strategies (including "skip"), seed SyncState with server's
-                    // CID/content so SSE updates work and uploads use correct parent CID
+                    // Seed SyncState so SSE updates work and uploads use correct parent CID
+                    // For "skip" strategy: use local content for last_written_content so
+                    // server edits aren't blocked (we didn't modify local, so local IS
+                    // what's "last written"). For "server" strategy: we wrote server
+                    // content to local, so use server content as last_written.
                     let mut s = state.write().await;
                     s.last_written_cid = head.cid;
-                    s.last_written_content = head.content;
+                    if initial_sync_strategy == "skip" {
+                        // Local file unchanged, so last_written matches local content
+                        s.last_written_content = file.content.clone();
+                    } else {
+                        // Server content was written to local
+                        s.last_written_content = head.content;
+                    }
                 }
             } else if should_push_content {
                 // Binary files are already base64 encoded by scan_directory_with_contents
