@@ -240,6 +240,7 @@ impl FilesystemReconciler {
 
     /// Update watchers for node-backed directories.
     /// Aborts old watchers and starts fresh ones to handle node recreation.
+    /// Triggers a post-restart reconcile to catch any edits during the transition.
     async fn update_dir_watchers(self: &Arc<Self>, discovered: HashSet<String>) {
         let mut handles = self.watcher_handles.write().await;
 
@@ -286,6 +287,15 @@ impl FilesystemReconciler {
 
             handles.insert(dir_id_for_handle, handle);
             tracing::debug!("Started watching node-backed dir: {}", dir_id);
+        }
+
+        // Drop the write lock before triggering reconcile
+        drop(handles);
+
+        // Trigger a post-restart reconcile to catch any edits that occurred
+        // during the watcher restart window
+        if let Some(ref tx) = *self.reconcile_trigger.read().await {
+            let _ = tx.send(()).await;
         }
     }
 
