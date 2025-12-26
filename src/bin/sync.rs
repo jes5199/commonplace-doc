@@ -643,11 +643,26 @@ async fn run_directory_mode(
                         };
 
                         if !already_tracked && path.is_file() {
-                            // New file - add to state and spawn sync tasks
+                            // New file - push schema first so server creates the node
                             let node_id = format!("{}:{}", fs_root_id, relative_path);
                             let state = Arc::new(RwLock::new(SyncState::new()));
 
-                            // Read and push initial content (handle binary files)
+                            // Push updated schema FIRST so server reconciler creates the node
+                            if let Ok(schema) = scan_directory(&directory, &options) {
+                                if let Ok(json) = schema_to_json(&schema) {
+                                    if let Err(e) =
+                                        push_schema_to_server(&client, &server, &fs_root_id, &json)
+                                            .await
+                                    {
+                                        warn!("Failed to push updated schema: {}", e);
+                                    }
+                                }
+                            }
+
+                            // Wait briefly for server to reconcile and create the node
+                            sleep(Duration::from_millis(100)).await;
+
+                            // Now push initial content (handle binary files)
                             if let Ok(raw_content) = tokio::fs::read(&path).await {
                                 let content_info = detect_from_path(&path);
                                 let is_binary =
@@ -691,18 +706,6 @@ async fn run_directory_mode(
                             );
 
                             info!("Started sync for new local file: {}", relative_path);
-                        }
-
-                        // Rescan and push updated schema
-                        if let Ok(schema) = scan_directory(&directory, &options) {
-                            if let Ok(json) = schema_to_json(&schema) {
-                                if let Err(e) =
-                                    push_schema_to_server(&client, &server, &fs_root_id, &json)
-                                        .await
-                                {
-                                    warn!("Failed to push updated schema: {}", e);
-                                }
-                            }
                         }
                     }
                     DirEvent::Modified(path) => {
