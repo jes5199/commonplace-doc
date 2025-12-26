@@ -16,4 +16,8 @@ pub struct Args {
     /// Host to bind to
     #[clap(long, default_value = "127.0.0.1")]
     pub host: String,
+
+    /// Node ID for filesystem root document
+    #[clap(long, value_name = "NODE_ID")]
+    pub fs_root: Option<String>,
 }

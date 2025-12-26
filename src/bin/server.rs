@@ -1,5 +1,5 @@
 use clap::Parser;
-use commonplace_doc::{cli::Args, create_router_with_store, store::CommitStore};
+use commonplace_doc::{cli::Args, create_router_with_config, store::CommitStore, RouterConfig};
 use std::net::SocketAddr;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -28,8 +28,17 @@ async fn main() {
         tracing::warn!("Use --database <path> to enable commits");
     }
 
+    // Log filesystem root if configured
+    if let Some(ref fs_root) = args.fs_root {
+        tracing::info!("Filesystem root: {}", fs_root);
+    }
+
     // Build our application with routes
-    let app = create_router_with_store(commit_store);
+    let app = create_router_with_config(RouterConfig {
+        commit_store,
+        fs_root: args.fs_root,
+    })
+    .await;
 
     // Run the server
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)
