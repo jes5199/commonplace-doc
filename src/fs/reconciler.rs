@@ -223,6 +223,14 @@ impl FilesystemReconciler {
         }
     }
 
+    /// Reconcile current state and register watchers for node-backed directories.
+    /// Use this for initial reconciliation when you want node-backed dirs to be watched.
+    pub async fn reconcile_with_watchers(self: &Arc<Self>, content: &str) -> Result<(), FsError> {
+        let dirs = self.reconcile_and_collect_dirs(content).await?;
+        self.update_dir_watchers(dirs).await;
+        Ok(())
+    }
+
     /// Reconcile current state: parse JSON, collect entries, create missing nodes.
     pub async fn reconcile(&self, content: &str) -> Result<(), FsError> {
         // 1. Parse JSON
@@ -388,22 +396,30 @@ impl FilesystemReconciler {
                         .and_then(ContentType::from_mime)
                         .unwrap_or(ContentType::Json);
 
-                    // Track this as a node-backed directory
-                    node_backed_dirs.insert(nid.clone());
-
                     // First, ensure the node exists
                     results.push((current_path.to_string(), nid.clone(), content_type.clone()));
 
-                    // Then, try to recursively process its content
-                    if let Some(child_entries) = self
-                        .collect_node_backed_dir_entries_with_dirs(
-                            nid,
-                            current_path,
-                            node_backed_dirs,
-                        )
-                        .await
-                    {
-                        results.extend(child_entries);
+                    // Check for cycles before recursing - skip if we've seen this node
+                    if node_backed_dirs.contains(nid) {
+                        tracing::warn!(
+                            "Cycle detected: node-backed dir {} already visited, skipping",
+                            nid
+                        );
+                    } else {
+                        // Track this as a node-backed directory
+                        node_backed_dirs.insert(nid.clone());
+
+                        // Then, try to recursively process its content
+                        if let Some(child_entries) = self
+                            .collect_node_backed_dir_entries_with_dirs(
+                                nid,
+                                current_path,
+                                node_backed_dirs,
+                            )
+                            .await
+                        {
+                            results.extend(child_entries);
+                        }
                     }
                 }
 

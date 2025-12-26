@@ -61,11 +61,11 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
                 // Start watching (spawns background task)
                 reconciler.clone().start().await;
 
-                // Perform initial reconciliation
+                // Perform initial reconciliation with watcher registration
                 if let Some(observable) = fs_node.as_any().downcast_ref::<node::DocumentNode>() {
                     match observable.get_content().await {
                         Ok(content) if !content.is_empty() && content != "{}" => {
-                            if let Err(e) = reconciler.reconcile(&content).await {
+                            if let Err(e) = reconciler.reconcile_with_watchers(&content).await {
                                 tracing::warn!("Initial fs reconcile failed: {}", e);
                                 // Emit fs.error event so clients are notified
                                 reconciler.emit_error(e, None).await;
