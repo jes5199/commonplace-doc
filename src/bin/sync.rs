@@ -1158,9 +1158,12 @@ async fn handle_schema_change(
                 if resp.status().is_success() {
                     if let Ok(file_head) = resp.json::<HeadResponse>().await {
                         // Detect if file is binary and decode base64 if needed
+                        // Use both extension-based detection AND try decoding as base64
+                        // to handle files that were uploaded as binary via content sniffing
+                        use base64::{engine::general_purpose::STANDARD, Engine};
                         let content_info = detect_from_path(&file_path);
                         let write_result = if content_info.is_binary {
-                            use base64::{engine::general_purpose::STANDARD, Engine};
+                            // Extension indicates binary - decode base64
                             match STANDARD.decode(&file_head.content) {
                                 Ok(decoded) => tokio::fs::write(&file_path, &decoded).await,
                                 Err(e) => {
@@ -1169,7 +1172,18 @@ async fn handle_schema_change(
                                 }
                             }
                         } else {
-                            tokio::fs::write(&file_path, &file_head.content).await
+                            // Extension says text, but try decoding as base64 in case
+                            // this was a binary file detected by content sniffing
+                            match STANDARD.decode(&file_head.content) {
+                                Ok(decoded) if is_binary_content(&decoded) => {
+                                    // Successfully decoded and content is binary
+                                    tokio::fs::write(&file_path, &decoded).await
+                                }
+                                _ => {
+                                    // Not base64 or not binary - write as text
+                                    tokio::fs::write(&file_path, &file_head.content).await
+                                }
+                            }
                         };
                         write_result?;
 
