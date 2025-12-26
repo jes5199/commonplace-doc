@@ -158,6 +158,18 @@ impl FilesystemReconciler {
                 results.push((current_path.to_string(), node_id, content_type));
             }
             Entry::Dir(dir) => {
+                // Spec: node-backed and inline forms are mutually exclusive
+                if dir.node_id.is_some() && dir.entries.is_some() {
+                    return Err(FsError::SchemaError(format!(
+                        "Directory at '{}' has both node_id and entries (mutually exclusive)",
+                        if current_path.is_empty() {
+                            "/"
+                        } else {
+                            current_path
+                        }
+                    )));
+                }
+
                 // Handle node-backed directory
                 if let Some(ref nid) = dir.node_id {
                     let content_type = dir
@@ -216,6 +228,11 @@ impl FilesystemReconciler {
 
         // Try to parse as filesystem schema
         let schema: FsSchema = serde_json::from_str(&content).ok()?;
+
+        // Validate version (same as main reconcile)
+        if schema.version != 1 {
+            return None;
+        }
 
         // Recursively collect from the nested root
         if let Some(ref root) = schema.root {
