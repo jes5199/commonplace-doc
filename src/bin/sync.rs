@@ -520,7 +520,17 @@ async fn run_directory_mode(
         sleep(Duration::from_millis(100)).await;
 
         let file_path = directory.join(&file.relative_path);
-        let state = Arc::new(RwLock::new(SyncState::new()));
+
+        // Reuse existing state if handle_schema_change already created one (server-first sync)
+        // Otherwise create a new state
+        let state = {
+            let states = file_states.read().await;
+            if let Some(existing) = states.get(&file.relative_path) {
+                existing.state.clone()
+            } else {
+                Arc::new(RwLock::new(SyncState::new()))
+            }
+        };
 
         // Push initial content if local wins or server is empty
         let file_head_url = format!("{}/nodes/{}/head", server, encode_node_id(&node_id));
