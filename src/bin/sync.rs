@@ -1265,8 +1265,30 @@ async fn initial_sync(
 
     let head: HeadResponse = resp.json().await?;
 
-    // Write content to file
-    tokio::fs::write(file_path, &head.content).await?;
+    // Write content to file, handling binary content (base64-encoded on server)
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let content_info = detect_from_path(file_path);
+    if content_info.is_binary {
+        // Extension indicates binary - decode base64
+        match STANDARD.decode(&head.content) {
+            Ok(decoded) => tokio::fs::write(file_path, &decoded).await?,
+            Err(e) => {
+                warn!("Failed to decode binary content: {}", e);
+                tokio::fs::write(file_path, &head.content).await?;
+            }
+        }
+    } else {
+        // Extension says text, but try decoding as base64 in case
+        // this was a binary file detected by content sniffing
+        match STANDARD.decode(&head.content) {
+            Ok(decoded) if is_binary_content(&decoded) => {
+                tokio::fs::write(file_path, &decoded).await?;
+            }
+            _ => {
+                tokio::fs::write(file_path, &head.content).await?;
+            }
+        }
+    }
 
     // Update state
     {
