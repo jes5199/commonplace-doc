@@ -28,6 +28,8 @@ pub struct FilesystemReconciler {
     watcher_handles: RwLock<std::collections::HashMap<String, JoinHandle<()>>>,
     /// Channel sender to trigger reconciliation (None until start() is called)
     reconcile_trigger: RwLock<Option<mpsc::Sender<()>>>,
+    /// Last valid schemas for node-backed directories (node_id -> schema)
+    last_valid_node_schemas: RwLock<std::collections::HashMap<String, FsSchema>>,
 }
 
 impl FilesystemReconciler {
@@ -40,6 +42,7 @@ impl FilesystemReconciler {
             known_nodes: RwLock::new(HashSet::new()),
             watcher_handles: RwLock::new(std::collections::HashMap::new()),
             reconcile_trigger: RwLock::new(None),
+            last_valid_node_schemas: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -471,24 +474,61 @@ impl FilesystemReconciler {
             return None;
         }
 
-        // Try to parse as filesystem schema - emit error if invalid
+        // Try to parse as filesystem schema - fall back to cached on error
         let schema: FsSchema = match serde_json::from_str(&content) {
             Ok(s) => s,
             Err(e) => {
                 self.emit_error(FsError::ParseError(e.to_string()), Some(base_path))
                     .await;
-                return None;
+                // Try to use cached schema for this node
+                let cache = self.last_valid_node_schemas.read().await;
+                if let Some(cached) = cache.get(node_id) {
+                    cached.clone()
+                } else {
+                    return None;
+                }
             }
         };
 
-        // Validate version - emit error if unsupported
+        // Validate version - fall back to cached on unsupported version
         if schema.version != 1 {
             self.emit_error(FsError::UnsupportedVersion(schema.version), Some(base_path))
                 .await;
+            // Try to use cached schema for this node
+            let cache = self.last_valid_node_schemas.read().await;
+            if let Some(cached) = cache.get(node_id) {
+                // Use cached schema instead
+                return self
+                    .collect_from_valid_node_schema(
+                        cached,
+                        base_path,
+                        node_backed_dirs,
+                        recursion_stack,
+                    )
+                    .await;
+            }
             return None;
         }
 
+        // Cache this valid schema
+        {
+            let mut cache = self.last_valid_node_schemas.write().await;
+            cache.insert(node_id.to_string(), schema.clone());
+        }
+
         // Recursively collect from the nested root
+        self.collect_from_valid_node_schema(&schema, base_path, node_backed_dirs, recursion_stack)
+            .await
+    }
+
+    /// Collect entries from a validated node schema.
+    async fn collect_from_valid_node_schema(
+        &self,
+        schema: &FsSchema,
+        base_path: &str,
+        node_backed_dirs: &mut HashSet<String>,
+        recursion_stack: &mut HashSet<String>,
+    ) -> Option<Vec<(String, String, ContentType)>> {
         if let Some(ref root) = schema.root {
             match Box::pin(self.collect_entries_with_dirs(
                 root,
