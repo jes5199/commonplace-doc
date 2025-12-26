@@ -1,1 +1,3 @@
 /target
+*.skill
+.claude/wiggum-loop.local.md
