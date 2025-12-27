@@ -256,17 +256,17 @@ impl RouterManager {
                 PortType::Both => Port::Both,
             };
 
-            // Check if an identical wire already exists (e.g., externally created)
-            if let Some(existing_sub_id) = self
+            // Check if an identical wire already exists (e.g., externally created or
+            // owned by another router). Skip to avoid duplicates but don't claim ownership
+            // - the other owner may remove it later, and we'll recreate on next apply_wiring.
+            if self
                 .registry
                 .find_existing_wiring(&from_id, &to_id, port)
                 .await
+                .is_some()
             {
-                // Wire already exists, adopt it into managed_wires
-                let mut managed = self.managed_wires.write().await;
-                managed.insert(wire_key.clone(), existing_sub_id);
                 tracing::debug!(
-                    "Adopted existing wire: {} -> {} (port: {:?})",
+                    "Wire already exists (external): {} -> {} (port: {:?})",
                     wire_key.from,
                     wire_key.to,
                     wire_key.port
@@ -639,24 +639,20 @@ mod tests {
 
         // Should still have exactly 1 wire (no duplicate created)
         let wirings = registry.get_outgoing_wirings(&NodeId::new("doc-a")).await;
-        assert_eq!(
-            wirings.len(),
-            1,
-            "should adopt existing wire, not create duplicate"
-        );
+        assert_eq!(wirings.len(), 1, "should skip creating duplicate wire");
 
         // The wire should be the same one that was externally created
         assert_eq!(
             wirings[0].0, external_sub_id,
-            "should adopt the external wire's subscription ID"
+            "external wire should still exist unchanged"
         );
 
-        // Verify managed_wires was updated
+        // Verify managed_wires was NOT updated (we don't claim ownership of external wires)
         let managed = manager.managed_wires.read().await;
         assert_eq!(
             managed.len(),
-            1,
-            "managed_wires should have the adopted wire"
+            0,
+            "managed_wires should NOT include external wire"
         );
     }
 }
