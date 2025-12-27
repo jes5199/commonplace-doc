@@ -79,6 +79,7 @@ impl FilesystemReconciler {
                     result = blue_sub.recv() => {
                         match result {
                             Ok(_edit) => {
+                                tracing::info!("Reconciler received blue edit, running reconciliation");
                                 reconciler.do_reconcile().await;
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -226,7 +227,7 @@ impl FilesystemReconciler {
                     .await
                     .map_err(|e| FsError::NodeError(e.to_string()))?;
 
-                tracing::debug!("Created fs node: {} -> {}", path, node_id);
+                tracing::info!("Reconciler created node: {} -> {}", path, node_id);
             }
 
             known.insert(node_id.clone());
@@ -363,7 +364,7 @@ impl FilesystemReconciler {
                     .await
                     .map_err(|e| FsError::NodeError(e.to_string()))?;
 
-                tracing::debug!("Created fs node: {} -> {}", path, node_id);
+                tracing::info!("Reconciler created node: {} -> {}", path, node_id);
             }
 
             // Track in known_nodes regardless
