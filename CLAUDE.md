@@ -141,5 +141,12 @@ Request inline code review comments from GitHub Codex bot:
 3. Address any issues found
 4. Create PR and push
 5. Run `github-codex-review` to get PR feedback
-6. Address inline comments
-7. Merge when all reviews pass
+6. Address ALL P1 issues (blocking)
+7. Address P2 issues (non-blocking suggestions)
+8. Push fixes and request `@codex review` again
+9. Repeat steps 6-8 until no new issues
+10. Merge ONLY when Codex review is clear (no unaddressed P1 issues)
+
+**CRITICAL: DO NOT MERGE UNTIL CODEX REVIEW SAYS IT IS ALL CLEAR**
+
+P1 issues are blocking and MUST be fixed before merging. If a P1 is found after merge, immediately create a bead to track the fix.
