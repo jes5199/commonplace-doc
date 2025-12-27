@@ -545,10 +545,25 @@ async fn run_directory_mode(
         };
 
         if let Ok(resp) = file_head_resp {
+            debug!(
+                "File head response status: {} for {}",
+                resp.status(),
+                node_id
+            );
             if resp.status().is_success() {
                 let head: HeadResponse = resp.json().await?;
+                info!(
+                    "File head content empty: {}, strategy: {}",
+                    head.content.is_empty(),
+                    initial_sync_strategy
+                );
                 if head.content.is_empty() || initial_sync_strategy == "local" {
                     // Push local content (binary files are already base64 encoded)
+                    info!(
+                        "Pushing initial content for: {} ({} bytes)",
+                        node_id,
+                        file.content.len()
+                    );
                     push_file_content(&client, &server, &node_id, &file.content, &state).await?;
                 } else {
                     // Server has content
@@ -580,7 +595,8 @@ async fn run_directory_mode(
                     }
                 }
             } else if should_push_content {
-                // Binary files are already base64 encoded by scan_directory_with_contents
+                // Node doesn't exist yet or returned non-success - push content with retries
+                info!("Node not ready, will push with retries for: {}", node_id);
                 push_file_content(&client, &server, &node_id, &file.content, &state).await?;
             }
         }
@@ -936,7 +952,8 @@ async fn push_file_content(
         _ => {}
     }
 
-    // No existing content, use edit endpoint
+    // No existing content, use edit endpoint with retry for node creation
+    debug!("Using edit endpoint for initial content: {}", node_id);
     let update = create_yjs_text_update(content);
     let edit_url = format!("{}/nodes/{}/edit", server, encode_node_id(node_id));
     let edit_req = EditRequest {
@@ -945,15 +962,33 @@ async fn push_file_content(
         message: Some("Initial file content".to_string()),
     };
 
-    let resp = client.post(&edit_url).json(&edit_req).send().await?;
-    if resp.status().is_success() {
-        let result: EditResponse = resp.json().await?;
-        let mut s = state.write().await;
-        s.last_written_cid = Some(result.cid);
-        s.last_written_content = content.to_string();
+    // Retry loop: wait for node to be created by reconciler
+    // The reconciler processes schema changes asynchronously, so we need to wait
+    let mut attempts = 0;
+    let max_attempts = 30; // 3 seconds max wait
+    loop {
+        let resp = client.post(&edit_url).json(&edit_req).send().await?;
+        if resp.status().is_success() {
+            let result: EditResponse = resp.json().await?;
+            let mut s = state.write().await;
+            s.last_written_cid = Some(result.cid);
+            s.last_written_content = content.to_string();
+            info!("Successfully pushed content for: {}", node_id);
+            return Ok(());
+        } else if resp.status() == reqwest::StatusCode::NOT_FOUND && attempts < max_attempts {
+            // Node not created yet by reconciler, wait and retry
+            attempts += 1;
+            info!(
+                "Node {} not found, waiting for reconciler (attempt {}/{})",
+                node_id, attempts, max_attempts
+            );
+            sleep(Duration::from_millis(100)).await;
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            warn!("Failed to push content for {}: {}", node_id, body);
+            return Ok(());
+        }
     }
-
-    Ok(())
 }
 
 /// Directory-level events

@@ -46,8 +46,9 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
         let node_id = NodeId::new(&fs_root_id);
 
         // Get or create the fs-root document node
+        // Use Text type since the edit system uses TEXT-based Yjs updates
         match node_registry
-            .get_or_create_document(&node_id, ContentType::Json)
+            .get_or_create_document(&node_id, ContentType::Text)
             .await
         {
             Ok(fs_node) => {
