@@ -346,6 +346,7 @@ async fn test_router_with_fs_root() {
     let _app = create_router_with_config(RouterConfig {
         commit_store: None,
         fs_root: Some("my-filesystem".to_string()),
+        routers: vec![],
     })
     .await;
 

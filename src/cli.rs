@@ -20,4 +20,8 @@ pub struct Args {
     /// Node ID for filesystem root document
     #[clap(long, value_name = "NODE_ID")]
     pub fs_root: Option<String>,
+
+    /// Node IDs for router documents (repeatable)
+    #[clap(long = "router", value_name = "NODE_ID")]
+    pub routers: Vec<String>,
 }

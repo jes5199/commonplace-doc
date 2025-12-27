@@ -33,10 +33,16 @@ async fn main() {
         tracing::info!("Filesystem root: {}", fs_root);
     }
 
+    // Log router documents if configured
+    for router_id in &args.routers {
+        tracing::info!("Router document: {}", router_id);
+    }
+
     // Build our application with routes
     let app = create_router_with_config(RouterConfig {
         commit_store,
         fs_root: args.fs_root,
+        routers: args.routers,
     })
     .await;
 
