@@ -309,6 +309,23 @@ impl NodeRegistry {
             .collect()
     }
 
+    /// Check if a wiring with the given (from, to, port) already exists.
+    /// Returns the subscription ID if found.
+    pub async fn find_existing_wiring(
+        &self,
+        from: &NodeId,
+        to: &NodeId,
+        port: Port,
+    ) -> Option<SubscriptionId> {
+        let wirings = self.wirings.read().await;
+        for (sub_id, wiring) in wirings.iter() {
+            if &wiring.from == from && &wiring.to == to && wiring.port == port {
+                return Some(sub_id.clone());
+            }
+        }
+        None
+    }
+
     /// Get count of registered nodes
     pub async fn node_count(&self) -> usize {
         let nodes = self.nodes.read().await;
