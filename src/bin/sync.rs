@@ -907,56 +907,31 @@ async fn run_directory_mode(
 }
 
 /// Push filesystem schema JSON to the fs-root node
+///
+/// Uses Y.Map updates for proper CRDT support. The edit endpoint is always used
+/// because the replace endpoint only supports text content type.
 async fn push_schema_to_server(
     client: &Client,
     server: &str,
     fs_root_id: &str,
     schema_json: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // First check if there's existing content
-    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(fs_root_id));
-    let head_resp = client.get(&head_url).send().await?;
-
-    if head_resp.status().is_success() {
-        let head: HeadResponse = head_resp.json().await?;
-        if let Some(parent_cid) = head.cid {
-            // Use replace endpoint
-            let replace_url = format!(
-                "{}/nodes/{}/replace?parent_cid={}&author=sync-client",
-                server,
-                encode_node_id(fs_root_id),
-                parent_cid
-            );
-            let resp = client
-                .post(&replace_url)
-                .header("content-type", "application/json")
-                .body(schema_json.to_string())
-                .send()
-                .await?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(format!("Failed to push schema: {} - {}", status, body).into());
-            }
-            return Ok(());
-        }
-    }
-
-    // No existing content, use edit endpoint with Y.Map update for proper CRDT merging
+    // Always use edit endpoint with Y.Map update for JSON schemas
+    // (replace endpoint only supports text content type)
     let update = create_yjs_map_update(schema_json)
         .map_err(|e| format!("Failed to create map update: {}", e))?;
     let edit_url = format!("{}/nodes/{}/edit", server, encode_node_id(fs_root_id));
     let edit_req = EditRequest {
         update,
         author: Some("sync-client".to_string()),
-        message: Some("Initial filesystem schema".to_string()),
+        message: Some("Update filesystem schema".to_string()),
     };
 
     let resp = client.post(&edit_url).json(&edit_req).send().await?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Failed to push initial schema: {} - {}", status, body).into());
+        return Err(format!("Failed to push schema: {} - {}", status, body).into());
     }
 
     Ok(())

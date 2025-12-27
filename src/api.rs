@@ -435,13 +435,20 @@ async fn get_node_head(
         "Commit store not enabled. Start server with --database flag.".to_string(),
     ))?;
 
-    // 2. Verify node exists
+    // 2. Verify node exists and get its content type
     let node_id = NodeId::new(&id);
-    let _node = state
+    let node = state
         .node_registry
         .get(&node_id)
         .await
         .ok_or((StatusCode::NOT_FOUND, format!("Node {} not found", id)))?;
+
+    // Get content type from the node (DocumentNode stores it)
+    let content_type = node
+        .as_any()
+        .downcast_ref::<DocumentNode>()
+        .map(|dn| dn.content_type())
+        .unwrap_or(ContentType::Text);
 
     // 3. Get current HEAD
     let head_cid = commit_store
@@ -457,10 +464,10 @@ async fn get_node_head(
         }));
     };
 
-    // 5. Replay content at HEAD
+    // 5. Replay content at HEAD using the node's actual content type
     let replayer = CommitReplayer::new(commit_store.as_ref());
     let content = replayer
-        .get_content_at_commit(&id, &cid, &ContentType::Text)
+        .get_content_at_commit(&id, &cid, &content_type)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -706,7 +713,7 @@ async fn replace_content(
         "Commit store not enabled. Start server with --database flag.".to_string(),
     ))?;
 
-    // 2. Verify node exists
+    // 2. Verify node exists and get its content type
     let node_id = NodeId::new(&id);
     let node = state
         .node_registry
@@ -714,8 +721,24 @@ async fn replace_content(
         .await
         .ok_or((StatusCode::NOT_FOUND, format!("Node {} not found", id)))?;
 
-    // 3. Only support text content type for now
-    let content_type = ContentType::Text;
+    // 3. Get content type from the node - only text is supported for replace
+    let content_type = node
+        .as_any()
+        .downcast_ref::<DocumentNode>()
+        .map(|dn| dn.content_type())
+        .unwrap_or(ContentType::Text);
+
+    // Replace endpoint uses text-based diffing, so only text content type is supported
+    if !matches!(content_type, ContentType::Text) {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!(
+                "Replace only supports text/plain documents. Node {} has content type {}. Use the edit endpoint with a pre-computed Yjs update for JSON documents.",
+                id,
+                content_type.to_mime()
+            ),
+        ));
+    }
 
     // 4. Validate parent_cid exists in document history
     let replayer = CommitReplayer::new(commit_store.as_ref());
