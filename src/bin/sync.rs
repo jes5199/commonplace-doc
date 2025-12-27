@@ -25,7 +25,8 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use yrs::any::Any;
-use yrs::{Doc, Map, Text, Transact};
+use yrs::updates::decoder::Decode;
+use yrs::{Doc, Map, Text, Transact, Update};
 
 /// URL-encode a node ID for use in URL paths.
 /// Node IDs for nested files contain `/` (e.g., `fs-root:notes/idea.md`) which
@@ -108,6 +109,9 @@ impl SyncState {
 struct HeadResponse {
     cid: Option<String>,
     content: String,
+    /// Yjs state bytes at HEAD (base64 encoded, for CRDT-compatible diffs)
+    #[serde(default)]
+    state: Option<String>,
 }
 
 /// Response from POST /nodes/:id/replace
@@ -189,22 +193,70 @@ fn create_yjs_text_update(content: &str) -> String {
     base64_encode(&update)
 }
 
-/// Create a Yjs update that sets the full map content from JSON
-fn create_yjs_map_update(json_content: &str) -> Result<String, serde_json::Error> {
-    let value: serde_json::Value = serde_json::from_str(json_content)?;
+/// Create a Yjs update that applies a diff between old and new JSON content.
+/// This properly handles both insertions/updates AND deletions.
+///
+/// When base_state is provided, it applies the state first so that removals
+/// create proper CRDT tombstones for the server's existing items.
+fn create_yjs_map_diff_update(
+    old_json: Option<&str>,
+    new_json: &str,
+    base_state: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let new_value: serde_json::Value = serde_json::from_str(new_json)?;
+    let old_value: Option<serde_json::Value> = match old_json {
+        Some(s) if !s.is_empty() => serde_json::from_str(s).ok(),
+        _ => None,
+    };
+
     let doc = Doc::with_client_id(1);
     let map = doc.get_or_insert_map(TEXT_ROOT_NAME);
+
+    // Apply base state if provided (critical for proper deletion tombstones)
+    if let Some(state_b64) = base_state {
+        if let Ok(state_bytes) = base64_decode(state_b64) {
+            if !state_bytes.is_empty() {
+                if let Ok(update) = Update::decode_v1(&state_bytes) {
+                    let mut txn = doc.transact_mut();
+                    txn.apply_update(update);
+                }
+            }
+        }
+    }
+
     let update = {
         let mut txn = doc.transact_mut();
-        // Set each top-level key from the JSON object
-        if let serde_json::Value::Object(obj) = value {
+
+        // Get old and new key/value pairs
+        let old_obj = old_value.as_ref().and_then(|v| v.as_object());
+        let new_obj = new_value.as_object();
+
+        let old_keys: std::collections::HashSet<String> = old_obj
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+        let new_keys: std::collections::HashSet<String> = new_obj
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+
+        // Keys to delete (in old but not in new)
+        let deleted_keys: Vec<&String> = old_keys.difference(&new_keys).collect();
+
+        // Remove deleted keys (base state was applied, so keys exist in CRDT)
+        for key in &deleted_keys {
+            map.remove(&mut txn, key);
+        }
+
+        // Insert/update keys from new schema
+        if let Some(obj) = new_obj {
             for (key, val) in obj {
-                let any_val = json_value_to_any(val);
+                let any_val = json_value_to_any(val.clone());
                 map.insert(&mut txn, key.as_str(), any_val);
             }
         }
+
         txn.encode_update_v1()
     };
+
     Ok(base64_encode(&update))
 }
 
@@ -241,6 +293,12 @@ fn json_value_to_any(value: serde_json::Value) -> Any {
 fn base64_encode(data: &[u8]) -> String {
     use base64::{engine::general_purpose::STANDARD, Engine};
     STANDARD.encode(data)
+}
+
+/// Simple base64 decoding (matching server's b64 module)
+fn base64_decode(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    STANDARD.decode(data)
 }
 
 /// Fork a source node and return the new node ID
@@ -910,16 +968,31 @@ async fn run_directory_mode(
 ///
 /// Uses Y.Map updates for proper CRDT support. The edit endpoint is always used
 /// because the replace endpoint only supports text content type.
+///
+/// This function properly handles deletions by:
+/// 1. Fetching the current server content
+/// 2. Comparing old keys vs new keys
+/// 3. Creating an update that removes missing keys and inserts new ones
 async fn push_schema_to_server(
     client: &Client,
     server: &str,
     fs_root_id: &str,
     schema_json: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Always use edit endpoint with Y.Map update for JSON schemas
-    // (replace endpoint only supports text content type)
-    let update = create_yjs_map_update(schema_json)
-        .map_err(|e| format!("Failed to create map update: {}", e))?;
+    // First fetch current server content and state to detect deletions
+    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(fs_root_id));
+    let head_resp = client.get(&head_url).send().await?;
+    let (old_content, base_state) = if head_resp.status().is_success() {
+        let head: HeadResponse = head_resp.json().await?;
+        (Some(head.content), head.state)
+    } else {
+        (None, None)
+    };
+
+    // Create an update that properly handles deletions (using server state for CRDT consistency)
+    let update =
+        create_yjs_map_diff_update(old_content.as_deref(), schema_json, base_state.as_deref())
+            .map_err(|e| format!("Failed to create map update: {}", e))?;
     let edit_url = format!("{}/nodes/{}/edit", server, encode_node_id(fs_root_id));
     let edit_req = EditRequest {
         update,
