@@ -24,7 +24,8 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
-use yrs::{Doc, Text, Transact};
+use yrs::any::Any;
+use yrs::{Doc, Map, Text, Transact};
 
 /// URL-encode a node ID for use in URL paths.
 /// Node IDs for nested files contain `/` (e.g., `fs-root:notes/idea.md`) which
@@ -186,6 +187,54 @@ fn create_yjs_text_update(content: &str) -> String {
         txn.encode_update_v1()
     };
     base64_encode(&update)
+}
+
+/// Create a Yjs update that sets the full map content from JSON
+fn create_yjs_map_update(json_content: &str) -> Result<String, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(json_content)?;
+    let doc = Doc::with_client_id(1);
+    let map = doc.get_or_insert_map(TEXT_ROOT_NAME);
+    let update = {
+        let mut txn = doc.transact_mut();
+        // Set each top-level key from the JSON object
+        if let serde_json::Value::Object(obj) = value {
+            for (key, val) in obj {
+                let any_val = json_value_to_any(val);
+                map.insert(&mut txn, key.as_str(), any_val);
+            }
+        }
+        txn.encode_update_v1()
+    };
+    Ok(base64_encode(&update))
+}
+
+/// Convert serde_json::Value to yrs::Any
+fn json_value_to_any(value: serde_json::Value) -> Any {
+    match value {
+        serde_json::Value::Null => Any::Null,
+        serde_json::Value::Bool(b) => Any::Bool(b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Any::BigInt(i)
+            } else if let Some(f) = n.as_f64() {
+                Any::Number(f)
+            } else {
+                Any::Null
+            }
+        }
+        serde_json::Value::String(s) => Any::String(s.into()),
+        serde_json::Value::Array(arr) => {
+            let items: Vec<Any> = arr.into_iter().map(json_value_to_any).collect();
+            Any::Array(items.into())
+        }
+        serde_json::Value::Object(obj) => {
+            let mut map = std::collections::HashMap::new();
+            for (k, v) in obj {
+                map.insert(k, json_value_to_any(v));
+            }
+            Any::Map(map.into())
+        }
+    }
 }
 
 /// Simple base64 encoding (matching server's b64 module)
@@ -893,8 +942,9 @@ async fn push_schema_to_server(
         }
     }
 
-    // No existing content, use edit endpoint
-    let update = create_yjs_text_update(schema_json);
+    // No existing content, use edit endpoint with Y.Map update for proper CRDT merging
+    let update = create_yjs_map_update(schema_json)
+        .map_err(|e| format!("Failed to create map update: {}", e))?;
     let edit_url = format!("{}/nodes/{}/edit", server, encode_node_id(fs_root_id));
     let edit_req = EditRequest {
         update,

@@ -9,6 +9,7 @@ use crate::document::ContentType;
 use crate::store::{CommitStore, StoreError};
 use std::collections::HashSet;
 use yrs::updates::decoder::Decode;
+use yrs::types::ToJson;
 use yrs::{Doc, GetString, ReadTxn, Transact};
 
 /// Text root name used in Yrs documents (must match DocumentNode)
@@ -95,19 +96,24 @@ impl<'a> CommitReplayer<'a> {
         target_cid: &str,
         content_type: &ContentType,
     ) -> Result<(String, Vec<u8>), ReplayError> {
-        // Verify content type is Text (for now)
-        if !matches!(content_type, ContentType::Text) {
-            return Err(ReplayError::UnsupportedContentType(
-                content_type.to_mime().to_string(),
-            ));
-        }
-
         // Collect all commits from root to target
         let commits = self.collect_commits_to_target(target_cid).await?;
 
-        // Create fresh Yrs doc and apply all updates in order
+        // Create fresh Yrs doc with appropriate root type
         let ydoc = Doc::with_client_id(1);
-        ydoc.get_or_insert_text(TEXT_ROOT_NAME);
+        match content_type {
+            ContentType::Text => {
+                ydoc.get_or_insert_text(TEXT_ROOT_NAME);
+            }
+            ContentType::Json => {
+                ydoc.get_or_insert_map(TEXT_ROOT_NAME);
+            }
+            ContentType::Xml => {
+                return Err(ReplayError::UnsupportedContentType(
+                    content_type.to_mime().to_string(),
+                ));
+            }
+        }
 
         for (_, commit) in commits {
             // Skip empty updates (e.g., merge commits)
@@ -129,12 +135,28 @@ impl<'a> CommitReplayer<'a> {
             txn.apply_update(update);
         }
 
-        // Extract final content and state
+        // Extract final content and state based on content type
         let txn = ydoc.transact();
-        let text = txn
-            .get_text(TEXT_ROOT_NAME)
-            .ok_or_else(|| ReplayError::InvalidUpdate("Text root not found".to_string()))?;
-        let content = text.get_string(&txn);
+        let content = match content_type {
+            ContentType::Text => {
+                let text = txn
+                    .get_text(TEXT_ROOT_NAME)
+                    .ok_or_else(|| ReplayError::InvalidUpdate("Text root not found".to_string()))?;
+                text.get_string(&txn)
+            }
+            ContentType::Json => {
+                let map = txn
+                    .get_map(TEXT_ROOT_NAME)
+                    .ok_or_else(|| ReplayError::InvalidUpdate("Map root not found".to_string()))?;
+                let any = map.to_json(&txn);
+                serde_json::to_string(&any)
+                    .map_err(|e| ReplayError::InvalidUpdate(format!("JSON serialization: {}", e)))?
+            }
+            ContentType::Xml => {
+                // Already returned error above
+                unreachable!()
+            }
+        };
         let state_bytes = txn.encode_state_as_update_v1(&yrs::StateVector::default());
 
         Ok((content, state_bytes))
@@ -451,9 +473,9 @@ mod tests {
 
         let replayer = CommitReplayer::new(&store);
 
-        // JSON content type should fail
+        // XML content type should fail (JSON now supported)
         let result = replayer
-            .get_content_at_commit("doc", &cid1, &ContentType::Json)
+            .get_content_at_commit("doc", &cid1, &ContentType::Xml)
             .await;
 
         assert!(matches!(
