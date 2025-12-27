@@ -11,7 +11,8 @@ use commonplace_doc::sync::{
     schema_to_json, ScanOptions,
 };
 use futures::StreamExt;
-use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::event::{ModifyKind, RenameMode};
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use reqwest::Client;
 use reqwest_eventsource::{Event as SseEvent, EventSource};
 use serde::{Deserialize, Serialize};
@@ -1045,8 +1046,42 @@ async fn directory_watcher_task(
                                 }
                             }
 
+                            // Handle rename events specially - treat as delete+create
+                            // so that sync tasks are properly stopped/started
                             let dir_event = if event.kind.is_create() {
                                 Some(DirEvent::Created(path.clone()))
+                            } else if let EventKind::Modify(ModifyKind::Name(rename_mode)) =
+                                event.kind
+                            {
+                                // Rename events: treat as delete (old path) or create (new path)
+                                match rename_mode {
+                                    RenameMode::From => {
+                                        // Source of rename - file moved away
+                                        debug!("Rename from (treating as delete): {}", path.display());
+                                        Some(DirEvent::Deleted(path.clone()))
+                                    }
+                                    RenameMode::To => {
+                                        // Destination of rename - file moved here
+                                        debug!("Rename to (treating as create): {}", path.display());
+                                        Some(DirEvent::Created(path.clone()))
+                                    }
+                                    RenameMode::Both | RenameMode::Any | RenameMode::Other => {
+                                        // Platform couldn't determine direction - check if path exists
+                                        if path.exists() {
+                                            debug!(
+                                                "Rename (path exists, treating as create): {}",
+                                                path.display()
+                                            );
+                                            Some(DirEvent::Created(path.clone()))
+                                        } else {
+                                            debug!(
+                                                "Rename (path gone, treating as delete): {}",
+                                                path.display()
+                                            );
+                                            Some(DirEvent::Deleted(path.clone()))
+                                        }
+                                    }
+                                }
                             } else if event.kind.is_modify() {
                                 Some(DirEvent::Modified(path.clone()))
                             } else if event.kind.is_remove() {
