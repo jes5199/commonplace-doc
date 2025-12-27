@@ -653,6 +653,10 @@ mod tests {
 
         // Verify managed_wires was updated
         let managed = manager.managed_wires.read().await;
-        assert_eq!(managed.len(), 1, "managed_wires should have the adopted wire");
+        assert_eq!(
+            managed.len(),
+            1,
+            "managed_wires should have the adopted wire"
+        );
     }
 }
