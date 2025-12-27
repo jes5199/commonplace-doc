@@ -4,6 +4,7 @@ use super::error::RouterError;
 use super::schema::{PortType, RouterSchema};
 use crate::document::ContentType;
 use crate::node::subscription::SubscriptionId;
+use crate::node::types::Port;
 use crate::node::{DocumentNode, Event, NodeId, NodeRegistry, ObservableNode};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -245,6 +246,31 @@ impl RouterManager {
             if self.registry.get(&to_id).await.is_none() {
                 self.emit_error(RouterError::MissingNode(wire_key.to.clone()))
                     .await;
+                continue;
+            }
+
+            // Convert PortType to Port for registry lookup
+            let port = match wire_key.port {
+                PortType::Blue => Port::Blue,
+                PortType::Red => Port::Red,
+                PortType::Both => Port::Both,
+            };
+
+            // Check if an identical wire already exists (e.g., externally created or
+            // owned by another router). Skip to avoid duplicates but don't claim ownership
+            // - the other owner may remove it later, and we'll recreate on next apply_wiring.
+            if self
+                .registry
+                .find_existing_wiring(&from_id, &to_id, port)
+                .await
+                .is_some()
+            {
+                tracing::debug!(
+                    "Wire already exists (external): {} -> {} (port: {:?})",
+                    wire_key.from,
+                    wire_key.to,
+                    wire_key.port
+                );
                 continue;
             }
 
@@ -575,6 +601,58 @@ mod tests {
             wirings.len(),
             1,
             "wire should be recreated after external unwire"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_router_adopts_externally_created_wire() {
+        let registry = Arc::new(NodeRegistry::new());
+
+        // Create two document nodes
+        let doc_a = Arc::new(DocumentNode::new("doc-a", ContentType::Text));
+        let doc_b = Arc::new(DocumentNode::new("doc-b", ContentType::Text));
+        registry.register(doc_a).await.unwrap();
+        registry.register(doc_b).await.unwrap();
+
+        // Externally create a wire (simulating POST /nodes/doc-a/wire/doc-b)
+        let external_sub_id = registry
+            .wire(&NodeId::new("doc-a"), &NodeId::new("doc-b"))
+            .await
+            .unwrap();
+
+        // Verify wire exists
+        let wirings = registry.get_outgoing_wirings(&NodeId::new("doc-a")).await;
+        assert_eq!(wirings.len(), 1, "external wire should exist");
+
+        // Create router node as Text type (stores JSON as text)
+        let router = Arc::new(DocumentNode::new("router", ContentType::Text));
+        registry.register(router.clone()).await.unwrap();
+
+        // Set router content with edge that matches the external wire
+        let content =
+            r#"{"version": 1, "edges": [{"from": "doc-a", "to": "doc-b", "port": "both"}]}"#;
+        router.apply_state(&make_text_update(content)).unwrap();
+
+        // Create and run router manager
+        let manager = Arc::new(RouterManager::new(NodeId::new("router"), registry.clone()));
+        manager.apply_wiring().await;
+
+        // Should still have exactly 1 wire (no duplicate created)
+        let wirings = registry.get_outgoing_wirings(&NodeId::new("doc-a")).await;
+        assert_eq!(wirings.len(), 1, "should skip creating duplicate wire");
+
+        // The wire should be the same one that was externally created
+        assert_eq!(
+            wirings[0].0, external_sub_id,
+            "external wire should still exist unchanged"
+        );
+
+        // Verify managed_wires was NOT updated (we don't claim ownership of external wires)
+        let managed = manager.managed_wires.read().await;
+        assert_eq!(
+            managed.len(),
+            0,
+            "managed_wires should NOT include external wire"
         );
     }
 }
