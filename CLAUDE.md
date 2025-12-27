@@ -119,3 +119,27 @@ Default content by type:
 ## Git Configuration
 
 - Main branch: `main`
+
+## Code Review Workflow
+
+Use a dual-review approach alternating between local and GitHub-based code reviews:
+
+### Local Code Review (before commit/PR)
+Run `codex review` CLI to review uncommitted changes or branch differences:
+- Use the `local-codex-review` skill for reviewing changes before committing
+- Good for catching issues early before pushing
+
+### GitHub Codex Review (on PRs)
+Request inline code review comments from GitHub Codex bot:
+- Use the `github-codex-review` skill after creating or updating PRs
+- Retrieves inline comments and suggestions from the Codex bot
+- Check review status before merging
+
+### Workflow Pattern
+1. Implement changes following TDD
+2. Run `local-codex-review` before committing
+3. Address any issues found
+4. Create PR and push
+5. Run `github-codex-review` to get PR feedback
+6. Address inline comments
+7. Merge when all reviews pass
