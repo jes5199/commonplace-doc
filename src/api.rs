@@ -423,6 +423,9 @@ struct NodeHeadResponse {
     cid: Option<String>,
     /// Document content at HEAD
     content: String,
+    /// Yjs state bytes at HEAD (base64 encoded, for CRDT-compatible diffs)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
 }
 
 async fn get_node_head(
@@ -461,19 +464,28 @@ async fn get_node_head(
         return Ok(Json(NodeHeadResponse {
             cid: None,
             content: String::new(),
+            state: None,
         }));
     };
 
-    // 5. Replay content at HEAD using the node's actual content type
+    // 5. Replay content and state at HEAD using the node's actual content type
     let replayer = CommitReplayer::new(commit_store.as_ref());
-    let content = replayer
-        .get_content_at_commit(&id, &cid, &content_type)
+    let (content, state_bytes) = replayer
+        .get_content_and_state_at_commit(&id, &cid, &content_type)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Encode state bytes as base64 for client use
+    let state = if state_bytes.is_empty() {
+        None
+    } else {
+        Some(crate::b64::encode(&state_bytes))
+    };
 
     Ok(Json(NodeHeadResponse {
         cid: Some(cid),
         content,
+        state,
     }))
 }
 
