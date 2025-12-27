@@ -990,8 +990,9 @@ async fn push_schema_to_server(
     };
 
     // Create an update that properly handles deletions (using server state for CRDT consistency)
-    let update = create_yjs_map_diff_update(old_content.as_deref(), schema_json, base_state.as_deref())
-        .map_err(|e| format!("Failed to create map update: {}", e))?;
+    let update =
+        create_yjs_map_diff_update(old_content.as_deref(), schema_json, base_state.as_deref())
+            .map_err(|e| format!("Failed to create map update: {}", e))?;
     let edit_url = format!("{}/nodes/{}/edit", server, encode_node_id(fs_root_id));
     let edit_req = EditRequest {
         update,
