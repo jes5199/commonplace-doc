@@ -9,7 +9,7 @@ use yrs::Transact;
 use yrs::Value;
 use yrs::WriteTxn;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContentType {
     Json,
     JsonArray,

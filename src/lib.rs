@@ -6,6 +6,7 @@ pub mod diff;
 pub mod document;
 pub mod events;
 pub mod fs;
+pub mod mqtt;
 pub mod node;
 pub mod replay;
 pub mod router;
