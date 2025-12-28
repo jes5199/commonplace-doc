@@ -4,20 +4,33 @@ use tokio::sync::RwLock;
 use yrs::types::ToJson;
 use yrs::updates::decoder::Decode;
 use yrs::GetString;
+use yrs::ReadTxn;
 use yrs::Transact;
+use yrs::Value;
 use yrs::WriteTxn;
 
 #[derive(Clone, Debug)]
 pub enum ContentType {
     Json,
+    JsonArray,
     Xml,
     Text,
 }
 
 impl ContentType {
     pub fn from_mime(mime: &str) -> Option<Self> {
-        match mime {
-            "application/json" => Some(ContentType::Json),
+        let mut parts = mime.split(';').map(|part| part.trim());
+        let base = parts.next().unwrap_or_default();
+        let params: Vec<&str> = parts.collect();
+
+        match base {
+            "application/json" => {
+                if params.iter().any(|p| p.eq_ignore_ascii_case("root=array")) {
+                    Some(ContentType::JsonArray)
+                } else {
+                    Some(ContentType::Json)
+                }
+            }
             "application/xml" | "text/xml" => Some(ContentType::Xml),
             "text/plain" => Some(ContentType::Text),
             _ => None,
@@ -27,6 +40,7 @@ impl ContentType {
     pub fn to_mime(&self) -> &'static str {
         match self {
             ContentType::Json => "application/json",
+            ContentType::JsonArray => "application/json;root=array",
             ContentType::Xml => "application/xml",
             ContentType::Text => "text/plain",
         }
@@ -35,6 +49,7 @@ impl ContentType {
     pub fn default_content(&self) -> String {
         match self {
             ContentType::Json => "{}".to_string(),
+            ContentType::JsonArray => "[]".to_string(),
             ContentType::Xml => r#"<?xml version="1.0" encoding="UTF-8"?><root/>"#.to_string(),
             ContentType::Text => String::new(),
         }
@@ -81,6 +96,9 @@ impl DocumentStore {
             }
             ContentType::Json => {
                 ydoc.get_or_insert_map(Self::TEXT_ROOT_NAME);
+            }
+            ContentType::JsonArray => {
+                ydoc.get_or_insert_array(Self::TEXT_ROOT_NAME);
             }
             ContentType::Xml => {
                 ydoc.get_or_insert_xml_fragment(Self::TEXT_ROOT_NAME);
@@ -129,9 +147,34 @@ impl DocumentStore {
                 text.get_string(&txn)
             }
             ContentType::Json => {
-                let map = txn.get_or_insert_map(Self::TEXT_ROOT_NAME);
-                let any = map.to_json(&txn);
-                serde_json::to_string(&any).map_err(|e| ApplyError::Serialization(e.to_string()))?
+                let root = txn
+                    .root_refs()
+                    .find(|(name, _)| *name == Self::TEXT_ROOT_NAME)
+                    .map(|(_, value)| value);
+
+                match root {
+                    Some(Value::YMap(map)) => {
+                        let any = map.to_json(&txn);
+                        serde_json::to_string(&any)
+                            .map_err(|e| ApplyError::Serialization(e.to_string()))?
+                    }
+                    _ => ContentType::Json.default_content(),
+                }
+            }
+            ContentType::JsonArray => {
+                let root = txn
+                    .root_refs()
+                    .find(|(name, _)| *name == Self::TEXT_ROOT_NAME)
+                    .map(|(_, value)| value);
+
+                match root {
+                    Some(Value::YArray(array)) => {
+                        let any = array.to_json(&txn);
+                        serde_json::to_string(&any)
+                            .map_err(|e| ApplyError::Serialization(e.to_string()))?
+                    }
+                    _ => ContentType::JsonArray.default_content(),
+                }
             }
             ContentType::Xml => {
                 let fragment = txn.get_or_insert_xml_fragment(Self::TEXT_ROOT_NAME);

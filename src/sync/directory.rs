@@ -2,6 +2,7 @@
 
 use crate::fs::{DirEntry, DocEntry, Entry, FsSchema};
 use crate::sync::content_type::{detect_from_path, is_binary_content};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -14,6 +15,14 @@ use thiserror::Error;
 /// normalized for consistency across platforms.
 fn normalize_path(path: &str) -> String {
     path.replace('\\', "/")
+}
+
+fn json_content_type_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    match serde_json::from_slice::<Value>(bytes).ok()? {
+        Value::Array(_) => Some("application/json;root=array"),
+        Value::Object(_) => Some("application/json"),
+        _ => None,
+    }
 }
 
 /// Error type for directory scanning operations.
@@ -104,9 +113,20 @@ fn scan_dir_recursive(current: &Path, options: &ScanOptions) -> Result<Entry, Sc
         } else if file_type.is_file() {
             // Create doc entry for file
             let content_info = detect_from_path(&entry_path);
+            let content_type = if content_info.mime_type == "application/json" {
+                if let Ok(raw) = fs::read(&entry_path) {
+                    json_content_type_from_bytes(&raw)
+                        .unwrap_or("application/json")
+                        .to_string()
+                } else {
+                    content_info.mime_type.clone()
+                }
+            } else {
+                content_info.mime_type.clone()
+            };
             let doc_entry = Entry::Doc(DocEntry {
                 node_id: None, // Use derived ID
-                content_type: Some(content_info.mime_type),
+                content_type: Some(content_type),
             });
             entries.insert(name, doc_entry);
         }
@@ -213,6 +233,14 @@ fn scan_files_recursive(
             // Check actual content for binary detection
             let is_binary = content_info.is_binary || is_binary_content(&raw_content);
 
+            let content_type = if content_info.mime_type == "application/json" && !is_binary {
+                json_content_type_from_bytes(&raw_content)
+                    .unwrap_or("application/json")
+                    .to_string()
+            } else {
+                content_info.mime_type.clone()
+            };
+
             let content = if is_binary {
                 use base64::{engine::general_purpose::STANDARD, Engine};
                 STANDARD.encode(&raw_content)
@@ -222,7 +250,7 @@ fn scan_files_recursive(
 
             files.push(ScannedFile {
                 relative_path: relative,
-                content_type: content_info.mime_type,
+                content_type,
                 is_binary,
                 content,
             });

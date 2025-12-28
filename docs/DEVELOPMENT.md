@@ -128,6 +128,13 @@ Both files stay in sync through the server. The sync tool:
 - Handles first commit (empty document) automatically
 - Prevents echo loops (ignores self-triggered file events)
 
+### JSON Files
+
+JSON files (`.json`) are synced as Yjs map/array types instead of plain text.
+This means:
+- JSON must be valid (top-level object or array).
+- Server serialization may normalize whitespace or key ordering.
+
 ## Troubleshooting
 
 - `POST /docs/:id/commit` returns `501`: start the server with `--database <path>`.

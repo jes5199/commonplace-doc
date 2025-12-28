@@ -59,6 +59,7 @@ is the filesystem root.
   - Optional fields:
     - `node_id` (string): explicit ID of the document node.
     - `content_type` (string): MIME type for new nodes.
+      - For JSON arrays, use `application/json;root=array`.
 
 ### Name Rules
 

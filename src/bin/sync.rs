@@ -26,7 +26,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use yrs::any::Any;
 use yrs::updates::decoder::Decode;
-use yrs::{Doc, Map, Text, Transact, Update};
+use yrs::{Array, Doc, Map, Text, Transact, Update, WriteTxn};
 
 /// URL-encode a node ID for use in URL paths.
 /// Node IDs for nested files contain `/` (e.g., `fs-root:notes/idea.md`) which
@@ -193,24 +193,18 @@ fn create_yjs_text_update(content: &str) -> String {
     base64_encode(&update)
 }
 
-/// Create a Yjs update that applies a diff between old and new JSON content.
-/// This properly handles both insertions/updates AND deletions.
+/// Create a Yjs update that applies a full JSON replacement.
+/// Supports object roots (Y.Map) and array roots (Y.Array).
 ///
 /// When base_state is provided, it applies the state first so that removals
 /// create proper CRDT tombstones for the server's existing items.
-fn create_yjs_map_diff_update(
-    old_json: Option<&str>,
+fn create_yjs_json_update(
     new_json: &str,
     base_state: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let new_value: serde_json::Value = serde_json::from_str(new_json)?;
-    let old_value: Option<serde_json::Value> = match old_json {
-        Some(s) if !s.is_empty() => serde_json::from_str(s).ok(),
-        _ => None,
-    };
 
     let doc = Doc::with_client_id(1);
-    let map = doc.get_or_insert_map(TEXT_ROOT_NAME);
 
     // Apply base state if provided (critical for proper deletion tombstones)
     if let Some(state_b64) = base_state {
@@ -227,30 +221,35 @@ fn create_yjs_map_diff_update(
     let update = {
         let mut txn = doc.transact_mut();
 
-        // Get old and new key/value pairs
-        let old_obj = old_value.as_ref().and_then(|v| v.as_object());
-        let new_obj = new_value.as_object();
+        match new_value {
+            serde_json::Value::Object(obj) => {
+                let map = txn.get_or_insert_map(TEXT_ROOT_NAME);
+                let existing_keys: std::collections::HashSet<String> =
+                    map.keys(&txn).map(|k| k.to_string()).collect();
+                let new_keys: std::collections::HashSet<String> = obj.keys().cloned().collect();
 
-        let old_keys: std::collections::HashSet<String> = old_obj
-            .map(|obj| obj.keys().cloned().collect())
-            .unwrap_or_default();
-        let new_keys: std::collections::HashSet<String> = new_obj
-            .map(|obj| obj.keys().cloned().collect())
-            .unwrap_or_default();
+                for key in existing_keys.difference(&new_keys) {
+                    map.remove(&mut txn, key.as_str());
+                }
 
-        // Keys to delete (in old but not in new)
-        let deleted_keys: Vec<&String> = old_keys.difference(&new_keys).collect();
-
-        // Remove deleted keys (base state was applied, so keys exist in CRDT)
-        for key in &deleted_keys {
-            map.remove(&mut txn, key);
-        }
-
-        // Insert/update keys from new schema
-        if let Some(obj) = new_obj {
-            for (key, val) in obj {
-                let any_val = json_value_to_any(val.clone());
-                map.insert(&mut txn, key.as_str(), any_val);
+                for (key, val) in obj {
+                    let any_val = json_value_to_any(val);
+                    map.insert(&mut txn, key.as_str(), any_val);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                let array = txn.get_or_insert_array(TEXT_ROOT_NAME);
+                let len = array.len(&txn);
+                if len > 0 {
+                    array.remove_range(&mut txn, 0, len);
+                }
+                for item in items {
+                    let any_val = json_value_to_any(item);
+                    array.push_back(&mut txn, any_val);
+                }
+            }
+            _ => {
+                return Err("JSON root must be an object or array".into());
             }
         }
 
@@ -672,7 +671,13 @@ async fn run_directory_mode(
                         node_id,
                         file.content.len()
                     );
-                    push_file_content(&client, &server, &node_id, &file.content, &state).await?;
+                    if !file.is_binary && file.content_type.starts_with("application/json") {
+                        push_json_content(&client, &server, &node_id, &file.content, &state)
+                            .await?;
+                    } else {
+                        push_file_content(&client, &server, &node_id, &file.content, &state)
+                            .await?;
+                    }
                 } else {
                     // Server has content
                     if initial_sync_strategy == "server" {
@@ -705,7 +710,11 @@ async fn run_directory_mode(
             } else if should_push_content {
                 // Node doesn't exist yet or returned non-success - push content with retries
                 info!("Node not ready, will push with retries for: {}", node_id);
-                push_file_content(&client, &server, &node_id, &file.content, &state).await?;
+                if !file.is_binary && file.content_type.starts_with("application/json") {
+                    push_json_content(&client, &server, &node_id, &file.content, &state).await?;
+                } else {
+                    push_file_content(&client, &server, &node_id, &file.content, &state).await?;
+                }
             }
         }
 
@@ -852,10 +861,15 @@ async fn run_directory_mode(
                                     String::from_utf8_lossy(&raw_content).to_string()
                                 };
 
-                                if let Err(e) =
+                                if let Err(e) = if !is_binary
+                                    && content_info.mime_type == "application/json"
+                                {
+                                    push_json_content(&client, &server, &node_id, &content, &state)
+                                        .await
+                                } else {
                                     push_file_content(&client, &server, &node_id, &content, &state)
                                         .await
-                                {
+                                } {
                                     warn!("Failed to push new file content: {}", e);
                                 }
                             }
@@ -982,7 +996,7 @@ async fn push_schema_to_server(
     // First fetch current server content and state to detect deletions
     let head_url = format!("{}/nodes/{}/head", server, encode_node_id(fs_root_id));
     let head_resp = client.get(&head_url).send().await?;
-    let (old_content, base_state) = if head_resp.status().is_success() {
+    let (_old_content, base_state) = if head_resp.status().is_success() {
         let head: HeadResponse = head_resp.json().await?;
         (Some(head.content), head.state)
     } else {
@@ -990,9 +1004,8 @@ async fn push_schema_to_server(
     };
 
     // Create an update that properly handles deletions (using server state for CRDT consistency)
-    let update =
-        create_yjs_map_diff_update(old_content.as_deref(), schema_json, base_state.as_deref())
-            .map_err(|e| format!("Failed to create map update: {}", e))?;
+    let update = create_yjs_json_update(schema_json, base_state.as_deref())
+        .map_err(|e| format!("Failed to create JSON update: {}", e))?;
     let edit_url = format!("{}/nodes/{}/edit", server, encode_node_id(fs_root_id));
     let edit_req = EditRequest {
         update,
@@ -1008,6 +1021,69 @@ async fn push_schema_to_server(
     }
 
     Ok(())
+}
+
+/// Push JSON content to a node using Y.Map/Y.Array updates.
+async fn push_json_content(
+    client: &Client,
+    server: &str,
+    node_id: &str,
+    content: &str,
+    state: &Arc<RwLock<SyncState>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(node_id));
+    let edit_url = format!("{}/nodes/{}/edit", server, encode_node_id(node_id));
+    let mut attempts = 0;
+    let max_attempts = 30; // 3 seconds max wait
+
+    loop {
+        let head_resp = client.get(&head_url).send().await?;
+        if head_resp.status() == reqwest::StatusCode::NOT_FOUND && attempts < max_attempts {
+            attempts += 1;
+            info!(
+                "Node {} not found, waiting for reconciler (attempt {}/{})",
+                node_id, attempts, max_attempts
+            );
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
+        let base_state = if head_resp.status().is_success() {
+            let head: HeadResponse = head_resp.json().await?;
+            head.state
+        } else {
+            None
+        };
+
+        let update = create_yjs_json_update(content, base_state.as_deref())?;
+        let edit_req = EditRequest {
+            update,
+            author: Some("sync-client".to_string()),
+            message: Some("Sync JSON content".to_string()),
+        };
+
+        let resp = client.post(&edit_url).json(&edit_req).send().await?;
+        if resp.status().is_success() {
+            let result: EditResponse = resp.json().await?;
+            let mut s = state.write().await;
+            s.last_written_cid = Some(result.cid);
+            s.last_written_content = content.to_string();
+            return Ok(());
+        }
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND && attempts < max_attempts {
+            attempts += 1;
+            info!(
+                "Node {} not found, waiting for reconciler (attempt {}/{})",
+                node_id, attempts, max_attempts
+            );
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Failed to push JSON content: {}", body).into());
+    }
 }
 
 /// Push file content to a node
@@ -1603,6 +1679,7 @@ async fn upload_task(
         // Detect if file is binary and convert accordingly
         let content_info = detect_from_path(&file_path);
         let is_binary = content_info.is_binary || is_binary_content(&raw_content);
+        let is_json = !is_binary && content_info.mime_type == "application/json";
 
         let content = if is_binary {
             use base64::{engine::general_purpose::STANDARD, Engine};
@@ -1618,6 +1695,13 @@ async fn upload_task(
                 debug!("Ignoring echo: content matches last written");
                 continue;
             }
+        }
+
+        if is_json {
+            if let Err(e) = push_json_content(&client, &server, &node_id, &content, &state).await {
+                error!("JSON upload failed: {}", e);
+            }
+            continue;
         }
 
         // Get parent CID to decide which endpoint to use

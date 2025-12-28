@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{broadcast, RwLock};
 use yrs::types::ToJson;
 use yrs::updates::decoder::Decode;
-use yrs::{GetString, Text, Transact, WriteTxn};
+use yrs::{GetString, ReadTxn, Text, Transact, Value, WriteTxn};
 
 /// Configuration for DocumentNode
 pub struct DocumentNodeConfig {
@@ -78,6 +78,9 @@ impl DocumentNode {
             ContentType::Json => {
                 ydoc.get_or_insert_map(Self::TEXT_ROOT_NAME);
             }
+            ContentType::JsonArray => {
+                ydoc.get_or_insert_array(Self::TEXT_ROOT_NAME);
+            }
             ContentType::Xml => {
                 ydoc.get_or_insert_xml_fragment(Self::TEXT_ROOT_NAME);
             }
@@ -134,10 +137,36 @@ impl DocumentNode {
                 Ok(text.get_string(txn))
             }
             ContentType::Json => {
-                let map = txn.get_or_insert_map(Self::TEXT_ROOT_NAME);
-                let any = map.to_json(txn);
-                serde_json::to_string(&any)
-                    .map_err(|e| NodeError::InvalidEdit(format!("JSON serialization: {}", e)))
+                let root = txn
+                    .root_refs()
+                    .find(|(name, _)| *name == Self::TEXT_ROOT_NAME)
+                    .map(|(_, value)| value);
+
+                match root {
+                    Some(Value::YMap(map)) => {
+                        let any = map.to_json(txn);
+                        serde_json::to_string(&any).map_err(|e| {
+                            NodeError::InvalidEdit(format!("JSON serialization: {}", e))
+                        })
+                    }
+                    _ => Ok(ContentType::Json.default_content()),
+                }
+            }
+            ContentType::JsonArray => {
+                let root = txn
+                    .root_refs()
+                    .find(|(name, _)| *name == Self::TEXT_ROOT_NAME)
+                    .map(|(_, value)| value);
+
+                match root {
+                    Some(Value::YArray(array)) => {
+                        let any = array.to_json(txn);
+                        serde_json::to_string(&any).map_err(|e| {
+                            NodeError::InvalidEdit(format!("JSON serialization: {}", e))
+                        })
+                    }
+                    _ => Ok(ContentType::JsonArray.default_content()),
+                }
             }
             ContentType::Xml => {
                 let fragment = txn.get_or_insert_xml_fragment(Self::TEXT_ROOT_NAME);
@@ -312,6 +341,7 @@ impl ObservableNode for DocumentNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yrs::{Array, Doc, Transact};
 
     #[tokio::test]
     async fn test_document_node_creation() {
@@ -326,6 +356,13 @@ mod tests {
         let node = DocumentNode::new("test-doc", ContentType::Json);
         let content = node.get_content().await.unwrap();
         assert_eq!(content, "{}");
+    }
+
+    #[tokio::test]
+    async fn test_document_node_json_array_default_content() {
+        let node = DocumentNode::new("test-doc", ContentType::JsonArray);
+        let content = node.get_content().await.unwrap();
+        assert_eq!(content, "[]");
     }
 
     #[tokio::test]
@@ -364,5 +401,23 @@ mod tests {
         let _combined = node.subscribe();
         assert_eq!(node.blue_subscriber_count(), 2);
         assert_eq!(node.red_subscriber_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_document_node_json_array_content() {
+        let node = DocumentNode::new("test-doc", ContentType::JsonArray);
+        let doc = Doc::with_client_id(1);
+        let update = {
+            let mut txn = doc.transact_mut();
+            let array = txn.get_or_insert_array("content");
+            array.push_back(&mut txn, 1);
+            array.push_back(&mut txn, "a");
+            txn.encode_update_v1()
+        };
+
+        node.apply_state(&update).unwrap();
+        let content = node.get_content().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed == serde_json::json!([1, "a"]) || parsed == serde_json::json!([1.0, "a"]));
     }
 }

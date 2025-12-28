@@ -10,7 +10,7 @@ use crate::store::{CommitStore, StoreError};
 use std::collections::HashSet;
 use yrs::types::ToJson;
 use yrs::updates::decoder::Decode;
-use yrs::{Doc, GetString, ReadTxn, Transact};
+use yrs::{Doc, GetString, ReadTxn, Transact, Value};
 
 /// Text root name used in Yrs documents (must match DocumentNode)
 const TEXT_ROOT_NAME: &str = "content";
@@ -108,6 +108,9 @@ impl<'a> CommitReplayer<'a> {
             ContentType::Json => {
                 ydoc.get_or_insert_map(TEXT_ROOT_NAME);
             }
+            ContentType::JsonArray => {
+                ydoc.get_or_insert_array(TEXT_ROOT_NAME);
+            }
             ContentType::Xml => {
                 return Err(ReplayError::UnsupportedContentType(
                     content_type.to_mime().to_string(),
@@ -145,12 +148,36 @@ impl<'a> CommitReplayer<'a> {
                 text.get_string(&txn)
             }
             ContentType::Json => {
-                let map = txn
-                    .get_map(TEXT_ROOT_NAME)
-                    .ok_or_else(|| ReplayError::InvalidUpdate("Map root not found".to_string()))?;
-                let any = map.to_json(&txn);
-                serde_json::to_string(&any)
-                    .map_err(|e| ReplayError::InvalidUpdate(format!("JSON serialization: {}", e)))?
+                let root = txn
+                    .root_refs()
+                    .find(|(name, _)| *name == TEXT_ROOT_NAME)
+                    .map(|(_, value)| value);
+
+                match root {
+                    Some(Value::YMap(map)) => {
+                        let any = map.to_json(&txn);
+                        serde_json::to_string(&any).map_err(|e| {
+                            ReplayError::InvalidUpdate(format!("JSON serialization: {}", e))
+                        })?
+                    }
+                    _ => ContentType::Json.default_content(),
+                }
+            }
+            ContentType::JsonArray => {
+                let root = txn
+                    .root_refs()
+                    .find(|(name, _)| *name == TEXT_ROOT_NAME)
+                    .map(|(_, value)| value);
+
+                match root {
+                    Some(Value::YArray(array)) => {
+                        let any = array.to_json(&txn);
+                        serde_json::to_string(&any).map_err(|e| {
+                            ReplayError::InvalidUpdate(format!("JSON serialization: {}", e))
+                        })?
+                    }
+                    _ => ContentType::JsonArray.default_content(),
+                }
             }
             ContentType::Xml => {
                 // Already returned error above
