@@ -37,6 +37,8 @@ pub struct RouterConfig {
     pub fs_root: Option<String>,
     /// Node IDs for router documents
     pub routers: Vec<String>,
+    /// MQTT configuration (if specified, enables MQTT transport)
+    pub mqtt: Option<mqtt::MqttConfig>,
 }
 
 /// Create a router with the given configuration.

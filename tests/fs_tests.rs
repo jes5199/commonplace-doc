@@ -347,6 +347,7 @@ async fn test_router_with_fs_root() {
         commit_store: None,
         fs_root: Some("my-filesystem".to_string()),
         routers: vec![],
+        mqtt: None,
     })
     .await;
 
