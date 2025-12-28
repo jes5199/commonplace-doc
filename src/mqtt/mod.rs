@@ -141,7 +141,73 @@ impl MqttService {
     /// Run the MQTT service event loop.
     /// This processes incoming messages and dispatches them to handlers.
     pub async fn run(&self) -> Result<(), MqttError> {
-        self.client.run_event_loop().await
+        // Subscribe to the message broadcast channel
+        let mut message_rx = self.client.subscribe_messages();
+
+        // Spawn the client event loop in a separate task
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client.run_event_loop().await {
+                tracing::error!("MQTT client event loop error: {}", e);
+            }
+        });
+
+        // Process incoming messages and dispatch to handlers
+        loop {
+            match message_rx.recv().await {
+                Ok(msg) => {
+                    if let Err(e) = self.dispatch_message(&msg.topic, &msg.payload).await {
+                        tracing::warn!("Error dispatching MQTT message: {}", e);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("MQTT message receiver lagged by {} messages", n);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    tracing::info!("MQTT message channel closed");
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Dispatch an incoming message to the appropriate handler.
+    async fn dispatch_message(&self, topic_str: &str, payload: &[u8]) -> Result<(), MqttError> {
+        // Parse the topic
+        let topic = match topics::Topic::parse(topic_str) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!("Ignoring unparseable topic {}: {}", topic_str, e);
+                return Ok(());
+            }
+        };
+
+        tracing::debug!("Dispatching message for topic: {:?}", topic);
+
+        match topic.port {
+            topics::Port::Edits => {
+                self.edits_handler.handle_edit(&topic, payload).await?;
+            }
+            topics::Port::Sync => {
+                // Parse sync message
+                let sync_msg: messages::SyncMessage = serde_json::from_slice(payload)?;
+                // Only handle requests, not responses
+                if sync_msg.is_request() {
+                    self.sync_handler.handle_sync_request(&topic, sync_msg).await?;
+                }
+            }
+            topics::Port::Commands => {
+                self.commands_handler.handle_command(&topic, payload).await?;
+            }
+            topics::Port::Events => {
+                // Events are outbound only from this doc store - we don't receive them
+                tracing::debug!("Ignoring incoming event message on {}", topic_str);
+            }
+        }
+
+        Ok(())
     }
 
     /// Get a reference to the MQTT client.
