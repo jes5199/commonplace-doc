@@ -1,7 +1,7 @@
 //! Directory scanning and FS JSON generation.
 
 use crate::fs::{DirEntry, DocEntry, Entry, FsSchema};
-use crate::sync::content_type::{detect_from_path, is_binary_content};
+use crate::sync::content_type::{detect_from_path, is_allowed_extension, is_binary_content};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -111,6 +111,11 @@ fn scan_dir_recursive(current: &Path, options: &ScanOptions) -> Result<Entry, Sc
             let sub_entry = scan_dir_recursive(&entry_path, options)?;
             entries.insert(name, sub_entry);
         } else if file_type.is_file() {
+            // Skip files with disallowed extensions
+            if !is_allowed_extension(&entry_path) {
+                continue;
+            }
+
             // Create doc entry for file
             let content_info = detect_from_path(&entry_path);
             let content_type = if content_info.mime_type == "application/json" {
@@ -221,6 +226,11 @@ fn scan_files_recursive(
         if file_type.is_dir() {
             scan_files_recursive(root, &entry_path, options, files)?;
         } else if file_type.is_file() {
+            // Skip files with disallowed extensions
+            if !is_allowed_extension(&entry_path) {
+                continue;
+            }
+
             // Normalize to forward slashes for cross-platform consistency
             let relative = entry_path
                 .strip_prefix(root)
@@ -292,8 +302,8 @@ mod tests {
             .write_all(b"# Idea")
             .unwrap();
 
-        // Create hidden file
-        File::create(temp.path().join(".hidden"))
+        // Create hidden file (with allowed extension)
+        File::create(temp.path().join(".hidden.txt"))
             .unwrap()
             .write_all(b"secret")
             .unwrap();
@@ -316,7 +326,7 @@ mod tests {
             assert!(entries.contains_key("data.json"));
             assert!(entries.contains_key("notes"));
             // Hidden files excluded by default
-            assert!(!entries.contains_key(".hidden"));
+            assert!(!entries.contains_key(".hidden.txt"));
         } else {
             panic!("Expected Dir entry");
         }
@@ -333,7 +343,7 @@ mod tests {
 
         if let Some(Entry::Dir(dir)) = &schema.root {
             let entries = dir.entries.as_ref().unwrap();
-            assert!(entries.contains_key(".hidden"));
+            assert!(entries.contains_key(".hidden.txt"));
         }
     }
 
@@ -429,5 +439,94 @@ mod tests {
 
         let result = scan_directory(&file_path, &ScanOptions::default());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_scan_filters_disallowed_extensions() {
+        let temp = TempDir::new().unwrap();
+
+        // Create allowed files
+        File::create(temp.path().join("allowed.txt"))
+            .unwrap()
+            .write_all(b"text")
+            .unwrap();
+        File::create(temp.path().join("data.json"))
+            .unwrap()
+            .write_all(b"{}")
+            .unwrap();
+        File::create(temp.path().join("doc.xml"))
+            .unwrap()
+            .write_all(b"<root/>")
+            .unwrap();
+        File::create(temp.path().join("page.xhtml"))
+            .unwrap()
+            .write_all(b"<html/>")
+            .unwrap();
+        File::create(temp.path().join("data.bin"))
+            .unwrap()
+            .write_all(b"\x00\x01\x02")
+            .unwrap();
+        File::create(temp.path().join("readme.md"))
+            .unwrap()
+            .write_all(b"# Readme")
+            .unwrap();
+
+        // Create disallowed files
+        File::create(temp.path().join("code.rs"))
+            .unwrap()
+            .write_all(b"fn main() {}")
+            .unwrap();
+        File::create(temp.path().join("script.py"))
+            .unwrap()
+            .write_all(b"print('hi')")
+            .unwrap();
+        File::create(temp.path().join("image.png"))
+            .unwrap()
+            .write_all(b"PNG")
+            .unwrap();
+
+        let schema = scan_directory(temp.path(), &ScanOptions::default()).unwrap();
+
+        if let Some(Entry::Dir(dir)) = &schema.root {
+            let entries = dir.entries.as_ref().unwrap();
+
+            // Allowed files should be present
+            assert!(entries.contains_key("allowed.txt"));
+            assert!(entries.contains_key("data.json"));
+            assert!(entries.contains_key("doc.xml"));
+            assert!(entries.contains_key("page.xhtml"));
+            assert!(entries.contains_key("data.bin"));
+            assert!(entries.contains_key("readme.md"));
+
+            // Disallowed files should NOT be present
+            assert!(!entries.contains_key("code.rs"));
+            assert!(!entries.contains_key("script.py"));
+            assert!(!entries.contains_key("image.png"));
+        } else {
+            panic!("Expected Dir entry");
+        }
+    }
+
+    #[test]
+    fn test_scan_with_contents_filters_disallowed_extensions() {
+        let temp = TempDir::new().unwrap();
+
+        // Create allowed file
+        File::create(temp.path().join("allowed.txt"))
+            .unwrap()
+            .write_all(b"text content")
+            .unwrap();
+
+        // Create disallowed file
+        File::create(temp.path().join("code.rs"))
+            .unwrap()
+            .write_all(b"fn main() {}")
+            .unwrap();
+
+        let files = scan_directory_with_contents(temp.path(), &ScanOptions::default()).unwrap();
+
+        let paths: Vec<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert!(paths.contains(&"allowed.txt"));
+        assert!(!paths.contains(&"code.rs"));
     }
 }

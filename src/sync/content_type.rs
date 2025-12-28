@@ -44,6 +44,7 @@ const TEXT_EXTENSIONS: &[(&str, &str)] = &[
     // Data
     ("json", "application/json"),
     ("xml", "application/xml"),
+    ("xhtml", "application/xhtml+xml"),
     ("yaml", "text/yaml"),
     ("yml", "text/yaml"),
     ("toml", "text/x-toml"),
@@ -84,6 +85,19 @@ const BINARY_EXTENSIONS: &[&str] = &[
     "ttf", "otf", "woff", "woff2", "eot", // Database
     "db", "sqlite", "sqlite3",
 ];
+
+/// Allowed file extensions for sync operations.
+/// Only files with these extensions will be synced.
+pub const ALLOWED_EXTENSIONS: &[&str] = &["json", "txt", "xml", "xhtml", "bin", "md"];
+
+/// Check if a file path has an allowed extension for syncing.
+/// Returns true if the file should be synced, false otherwise.
+pub fn is_allowed_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ALLOWED_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
 
 /// Result of content type detection.
 #[derive(Debug, Clone, PartialEq)]
@@ -248,5 +262,41 @@ mod tests {
             detect_from_path(Path::new("foo.png")).mime_type,
             "image/png"
         );
+    }
+
+    #[test]
+    fn test_allowed_extensions() {
+        // Allowed extensions
+        assert!(is_allowed_extension(Path::new("foo.json")));
+        assert!(is_allowed_extension(Path::new("foo.txt")));
+        assert!(is_allowed_extension(Path::new("foo.xml")));
+        assert!(is_allowed_extension(Path::new("foo.xhtml")));
+        assert!(is_allowed_extension(Path::new("foo.bin")));
+        assert!(is_allowed_extension(Path::new("foo.md")));
+
+        // Case insensitive
+        assert!(is_allowed_extension(Path::new("foo.JSON")));
+        assert!(is_allowed_extension(Path::new("foo.TXT")));
+        assert!(is_allowed_extension(Path::new("foo.Xml")));
+        assert!(is_allowed_extension(Path::new("foo.MD")));
+
+        // Disallowed extensions
+        assert!(!is_allowed_extension(Path::new("foo.rs")));
+        assert!(!is_allowed_extension(Path::new("foo.py")));
+        assert!(!is_allowed_extension(Path::new("foo.png")));
+        assert!(!is_allowed_extension(Path::new("foo.html")));
+
+        // No extension
+        assert!(!is_allowed_extension(Path::new("Makefile")));
+        assert!(!is_allowed_extension(Path::new("no_extension")));
+    }
+
+    #[test]
+    fn test_xhtml_mime_type() {
+        assert_eq!(
+            detect_from_path(Path::new("foo.xhtml")).mime_type,
+            "application/xhtml+xml"
+        );
+        assert!(!detect_from_path(Path::new("foo.xhtml")).is_binary);
     }
 }

@@ -7,8 +7,8 @@
 use clap::Parser;
 use commonplace_doc::fs::{Entry, FsSchema};
 use commonplace_doc::sync::{
-    detect_from_path, is_binary_content, scan_directory, scan_directory_with_contents,
-    schema_to_json, ScanOptions,
+    detect_from_path, is_allowed_extension, is_binary_content, scan_directory,
+    scan_directory_with_contents, schema_to_json, ScanOptions,
 };
 use futures::StreamExt;
 use notify::event::{ModifyKind, RenameMode};
@@ -822,6 +822,12 @@ async fn run_directory_mode(
                             continue;
                         }
 
+                        // Skip files with disallowed extensions
+                        if !is_allowed_extension(&path) {
+                            debug!("Ignoring file with disallowed extension: {}", relative_path);
+                            continue;
+                        }
+
                         // Check if we already have sync tasks for this file
                         let already_tracked = {
                             let states = file_states.read().await;
@@ -1410,11 +1416,18 @@ async fn handle_schema_change(
     for (path, explicit_node_id) in &schema_paths {
         if !known_paths.contains(path) {
             // New file from server - create local file and fetch content
+            let file_path = directory.join(path);
+
+            // Skip files with disallowed extensions
+            if !is_allowed_extension(&file_path) {
+                debug!("Ignoring server file with disallowed extension: {}", path);
+                continue;
+            }
+
             // Use explicit node_id if present, otherwise derive from path
             let node_id = explicit_node_id
                 .clone()
                 .unwrap_or_else(|| format!("{}:{}", fs_root_id, path));
-            let file_path = directory.join(path);
 
             info!(
                 "Server created new file: {} -> {}",
