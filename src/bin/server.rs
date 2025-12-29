@@ -35,11 +35,6 @@ async fn main() {
         tracing::info!("Filesystem root: {}", fs_root);
     }
 
-    // Log router documents if configured
-    for router_id in &args.routers {
-        tracing::info!("Router document: {}", router_id);
-    }
-
     // Create MQTT config if broker URL is specified
     let mqtt_config = args.mqtt_broker.as_ref().map(|broker_url| {
         let client_id = args
@@ -63,7 +58,6 @@ async fn main() {
     let app = create_router_with_config(RouterConfig {
         commit_store,
         fs_root: args.fs_root,
-        routers: args.routers,
         mqtt: mqtt_config,
         mqtt_subscribe: args.mqtt_subscribe,
     })

@@ -22,10 +22,6 @@ pub struct Args {
     #[clap(long, value_name = "NODE_ID")]
     pub fs_root: Option<String>,
 
-    /// Node IDs for router documents (repeatable)
-    #[clap(long = "router", value_name = "NODE_ID")]
-    pub routers: Vec<String>,
-
     /// MQTT broker URL (e.g., mqtt://localhost:1883)
     #[clap(long, value_name = "URL")]
     pub mqtt_broker: Option<String>,
@@ -60,10 +56,6 @@ pub struct StoreArgs {
     /// Node ID for filesystem root document (required - determines MQTT subscriptions)
     #[clap(long, value_name = "NODE_ID")]
     pub fs_root: String,
-
-    /// Node IDs for router documents (repeatable)
-    #[clap(long = "router", value_name = "NODE_ID")]
-    pub routers: Vec<String>,
 }
 
 /// CLI arguments for commonplace-http (HTTP gateway via MQTT)

@@ -8,7 +8,6 @@ pub mod events;
 pub mod fs;
 pub mod http_gateway;
 pub mod mqtt;
-pub mod node;
 pub mod orchestrator;
 pub mod replay;
 pub mod sse;
@@ -19,7 +18,6 @@ use axum::{routing::get, Router};
 use document::{ContentType, DocumentStore};
 use events::CommitBroadcaster;
 use fs::FilesystemReconciler;
-use node::NodeRegistry;
 use std::sync::Arc;
 use store::CommitStore;
 use tower_http::cors::CorsLayer;
@@ -46,7 +44,6 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
     let doc_store = Arc::new(DocumentStore::new());
     let commit_store = config.commit_store.map(Arc::new);
     let commit_broadcaster = commit_store.as_ref().map(|_| CommitBroadcaster::new(1024));
-    let node_registry = Arc::new(NodeRegistry::new());
 
     // Initialize filesystem if --fs-root is specified
     if let Some(ref fs_root_id) = config.fs_root {
@@ -116,7 +113,6 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
             doc_store.clone(),
             commit_store.clone(),
             commit_broadcaster.clone(),
-            node_registry.clone(),
         ))
         .merge(sse::router(doc_store, commit_store, commit_broadcaster))
         .layer(CorsLayer::permissive())
@@ -128,7 +124,6 @@ pub fn create_router_with_store(store: Option<CommitStore>) -> Router {
     let doc_store = Arc::new(DocumentStore::new());
     let commit_store = store.map(Arc::new);
     let commit_broadcaster = commit_store.as_ref().map(|_| CommitBroadcaster::new(1024));
-    let node_registry = Arc::new(NodeRegistry::new());
 
     Router::new()
         .route("/health", get(health_check))
@@ -136,7 +131,6 @@ pub fn create_router_with_store(store: Option<CommitStore>) -> Router {
             doc_store.clone(),
             commit_store.clone(),
             commit_broadcaster.clone(),
-            node_registry.clone(),
         ))
         .merge(sse::router(doc_store, commit_store, commit_broadcaster))
         .layer(CorsLayer::permissive())

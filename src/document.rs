@@ -124,6 +124,54 @@ impl DocumentStore {
         documents.get(id).cloned()
     }
 
+    /// Get an existing document or create one with the given ID.
+    /// Unlike create_document, this uses a specific ID instead of generating a new UUID.
+    pub async fn get_or_create_with_id(&self, id: &str, content_type: ContentType) -> Document {
+        // First check with read lock
+        {
+            let documents = self.documents.read().await;
+            if let Some(doc) = documents.get(id) {
+                return doc.clone();
+            }
+        }
+
+        // Not found, create with write lock
+        let mut documents = self.documents.write().await;
+
+        // Double-check after acquiring write lock
+        if let Some(doc) = documents.get(id) {
+            return doc.clone();
+        }
+
+        // Create new document with this ID
+        let ydoc = yrs::Doc::with_client_id(Self::DEFAULT_YDOC_CLIENT_ID);
+        match content_type {
+            ContentType::Text => {
+                ydoc.get_or_insert_text(Self::TEXT_ROOT_NAME);
+            }
+            ContentType::Json => {
+                ydoc.get_or_insert_map(Self::TEXT_ROOT_NAME);
+            }
+            ContentType::JsonArray => {
+                ydoc.get_or_insert_array(Self::TEXT_ROOT_NAME);
+            }
+            ContentType::Xml => {
+                ydoc.get_or_insert_xml_fragment(Self::TEXT_ROOT_NAME);
+            }
+        }
+
+        let content = content_type.default_content();
+
+        let doc = Document {
+            content,
+            content_type,
+            ydoc: Some(ydoc),
+        };
+
+        documents.insert(id.to_string(), doc.clone());
+        doc
+    }
+
     pub async fn delete_document(&self, id: &str) -> bool {
         let mut documents = self.documents.write().await;
         documents.remove(id).is_some()
