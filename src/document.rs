@@ -248,4 +248,18 @@ mod tests {
         );
         assert_eq!(resolve_path_to_uuid(fs_root, "nonexistent.txt"), None);
     }
+
+    #[tokio::test]
+    async fn test_create_document_returns_uuid() {
+        let store = DocumentStore::new();
+        let uuid = store.create_document(ContentType::Text).await;
+
+        // UUID should be valid format (36 chars with dashes)
+        assert!(uuid.len() == 36);
+        assert!(uuid.contains('-'));
+
+        // Document should be retrievable
+        let doc = store.get_document(&uuid).await;
+        assert!(doc.is_some());
+    }
 }
