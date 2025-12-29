@@ -19,6 +19,7 @@ pub struct ApiState {
     pub doc_store: Arc<DocumentStore>,
     pub commit_store: Option<Arc<CommitStore>>,
     pub commit_broadcaster: Option<CommitBroadcaster>,
+    pub fs_root: Option<String>,
 }
 
 fn broadcast_commit(state: &ApiState, doc_id: &str, commit_id: &str, timestamp: u64) {
@@ -41,15 +42,17 @@ pub fn router(
     doc_store: Arc<DocumentStore>,
     commit_store: Option<Arc<CommitStore>>,
     commit_broadcaster: Option<CommitBroadcaster>,
+    fs_root: Option<String>,
 ) -> Router {
     let state = ApiState {
         doc_store,
         commit_store,
         commit_broadcaster,
+        fs_root,
     };
 
     Router::new()
-        // Document endpoints
+        // Document endpoints (ID-based)
         .route("/docs", post(create_doc))
         .route("/docs/:id", get(get_doc_content))
         .route("/docs/:id", delete(delete_doc))
@@ -59,6 +62,14 @@ pub fn router(
         .route("/docs/:id/edit", post(edit_doc))
         .route("/docs/:id/replace", post(replace_doc))
         .route("/docs/:id/fork", post(fork_doc))
+        // Path-based endpoints (resolve via fs-root)
+        // Use single wildcard route and parse suffix in handlers
+        .route(
+            "/files/*path",
+            get(handle_file_request)
+                .delete(handle_file_delete)
+                .post(handle_file_post),
+        )
         .with_state(state)
 }
 
@@ -634,4 +645,247 @@ async fn fork_doc(
         id: new_id,
         head: new_cid,
     }))
+}
+
+// ============================================================================
+// Path-based endpoints (resolve paths via fs-root)
+// ============================================================================
+
+/// Error type for path resolution failures
+pub enum PathResolveError {
+    /// No fs-root configured on server
+    NoFsRoot,
+    /// fs-root document not found
+    FsRootNotFound,
+    /// Path not found in filesystem schema
+    PathNotFound,
+}
+
+impl IntoResponse for PathResolveError {
+    fn into_response(self) -> Response {
+        match self {
+            PathResolveError::NoFsRoot => {
+                (StatusCode::SERVICE_UNAVAILABLE, "No fs-root configured").into_response()
+            }
+            PathResolveError::FsRootNotFound => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "fs-root document not found",
+            )
+                .into_response(),
+            PathResolveError::PathNotFound => {
+                (StatusCode::NOT_FOUND, "Path not found in filesystem").into_response()
+            }
+        }
+    }
+}
+
+/// Resolve a filesystem path to a document ID using the fs-root schema.
+async fn resolve_path(state: &ApiState, path: &str) -> Result<String, PathResolveError> {
+    let fs_root_id = state.fs_root.as_ref().ok_or(PathResolveError::NoFsRoot)?;
+
+    let fs_root_doc = state
+        .doc_store
+        .get_document(fs_root_id)
+        .await
+        .ok_or(PathResolveError::FsRootNotFound)?;
+
+    crate::document::resolve_path_to_uuid(&fs_root_doc.content, path, fs_root_id)
+        .ok_or(PathResolveError::PathNotFound)
+}
+
+/// GET /files/*path - Handle GET requests (content or /head)
+async fn handle_file_request(
+    State(state): State<ApiState>,
+    Path(path): Path<String>,
+) -> Result<Response, PathResolveError> {
+    // Check if path ends with /head
+    if let Some(clean_path) = path.strip_suffix("/head") {
+        // Return HEAD response
+        let doc_id = resolve_path(&state, clean_path).await?;
+
+        let doc = state
+            .doc_store
+            .get_document(&doc_id)
+            .await
+            .ok_or(PathResolveError::PathNotFound)?;
+
+        let cid = if let Some(store) = &state.commit_store {
+            store.get_document_head(&doc_id).await.ok().flatten()
+        } else {
+            None
+        };
+
+        let state_bytes = state.doc_store.get_yjs_state(&doc_id).await;
+        let state_b64 = state_bytes.map(|b| b64::encode(&b));
+
+        let response = DocHeadResponse {
+            cid,
+            content: doc.content,
+            state: state_b64,
+        };
+
+        Ok(Json(response).into_response())
+    } else {
+        // Return content
+        let doc_id = resolve_path(&state, &path).await?;
+
+        let doc = state
+            .doc_store
+            .get_document(&doc_id)
+            .await
+            .ok_or(PathResolveError::PathNotFound)?;
+
+        Ok((
+            [(axum::http::header::CONTENT_TYPE, doc.content_type.to_mime())],
+            doc.content,
+        )
+            .into_response())
+    }
+}
+
+/// DELETE /files/*path - Delete document by path
+async fn handle_file_delete(
+    State(state): State<ApiState>,
+    Path(path): Path<String>,
+) -> Result<StatusCode, PathResolveError> {
+    let doc_id = resolve_path(&state, &path).await?;
+
+    if state.doc_store.delete_document(&doc_id).await {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(PathResolveError::PathNotFound)
+    }
+}
+
+/// POST /files/*path - Handle POST requests (/edit or /replace)
+async fn handle_file_post(
+    State(state): State<ApiState>,
+    Path(path): Path<String>,
+    Query(params): Query<ReplaceParams>,
+    body: String,
+) -> Result<Response, Response> {
+    // Check if path ends with /edit
+    if let Some(clean_path) = path.strip_suffix("/edit") {
+        // Parse body as JSON edit request
+        let req: DocEditRequest =
+            serde_json::from_str(&body).map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+
+        let doc_id = resolve_path(&state, clean_path)
+            .await
+            .map_err(|e| e.into_response())?;
+
+        let commit_store = state
+            .commit_store
+            .as_ref()
+            .ok_or_else(|| StatusCode::NOT_IMPLEMENTED.into_response())?;
+
+        let _doc = state
+            .doc_store
+            .get_document(&doc_id)
+            .await
+            .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
+
+        let update_bytes =
+            b64::decode(&req.update).map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+
+        let current_head = commit_store
+            .get_document_head(&doc_id)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+
+        let parents = current_head.into_iter().collect();
+        let author = req.author.unwrap_or_else(|| "anonymous".to_string());
+
+        let commit = Commit::new(parents, req.update, author, req.message);
+        let timestamp = commit.timestamp;
+
+        let cid = commit_store
+            .store_commit(&commit)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+
+        state
+            .doc_store
+            .apply_yjs_update(&doc_id, &update_bytes)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+
+        commit_store
+            .set_document_head(&doc_id, &cid)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+
+        broadcast_commit(&state, &doc_id, &cid, timestamp);
+
+        Ok(Json(DocEditResponse { cid }).into_response())
+    } else if let Some(clean_path) = path.strip_suffix("/replace") {
+        // Handle replace
+        let doc_id = resolve_path(&state, clean_path)
+            .await
+            .map_err(|e| e.into_response())?;
+
+        let commit_store = state
+            .commit_store
+            .as_ref()
+            .ok_or_else(|| StatusCode::NOT_IMPLEMENTED.into_response())?;
+
+        let doc = state
+            .doc_store
+            .get_document(&doc_id)
+            .await
+            .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
+
+        let diff_result = crate::diff::compute_diff_update(&doc.content, &body)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+
+        let parent = if let Some(p) = params.parent_cid.clone() {
+            Some(p)
+        } else {
+            commit_store
+                .get_document_head(&doc_id)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
+        };
+
+        let parents: Vec<String> = parent.into_iter().collect();
+        let author = params
+            .author
+            .clone()
+            .unwrap_or_else(|| "anonymous".to_string());
+
+        let commit = Commit::new(parents, diff_result.update_b64.clone(), author, None);
+        let timestamp = commit.timestamp;
+
+        let cid = commit_store
+            .store_commit(&commit)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+
+        state
+            .doc_store
+            .apply_yjs_update(&doc_id, &diff_result.update_bytes)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+
+        commit_store
+            .set_document_head(&doc_id, &cid)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+
+        broadcast_commit(&state, &doc_id, &cid, timestamp);
+
+        Ok(Json(ReplaceResponse {
+            cid: cid.clone(),
+            edit_cid: cid,
+            summary: ReplaceSummary {
+                chars_inserted: diff_result.summary.chars_inserted,
+                chars_deleted: diff_result.summary.chars_deleted,
+                operations: diff_result.operation_count,
+            },
+        })
+        .into_response())
+    } else {
+        // Unknown POST endpoint
+        Err(StatusCode::NOT_FOUND.into_response())
+    }
 }
