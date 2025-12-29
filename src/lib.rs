@@ -118,12 +118,7 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
             commit_broadcaster.clone(),
             node_registry.clone(),
         ))
-        .merge(sse::router(
-            doc_store,
-            commit_store,
-            commit_broadcaster,
-            node_registry,
-        ))
+        .merge(sse::router(doc_store, commit_store, commit_broadcaster))
         .layer(CorsLayer::permissive())
 }
 
@@ -143,12 +138,7 @@ pub fn create_router_with_store(store: Option<CommitStore>) -> Router {
             commit_broadcaster.clone(),
             node_registry.clone(),
         ))
-        .merge(sse::router(
-            doc_store,
-            commit_store,
-            commit_broadcaster,
-            node_registry,
-        ))
+        .merge(sse::router(doc_store, commit_store, commit_broadcaster))
         .layer(CorsLayer::permissive())
 }
 

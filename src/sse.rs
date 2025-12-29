@@ -12,9 +12,8 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::time::Duration;
 
-use crate::document::{ContentType, DocumentStore};
+use crate::document::DocumentStore;
 use crate::events::CommitBroadcaster;
-use crate::node::{ConnectionNode, Node, NodeId, NodeRegistry};
 use crate::store::{CommitStore, StoreError};
 
 #[derive(Clone)]
@@ -22,146 +21,26 @@ pub struct SseState {
     pub doc_store: Arc<DocumentStore>,
     pub commit_store: Option<Arc<CommitStore>>,
     pub broadcaster: Option<CommitBroadcaster>,
-    pub node_registry: Arc<NodeRegistry>,
 }
 
 pub fn router(
     doc_store: Arc<DocumentStore>,
     commit_store: Option<Arc<CommitStore>>,
     broadcaster: Option<CommitBroadcaster>,
-    node_registry: Arc<NodeRegistry>,
 ) -> Router {
     let state = SseState {
         doc_store,
         commit_store,
         broadcaster,
-        node_registry,
     };
 
     Router::new()
-        // Node subscription endpoint
-        .route("/sse/nodes/:id", get(subscribe_to_node))
         // Document change history endpoints
         .route("/documents/:id/changes", get(get_document_changes))
         .route("/documents/changes", get(get_documents_changes))
         .route("/documents/:id/stream", get(stream_document_changes))
         .route("/documents/stream", get(stream_documents_changes))
         .with_state(state)
-}
-
-// ============================================================================
-// Node subscription handlers
-// ============================================================================
-
-async fn subscribe_to_node(
-    State(state): State<SseState>,
-    Path(id): Path<String>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    let node_id = NodeId::new(&id);
-
-    // Get or lazily create the target document node
-    let target = state
-        .node_registry
-        .get_or_create_document(&node_id, ContentType::Json)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Create a transient connection node for this SSE client
-    let connection = Arc::new(ConnectionNode::new(target));
-    let connection_id = connection.id().clone();
-
-    // Register the connection node
-    state
-        .node_registry
-        .register(connection.clone())
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Get subscriptions for streaming
-    let mut blue_sub = connection.get_target_blue_subscription();
-    let mut red_sub = connection.subscribe_red();
-
-    // Clone what we need for the stream closure
-    let registry = state.node_registry.clone();
-    let conn_id_for_cleanup = connection_id.clone();
-
-    let stream = async_stream::stream! {
-        // First event: connection info
-        let connected_data = serde_json::json!({
-            "connection_id": connection_id.0,
-            "target_id": id,
-        });
-        yield Ok(Event::default()
-            .event("connected")
-            .json_data(connected_data)
-            .unwrap_or_else(|_| Event::default().event("error").data("serialization failed")));
-
-        // Stream from both blue and red ports
-        loop {
-            tokio::select! {
-                biased;
-                // Blue port: edits from target document
-                result = blue_sub.recv() => {
-                    match result {
-                        Ok(edit) => {
-                            let data = serde_json::json!({
-                                "source": edit.source.0,
-                                "commit": {
-                                    "update": edit.commit.update,
-                                    "parents": edit.commit.parents,
-                                    "timestamp": edit.commit.timestamp,
-                                    "author": edit.commit.author,
-                                    "message": edit.commit.message,
-                                }
-                            });
-                            yield Ok(Event::default()
-                                .event("edit")
-                                .json_data(data)
-                                .unwrap_or_else(|_| Event::default().event("error").data("serialization failed")));
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            yield Ok(Event::default()
-                                .event("warning")
-                                .data(format!("Blue port lagged by {} messages", n)));
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            yield Ok(Event::default().event("closed").data("Target node shut down"));
-                            break;
-                        }
-                    }
-                }
-                // Red port: events directed at this connection
-                result = red_sub.recv() => {
-                    match result {
-                        Ok(event) => {
-                            let data = serde_json::json!({
-                                "source": event.source.0,
-                                "payload": event.payload,
-                            });
-                            yield Ok(Event::default()
-                                .event(&event.event_type)
-                                .json_data(data)
-                                .unwrap_or_else(|_| Event::default().event("error").data("serialization failed")));
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            yield Ok(Event::default()
-                                .event("warning")
-                                .data(format!("Red port lagged by {} messages", n)));
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            // Red channel closed, but we can continue with blue
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Cleanup: unregister the connection node when stream ends
-        let _ = registry.unregister(&conn_id_for_cleanup).await;
-    };
-
-    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30))))
 }
 
 // ============================================================================
