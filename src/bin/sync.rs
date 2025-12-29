@@ -2255,7 +2255,9 @@ async fn handle_server_edit(
         // Check if local content differs from what we last wrote
         if local_content != s.last_written_content {
             // Local changes pending - don't overwrite, let upload_task handle
-            debug!("Skipping server update - local changes pending");
+            // Set needs_head_refresh so upload_task will fetch HEAD after uploading
+            debug!("Skipping server update - local changes pending, setting needs_head_refresh");
+            s.needs_head_refresh = true;
             return;
         }
 
