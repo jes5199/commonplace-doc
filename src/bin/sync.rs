@@ -86,6 +86,19 @@ struct Args {
     initial_sync: String,
 }
 
+/// Pending write from server - used for barrier-based echo detection
+#[derive(Debug, Clone)]
+struct PendingWrite {
+    /// Unique token for this write operation
+    write_id: u64,
+    /// Content being written
+    content: String,
+    /// CID of the commit being written
+    cid: Option<String>,
+    /// When this write started (for timeout detection)
+    started_at: std::time::Instant,
+}
+
 /// Shared state between file watcher and SSE tasks
 #[derive(Debug)]
 struct SyncState {
@@ -93,6 +106,13 @@ struct SyncState {
     last_written_cid: Option<String>,
     /// Content we last wrote to the local file (for echo detection)
     last_written_content: String,
+    /// Monotonic counter for write operations
+    current_write_id: u64,
+    /// Currently pending server write (barrier is "up" when Some)
+    pending_write: Option<PendingWrite>,
+    /// Flag indicating a server edit was skipped while barrier was up
+    /// upload_task should refresh HEAD after clearing barrier if this is true
+    needs_head_refresh: bool,
 }
 
 impl SyncState {
@@ -100,6 +120,9 @@ impl SyncState {
         Self {
             last_written_cid: None,
             last_written_content: String::new(),
+            current_write_id: 0,
+            pending_write: None,
+            needs_head_refresh: false,
         }
     }
 }
@@ -1481,6 +1504,9 @@ async fn handle_schema_change(
                         let state = Arc::new(RwLock::new(SyncState {
                             last_written_cid: file_head.cid.clone(),
                             last_written_content: file_head.content,
+                            current_write_id: 0,
+                            pending_write: None,
+                            needs_head_refresh: false,
                         }));
 
                         info!("Created local file: {}", file_path.display());
@@ -1670,6 +1696,11 @@ async fn file_watcher_task(file_path: PathBuf, tx: mpsc::Sender<FileEvent>) {
     }
 }
 
+/// Number of retries when content differs during a pending write (handles partial writes)
+const BARRIER_RETRY_COUNT: u32 = 5;
+/// Delay between retries when checking for stable content
+const BARRIER_RETRY_DELAY: Duration = Duration::from_millis(50);
+
 /// Task that handles file changes and uploads to server
 async fn upload_task(
     client: Client,
@@ -1694,25 +1725,199 @@ async fn upload_task(
         let is_binary = content_info.is_binary || is_binary_content(&raw_content);
         let is_json = !is_binary && content_info.mime_type == "application/json";
 
-        let content = if is_binary {
+        let mut content = if is_binary {
             use base64::{engine::general_purpose::STANDARD, Engine};
             STANDARD.encode(&raw_content)
         } else {
             String::from_utf8_lossy(&raw_content).to_string()
         };
 
-        // Check if this is an echo from our own write
+        // Check for pending write barrier and handle echo detection
+        // Track whether we detected an echo and need to refresh from HEAD
+        let mut echo_detected = false;
+        let mut should_refresh = false;
+
         {
-            let s = state.read().await;
-            if content == s.last_written_content {
-                debug!("Ignoring echo: content matches last written");
-                continue;
+            let mut s = state.write().await;
+
+            // Check for pending write (barrier is up)
+            if let Some(pending) = s.pending_write.take() {
+                // Check for timeout
+                if pending.started_at.elapsed() > PENDING_WRITE_TIMEOUT {
+                    warn!(
+                        "Pending write timed out (id={}), clearing barrier",
+                        pending.write_id
+                    );
+                    // The pending write timed out - we don't know if the file contains
+                    // the server content (write succeeded but watcher was slow) or
+                    // stale content (write failed or was interrupted).
+                    //
+                    // If content matches the pending write, treat as delayed echo.
+                    // Otherwise, upload with old parent_cid for CRDT merge.
+                    if content == pending.content {
+                        debug!(
+                            "Timed-out pending matches current content, treating as delayed echo"
+                        );
+                        s.last_written_cid = pending.cid;
+                        s.last_written_content = pending.content;
+                        should_refresh = s.needs_head_refresh;
+                        s.needs_head_refresh = false;
+                        echo_detected = true;
+                    } else {
+                        // Content differs - this is a user edit that slipped through,
+                        // or the write failed. Upload with old parent for merge.
+                        debug!(
+                            "Timed-out pending differs from current content, uploading as user edit"
+                        );
+                        // DON'T update last_written_* - use old parent for CRDT merge
+                    }
+                } else if content == pending.content {
+                    // Content matches what we wrote - this is our echo
+                    debug!(
+                        "Echo detected: content matches pending write (id={})",
+                        pending.write_id
+                    );
+                    s.last_written_cid = pending.cid;
+                    s.last_written_content = pending.content;
+                    // Barrier cleared (we took it with .take())
+                    should_refresh = s.needs_head_refresh;
+                    s.needs_head_refresh = false;
+                    echo_detected = true;
+                } else {
+                    // Content differs from pending - could be:
+                    // a) Partial write (we're mid-write or just finished)
+                    // b) User edit during our write
+                    //
+                    // Retry a few times to handle partial writes
+                    let pending_content = pending.content.clone();
+                    let pending_cid = pending.cid.clone();
+                    let pending_write_id = pending.write_id;
+
+                    // Put the pending back while we retry
+                    s.pending_write = Some(pending);
+                    drop(s); // Release lock during retries
+
+                    let mut is_echo = false;
+                    for i in 0..BARRIER_RETRY_COUNT {
+                        sleep(BARRIER_RETRY_DELAY).await;
+
+                        // Re-read file
+                        let raw = match tokio::fs::read(&file_path).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                error!("Failed to re-read file during retry: {}", e);
+                                break;
+                            }
+                        };
+
+                        let reread = if is_binary {
+                            use base64::{engine::general_purpose::STANDARD, Engine};
+                            STANDARD.encode(&raw)
+                        } else {
+                            String::from_utf8_lossy(&raw).to_string()
+                        };
+
+                        if reread == pending_content {
+                            // Content now matches - was partial write, now complete
+                            debug!(
+                                "Retry {}: content now matches pending write (id={})",
+                                i + 1,
+                                pending_write_id
+                            );
+                            content = reread;
+                            is_echo = true;
+                            break;
+                        }
+
+                        if reread != content {
+                            // Content still changing, update and keep retrying
+                            debug!("Retry {}: content still changing", i + 1);
+                            content = reread;
+                        }
+                        // If reread == content and != pending, content is stable but different (user edit)
+                    }
+
+                    // Re-acquire lock and finalize
+                    let mut s = state.write().await;
+
+                    if is_echo {
+                        // Our write completed after retries
+                        debug!("Echo confirmed after retries (id={})", pending_write_id);
+                        s.last_written_cid = pending_cid;
+                        s.last_written_content = content.clone();
+                        s.pending_write = None;
+                        should_refresh = s.needs_head_refresh;
+                        s.needs_head_refresh = false;
+                        echo_detected = true;
+                    } else {
+                        // User edited during our write
+                        info!(
+                            "User edit detected during server write (id={})",
+                            pending_write_id
+                        );
+                        s.pending_write = None; // Clear barrier
+                                                // DON'T update last_written_* - use old parent for CRDT merge
+                                                // Fall through to upload with old parent_cid
+
+                        // IMPORTANT: Also check needs_head_refresh here!
+                        // If server edits were skipped while barrier was up, we need to
+                        // refresh after uploading to get the merged state.
+                        should_refresh = s.needs_head_refresh;
+                        s.needs_head_refresh = false;
+                    }
+                }
+            } else {
+                // No barrier - normal echo detection
+                // Also check needs_head_refresh in case server edit was skipped
+                // due to local changes being pending
+                should_refresh = s.needs_head_refresh;
+                s.needs_head_refresh = false;
+
+                if content == s.last_written_content {
+                    debug!("Ignoring echo: content matches last written");
+                    echo_detected = true;
+                }
             }
         }
 
+        // If echo detected, optionally refresh from HEAD then skip upload
+        if echo_detected {
+            if should_refresh {
+                let refresh_succeeded =
+                    refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+                if !refresh_succeeded {
+                    // Re-set the flag so we try again next time
+                    let mut s = state.write().await;
+                    s.needs_head_refresh = true;
+                }
+            }
+            continue;
+        }
+
         if is_json {
-            if let Err(e) = push_json_content(&client, &server, &node_id, &content, &state).await {
-                error!("JSON upload failed: {}", e);
+            let json_upload_succeeded =
+                match push_json_content(&client, &server, &node_id, &content, &state).await {
+                    Ok(_) => true,
+                    Err(e) => {
+                        error!("JSON upload failed: {}", e);
+                        false
+                    }
+                };
+            // Refresh from HEAD if server edits were skipped AND upload succeeded
+            // IMPORTANT: Don't refresh after failed upload to avoid overwriting local edits
+            if should_refresh {
+                if json_upload_succeeded {
+                    let refresh_succeeded =
+                        refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+                    if !refresh_succeeded {
+                        let mut s = state.write().await;
+                        s.needs_head_refresh = true;
+                    }
+                } else {
+                    // Upload failed - re-set the flag so we try again next time
+                    let mut s = state.write().await;
+                    s.needs_head_refresh = true;
+                }
             }
             continue;
         }
@@ -1722,6 +1927,9 @@ async fn upload_task(
             let s = state.read().await;
             s.last_written_cid.clone()
         };
+
+        // Track upload success - only refresh if upload succeeded
+        let mut upload_succeeded = false;
 
         match parent_cid {
             Some(parent) => {
@@ -1755,6 +1963,7 @@ async fn upload_task(
                                     let mut s = state.write().await;
                                     s.last_written_cid = Some(result.cid);
                                     s.last_written_content = content;
+                                    upload_succeeded = true;
                                 }
                                 Err(e) => {
                                     error!("Failed to parse replace response: {}", e);
@@ -1797,6 +2006,7 @@ async fn upload_task(
                                     let mut s = state.write().await;
                                     s.last_written_cid = Some(result.cid);
                                     s.last_written_content = content;
+                                    upload_succeeded = true;
                                 }
                                 Err(e) => {
                                     error!("Failed to parse edit response: {}", e);
@@ -1812,6 +2022,24 @@ async fn upload_task(
                         error!("Initial commit request failed: {}", e);
                     }
                 }
+            }
+        }
+
+        // After successful upload, refresh from HEAD if server edits were skipped
+        // IMPORTANT: Only refresh after successful upload to avoid overwriting
+        // local edits when upload fails
+        if should_refresh {
+            if upload_succeeded {
+                let refresh_succeeded =
+                    refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+                if !refresh_succeeded {
+                    let mut s = state.write().await;
+                    s.needs_head_refresh = true;
+                }
+            } else {
+                // Upload failed - re-set the flag so we try again next time
+                let mut s = state.write().await;
+                s.needs_head_refresh = true;
             }
         }
     }
@@ -1891,6 +2119,102 @@ async fn sse_task(
     }
 }
 
+/// Timeout for pending write barrier (30 seconds)
+const PENDING_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Refresh local file from server HEAD if needed
+/// Called by upload_task after clearing barrier when needs_head_refresh was set
+/// Returns true on success, false on failure (caller should re-set needs_head_refresh)
+async fn refresh_from_head(
+    client: &Client,
+    server: &str,
+    node_id: &str,
+    file_path: &PathBuf,
+    state: &Arc<RwLock<SyncState>>,
+) -> bool {
+    debug!("Refreshing from HEAD due to skipped server edit");
+
+    // Fetch HEAD
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
+    let resp = match client.get(&head_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Failed to fetch HEAD for refresh: {}", e);
+            return false;
+        }
+    };
+
+    if !resp.status().is_success() {
+        error!("HEAD fetch failed for refresh: {}", resp.status());
+        return false;
+    }
+
+    let head: HeadResponse = match resp.json().await {
+        Ok(h) => h,
+        Err(e) => {
+            error!("Failed to parse HEAD response for refresh: {}", e);
+            return false;
+        }
+    };
+
+    // Check if content differs from what we have, and update state BEFORE writing
+    // to prevent file watcher from re-uploading the refreshed content
+    {
+        let mut s = state.write().await;
+        if head.content == s.last_written_content {
+            // Content matches, but still update CID in case server advanced to new commit
+            // with identical content (e.g., concurrent edits that merge to same text)
+            debug!("HEAD matches last_written_content, updating CID only");
+            s.last_written_cid = head.cid.clone();
+            return true; // Success - content already matches
+        }
+        // Update state BEFORE writing file - this way if watcher fires after write,
+        // echo detection will see matching content and skip upload
+        s.last_written_cid = head.cid.clone();
+        s.last_written_content = head.content.clone();
+    }
+
+    // Content differs - we need to write the new content
+    // Use similar logic to handle_server_edit for binary detection
+    let content_info = detect_from_path(file_path);
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let write_result = if content_info.is_binary {
+        match STANDARD.decode(&head.content) {
+            Ok(decoded) => tokio::fs::write(file_path, &decoded).await,
+            Err(e) => {
+                // Decode failed - fall back to writing as text (like initial sync does)
+                warn!(
+                    "Failed to decode base64 content for refresh, writing as text: {}",
+                    e
+                );
+                tokio::fs::write(file_path, &head.content).await
+            }
+        }
+    } else {
+        match STANDARD.decode(&head.content) {
+            Ok(decoded) if is_binary_content(&decoded) => {
+                tokio::fs::write(file_path, &decoded).await
+            }
+            _ => tokio::fs::write(file_path, &head.content).await,
+        }
+    };
+
+    if let Err(e) = write_result {
+        error!("Failed to write file for refresh: {}", e);
+        // Revert state on failure
+        let mut s = state.write().await;
+        s.last_written_cid = None;
+        s.last_written_content = String::new();
+        return false;
+    }
+
+    info!(
+        "Refreshed local file from HEAD: {} bytes",
+        head.content.len()
+    );
+    true
+}
+
 /// Handle a server edit event
 async fn handle_server_edit(
     client: &Client,
@@ -1900,40 +2224,10 @@ async fn handle_server_edit(
     state: &Arc<RwLock<SyncState>>,
     _edit: &EditEventData,
 ) {
-    // Read current local file content as bytes
-    let raw_content = match tokio::fs::read(file_path).await {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Failed to read local file: {}", e);
-            return;
-        }
-    };
-
     // Detect if this file is binary (use both extension and content-based detection)
     let content_info = detect_from_path(file_path);
-    let is_binary = content_info.is_binary || is_binary_content(&raw_content);
 
-    // Convert to string (base64 for binary, UTF-8 for text)
-    let local_content = if is_binary {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        STANDARD.encode(&raw_content)
-    } else {
-        String::from_utf8_lossy(&raw_content).to_string()
-    };
-
-    // Check if there are pending local changes
-    let has_local_changes = {
-        let s = state.read().await;
-        local_content != s.last_written_content
-    };
-
-    if has_local_changes {
-        // Don't overwrite - local changes will be pushed and merged
-        debug!("Skipping server update - local changes pending");
-        return;
-    }
-
-    // Safe to overwrite - fetch new content from server
+    // Fetch new content from server first
     let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
     let resp = match client.get(&head_url).send().await {
         Ok(r) => r,
@@ -1956,46 +2250,131 @@ async fn handle_server_edit(
         }
     };
 
-    // Update state BEFORE writing to file to prevent race condition.
-    // If file watcher fires during the write, it will see the new content
-    // and correctly detect it as an echo.
-    {
+    // Acquire write lock and set up barrier atomically
+    let write_id = {
         let mut s = state.write().await;
-        s.last_written_cid = head.cid.clone();
-        s.last_written_content = head.content.clone();
-    }
+
+        // Check if there's already a pending write (concurrent SSE events)
+        if let Some(pending) = &s.pending_write {
+            if pending.started_at.elapsed() < PENDING_WRITE_TIMEOUT {
+                // Another write in progress, we can't process this SSE event now.
+                // Set a flag so upload_task knows to refresh HEAD after clearing barrier.
+                // This prevents data loss when multiple server edits arrive quickly.
+                debug!(
+                    "Skipping server edit - another write in progress (id={}), \
+                     setting needs_head_refresh flag",
+                    pending.write_id
+                );
+                s.needs_head_refresh = true;
+                return;
+            }
+            // Timeout - clear stale pending and continue
+            warn!("Clearing timed-out pending write (id={})", pending.write_id);
+        }
+
+        // Read local file content to check for pending local changes
+        let raw_content = match std::fs::read(file_path) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to read local file: {}", e);
+                return;
+            }
+        };
+
+        let is_binary = content_info.is_binary || is_binary_content(&raw_content);
+        let local_content = if is_binary {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            STANDARD.encode(&raw_content)
+        } else {
+            String::from_utf8_lossy(&raw_content).to_string()
+        };
+
+        // Check if local content differs from what we last wrote
+        if local_content != s.last_written_content {
+            // Local changes pending - don't overwrite, let upload_task handle
+            // Set needs_head_refresh so upload_task will fetch HEAD after uploading
+            debug!("Skipping server update - local changes pending, setting needs_head_refresh");
+            s.needs_head_refresh = true;
+            return;
+        }
+
+        // Set barrier with new token BEFORE writing
+        s.current_write_id += 1;
+        let write_id = s.current_write_id;
+        s.pending_write = Some(PendingWrite {
+            write_id,
+            content: head.content.clone(),
+            cid: head.cid.clone(),
+            started_at: std::time::Instant::now(),
+        });
+
+        write_id
+    };
+    // Lock released before I/O
 
     // Write directly to local file (not atomic)
     // We avoid temp+rename because it changes the inode, which breaks
     // inotify file watchers on Linux. Since the server is authoritative,
     // partial writes on crash are recoverable via re-sync.
-    // For binary files, decode base64 before writing
-    let write_result = if is_binary {
-        use base64::{engine::general_purpose::STANDARD, Engine};
+    //
+    // For binary detection, use both extension-based AND content-based detection:
+    // - If extension suggests binary, decode base64
+    // - If extension says text, still try decoding as base64 in case
+    //   the file was detected as binary by content sniffing on upload
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let write_result = if content_info.is_binary {
+        // Extension says binary - decode base64
         match STANDARD.decode(&head.content) {
             Ok(decoded) => tokio::fs::write(file_path, &decoded).await,
             Err(e) => {
                 error!("Failed to decode base64 content: {}", e);
+                // Clear barrier on failure
+                let mut s = state.write().await;
+                if s.pending_write.as_ref().map(|p| p.write_id) == Some(write_id) {
+                    s.pending_write = None;
+                }
                 return;
             }
         }
     } else {
-        tokio::fs::write(file_path, &head.content).await
+        // Extension says text, but try decoding as base64 in case
+        // this was a binary file detected by content sniffing on upload
+        match STANDARD.decode(&head.content) {
+            Ok(decoded) if is_binary_content(&decoded) => {
+                // Successfully decoded and content is binary - write decoded bytes
+                tokio::fs::write(file_path, &decoded).await
+            }
+            _ => {
+                // Not base64 or not binary - write as text
+                tokio::fs::write(file_path, &head.content).await
+            }
+        }
     };
 
     if let Err(e) = write_result {
         error!("Failed to write file: {}", e);
-        // Note: state is already updated, which is fine - next server event
-        // will retry and the echo detection will still work correctly
+        // Clear barrier on failure
+        let mut s = state.write().await;
+        if s.pending_write.as_ref().map(|p| p.write_id) == Some(write_id) {
+            s.pending_write = None;
+        }
         return;
     }
 
+    // DO NOT clear barrier or update last_written_* here!
+    // upload_task will do it when it sees the matching content from file watcher.
+    // This ensures proper echo detection even with stale watcher events.
+
     match &head.cid {
         Some(cid) => info!(
-            "Downloaded update: {} bytes at {}",
+            "Wrote server content: {} bytes at {} (write_id={})",
             head.content.len(),
-            &cid[..8.min(cid.len())]
+            &cid[..8.min(cid.len())],
+            write_id
         ),
-        None => info!("Downloaded update: empty document"),
+        None => info!(
+            "Wrote server content: empty document (write_id={})",
+            write_id
+        ),
     }
 }
