@@ -1901,6 +1901,9 @@ async fn upload_task(
             s.last_written_cid.clone()
         };
 
+        // Track upload success - only refresh if upload succeeded
+        let mut upload_succeeded = false;
+
         match parent_cid {
             Some(parent) => {
                 // Normal case: use replace endpoint
@@ -1933,6 +1936,7 @@ async fn upload_task(
                                     let mut s = state.write().await;
                                     s.last_written_cid = Some(result.cid);
                                     s.last_written_content = content;
+                                    upload_succeeded = true;
                                 }
                                 Err(e) => {
                                     error!("Failed to parse replace response: {}", e);
@@ -1975,6 +1979,7 @@ async fn upload_task(
                                     let mut s = state.write().await;
                                     s.last_written_cid = Some(result.cid);
                                     s.last_written_content = content;
+                                    upload_succeeded = true;
                                 }
                                 Err(e) => {
                                     error!("Failed to parse edit response: {}", e);
@@ -1993,8 +1998,10 @@ async fn upload_task(
             }
         }
 
-        // After upload, refresh from HEAD if server edits were skipped
-        if should_refresh {
+        // After successful upload, refresh from HEAD if server edits were skipped
+        // IMPORTANT: Only refresh after successful upload to avoid overwriting
+        // local edits when upload fails
+        if should_refresh && upload_succeeded {
             refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
         }
     }
