@@ -9,6 +9,7 @@ pub mod fs;
 pub mod http_gateway;
 pub mod mqtt;
 pub mod node;
+pub mod orchestrator;
 pub mod replay;
 pub mod router;
 pub mod sse;
