@@ -37,7 +37,8 @@ async fn main() {
     if let Err(e) = validate_extension(&args.fs_root) {
         tracing::error!(
             "Invalid fs-root path '{}': {}. Paths must have extensions like .json, .txt, etc.",
-            args.fs_root, e
+            args.fs_root,
+            e
         );
         std::process::exit(1);
     }
@@ -46,7 +47,8 @@ async fn main() {
         if let Err(e) = validate_extension(router_path) {
             tracing::error!(
                 "Invalid router path '{}': {}. Paths must have extensions like .json, .txt, etc.",
-                router_path, e
+                router_path,
+                e
             );
             std::process::exit(1);
         }
