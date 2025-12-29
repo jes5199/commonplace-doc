@@ -15,13 +15,17 @@ pub mod messages;
 pub mod sync;
 pub mod topics;
 
-use crate::node::NodeRegistry;
+use crate::document::DocumentStore;
 use crate::store::CommitStore;
+use rumqttc::QoS;
 use std::sync::Arc;
 use thiserror::Error;
 
 pub use client::MqttClient;
-pub use messages::{CommandMessage, EditMessage, EventMessage, SyncMessage};
+pub use messages::{
+    CommandMessage, CreateDocumentRequest, CreateDocumentResponse, EditMessage, EventMessage,
+    SyncMessage,
+};
 pub use topics::{Port, Topic};
 
 /// Errors that can occur in MQTT operations.
@@ -83,7 +87,7 @@ impl Default for MqttConfig {
 #[allow(dead_code)] // Fields used for future integration
 pub struct MqttService {
     client: Arc<MqttClient>,
-    node_registry: Arc<NodeRegistry>,
+    document_store: Arc<DocumentStore>,
     commit_store: Option<Arc<CommitStore>>,
     edits_handler: edits::EditsHandler,
     sync_handler: sync::SyncHandler,
@@ -92,33 +96,49 @@ pub struct MqttService {
 }
 
 impl MqttService {
+    /// Store commands topic for create-document.
+    const STORE_COMMANDS_CREATE_DOCUMENT: &'static str = "$store/commands/create-document";
+
     /// Create a new MQTT service with the given configuration.
     pub async fn new(
         config: MqttConfig,
-        node_registry: Arc<NodeRegistry>,
+        document_store: Arc<DocumentStore>,
         commit_store: Option<Arc<CommitStore>>,
     ) -> Result<Self, MqttError> {
         let client = Arc::new(MqttClient::connect(config).await?);
 
         let edits_handler =
-            edits::EditsHandler::new(client.clone(), node_registry.clone(), commit_store.clone());
+            edits::EditsHandler::new(client.clone(), document_store.clone(), commit_store.clone());
 
         let sync_handler = sync::SyncHandler::new(client.clone(), commit_store.clone());
 
         let events_handler = events::EventsHandler::new(client.clone());
 
         let commands_handler =
-            commands::CommandsHandler::new(client.clone(), node_registry.clone());
+            commands::CommandsHandler::new(client.clone(), document_store.clone());
 
         Ok(Self {
             client,
-            node_registry,
+            document_store,
             commit_store,
             edits_handler,
             sync_handler,
             events_handler,
             commands_handler,
         })
+    }
+
+    /// Subscribe to store-level commands.
+    /// This subscribes to the `$store/commands/create-document` topic.
+    pub async fn subscribe_store_commands(&self) -> Result<(), MqttError> {
+        self.client
+            .subscribe(Self::STORE_COMMANDS_CREATE_DOCUMENT, QoS::AtLeastOnce)
+            .await?;
+        tracing::debug!(
+            "Subscribed to store commands: {}",
+            Self::STORE_COMMANDS_CREATE_DOCUMENT
+        );
+        Ok(())
     }
 
     /// Subscribe to edits for a path.
@@ -172,6 +192,11 @@ impl MqttService {
 
     /// Dispatch an incoming message to the appropriate handler.
     async fn dispatch_message(&self, topic_str: &str, payload: &[u8]) -> Result<(), MqttError> {
+        // Check for store-level commands first (these don't follow the document path pattern)
+        if topic_str == Self::STORE_COMMANDS_CREATE_DOCUMENT {
+            return self.commands_handler.handle_create_document(payload).await;
+        }
+
         // Parse the topic
         let topic = match topics::Topic::parse(topic_str) {
             Ok(t) => t,

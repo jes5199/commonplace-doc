@@ -11,7 +11,6 @@ pub mod mqtt;
 pub mod node;
 pub mod orchestrator;
 pub mod replay;
-pub mod router;
 pub mod sse;
 pub mod store;
 pub mod sync;
@@ -21,7 +20,6 @@ use document::{ContentType, DocumentStore};
 use events::CommitBroadcaster;
 use fs::FilesystemReconciler;
 use node::{NodeId, NodeRegistry, ObservableNode};
-use router::RouterManager;
 use std::sync::Arc;
 use store::CommitStore;
 use tower_http::cors::CorsLayer;
@@ -37,8 +35,6 @@ pub struct RouterConfig {
     pub commit_store: Option<CommitStore>,
     /// Node ID for filesystem root document
     pub fs_root: Option<String>,
-    /// Node IDs for router documents
-    pub routers: Vec<String>,
     /// MQTT configuration (if specified, enables MQTT transport)
     pub mqtt: Option<mqtt::MqttConfig>,
     /// Document paths to subscribe via MQTT (requires mqtt to be set)
@@ -96,11 +92,17 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
 
     // Initialize MQTT service if configured
     if let Some(mqtt_config) = config.mqtt {
-        match mqtt::MqttService::new(mqtt_config, node_registry.clone(), commit_store.clone()).await
-        {
+        match mqtt::MqttService::new(mqtt_config, doc_store.clone(), commit_store.clone()).await {
             Ok(mqtt_service) => {
                 tracing::info!("MQTT service connected");
                 let mqtt_service = Arc::new(mqtt_service);
+
+                // Subscribe to store-level commands (e.g., create-document)
+                if let Err(e) = mqtt_service.subscribe_store_commands().await {
+                    tracing::warn!("Failed to subscribe to store commands: {}", e);
+                } else {
+                    tracing::info!("MQTT subscribed to store commands");
+                }
 
                 // Subscribe to configured document paths
                 for path in &config.mqtt_subscribe {
@@ -121,30 +123,6 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
             }
             Err(e) => {
                 tracing::error!("Failed to connect MQTT service: {}", e);
-            }
-        }
-    }
-
-    // Initialize router documents
-    for router_id_str in config.routers {
-        let node_id = NodeId::new(&router_id_str);
-
-        // Get or create the router document node
-        // Use Json type since router documents are JSON
-        match node_registry
-            .get_or_create_document(&node_id, ContentType::Json)
-            .await
-        {
-            Ok(_) => {
-                tracing::info!("Router document initialized at node: {}", router_id_str);
-
-                // Create and start the router manager
-                // (start() performs initial wiring before listening for edits)
-                let manager = Arc::new(RouterManager::new(node_id.clone(), node_registry.clone()));
-                manager.start().await;
-            }
-            Err(e) => {
-                tracing::error!("Failed to create router node {}: {}", router_id_str, e);
             }
         }
     }

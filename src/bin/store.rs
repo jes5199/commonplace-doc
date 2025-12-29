@@ -6,11 +6,10 @@
 use clap::Parser;
 use commonplace_doc::{
     cli::StoreArgs,
-    document::ContentType,
+    document::{ContentType, DocumentStore},
     fs::FilesystemReconciler,
     mqtt::{topics::validate_extension, MqttConfig, MqttService},
     node::{NodeId, NodeRegistry, ObservableNode},
-    router::RouterManager,
     store::CommitStore,
 };
 use std::sync::Arc;
@@ -32,7 +31,7 @@ async fn main() {
 
     tracing::info!("Starting commonplace-store");
 
-    // Validate that fs-root and router paths have valid extensions
+    // Validate that fs-root path has a valid extension
     // (required for MQTT topic parsing to work)
     if let Err(e) = validate_extension(&args.fs_root) {
         tracing::error!(
@@ -43,21 +42,13 @@ async fn main() {
         std::process::exit(1);
     }
 
-    for router_path in &args.routers {
-        if let Err(e) = validate_extension(router_path) {
-            tracing::error!(
-                "Invalid router path '{}': {}. Paths must have extensions like .json, .txt, etc.",
-                router_path,
-                e
-            );
-            std::process::exit(1);
-        }
-    }
-
     // Create commit store (required for store binary)
     tracing::info!("Using database at: {}", args.database.display());
     let commit_store =
         Arc::new(CommitStore::new(&args.database).expect("Failed to create commit store"));
+
+    // Create document store
+    let doc_store = Arc::new(DocumentStore::new());
 
     // Create node registry
     let node_registry = Arc::new(NodeRegistry::new());
@@ -106,25 +97,6 @@ async fn main() {
         }
     }
 
-    // Initialize router documents
-    for router_id_str in &args.routers {
-        let node_id = NodeId::new(router_id_str);
-
-        match node_registry
-            .get_or_create_document(&node_id, ContentType::Json)
-            .await
-        {
-            Ok(_) => {
-                tracing::info!("Router document initialized at node: {}", router_id_str);
-                let manager = Arc::new(RouterManager::new(node_id.clone(), node_registry.clone()));
-                manager.start().await;
-            }
-            Err(e) => {
-                tracing::error!("Failed to create router node {}: {}", router_id_str, e);
-            }
-        }
-    }
-
     // Create MQTT config
     let mqtt_config = MqttConfig {
         broker_url: args.mqtt_broker.clone(),
@@ -139,37 +111,30 @@ async fn main() {
     );
 
     // Connect to MQTT
-    let mqtt_service = match MqttService::new(
-        mqtt_config,
-        node_registry.clone(),
-        Some(commit_store.clone()),
-    )
-    .await
-    {
-        Ok(service) => {
-            tracing::info!("MQTT service connected");
-            Arc::new(service)
-        }
-        Err(e) => {
-            tracing::error!("Failed to connect MQTT service: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let mqtt_service =
+        match MqttService::new(mqtt_config, doc_store.clone(), Some(commit_store.clone())).await {
+            Ok(service) => {
+                tracing::info!("MQTT service connected");
+                Arc::new(service)
+            }
+            Err(e) => {
+                tracing::error!("Failed to connect MQTT service: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+    // Subscribe to store-level commands (e.g., create-document)
+    if let Err(e) = mqtt_service.subscribe_store_commands().await {
+        tracing::warn!("Failed to subscribe to store commands: {}", e);
+    } else {
+        tracing::info!("Subscribed to store commands");
+    }
 
     // Subscribe to fs-root document itself (so we receive updates to filesystem structure)
     if let Err(e) = mqtt_service.subscribe_path(&args.fs_root).await {
         tracing::warn!("Failed to subscribe to fs-root {}: {}", args.fs_root, e);
     } else {
         tracing::info!("Subscribed to fs-root path: {}", args.fs_root);
-    }
-
-    // Subscribe to router documents
-    for router_id_str in &args.routers {
-        if let Err(e) = mqtt_service.subscribe_path(router_id_str).await {
-            tracing::warn!("Failed to subscribe to router {}: {}", router_id_str, e);
-        } else {
-            tracing::info!("Subscribed to router path: {}", router_id_str);
-        }
     }
 
     // Subscribe to paths based on fs-root content

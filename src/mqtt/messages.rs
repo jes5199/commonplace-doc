@@ -127,6 +127,28 @@ pub enum SyncMessage {
     },
 }
 
+/// Request to create a new document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateDocumentRequest {
+    /// Request ID for correlation
+    pub req: String,
+    /// MIME content type (e.g., "text/plain", "application/json")
+    pub content_type: String,
+}
+
+/// Response with created document UUID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateDocumentResponse {
+    /// Request ID for correlation
+    pub req: String,
+    /// Created document UUID (present on success)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    /// Error message (present on failure)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 impl SyncMessage {
     /// Get the request ID from any sync message.
     pub fn req(&self) -> &str {
@@ -278,5 +300,47 @@ mod tests {
             commits: vec![]
         }
         .is_request());
+    }
+
+    #[test]
+    fn test_create_document_request_serialize() {
+        let req = CreateDocumentRequest {
+            req: "r-001".to_string(),
+            content_type: "text/plain".to_string(),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"req\":\"r-001\""));
+        assert!(json.contains("\"content_type\":\"text/plain\""));
+    }
+
+    #[test]
+    fn test_create_document_response_success() {
+        let resp = CreateDocumentResponse {
+            req: "r-001".to_string(),
+            uuid: Some("abc-123".to_string()),
+            error: None,
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"req\":\"r-001\""));
+        assert!(json.contains("\"uuid\":\"abc-123\""));
+        // error should be omitted when None
+        assert!(!json.contains("\"error\""));
+    }
+
+    #[test]
+    fn test_create_document_response_error() {
+        let resp = CreateDocumentResponse {
+            req: "r-001".to_string(),
+            uuid: None,
+            error: Some("Invalid content type".to_string()),
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"req\":\"r-001\""));
+        assert!(json.contains("\"error\":\"Invalid content type\""));
+        // uuid should be omitted when None
+        assert!(!json.contains("\"uuid\""));
     }
 }

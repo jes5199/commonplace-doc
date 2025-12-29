@@ -1,12 +1,12 @@
 //! Commands port handler.
 //!
-//! Subscribes to `{path}/commands/{verb}` topics and dispatches commands to nodes.
+//! Handles store-level commands like create-document and path-specific commands.
 
+use crate::document::{ContentType, DocumentStore};
 use crate::mqtt::client::MqttClient;
-use crate::mqtt::messages::CommandMessage;
+use crate::mqtt::messages::{CommandMessage, CreateDocumentRequest, CreateDocumentResponse};
 use crate::mqtt::topics::Topic;
 use crate::mqtt::MqttError;
-use crate::node::{Event, NodeId, NodeRegistry};
 use rumqttc::QoS;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -16,17 +16,17 @@ use tracing::{debug, warn};
 /// Handler for the commands port.
 pub struct CommandsHandler {
     client: Arc<MqttClient>,
-    node_registry: Arc<NodeRegistry>,
+    document_store: Arc<DocumentStore>,
     /// Map of path -> set of subscribed verbs
     subscribed_commands: RwLock<HashMap<String, HashSet<String>>>,
 }
 
 impl CommandsHandler {
     /// Create a new commands handler.
-    pub fn new(client: Arc<MqttClient>, node_registry: Arc<NodeRegistry>) -> Self {
+    pub fn new(client: Arc<MqttClient>, document_store: Arc<DocumentStore>) -> Self {
         Self {
             client,
-            node_registry,
+            document_store,
             subscribed_commands: RwLock::new(HashMap::new()),
         }
     }
@@ -79,10 +79,10 @@ impl CommandsHandler {
         Ok(())
     }
 
-    /// Handle an incoming command.
+    /// Handle an incoming command on a path-specific topic.
     ///
-    /// Commands are dispatched to the target node's red port via `receive_event()`.
-    /// The verb becomes the event_type.
+    /// Note: Path-specific commands are not currently implemented.
+    /// Use store-level commands like `$store/commands/create-document` instead.
     pub async fn handle_command(&self, topic: &Topic, payload: &[u8]) -> Result<(), MqttError> {
         let verb = topic.qualifier.as_deref().ok_or_else(|| {
             MqttError::InvalidTopic("Command topic missing verb qualifier".to_string())
@@ -97,35 +97,60 @@ impl CommandsHandler {
             verb, topic.path, command.source
         );
 
-        // Get the target node
-        let node_id = NodeId::new(&topic.path);
+        // Path-specific commands are not currently implemented
+        warn!(
+            "Path-specific command '{}' at path '{}' not implemented - use store-level commands",
+            verb, topic.path
+        );
+        Ok(())
+    }
 
-        match self.node_registry.get(&node_id).await {
-            Some(node) => {
-                // Create an Event with the verb as event_type
-                let event = Event {
-                    source: NodeId::new(command.source.as_deref().unwrap_or("mqtt")),
-                    event_type: verb.to_string(),
-                    payload: command.payload,
-                };
+    /// Handle create-document command.
+    /// Topic: $store/commands/create-document
+    pub async fn handle_create_document(&self, payload: &[u8]) -> Result<(), MqttError> {
+        let request: CreateDocumentRequest = serde_json::from_slice(payload)
+            .map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
 
-                // Dispatch to the node's red port
-                if let Err(e) = node.receive_event(event).await {
-                    debug!("Error dispatching command to node {}: {:?}", topic.path, e);
+        debug!(
+            "Received create-document command: req={}, content_type={}",
+            request.req, request.content_type
+        );
+
+        let response = match ContentType::from_mime(&request.content_type) {
+            Some(content_type) => {
+                let uuid = self.document_store.create_document(content_type).await;
+                debug!(
+                    "Created document with uuid={} for req={}",
+                    uuid, request.req
+                );
+                CreateDocumentResponse {
+                    req: request.req,
+                    uuid: Some(uuid),
+                    error: None,
                 }
-
-                debug!("Dispatched command '{}' to node: {}", verb, topic.path);
-                Ok(())
             }
             None => {
                 warn!(
-                    "No node found for command '{}' at path: {}",
-                    verb, topic.path
+                    "Invalid content type '{}' for req={}",
+                    request.content_type, request.req
                 );
-                // Don't error - the node might not exist yet
-                Ok(())
+                CreateDocumentResponse {
+                    req: request.req,
+                    uuid: None,
+                    error: Some(format!("Invalid content type: {}", request.content_type)),
+                }
             }
-        }
+        };
+
+        // Publish response to $store/responses
+        let payload =
+            serde_json::to_vec(&response).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+
+        self.client
+            .publish("$store/responses", &payload, QoS::AtLeastOnce)
+            .await?;
+
+        Ok(())
     }
 
     /// Check if commands are subscribed for a path.
