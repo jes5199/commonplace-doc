@@ -1,0 +1,24 @@
+{
+  "mqtt_broker": "localhost:1883",
+  "processes": {
+    "store": {
+      "command": "commonplace-store",
+      "args": ["--database", "./data.redb", "--fs-root", "fs-root.json"],
+      "restart": {
+        "policy": "always",
+        "backoff_ms": 500,
+        "max_backoff_ms": 10000
+      }
+    },
+    "http": {
+      "command": "commonplace-http",
+      "args": ["--port", "3000"],
+      "restart": {
+        "policy": "always",
+        "backoff_ms": 500,
+        "max_backoff_ms": 10000
+      },
+      "depends_on": ["store"]
+    }
+  }
+}
