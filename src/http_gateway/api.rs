@@ -160,7 +160,7 @@ async fn get_node_content(
         StatusCode::NOT_IMPLEMENTED,
         format!(
             "Content retrieval not available via stateless HTTP gateway. \
-             Subscribe via SSE at /sse/nodes/{} to receive updates.",
+             Subscribe via SSE at /sse/docs/{} to receive updates.",
             id
         ),
     ))

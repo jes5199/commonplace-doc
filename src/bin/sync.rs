@@ -1308,7 +1308,7 @@ async fn directory_sse_task(
     directory: PathBuf,
     file_states: Arc<RwLock<HashMap<String, FileSyncState>>>,
 ) {
-    let sse_url = format!("{}/sse/nodes/{}", server, encode_node_id(&fs_root_id));
+    let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&fs_root_id));
 
     loop {
         info!("Connecting to fs-root SSE: {}", sse_url);
@@ -1825,7 +1825,7 @@ async fn sse_task(
     file_path: PathBuf,
     state: Arc<RwLock<SyncState>>,
 ) {
-    let sse_url = format!("{}/sse/nodes/{}", server, encode_node_id(&node_id));
+    let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&node_id));
 
     loop {
         info!("Connecting to SSE: {}", sse_url);

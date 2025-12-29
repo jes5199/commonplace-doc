@@ -40,8 +40,8 @@ pub fn router(
         .route("/documents/changes", get(get_documents_changes))
         .route("/documents/:id/stream", get(stream_document_changes))
         .route("/documents/stream", get(stream_documents_changes))
-        // Node SSE endpoints (for sync client compatibility)
-        .route("/sse/nodes/:id", get(stream_node))
+        // Document SSE endpoints (for sync client)
+        .route("/sse/docs/:id", get(stream_doc))
         .with_state(state)
 }
 
@@ -279,10 +279,10 @@ fn map_store_error(_: StoreError) -> StatusCode {
 }
 
 // ============================================================================
-// Node SSE handlers (for sync client compatibility)
+// Document SSE handlers (for sync client)
 // ============================================================================
 
-/// Edit event data for sync client compatibility
+/// Edit event data for sync client
 #[derive(Serialize, Clone)]
 struct EditEventData {
     source: String,
@@ -299,13 +299,13 @@ struct CommitEventData {
     message: Option<String>,
 }
 
-/// Stream edit events for a node/document
-async fn stream_node(
+/// Stream edit events for a document
+async fn stream_doc(
     State(state): State<SseState>,
-    Path(node_id): Path<String>,
+    Path(doc_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    // Verify node/document exists
-    if state.doc_store.get_document(&node_id).await.is_none() {
+    // Verify document exists
+    if state.doc_store.get_document(&doc_id).await.is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
 
@@ -316,14 +316,14 @@ async fn stream_node(
 
     let commit_store = state.commit_store.clone();
     let mut receiver = broadcaster.subscribe();
-    let target_node_id = node_id.clone();
+    let target_doc_id = doc_id.clone();
 
     let stream = async_stream::stream! {
         loop {
             match receiver.recv().await {
                 Ok(notification) => {
-                    // Only emit events for this node
-                    if notification.doc_id != target_node_id {
+                    // Only emit events for this document
+                    if notification.doc_id != target_doc_id {
                         continue;
                     }
 

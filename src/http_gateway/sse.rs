@@ -1,12 +1,12 @@
 //! HTTP Gateway SSE routes - bridges MQTT to Server-Sent Events
 //!
-//! ## Node ID Encoding
+//! ## Document ID Encoding
 //!
-//! Node IDs may contain path separators (e.g., `foo/bar/file.txt`). When making
+//! Document IDs may contain path separators (e.g., `foo/bar/file.txt`). When making
 //! HTTP requests, these must be URL-encoded:
 //!
-//! - Node ID: `foo/bar/file.txt`
-//! - SSE endpoint: `/sse/nodes/foo%2Fbar%2Ffile.txt`
+//! - Document ID: `foo/bar/file.txt`
+//! - SSE endpoint: `/sse/docs/foo%2Fbar%2Ffile.txt`
 //!
 //! Axum automatically URL-decodes the path parameter.
 
@@ -26,14 +26,14 @@ use super::HttpGateway;
 
 /// Create the SSE router for the HTTP gateway
 pub fn router(_gateway: Arc<HttpGateway>) -> Router<Arc<HttpGateway>> {
-    Router::new().route("/nodes/:id", get(subscribe_to_node))
+    Router::new().route("/docs/:id", get(subscribe_to_doc))
 }
 
-/// GET /sse/nodes/{id} - Subscribe to node updates via SSE
+/// GET /sse/docs/{id} - Subscribe to document updates via SSE
 ///
-/// This subscribes to the MQTT edits topic for the node and streams
+/// This subscribes to the MQTT edits topic for the document and streams
 /// updates to the client as SSE events.
-async fn subscribe_to_node(
+async fn subscribe_to_doc(
     State(gateway): State<Arc<HttpGateway>>,
     Path(id): Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {

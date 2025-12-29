@@ -199,23 +199,21 @@ Removes the wiring between nodes.
 
 ### SSE
 
-#### Node Subscriptions
+#### Document Subscriptions
 
-Subscribe to real-time updates from a node:
+Subscribe to real-time updates from a document:
 
 ```bash
-GET /sse/nodes/{id}
+GET /sse/docs/{id}
 ```
 
 Streams Server-Sent Events:
 - `edit` events contain commit data (update, parents, timestamp, author, message)
-- Custom event types for ephemeral events (cursor, presence, etc.)
 - `warning` events if the subscription lags
-- `closed` event when the node shuts down
 
 **Example:**
 ```bash
-curl -N http://localhost:3000/sse/nodes/{id}
+curl -N http://localhost:3000/sse/docs/{id}
 ```
 
 #### Document Change History

@@ -80,7 +80,7 @@ The server runs on `localhost:3000` by default.
 - `DELETE /nodes/{from}/wire/{to}` - Remove wiring between nodes
 
 #### SSE
-- `GET /sse/nodes/{id}` - Subscribe to real-time updates from a node (creates transient ConnectionNode)
+- `GET /sse/docs/{id}` - Subscribe to real-time document updates
 - `GET /documents/{id}/changes` - Get commit history for a document
 - `GET /documents/{id}/stream` - Stream document changes via SSE
 

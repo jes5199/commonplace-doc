@@ -23,7 +23,7 @@ Internally, each document uses a Yrs root type named `content`:
 - `src/document.rs`: `DocumentStore` + `ContentType`.
 - `src/commit.rs`: `Commit` model + CID calculation.
 - `src/store.rs`: `CommitStore` backed by `redb`.
-- `src/sse.rs`: `/sse/nodes/:id` real-time event stream.
+- `src/sse.rs`: `/sse/docs/:id` real-time event stream.
 - `src/node/mod.rs`: `Node` trait definition.
 - `src/node/types.rs`: `NodeId`, `Edit`, `Event`, `NodeMessage`, `NodeError`.
 - `src/node/subscription.rs`: `Subscription`, `SubscriptionId`.
@@ -317,15 +317,14 @@ flowchart TD
 
 ## SSE Endpoint
 
-`src/sse.rs` exposes `GET /sse/nodes/:id`:
+`src/sse.rs` exposes `GET /sse/docs/:id`:
 
-- Subscribes to a node via `node.subscribe()`
-- Streams `NodeMessage` as SSE events
-- Edit events have type `edit` with commit data
-- Events use their `event_type` as the SSE event name
-- Emits `warning` if subscription lags, `closed` when node shuts down
+- Subscribes to CommitBroadcaster for the document
+- Streams commit notifications as SSE events
+- Edit events have type `edit` with commit data (update, parents, timestamp, author, message)
+- Emits `warning` if subscription lags
 
-The SSE router shares the same `NodeRegistry` as the API, so updates made via API endpoints are immediately streamed to SSE subscribers.
+Updates made via API endpoints are immediately streamed to SSE subscribers.
 
 ## Blue and Red Edges
 
