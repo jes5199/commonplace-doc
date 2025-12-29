@@ -1883,7 +1883,13 @@ async fn upload_task(
         // If echo detected, optionally refresh from HEAD then skip upload
         if echo_detected {
             if should_refresh {
-                refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+                let refresh_succeeded =
+                    refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+                if !refresh_succeeded {
+                    // Re-set the flag so we try again next time
+                    let mut s = state.write().await;
+                    s.needs_head_refresh = true;
+                }
             }
             continue;
         }
@@ -1901,7 +1907,12 @@ async fn upload_task(
             // IMPORTANT: Don't refresh after failed upload to avoid overwriting local edits
             if should_refresh {
                 if json_upload_succeeded {
-                    refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+                    let refresh_succeeded =
+                        refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+                    if !refresh_succeeded {
+                        let mut s = state.write().await;
+                        s.needs_head_refresh = true;
+                    }
                 } else {
                     // Upload failed - re-set the flag so we try again next time
                     let mut s = state.write().await;
@@ -2019,7 +2030,12 @@ async fn upload_task(
         // local edits when upload fails
         if should_refresh {
             if upload_succeeded {
-                refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+                let refresh_succeeded =
+                    refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+                if !refresh_succeeded {
+                    let mut s = state.write().await;
+                    s.needs_head_refresh = true;
+                }
             } else {
                 // Upload failed - re-set the flag so we try again next time
                 let mut s = state.write().await;
@@ -2108,13 +2124,14 @@ const PENDING_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Refresh local file from server HEAD if needed
 /// Called by upload_task after clearing barrier when needs_head_refresh was set
+/// Returns true on success, false on failure (caller should re-set needs_head_refresh)
 async fn refresh_from_head(
     client: &Client,
     server: &str,
     node_id: &str,
     file_path: &PathBuf,
     state: &Arc<RwLock<SyncState>>,
-) {
+) -> bool {
     debug!("Refreshing from HEAD due to skipped server edit");
 
     // Fetch HEAD
@@ -2123,20 +2140,20 @@ async fn refresh_from_head(
         Ok(r) => r,
         Err(e) => {
             error!("Failed to fetch HEAD for refresh: {}", e);
-            return;
+            return false;
         }
     };
 
     if !resp.status().is_success() {
         error!("HEAD fetch failed for refresh: {}", resp.status());
-        return;
+        return false;
     }
 
     let head: HeadResponse = match resp.json().await {
         Ok(h) => h,
         Err(e) => {
             error!("Failed to parse HEAD response for refresh: {}", e);
-            return;
+            return false;
         }
     };
 
@@ -2149,7 +2166,7 @@ async fn refresh_from_head(
             // with identical content (e.g., concurrent edits that merge to same text)
             debug!("HEAD matches last_written_content, updating CID only");
             s.last_written_cid = head.cid.clone();
-            return;
+            return true; // Success - content already matches
         }
         // Update state BEFORE writing file - this way if watcher fires after write,
         // echo detection will see matching content and skip upload
@@ -2188,13 +2205,14 @@ async fn refresh_from_head(
         let mut s = state.write().await;
         s.last_written_cid = None;
         s.last_written_content = String::new();
-        return;
+        return false;
     }
 
     info!(
         "Refreshed local file from HEAD: {} bytes",
         head.content.len()
     );
+    true
 }
 
 /// Handle a server edit event
