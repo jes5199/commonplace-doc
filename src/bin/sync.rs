@@ -35,6 +35,16 @@ fn encode_node_id(node_id: &str) -> String {
     urlencoding::encode(node_id).into_owned()
 }
 
+/// URL-encode a path for use in `/files/*path` endpoints.
+/// Each path segment is encoded individually to preserve the `/` separators
+/// while encoding special characters within segments.
+fn encode_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Normalize a path to use forward slashes regardless of OS.
 ///
 /// Schema paths always use forward slashes, but on Windows `to_string_lossy()`
@@ -42,6 +52,56 @@ fn encode_node_id(node_id: &str) -> String {
 /// between the client and server.
 fn normalize_path(path: &str) -> String {
     path.replace('\\', "/")
+}
+
+// ============================================================================
+// URL builders - choose between path-based (/files/*) and ID-based (/docs/:id)
+// ============================================================================
+
+/// Build URL for getting document HEAD
+fn build_head_url(server: &str, path_or_id: &str, use_paths: bool) -> String {
+    if use_paths {
+        format!("{}/files/{}/head", server, encode_path(path_or_id))
+    } else {
+        format!("{}/docs/{}/head", server, encode_node_id(path_or_id))
+    }
+}
+
+/// Build URL for document edit
+fn build_edit_url(server: &str, path_or_id: &str, use_paths: bool) -> String {
+    if use_paths {
+        format!("{}/files/{}/edit", server, encode_path(path_or_id))
+    } else {
+        format!("{}/docs/{}/edit", server, encode_node_id(path_or_id))
+    }
+}
+
+/// Build URL for document replace
+fn build_replace_url(server: &str, path_or_id: &str, parent_cid: &str, use_paths: bool) -> String {
+    if use_paths {
+        format!(
+            "{}/files/{}/replace?parent_cid={}&author=sync-client",
+            server,
+            encode_path(path_or_id),
+            parent_cid
+        )
+    } else {
+        format!(
+            "{}/docs/{}/replace?parent_cid={}&author=sync-client",
+            server,
+            encode_node_id(path_or_id),
+            parent_cid
+        )
+    }
+}
+
+/// Build URL for SSE subscription
+fn build_sse_url(server: &str, path_or_id: &str, use_paths: bool) -> String {
+    if use_paths {
+        format!("{}/sse/files/{}", server, encode_path(path_or_id))
+    } else {
+        format!("{}/sse/docs/{}", server, encode_node_id(path_or_id))
+    }
 }
 
 /// Commonplace Sync - Keep a local file or directory in sync with a server document
@@ -84,6 +144,11 @@ struct Args {
     /// Initial sync strategy when both sides have content
     #[arg(long, default_value = "skip", value_parser = ["local", "server", "skip"])]
     initial_sync: String,
+
+    /// Use path-based API endpoints (/files/*path) instead of ID-based endpoints
+    /// This requires the server to have --fs-root configured
+    #[arg(long, default_value = "false")]
+    use_paths: bool,
 }
 
 /// Pending write from server - used for barrier-based echo detection
@@ -412,6 +477,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ignore_patterns: args.ignore,
             },
             args.initial_sync,
+            args.use_paths,
         )
         .await
     } else if let Some(file) = args.file {
@@ -457,6 +523,7 @@ async fn run_file_mode(
     let watcher_handle = tokio::spawn(file_watcher_task(file.clone(), file_tx));
 
     // Start file change handler task
+    // File mode always uses ID-based API (use_paths=false)
     let upload_handle = tokio::spawn(upload_task(
         client.clone(),
         server.clone(),
@@ -464,6 +531,7 @@ async fn run_file_mode(
         file.clone(),
         state.clone(),
         file_rx,
+        false, // use_paths: file mode uses ID-based API
     ));
 
     // Start SSE subscription task
@@ -473,6 +541,7 @@ async fn run_file_mode(
         node_id.clone(),
         file.clone(),
         state.clone(),
+        false, // use_paths: file mode uses ID-based API
     ));
 
     // Wait for Ctrl+C
@@ -494,12 +563,14 @@ struct FileSyncState {
     /// Relative path from directory root
     #[allow(dead_code)]
     relative_path: String,
-    /// Derived node ID
-    node_id: String,
+    /// Identifier - either path (for /files/* API) or node ID (for /docs/* API)
+    identifier: String,
     /// Sync state for this file
     state: Arc<RwLock<SyncState>>,
     /// Task handles for cleanup on deletion
     task_handles: Vec<JoinHandle<()>>,
+    /// Whether to use path-based API (/files/*) or ID-based API (/docs/*)
+    use_paths: bool,
 }
 
 /// Spawn sync tasks (watcher, upload, SSE) for a single file.
@@ -507,9 +578,10 @@ struct FileSyncState {
 fn spawn_file_sync_tasks(
     client: Client,
     server: String,
-    node_id: String,
+    identifier: String,
     file_path: PathBuf,
     state: Arc<RwLock<SyncState>>,
+    use_paths: bool,
 ) -> Vec<JoinHandle<()>> {
     let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
 
@@ -520,13 +592,16 @@ fn spawn_file_sync_tasks(
         tokio::spawn(upload_task(
             client.clone(),
             server.clone(),
-            node_id.clone(),
+            identifier.clone(),
             file_path.clone(),
             state.clone(),
             file_rx,
+            use_paths,
         )),
         // SSE task
-        tokio::spawn(sse_task(client, server, node_id, file_path, state)),
+        tokio::spawn(sse_task(
+            client, server, identifier, file_path, state, use_paths,
+        )),
     ]
 }
 
@@ -538,12 +613,14 @@ async fn run_directory_mode(
     directory: PathBuf,
     options: ScanOptions,
     initial_sync_strategy: String,
+    use_paths: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(
-        "Starting commonplace-sync (directory mode): server={}, fs-root={}, directory={}",
+        "Starting commonplace-sync (directory mode): server={}, fs-root={}, directory={}, use_paths={}",
         server,
         fs_root_id,
-        directory.display()
+        directory.display(),
+        use_paths
     );
 
     // Verify directory exists
@@ -601,6 +678,7 @@ async fn run_directory_mode(
             &directory,
             &file_states,
             false,
+            use_paths,
         )
         .await?;
         info!("Server files pulled to local directory");
@@ -642,8 +720,14 @@ async fn run_directory_mode(
 
     // Sync each file (file_states was created earlier for server-first pull)
     for file in &files {
-        let node_id = format!("{}:{}", fs_root_id, file.relative_path);
-        info!("Syncing file: {} -> {}", file.relative_path, node_id);
+        // When use_paths=true, use relative path directly for /files/* endpoints
+        // When use_paths=false, derive node ID as fs_root_id:path for /docs/* endpoints
+        let identifier = if use_paths {
+            file.relative_path.clone()
+        } else {
+            format!("{}:{}", fs_root_id, file.relative_path)
+        };
+        info!("Syncing file: {} -> {}", file.relative_path, identifier);
 
         // Get or create the node (server's reconciler should have created it)
         // Wait a moment for reconciler
@@ -663,7 +747,7 @@ async fn run_directory_mode(
         };
 
         // Push initial content if local wins or server is empty
-        let file_head_url = format!("{}/docs/{}/head", server, encode_node_id(&node_id));
+        let file_head_url = build_head_url(&server, &identifier, use_paths);
         let file_head_resp = client.get(&file_head_url).send().await;
 
         let should_push_content = match &file_head_resp {
@@ -678,7 +762,7 @@ async fn run_directory_mode(
             debug!(
                 "File head response status: {} for {}",
                 resp.status(),
-                node_id
+                identifier
             );
             if resp.status().is_success() {
                 let head: HeadResponse = resp.json().await?;
@@ -691,15 +775,29 @@ async fn run_directory_mode(
                     // Push local content (binary files are already base64 encoded)
                     info!(
                         "Pushing initial content for: {} ({} bytes)",
-                        node_id,
+                        identifier,
                         file.content.len()
                     );
                     if !file.is_binary && file.content_type.starts_with("application/json") {
-                        push_json_content(&client, &server, &node_id, &file.content, &state)
-                            .await?;
+                        push_json_content(
+                            &client,
+                            &server,
+                            &identifier,
+                            &file.content,
+                            &state,
+                            use_paths,
+                        )
+                        .await?;
                     } else {
-                        push_file_content(&client, &server, &node_id, &file.content, &state)
-                            .await?;
+                        push_file_content(
+                            &client,
+                            &server,
+                            &identifier,
+                            &file.content,
+                            &state,
+                            use_paths,
+                        )
+                        .await?;
                     }
                 } else {
                     // Server has content
@@ -732,11 +830,27 @@ async fn run_directory_mode(
                 }
             } else if should_push_content {
                 // Node doesn't exist yet or returned non-success - push content with retries
-                info!("Node not ready, will push with retries for: {}", node_id);
+                info!("Node not ready, will push with retries for: {}", identifier);
                 if !file.is_binary && file.content_type.starts_with("application/json") {
-                    push_json_content(&client, &server, &node_id, &file.content, &state).await?;
+                    push_json_content(
+                        &client,
+                        &server,
+                        &identifier,
+                        &file.content,
+                        &state,
+                        use_paths,
+                    )
+                    .await?;
                 } else {
-                    push_file_content(&client, &server, &node_id, &file.content, &state).await?;
+                    push_file_content(
+                        &client,
+                        &server,
+                        &identifier,
+                        &file.content,
+                        &state,
+                        use_paths,
+                    )
+                    .await?;
                 }
             }
         }
@@ -748,9 +862,10 @@ async fn run_directory_mode(
                 file.relative_path.clone(),
                 FileSyncState {
                     relative_path: file.relative_path.clone(),
-                    node_id: node_id.clone(),
+                    identifier: identifier.clone(),
                     state,
                     task_handles: Vec::new(), // Will be populated after initial sync
+                    use_paths,
                 },
             );
         }
@@ -773,6 +888,7 @@ async fn run_directory_mode(
         fs_root_id.clone(),
         directory.clone(),
         file_states.clone(),
+        use_paths,
     ));
 
     // Start file sync tasks for each file and store handles in FileSyncState
@@ -785,9 +901,10 @@ async fn run_directory_mode(
             file_state.task_handles = spawn_file_sync_tasks(
                 client.clone(),
                 server.clone(),
-                file_state.node_id.clone(),
+                file_state.identifier.clone(),
                 file_path,
                 file_state.state.clone(),
+                file_state.use_paths,
             );
         }
     }
@@ -859,7 +976,11 @@ async fn run_directory_mode(
 
                         if !already_tracked && path.is_file() {
                             // New file - push schema first so server creates the node
-                            let node_id = format!("{}:{}", fs_root_id, relative_path);
+                            let identifier = if use_paths {
+                                relative_path.clone()
+                            } else {
+                                format!("{}:{}", fs_root_id, relative_path)
+                            };
                             let state = Arc::new(RwLock::new(SyncState::new()));
 
                             // Push updated schema FIRST so server reconciler creates the node
@@ -890,15 +1011,29 @@ async fn run_directory_mode(
                                     String::from_utf8_lossy(&raw_content).to_string()
                                 };
 
-                                if let Err(e) = if !is_binary
-                                    && content_info.mime_type == "application/json"
+                                if let Err(e) =
+                                    if !is_binary && content_info.mime_type == "application/json" {
+                                        push_json_content(
+                                            &client,
+                                            &server,
+                                            &identifier,
+                                            &content,
+                                            &state,
+                                            use_paths,
+                                        )
+                                        .await
+                                    } else {
+                                        push_file_content(
+                                            &client,
+                                            &server,
+                                            &identifier,
+                                            &content,
+                                            &state,
+                                            use_paths,
+                                        )
+                                        .await
+                                    }
                                 {
-                                    push_json_content(&client, &server, &node_id, &content, &state)
-                                        .await
-                                } else {
-                                    push_file_content(&client, &server, &node_id, &content, &state)
-                                        .await
-                                } {
                                     warn!("Failed to push new file content: {}", e);
                                 }
                             }
@@ -907,9 +1042,10 @@ async fn run_directory_mode(
                             let task_handles = spawn_file_sync_tasks(
                                 client.clone(),
                                 server.clone(),
-                                node_id.clone(),
+                                identifier.clone(),
                                 path.clone(),
                                 state.clone(),
+                                use_paths,
                             );
 
                             // Add to file_states with task handles
@@ -919,9 +1055,10 @@ async fn run_directory_mode(
                                     relative_path.clone(),
                                     FileSyncState {
                                         relative_path: relative_path.clone(),
-                                        node_id,
+                                        identifier,
                                         state,
                                         task_handles,
+                                        use_paths,
                                     },
                                 );
                             }
@@ -1056,12 +1193,13 @@ async fn push_schema_to_server(
 async fn push_json_content(
     client: &Client,
     server: &str,
-    node_id: &str,
+    identifier: &str,
     content: &str,
     state: &Arc<RwLock<SyncState>>,
+    use_paths: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
-    let edit_url = format!("{}/docs/{}/edit", server, encode_node_id(node_id));
+    let head_url = build_head_url(server, identifier, use_paths);
+    let edit_url = build_edit_url(server, identifier, use_paths);
     let mut attempts = 0;
     let max_attempts = 30; // 3 seconds max wait
 
@@ -1070,8 +1208,8 @@ async fn push_json_content(
         if head_resp.status() == reqwest::StatusCode::NOT_FOUND && attempts < max_attempts {
             attempts += 1;
             info!(
-                "Node {} not found, waiting for reconciler (attempt {}/{})",
-                node_id, attempts, max_attempts
+                "Identifier {} not found, waiting for reconciler (attempt {}/{})",
+                identifier, attempts, max_attempts
             );
             sleep(Duration::from_millis(100)).await;
             continue;
@@ -1103,8 +1241,8 @@ async fn push_json_content(
         if resp.status() == reqwest::StatusCode::NOT_FOUND && attempts < max_attempts {
             attempts += 1;
             info!(
-                "Node {} not found, waiting for reconciler (attempt {}/{})",
-                node_id, attempts, max_attempts
+                "Identifier {} not found, waiting for reconciler (attempt {}/{})",
+                identifier, attempts, max_attempts
             );
             sleep(Duration::from_millis(100)).await;
             continue;
@@ -1119,12 +1257,13 @@ async fn push_json_content(
 async fn push_file_content(
     client: &Client,
     server: &str,
-    node_id: &str,
+    identifier: &str,
     content: &str,
     state: &Arc<RwLock<SyncState>>,
+    use_paths: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // First check if there's existing content
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
+    let head_url = build_head_url(server, identifier, use_paths);
     let head_resp = client.get(&head_url).send().await;
 
     match head_resp {
@@ -1132,12 +1271,7 @@ async fn push_file_content(
             let head: HeadResponse = resp.json().await?;
             if let Some(parent_cid) = head.cid {
                 // Use replace endpoint
-                let replace_url = format!(
-                    "{}/docs/{}/replace?parent_cid={}&author=sync-client",
-                    server,
-                    encode_node_id(node_id),
-                    parent_cid
-                );
+                let replace_url = build_replace_url(server, identifier, &parent_cid, use_paths);
                 let resp = client
                     .post(&replace_url)
                     .header("content-type", "text/plain")
@@ -1157,9 +1291,9 @@ async fn push_file_content(
     }
 
     // No existing content, use edit endpoint with retry for node creation
-    debug!("Using edit endpoint for initial content: {}", node_id);
+    debug!("Using edit endpoint for initial content: {}", identifier);
     let update = create_yjs_text_update(content);
-    let edit_url = format!("{}/docs/{}/edit", server, encode_node_id(node_id));
+    let edit_url = build_edit_url(server, identifier, use_paths);
     let edit_req = EditRequest {
         update,
         author: Some("sync-client".to_string()),
@@ -1177,19 +1311,19 @@ async fn push_file_content(
             let mut s = state.write().await;
             s.last_written_cid = Some(result.cid);
             s.last_written_content = content.to_string();
-            info!("Successfully pushed content for: {}", node_id);
+            info!("Successfully pushed content for: {}", identifier);
             return Ok(());
         } else if resp.status() == reqwest::StatusCode::NOT_FOUND && attempts < max_attempts {
             // Node not created yet by reconciler, wait and retry
             attempts += 1;
             info!(
-                "Node {} not found, waiting for reconciler (attempt {}/{})",
-                node_id, attempts, max_attempts
+                "Identifier {} not found, waiting for reconciler (attempt {}/{})",
+                identifier, attempts, max_attempts
             );
             sleep(Duration::from_millis(100)).await;
         } else {
             let body = resp.text().await.unwrap_or_default();
-            warn!("Failed to push content for {}: {}", node_id, body);
+            warn!("Failed to push content for {}: {}", identifier, body);
             return Ok(());
         }
     }
@@ -1330,7 +1464,9 @@ async fn directory_sse_task(
     fs_root_id: String,
     directory: PathBuf,
     file_states: Arc<RwLock<HashMap<String, FileSyncState>>>,
+    use_paths: bool,
 ) {
+    // fs-root schema subscription always uses ID-based API
     let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&fs_root_id));
 
     loop {
@@ -1368,6 +1504,7 @@ async fn directory_sse_task(
                                 &directory,
                                 &file_states,
                                 true, // spawn_tasks: true for runtime schema changes
+                                use_paths,
                             )
                             .await
                             {
@@ -1401,8 +1538,9 @@ async fn handle_schema_change(
     directory: &std::path::Path,
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
     spawn_tasks: bool,
+    use_paths: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Fetch current schema from server
+    // Fetch current schema from server (fs-root schema always uses ID-based API)
     let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
     let resp = client.get(&head_url).send().await?;
 
@@ -1447,10 +1585,15 @@ async fn handle_schema_change(
                 continue;
             }
 
-            // Use explicit node_id if present, otherwise derive from path
-            let node_id = explicit_node_id
-                .clone()
-                .unwrap_or_else(|| format!("{}:{}", fs_root_id, path));
+            // When use_paths=true, use path for /files/* API
+            // When use_paths=false, use explicit node_id or derive as fs_root:path for /docs/* API
+            let identifier = if use_paths {
+                path.clone()
+            } else {
+                explicit_node_id
+                    .clone()
+                    .unwrap_or_else(|| format!("{}:{}", fs_root_id, path))
+            };
 
             info!(
                 "Server created new file: {} -> {}",
@@ -1466,7 +1609,7 @@ async fn handle_schema_change(
             }
 
             // Fetch content from server
-            let file_head_url = format!("{}/docs/{}/head", server, encode_node_id(&node_id));
+            let file_head_url = build_head_url(server, &identifier, use_paths);
             if let Ok(resp) = client.get(&file_head_url).send().await {
                 if resp.status().is_success() {
                     if let Ok(file_head) = resp.json::<HeadResponse>().await {
@@ -1516,9 +1659,10 @@ async fn handle_schema_change(
                             spawn_file_sync_tasks(
                                 client.clone(),
                                 server.to_string(),
-                                node_id.clone(),
+                                identifier.clone(),
                                 file_path.clone(),
                                 state.clone(),
+                                use_paths,
                             )
                         } else {
                             Vec::new()
@@ -1529,9 +1673,10 @@ async fn handle_schema_change(
                             path.clone(),
                             FileSyncState {
                                 relative_path: path.clone(),
-                                node_id,
+                                identifier,
                                 state,
                                 task_handles,
+                                use_paths,
                             },
                         );
                     }
@@ -1705,10 +1850,11 @@ const BARRIER_RETRY_DELAY: Duration = Duration::from_millis(50);
 async fn upload_task(
     client: Client,
     server: String,
-    node_id: String,
+    identifier: String,
     file_path: PathBuf,
     state: Arc<RwLock<SyncState>>,
     mut rx: mpsc::Receiver<FileEvent>,
+    use_paths: bool,
 ) {
     while let Some(_event) = rx.recv().await {
         // Read current file content as bytes
@@ -1884,7 +2030,8 @@ async fn upload_task(
         if echo_detected {
             if should_refresh {
                 let refresh_succeeded =
-                    refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+                    refresh_from_head(&client, &server, &identifier, &file_path, &state, use_paths)
+                        .await;
                 if !refresh_succeeded {
                     // Re-set the flag so we try again next time
                     let mut s = state.write().await;
@@ -1896,7 +2043,9 @@ async fn upload_task(
 
         if is_json {
             let json_upload_succeeded =
-                match push_json_content(&client, &server, &node_id, &content, &state).await {
+                match push_json_content(&client, &server, &identifier, &content, &state, use_paths)
+                    .await
+                {
                     Ok(_) => true,
                     Err(e) => {
                         error!("JSON upload failed: {}", e);
@@ -1907,8 +2056,15 @@ async fn upload_task(
             // IMPORTANT: Don't refresh after failed upload to avoid overwriting local edits
             if should_refresh {
                 if json_upload_succeeded {
-                    let refresh_succeeded =
-                        refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+                    let refresh_succeeded = refresh_from_head(
+                        &client,
+                        &server,
+                        &identifier,
+                        &file_path,
+                        &state,
+                        use_paths,
+                    )
+                    .await;
                     if !refresh_succeeded {
                         let mut s = state.write().await;
                         s.needs_head_refresh = true;
@@ -1934,12 +2090,7 @@ async fn upload_task(
         match parent_cid {
             Some(parent) => {
                 // Normal case: use replace endpoint
-                let replace_url = format!(
-                    "{}/docs/{}/replace?parent_cid={}&author=sync-client",
-                    server,
-                    encode_node_id(&node_id),
-                    parent
-                );
+                let replace_url = build_replace_url(&server, &identifier, &parent, use_paths);
 
                 match client
                     .post(&replace_url)
@@ -1984,7 +2135,7 @@ async fn upload_task(
                 // First commit: use edit endpoint with generated Yjs update
                 info!("Creating initial commit...");
                 let update = create_yjs_text_update(&content);
-                let edit_url = format!("{}/docs/{}/edit", server, encode_node_id(&node_id));
+                let edit_url = build_edit_url(&server, &identifier, use_paths);
                 let edit_req = EditRequest {
                     update,
                     author: Some("sync-client".to_string()),
@@ -2031,7 +2182,8 @@ async fn upload_task(
         if should_refresh {
             if upload_succeeded {
                 let refresh_succeeded =
-                    refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+                    refresh_from_head(&client, &server, &identifier, &file_path, &state, use_paths)
+                        .await;
                 if !refresh_succeeded {
                     let mut s = state.write().await;
                     s.needs_head_refresh = true;
@@ -2049,11 +2201,12 @@ async fn upload_task(
 async fn sse_task(
     client: Client,
     server: String,
-    node_id: String,
+    identifier: String,
     file_path: PathBuf,
     state: Arc<RwLock<SyncState>>,
+    use_paths: bool,
 ) {
-    let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&node_id));
+    let sse_url = build_sse_url(&server, &identifier, use_paths);
 
     loop {
         info!("Connecting to SSE: {}", sse_url);
@@ -2086,7 +2239,13 @@ async fn sse_task(
                             match serde_json::from_str::<EditEventData>(&msg.data) {
                                 Ok(edit) => {
                                     handle_server_edit(
-                                        &client, &server, &node_id, &file_path, &state, &edit,
+                                        &client,
+                                        &server,
+                                        &identifier,
+                                        &file_path,
+                                        &state,
+                                        &edit,
+                                        use_paths,
                                     )
                                     .await;
                                 }
@@ -2128,14 +2287,15 @@ const PENDING_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 async fn refresh_from_head(
     client: &Client,
     server: &str,
-    node_id: &str,
+    identifier: &str,
     file_path: &PathBuf,
     state: &Arc<RwLock<SyncState>>,
+    use_paths: bool,
 ) -> bool {
     debug!("Refreshing from HEAD due to skipped server edit");
 
     // Fetch HEAD
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
+    let head_url = build_head_url(server, identifier, use_paths);
     let resp = match client.get(&head_url).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -2219,16 +2379,17 @@ async fn refresh_from_head(
 async fn handle_server_edit(
     client: &Client,
     server: &str,
-    node_id: &str,
+    identifier: &str,
     file_path: &PathBuf,
     state: &Arc<RwLock<SyncState>>,
     _edit: &EditEventData,
+    use_paths: bool,
 ) {
     // Detect if this file is binary (use both extension and content-based detection)
     let content_info = detect_from_path(file_path);
 
     // Fetch new content from server first
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
+    let head_url = build_head_url(server, identifier, use_paths);
     let resp = match client.get(&head_url).send().await {
         Ok(r) => r,
         Err(e) => {
