@@ -1965,30 +1965,28 @@ async fn handle_server_edit(
         s.last_written_content = head.content.clone();
     }
 
-    // Write to local file (atomic via temp file)
+    // Write directly to local file (not atomic)
+    // We avoid temp+rename because it changes the inode, which breaks
+    // inotify file watchers on Linux. Since the server is authoritative,
+    // partial writes on crash are recoverable via re-sync.
     // For binary files, decode base64 before writing
-    let temp_path = file_path.with_extension("tmp");
     let write_result = if is_binary {
         use base64::{engine::general_purpose::STANDARD, Engine};
         match STANDARD.decode(&head.content) {
-            Ok(decoded) => tokio::fs::write(&temp_path, &decoded).await,
+            Ok(decoded) => tokio::fs::write(file_path, &decoded).await,
             Err(e) => {
                 error!("Failed to decode base64 content: {}", e);
                 return;
             }
         }
     } else {
-        tokio::fs::write(&temp_path, &head.content).await
+        tokio::fs::write(file_path, &head.content).await
     };
 
     if let Err(e) = write_result {
-        error!("Failed to write temp file: {}", e);
+        error!("Failed to write file: {}", e);
         // Note: state is already updated, which is fine - next server event
         // will retry and the echo detection will still work correctly
-        return;
-    }
-    if let Err(e) = tokio::fs::rename(&temp_path, file_path).await {
-        error!("Failed to rename temp file: {}", e);
         return;
     }
 
