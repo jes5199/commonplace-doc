@@ -1888,6 +1888,10 @@ async fn upload_task(
             if let Err(e) = push_json_content(&client, &server, &node_id, &content, &state).await {
                 error!("JSON upload failed: {}", e);
             }
+            // Refresh from HEAD if server edits were skipped
+            if should_refresh {
+                refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+            }
             continue;
         }
 
