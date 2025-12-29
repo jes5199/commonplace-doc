@@ -84,24 +84,36 @@ async fn main() {
         }
         manager.shutdown().await;
     } else {
-        // Spawn the run loop in a task so we can handle shutdown
-        let run_handle = tokio::spawn(async move {
-            if let Err(e) = manager.run().await {
-                tracing::error!("[orchestrator] Run error: {}", e);
-            }
-            manager
+        // Start all processes
+        if let Err(e) = manager.start_all().await {
+            tracing::error!("[orchestrator] Failed to start processes: {}", e);
+            std::process::exit(1);
+        }
+
+        // Create a shutdown signal
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Spawn Ctrl+C handler
+        tokio::spawn(async move {
+            let _ = signal::ctrl_c().await;
+            tracing::info!("[orchestrator] Received Ctrl+C");
+            let _ = shutdown_tx.send(());
         });
 
-        tokio::select! {
-            _ = signal::ctrl_c() => {
-                tracing::info!("[orchestrator] Received Ctrl+C");
+        // Run monitoring loop until shutdown
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                    // Check for exited processes and restart if needed
+                    manager.check_and_restart().await;
+                }
             }
         }
 
-        // Abort the run loop and get manager back for shutdown
-        run_handle.abort();
-        // Note: We can't easily get the manager back after abort, so we'll just exit
-        // The OS will clean up child processes
-        tracing::info!("[orchestrator] Shutdown complete");
+        // Gracefully shutdown all child processes
+        manager.shutdown().await;
     }
 }
