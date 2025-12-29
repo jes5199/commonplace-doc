@@ -4,12 +4,11 @@ A Rust server for managing documents with a small REST API, plus Server-Sent Eve
 
 ## Features
 
-- **REST API** for document CRUD operations (`/docs`)
-- **Node API** for reactive document graph (`/nodes`) - nodes receive/emit edits and events, can be wired together
+- **REST API** for document CRUD and CRDT operations (`/docs`)
 - Support for multiple content types: JSON, XML, and plain text
 - **Commit endpoint** (`/docs/:id/commit`) that persists content-addressed commits to a local `redb` database (enabled with `--database`)
 - For `text/plain`, `application/json`, and `application/xml` documents, commits are applied to the in-memory document body (so `GET /docs/:id` reflects committed edits)
-- **SSE** for real-time node subscriptions and document updates with history replay
+- **SSE** for real-time document subscriptions and updates with history replay
 - Built with [Axum](https://github.com/tokio-rs/axum) web framework
 - In-memory document storage (document bodies are not persisted)
 
@@ -120,82 +119,65 @@ GET /health
 
 Returns "OK" if the server is running.
 
-### Node API
+### Document CRDT Operations
 
-The Node API provides a reactive abstraction where nodes can receive and emit edits (commits) and events (ephemeral JSON messages). Nodes can be wired together to create processing graphs.
+Additional endpoints for Yjs CRDT operations on documents:
 
-#### Create Node
+#### Get Document Info
 ```bash
-POST /nodes
-Content-Type: application/json
-
-{"node_type": "document", "content_type": "application/json"}
+GET /docs/{id}/info
 ```
 
-Creates a new node. Currently only `"document"` type is supported. Returns:
+Returns document metadata:
 ```json
-{"id": "uuid", "node_type": "document"}
+{"id": "uuid", "type": "document"}
 ```
 
-#### List Nodes
+#### Get Document Head
 ```bash
-GET /nodes
+GET /docs/{id}/head
 ```
 
-Returns all registered nodes with their status.
-
-#### Get Node Info
-```bash
-GET /nodes/{id}
+Returns the document HEAD with CID, content, and Yjs state:
+```json
+{"cid": "commit-id", "content": "document content", "state": "base64_yjs_state"}
 ```
 
-Returns node details including subscriber count and health status.
-
-#### Delete Node
+#### Send Edit
 ```bash
-DELETE /nodes/{id}
-```
-
-Shuts down and removes a node.
-
-#### Send Edit to Node
-```bash
-POST /nodes/{id}/edit
+POST /docs/{id}/edit
 Content-Type: application/json
 
 {"update": "base64_yjs_update", "author": "alice", "message": "optional"}
 ```
 
-Sends a Yjs update to the node. The node applies it and emits to subscribers.
-
-#### Send Event to Node
-```bash
-POST /nodes/{id}/event
-Content-Type: application/json
-
-{"event_type": "cursor", "payload": {"x": 100, "y": 200}}
-```
-
-Sends an ephemeral event to the node. Events are forwarded to subscribers but not persisted.
-
-#### Wire Nodes
-```bash
-POST /nodes/{from}/wire/{to}
-```
-
-Wires two nodes together. Edits and events emitted by `from` are sent to `to`. Returns:
+Sends a Yjs update to the document. Returns:
 ```json
-{"subscription_id": "uuid", "from": "node1", "to": "node2"}
+{"cid": "new-commit-id"}
 ```
 
-Cycle detection prevents creating circular dependencies.
-
-#### Unwire Nodes
+#### Replace Content
 ```bash
-DELETE /nodes/{from}/wire/{to}
+POST /docs/{id}/replace?parent_cid=...&author=...
+Content-Type: text/plain
+
+New document content here
 ```
 
-Removes the wiring between nodes.
+Replaces document content with automatic diff computation. Returns:
+```json
+{"cid": "commit-id", "edit_cid": "edit-id", "summary": {"chars_inserted": 10, "chars_deleted": 5, "operations": 2}}
+```
+
+#### Fork Document
+```bash
+POST /docs/{id}/fork?at_commit=...
+```
+
+Creates a fork of the document at HEAD or a specific commit. Returns:
+```json
+{"id": "new-doc-id", "head": "commit-id"}
+```
 
 ### SSE
 
@@ -227,7 +209,7 @@ Commit notifications include canonical URLs of the form `commonplace://document/
 
 ### Blue and Red Edges
 
-Nodes communicate through two distinct types of connections:
+Documents communicate through two distinct types of connections:
 
 **Blue edges (edits)** carry persistent document changes:
 - Yjs CRDT commits backed by merkle-tree storage
@@ -236,10 +218,10 @@ Nodes communicate through two distinct types of connections:
 
 **Red edges (events)** carry ephemeral messages:
 - JSON envelopes for cursors, presence, metadata
-- Any client can POST to any node's red port (no subscription needed)
-- Optionally subscribe to a node's red broadcasts
+- Any client can POST to any document's red port (no subscription needed)
+- Optionally subscribe to a document's red broadcasts
 
-When you connect via SSE, the server creates a transient **ConnectionNode** with a server-generated UUID. This node subscribes to the document's blue port and has its own red port for receiving events. The node is automatically cleaned up when the TCP connection closes.
+When you connect via SSE, the server creates a transient connection with a server-generated UUID. This connection subscribes to the document's blue port and has its own red port for receiving events. The connection is automatically cleaned up when the TCP connection closes.
 
 See `docs/ARCHITECTURE.md` for detailed diagrams.
 
@@ -253,17 +235,17 @@ More detailed documentation:
 
 The server is organized into a few main modules:
 
-- `api.rs` - REST API endpoints for document and node management
+- `api.rs` - REST API endpoints for document management and CRDT operations
 - `document.rs` - Document storage with content type support
-- `node/` - Node trait abstraction for reactive document processing
+- `node/` - Reactive document processing internals
   - `mod.rs` - Node trait definition
   - `document_node.rs` - Document node implementation
-  - `registry.rs` - Node graph management with cycle detection
+  - `registry.rs` - Document graph management
   - `types.rs` - Edit, Event, NodeId, NodeMessage types
   - `subscription.rs` - Subscription handling
 - `commit.rs` / `store.rs` - Commit model and `redb`-backed commit storage (optional)
 - `events.rs` - Commit broadcast for SSE change notifications
-- `sse.rs` - Server-Sent Events for node subscriptions and document change streams
+- `sse.rs` - Server-Sent Events for document subscriptions and change streams
 - `main.rs` - Server initialization and routing
 
 Documents are stored in-memory using a `DocumentStore`. Each document has:

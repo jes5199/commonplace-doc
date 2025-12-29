@@ -1,10 +1,9 @@
 # Architecture
 
-This repo is a small Axum-based HTTP server with three main subsystems:
+This repo is a small Axum-based HTTP server with two main subsystems:
 
-- **Documents**: in-memory, created and fetched via `/docs`.
+- **Documents**: in-memory, created and fetched via `/docs` with CRDT operations (`/docs/:id/edit`, `/docs/:id/replace`, `/docs/:id/fork`).
 - **Commits**: optional, persisted to a local `redb` file and created via `/docs/:id/commit`.
-- **Nodes**: reactive document graph via `/nodes` - nodes receive/emit edits and events, can be wired together.
 
 For `text/plain`, `application/json`, and `application/xml` documents, commits are interpreted as Yjs (Yrs) updates and applied to the in-memory document body.
 
@@ -19,7 +18,7 @@ Internally, each document uses a Yrs root type named `content`:
 - `src/main.rs`: CLI parsing, tracing setup, server bind + serve.
 - `src/lib.rs`: router construction (`create_router_with_store`).
 - `src/cli.rs`: CLI flags (`--database`, `--host`, `--port`).
-- `src/api.rs`: REST routes under `/docs` and `/nodes`.
+- `src/api.rs`: REST routes under `/docs`.
 - `src/document.rs`: `DocumentStore` + `ContentType`.
 - `src/commit.rs`: `Commit` model + CID calculation.
 - `src/store.rs`: `CommitStore` backed by `redb`.
@@ -58,7 +57,7 @@ flowchart LR
   subgraph App["commonplace-doc (Axum)"]
     Router["Router (lib.rs)"]
 
-    API["/docs + /nodes routes (api.rs)"]
+    API["/docs routes (api.rs)"]
     SSE["/sse routes (sse.rs)"]
 
     DocStore["DocumentStore (document.rs)"]
@@ -302,18 +301,19 @@ flowchart TD
     C -.->|emit edit| Client2
 ```
 
-### Node API Routes
+### Document API Routes
 
 `src/api.rs` exposes:
 
-- `POST /nodes`: Create a node (type: "document")
-- `GET /nodes`: List all nodes
-- `GET /nodes/:id`: Get node info
-- `DELETE /nodes/:id`: Delete node
-- `POST /nodes/:id/edit`: Send edit to node
-- `POST /nodes/:id/event`: Send event to node
-- `POST /nodes/:from/wire/:to`: Wire nodes
-- `DELETE /nodes/:from/wire/:to`: Unwire nodes
+- `POST /docs`: Create a document (JSON body with `content_type` or Content-Type header)
+- `GET /docs/:id`: Get raw document content
+- `DELETE /docs/:id`: Delete document
+- `GET /docs/:id/info`: Get document metadata
+- `GET /docs/:id/head`: Get HEAD (cid, content, Yjs state)
+- `POST /docs/:id/commit`: Create a commit
+- `POST /docs/:id/edit`: Send Yjs edit to document
+- `POST /docs/:id/replace`: Replace content with diff computation
+- `POST /docs/:id/fork`: Fork document
 
 ## SSE Endpoint
 

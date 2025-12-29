@@ -1,15 +1,15 @@
 //! HTTP Gateway API routes - translates HTTP to MQTT
 //!
-//! ## Node ID Encoding
+//! ## Document ID Encoding
 //!
-//! Node IDs may contain path separators (e.g., `foo/bar/file.txt`). When making
+//! Document IDs may contain path separators (e.g., `foo/bar/file.txt`). When making
 //! HTTP requests, these must be URL-encoded. For example:
 //!
-//! - Node ID: `foo/bar/file.txt`
-//! - HTTP path: `/nodes/foo%2Fbar%2Ffile.txt/edit`
+//! - Doc ID: `foo/bar/file.txt`
+//! - HTTP path: `/docs/foo%2Fbar%2Ffile.txt/edit`
 //!
 //! Axum automatically URL-decodes the path parameter, so the handler receives
-//! the original node ID.
+//! the original document ID.
 
 use axum::{
     extract::{Path, State},
@@ -27,9 +27,9 @@ use crate::mqtt::{messages::EditMessage, topics::Topic};
 /// Create the HTTP gateway router
 pub fn router(gateway: Arc<HttpGateway>) -> Router {
     Router::new()
-        .route("/nodes/:id", get(get_node_content))
-        .route("/nodes/:id/edit", post(send_edit))
-        .route("/nodes/:id/event", post(send_event))
+        .route("/docs/:id", get(get_doc_content))
+        .route("/docs/:id/edit", post(send_edit))
+        .route("/docs/:id/event", post(send_event))
         .nest("/sse", super::sse::router(gateway.clone()))
         .with_state(gateway)
 }
@@ -58,7 +58,7 @@ struct SendEventRequest {
 }
 
 #[derive(Serialize)]
-struct NodeContentResponse {
+struct DocContentResponse {
     /// Current HEAD commit ID (None if no commits yet)
     cid: Option<String>,
     /// Document content at HEAD
@@ -69,7 +69,7 @@ struct NodeContentResponse {
 // Handlers
 // ============================================================================
 
-/// POST /nodes/{id}/edit - Send a Yjs edit to a node via MQTT
+/// POST /docs/{id}/edit - Send a Yjs edit to a document via MQTT
 async fn send_edit(
     State(gateway): State<Arc<HttpGateway>>,
     Path(id): Path<String>,
@@ -108,7 +108,7 @@ async fn send_edit(
     }))
 }
 
-/// POST /nodes/{id}/event - Send an event to a node via MQTT
+/// POST /docs/{id}/event - Send an event to a document via MQTT
 async fn send_event(
     State(gateway): State<Arc<HttpGateway>>,
     Path(id): Path<String>,
@@ -130,21 +130,21 @@ async fn send_event(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// GET /nodes/{id} - Get current node content via MQTT sync protocol
+/// GET /docs/{id} - Get current document content via MQTT sync protocol
 ///
 /// Note: This is a simplified implementation. Full content retrieval would
 /// require running the MQTT event loop to receive responses. For now, this
 /// returns a placeholder indicating the gateway doesn't maintain document state.
-async fn get_node_content(
+async fn get_doc_content(
     State(_gateway): State<Arc<HttpGateway>>,
     Path(id): Path<String>,
-) -> Result<Json<NodeContentResponse>, (StatusCode, String)> {
+) -> Result<Json<DocContentResponse>, (StatusCode, String)> {
     // The HTTP gateway is stateless - it doesn't maintain document state.
     // To get document content, clients should:
     // 1. Subscribe via SSE to receive updates
     // 2. Use the sync protocol directly via MQTT
     //
-    // For now, return a response indicating the node ID was received
+    // For now, return a response indicating the document ID was received
     // but content is not available through the stateless gateway.
     //
     // TODO: Implement proper sync protocol request/response via MQTT
@@ -152,7 +152,7 @@ async fn get_node_content(
     // response correlation.
 
     tracing::warn!(
-        "GET /nodes/{} - content retrieval not implemented in stateless gateway",
+        "GET /docs/{} - content retrieval not implemented in stateless gateway",
         id
     );
 

@@ -16,9 +16,8 @@ This is a Rust server for managing documents with support for multiple content t
 - **Purpose**: Document management server with multi-format support and reactive node graph
 - **Web Framework**: Axum 0.7
 - **API Protocols**:
-  - REST API for document CRUD operations (`/docs`)
-  - Node API for reactive document graph (`/nodes`)
-  - SSE (Server-Sent Events) for real-time node subscriptions
+  - REST API for document CRUD and CRDT operations (`/docs`)
+  - SSE (Server-Sent Events) for real-time document subscriptions
 
 ### Key Dependencies
 
@@ -39,7 +38,7 @@ src/
 ├── lib.rs              # Library root, router setup
 ├── bin/
 │   └── server.rs       # HTTP server binary (commonplace-server)
-├── api.rs              # REST API endpoints (/docs, /nodes)
+├── api.rs              # REST API endpoints (/docs)
 ├── sse.rs              # Server-Sent Events for subscriptions
 ├── document.rs         # DocumentStore, ContentType enum
 ├── commit.rs           # Commit model (merkle-tree)
@@ -62,22 +61,17 @@ The server runs on `localhost:3000` by default.
 
 ### API Endpoints
 
-#### REST API
-- `POST /docs` - Create a blank document (Content-Type header: application/json, application/xml, or text/plain)
-- `GET /docs/{uuid}` - Retrieve document content
-- `DELETE /docs/{uuid}` - Delete a document
-- `POST /docs/{uuid}/commit` - Persist a Yjs update and apply it to the document (requires `--database`)
+#### Document API
+- `POST /docs` - Create a document (JSON body with `content_type` or Content-Type header)
+- `GET /docs/{id}` - Retrieve raw document content
+- `DELETE /docs/{id}` - Delete a document
+- `GET /docs/{id}/info` - Get document metadata (id, type)
+- `GET /docs/{id}/head` - Get document HEAD (cid, content, Yjs state)
+- `POST /docs/{id}/commit` - Persist a Yjs update (requires `--database`)
+- `POST /docs/{id}/edit` - Send a Yjs update to a document
+- `POST /docs/{id}/replace` - Replace content with diff computation
+- `POST /docs/{id}/fork` - Fork a document at HEAD or specific commit
 - `GET /health` - Health check
-
-#### Node API
-- `POST /nodes` - Create a node (type: "document")
-- `GET /nodes` - List all nodes
-- `GET /nodes/{id}` - Get node info
-- `DELETE /nodes/{id}` - Delete a node
-- `POST /nodes/{id}/edit` - Send an edit (Yjs update) to a node
-- `POST /nodes/{id}/event` - Send an event (ephemeral JSON) to a node
-- `POST /nodes/{from}/wire/{to}` - Wire two nodes together
-- `DELETE /nodes/{from}/wire/{to}` - Remove wiring between nodes
 
 #### SSE
 - `GET /sse/docs/{id}` - Subscribe to real-time document updates
@@ -86,12 +80,12 @@ The server runs on `localhost:3000` by default.
 
 ### Blue and Red Edges
 
-Nodes communicate via two port types:
+Documents communicate via two port types:
 
 - **Blue (edits)**: Persistent Yjs commits. Subscribe to watch changes, push to edit. Must listen before editing (need parent context).
-- **Red (events)**: Ephemeral JSON. Any client can POST to any node's red port. Subscribe to watch broadcasts.
+- **Red (events)**: Ephemeral JSON. Any client can POST to any document's red port. Subscribe to watch broadcasts.
 
-SSE connections are transient nodes with server-generated UUIDs. They subscribe to a document's blue port and have their own red port for receiving events.
+SSE connections are transient with server-generated UUIDs. They subscribe to a document's blue port and have their own red port for receiving events.
 
 See `docs/ARCHITECTURE.md` for detailed diagrams.
 
