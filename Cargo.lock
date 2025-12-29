@@ -310,6 +310,7 @@ dependencies = [
  "futures",
  "hex",
  "http-body-util",
+ "libc",
  "notify",
  "redb",
  "reqwest",

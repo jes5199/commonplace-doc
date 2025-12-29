@@ -54,6 +54,7 @@ thiserror = "1.0"
 urlencoding = "2.1"
 rumqttc = "0.24"
 tokio-stream = "0.1"
+libc = "0.2"
 
 [dev-dependencies]
 http-body-util = "0.1"

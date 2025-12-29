@@ -241,4 +241,48 @@ impl ProcessManager {
             }
         }
     }
+
+    pub async fn shutdown(&mut self) {
+        tracing::info!("[orchestrator] Shutting down...");
+
+        let order = self.config.startup_order().unwrap_or_default();
+
+        for name in order.iter().rev() {
+            if let Some(process) = self.processes.get_mut(name) {
+                if let Some(ref mut child) = process.handle {
+                    tracing::info!("[orchestrator] Stopping '{}'", name);
+
+                    #[cfg(unix)]
+                    {
+                        if let Some(pid) = child.id() {
+                            unsafe {
+                                libc::kill(pid as i32, libc::SIGTERM);
+                            }
+                        }
+                    }
+
+                    let timeout =
+                        tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+
+                    match timeout {
+                        Ok(Ok(_)) => {
+                            tracing::info!("[orchestrator] '{}' stopped gracefully", name);
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "[orchestrator] '{}' didn't stop gracefully, killing",
+                                name
+                            );
+                            let _ = child.kill().await;
+                        }
+                    }
+
+                    process.handle = None;
+                    process.state = ProcessState::Stopped;
+                }
+            }
+        }
+
+        tracing::info!("[orchestrator] Shutdown complete");
+    }
 }
