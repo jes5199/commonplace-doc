@@ -21,17 +21,20 @@ pub struct SseState {
     pub doc_store: Arc<DocumentStore>,
     pub commit_store: Option<Arc<CommitStore>>,
     pub broadcaster: Option<CommitBroadcaster>,
+    pub fs_root: Option<String>,
 }
 
 pub fn router(
     doc_store: Arc<DocumentStore>,
     commit_store: Option<Arc<CommitStore>>,
     broadcaster: Option<CommitBroadcaster>,
+    fs_root: Option<String>,
 ) -> Router {
     let state = SseState {
         doc_store,
         commit_store,
         broadcaster,
+        fs_root,
     };
 
     Router::new()
@@ -42,6 +45,8 @@ pub fn router(
         .route("/documents/stream", get(stream_documents_changes))
         // Document SSE endpoints (for sync client)
         .route("/sse/docs/:id", get(stream_doc))
+        // Path-based SSE endpoint
+        .route("/sse/files/*path", get(stream_file))
         .with_state(state)
 }
 
@@ -299,10 +304,41 @@ struct CommitEventData {
     message: Option<String>,
 }
 
-/// Stream edit events for a document
+/// Stream edit events for a document (by ID)
 async fn stream_doc(
     State(state): State<SseState>,
     Path(doc_id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    stream_doc_by_id(state, doc_id).await
+}
+
+/// Stream edit events for a document by path
+async fn stream_file(
+    State(state): State<SseState>,
+    Path(path): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    // Resolve path to document ID
+    let fs_root_id = state
+        .fs_root
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let fs_root_doc = state
+        .doc_store
+        .get_document(fs_root_id)
+        .await
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let doc_id = crate::document::resolve_path_to_uuid(&fs_root_doc.content, &path, fs_root_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    stream_doc_by_id(state, doc_id).await
+}
+
+/// Shared implementation for streaming edit events
+async fn stream_doc_by_id(
+    state: SseState,
+    doc_id: String,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
     // Verify document exists
     if state.doc_store.get_document(&doc_id).await.is_none() {
