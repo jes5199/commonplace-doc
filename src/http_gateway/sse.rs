@@ -10,7 +10,6 @@ use futures::stream::Stream;
 use rumqttc::QoS;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -40,7 +39,7 @@ async fn subscribe_to_node(
     let tx_clone = tx.clone();
     let id_clone = id.clone();
 
-    // Spawn a task to handle the MQTT subscription
+    // Spawn a task to handle the MQTT subscription and forward messages
     tokio::spawn(async move {
         // Subscribe to edits
         if let Err(e) = gateway_clone
@@ -64,25 +63,46 @@ async fn subscribe_to_node(
                 .data(format!("{{\"node_id\": \"{}\"}}", id_clone))))
             .await;
 
-        // Note: In a full implementation, we would need to:
-        // 1. Set up a message handler on the MQTT client
-        // 2. Forward matching messages to this channel
-        // 3. Handle client disconnect to unsubscribe
-        //
-        // For now, this is a placeholder that sends keepalive pings.
-        // The actual message bridging would require changes to MqttClient
-        // to support per-topic callbacks or a shared event bus.
+        // Subscribe to the MQTT message broadcast and forward matching messages
+        let mut mqtt_rx = gateway_clone.client.subscribe_messages();
 
         loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-
-            // Check if client disconnected (channel closed)
-            if tx_clone.is_closed() {
-                // Unsubscribe from MQTT
-                let _ = gateway_clone.client.unsubscribe(&edits_topic_clone).await;
-                break;
+            tokio::select! {
+                // Wait for MQTT messages
+                result = mqtt_rx.recv() => {
+                    match result {
+                        Ok(msg) => {
+                            // Check if this message is for our topic
+                            if msg.topic == edits_topic_clone {
+                                // Convert payload to string (it's JSON)
+                                let payload = String::from_utf8_lossy(&msg.payload);
+                                if tx_clone.send(Ok(Event::default()
+                                    .event("edit")
+                                    .data(&*payload))).await.is_err() {
+                                    // Client disconnected
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("SSE subscriber lagged {} messages", n);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // MQTT client shut down
+                            break;
+                        }
+                    }
+                }
+                // Check if SSE client disconnected
+                _ = tx_clone.closed() => {
+                    break;
+                }
             }
         }
+
+        // Cleanup: unsubscribe from MQTT topic
+        let _ = gateway_clone.client.unsubscribe(&edits_topic_clone).await;
+        tracing::debug!("SSE client disconnected, unsubscribed from {}", edits_topic_clone);
     });
 
     Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
