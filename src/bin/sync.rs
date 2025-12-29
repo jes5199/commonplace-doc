@@ -1868,9 +1868,13 @@ async fn upload_task(
                 }
             } else {
                 // No barrier - normal echo detection
+                // Also check needs_head_refresh in case server edit was skipped
+                // due to local changes being pending
+                should_refresh = s.needs_head_refresh;
+                s.needs_head_refresh = false;
+
                 if content == s.last_written_content {
                     debug!("Ignoring echo: content matches last written");
-                    // No barrier means no needs_head_refresh to check
                     echo_detected = true;
                 }
             }
@@ -2129,7 +2133,10 @@ async fn refresh_from_head(
     {
         let mut s = state.write().await;
         if head.content == s.last_written_content {
-            debug!("HEAD matches last_written_content, no refresh needed");
+            // Content matches, but still update CID in case server advanced to new commit
+            // with identical content (e.g., concurrent edits that merge to same text)
+            debug!("HEAD matches last_written_content, updating CID only");
+            s.last_written_cid = head.cid.clone();
             return;
         }
         // Update state BEFORE writing file - this way if watcher fires after write,
