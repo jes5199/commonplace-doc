@@ -50,46 +50,69 @@ pub fn router(
 
     Router::new()
         // Document endpoints
-        .route("/docs", post(create_document))
-        .route("/docs/:id", get(get_document))
-        .route("/docs/:id", delete(delete_document))
+        .route("/docs", post(create_doc))
+        .route("/docs/:id", get(get_doc_content))
+        .route("/docs/:id", delete(delete_doc))
         .route("/docs/:id/commit", post(create_commit))
-        // Node endpoints (for sync client compatibility)
-        .route("/nodes", post(create_node))
-        .route("/nodes/:id", get(get_node))
-        .route("/nodes/:id/head", get(get_node_head))
-        .route("/nodes/:id/edit", post(edit_node))
-        .route("/nodes/:id/replace", post(replace_node))
-        .route("/nodes/:id/fork", post(fork_node))
+        .route("/docs/:id/info", get(get_doc_info))
+        .route("/docs/:id/head", get(get_doc_head))
+        .route("/docs/:id/edit", post(edit_doc))
+        .route("/docs/:id/replace", post(replace_doc))
+        .route("/docs/:id/fork", post(fork_doc))
         .with_state(state)
 }
 
+#[derive(Deserialize)]
+struct CreateDocRequest {
+    #[serde(rename = "type")]
+    #[allow(dead_code)]
+    doc_type: Option<String>,
+    #[serde(default)]
+    content_type: Option<String>,
+}
+
 #[derive(Serialize)]
-struct CreateDocumentResponse {
+struct CreateDocResponse {
     id: String,
 }
 
-async fn create_document(
+async fn create_doc(
     State(state): State<ApiState>,
     headers: HeaderMap,
-) -> Result<Json<CreateDocumentResponse>, StatusCode> {
-    // Get Content-Type header
-    let content_type_str = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json");
+    body: Option<Json<CreateDocRequest>>,
+) -> Result<Json<CreateDocResponse>, StatusCode> {
+    // Support both Content-Type header and JSON body for content_type
+    // Priority: JSON body content_type > HTTP Content-Type header
+    let content_type = if let Some(Json(ref req)) = body {
+        // Check JSON body content_type field first
+        if let Some(ct) = req.content_type.as_deref().and_then(ContentType::from_mime) {
+            ct
+        } else {
+            // Fall back to Content-Type header
+            let content_type_str = headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("text/plain");
 
-    // Parse content type
-    let content_type =
-        ContentType::from_mime(content_type_str).ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
+            ContentType::from_mime(content_type_str).ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?
+        }
+    } else {
+        // No body - use Content-Type header
+        let content_type_str = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json");
+
+        ContentType::from_mime(content_type_str).ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?
+    };
 
     // Create document
     let id = state.doc_store.create_document(content_type).await;
 
-    Ok(Json(CreateDocumentResponse { id }))
+    Ok(Json(CreateDocResponse { id }))
 }
 
-async fn get_document(
+async fn get_doc_content(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<Response, StatusCode> {
@@ -107,7 +130,7 @@ async fn get_document(
         .into_response())
 }
 
-async fn delete_document(
+async fn delete_doc(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
@@ -312,73 +335,44 @@ async fn create_commit(
 }
 
 // ============================================================================
-// Node endpoints (for sync client compatibility)
+// Document info/head/edit/replace/fork endpoints
 // ============================================================================
 
-#[derive(Deserialize)]
-struct CreateNodeRequest {
-    #[serde(rename = "type")]
-    #[allow(dead_code)]
-    node_type: Option<String>,
-    #[serde(default)]
-    content_type: Option<String>,
-}
-
 #[derive(Serialize)]
-struct CreateNodeResponse {
-    id: String,
-}
-
-async fn create_node(
-    State(state): State<ApiState>,
-    Json(req): Json<CreateNodeRequest>,
-) -> Result<Json<CreateNodeResponse>, StatusCode> {
-    let content_type = req
-        .content_type
-        .as_deref()
-        .and_then(ContentType::from_mime)
-        .unwrap_or(ContentType::Text);
-
-    let id = state.doc_store.create_document(content_type).await;
-
-    Ok(Json(CreateNodeResponse { id }))
-}
-
-#[derive(Serialize)]
-struct NodeInfoResponse {
+struct DocInfoResponse {
     id: String,
     #[serde(rename = "type")]
-    node_type: String,
+    doc_type: String,
 }
 
-async fn get_node(
+async fn get_doc_info(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-) -> Result<Json<NodeInfoResponse>, StatusCode> {
+) -> Result<Json<DocInfoResponse>, StatusCode> {
     let _doc = state
         .doc_store
         .get_document(&id)
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    Ok(Json(NodeInfoResponse {
+    Ok(Json(DocInfoResponse {
         id: id.clone(),
-        node_type: "document".to_string(),
+        doc_type: "document".to_string(),
     }))
 }
 
 #[derive(Serialize)]
-struct HeadResponse {
+struct DocHeadResponse {
     cid: Option<String>,
     content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<String>,
 }
 
-async fn get_node_head(
+async fn get_doc_head(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-) -> Result<Json<HeadResponse>, StatusCode> {
+) -> Result<Json<DocHeadResponse>, StatusCode> {
     let doc = state
         .doc_store
         .get_document(&id)
@@ -395,7 +389,7 @@ async fn get_node_head(
     let state_bytes = state.doc_store.get_yjs_state(&id).await;
     let state_b64 = state_bytes.map(|b| b64::encode(&b));
 
-    Ok(Json(HeadResponse {
+    Ok(Json(DocHeadResponse {
         cid,
         content: doc.content,
         state: state_b64,
@@ -403,7 +397,7 @@ async fn get_node_head(
 }
 
 #[derive(Deserialize)]
-struct NodeEditRequest {
+struct DocEditRequest {
     update: String,
     #[serde(default)]
     author: Option<String>,
@@ -412,15 +406,15 @@ struct NodeEditRequest {
 }
 
 #[derive(Serialize)]
-struct NodeEditResponse {
+struct DocEditResponse {
     cid: String,
 }
 
-async fn edit_node(
+async fn edit_doc(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-    Json(req): Json<NodeEditRequest>,
-) -> Result<Json<NodeEditResponse>, StatusCode> {
+    Json(req): Json<DocEditRequest>,
+) -> Result<Json<DocEditResponse>, StatusCode> {
     let commit_store = state
         .commit_store
         .as_ref()
@@ -467,7 +461,7 @@ async fn edit_node(
 
     broadcast_commit(&state, &id, &cid, timestamp);
 
-    Ok(Json(NodeEditResponse { cid }))
+    Ok(Json(DocEditResponse { cid }))
 }
 
 #[derive(Deserialize)]
@@ -491,7 +485,7 @@ struct ReplaceSummary {
     operations: usize,
 }
 
-async fn replace_node(
+async fn replace_doc(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Query(params): Query<ReplaceParams>,
@@ -569,7 +563,7 @@ struct ForkResponse {
     head: String,
 }
 
-async fn fork_node(
+async fn fork_doc(
     State(state): State<ApiState>,
     Path(source_id): Path<String>,
     Query(params): Query<ForkParams>,

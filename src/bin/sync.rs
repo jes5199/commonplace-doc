@@ -104,7 +104,7 @@ impl SyncState {
     }
 }
 
-/// Response from GET /nodes/:id/head
+/// Response from GET /docs/:id/head
 #[derive(Debug, Deserialize)]
 struct HeadResponse {
     cid: Option<String>,
@@ -114,7 +114,7 @@ struct HeadResponse {
     state: Option<String>,
 }
 
-/// Response from POST /nodes/:id/replace
+/// Response from POST /docs/:id/replace
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct ReplaceResponse {
@@ -149,7 +149,7 @@ struct CommitData {
     message: Option<String>,
 }
 
-/// Request for POST /nodes/:id/edit (initial commit)
+/// Request for POST /docs/:id/edit (initial commit)
 #[derive(Debug, Serialize)]
 struct EditRequest {
     update: String,
@@ -159,13 +159,13 @@ struct EditRequest {
     message: Option<String>,
 }
 
-/// Response from POST /nodes/:id/edit
+/// Response from POST /docs/:id/edit
 #[derive(Debug, Deserialize)]
 struct EditResponse {
     cid: String,
 }
 
-/// Response from POST /nodes/:id/fork
+/// Response from POST /docs/:id/fork
 #[derive(Debug, Deserialize)]
 struct ForkResponse {
     id: String,
@@ -307,7 +307,7 @@ async fn fork_node(
     source_node: &str,
     at_commit: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut fork_url = format!("{}/nodes/{}/fork", server, encode_node_id(source_node));
+    let mut fork_url = format!("{}/docs/{}/fork", server, encode_node_id(source_node));
     if let Some(commit) = at_commit {
         fork_url = format!("{}?at_commit={}", fork_url, commit);
     }
@@ -412,14 +412,14 @@ async fn run_file_mode(
         file.display()
     );
 
-    // Verify node exists
-    let node_url = format!("{}/nodes/{}", server, encode_node_id(&node_id));
-    let resp = client.get(&node_url).send().await?;
+    // Verify document exists
+    let doc_url = format!("{}/docs/{}/info", server, encode_node_id(&node_id));
+    let resp = client.get(&doc_url).send().await?;
     if !resp.status().is_success() {
-        error!("Node {} not found on server", node_id);
-        return Err(format!("Node {} not found", node_id).into());
+        error!("Document {} not found on server", node_id);
+        return Err(format!("Document {} not found", node_id).into());
     }
-    info!("Connected to node {}", node_id);
+    info!("Connected to document {}", node_id);
 
     // Initialize shared state
     let state = Arc::new(RwLock::new(SyncState::new()));
@@ -529,13 +529,13 @@ async fn run_directory_mode(
         return Err(format!("Not a directory: {}", directory.display()).into());
     }
 
-    // Verify fs-root node exists (or create it)
-    let node_url = format!("{}/nodes/{}", server, encode_node_id(&fs_root_id));
-    let resp = client.get(&node_url).send().await?;
+    // Verify fs-root document exists (or create it)
+    let doc_url = format!("{}/docs/{}/info", server, encode_node_id(&fs_root_id));
+    let resp = client.get(&doc_url).send().await?;
     if !resp.status().is_success() {
-        // Create the node
-        info!("Creating fs-root node: {}", fs_root_id);
-        let create_url = format!("{}/nodes", server);
+        // Create the document
+        info!("Creating fs-root document: {}", fs_root_id);
+        let create_url = format!("{}/docs", server);
         let create_resp = client
             .post(&create_url)
             .json(&serde_json::json!({
@@ -548,13 +548,13 @@ async fn run_directory_mode(
         if !create_resp.status().is_success() {
             let status = create_resp.status();
             let body = create_resp.text().await.unwrap_or_default();
-            return Err(format!("Failed to create fs-root node: {} - {}", status, body).into());
+            return Err(format!("Failed to create fs-root document: {} - {}", status, body).into());
         }
     }
-    info!("Connected to fs-root node: {}", fs_root_id);
+    info!("Connected to fs-root document: {}", fs_root_id);
 
     // Check if server has existing schema FIRST (needed for server strategy)
-    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(&fs_root_id));
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(&fs_root_id));
     let head_resp = client.get(&head_url).send().await?;
     let server_has_content = if head_resp.status().is_success() {
         let head: HeadResponse = head_resp.json().await?;
@@ -640,7 +640,7 @@ async fn run_directory_mode(
         };
 
         // Push initial content if local wins or server is empty
-        let file_head_url = format!("{}/nodes/{}/head", server, encode_node_id(&node_id));
+        let file_head_url = format!("{}/docs/{}/head", server, encode_node_id(&node_id));
         let file_head_resp = client.get(&file_head_url).send().await;
 
         let should_push_content = match &file_head_resp {
@@ -1000,7 +1000,7 @@ async fn push_schema_to_server(
     schema_json: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // First fetch current server content and state to detect deletions
-    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(fs_root_id));
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
     let head_resp = client.get(&head_url).send().await?;
     let (_old_content, base_state) = if head_resp.status().is_success() {
         let head: HeadResponse = head_resp.json().await?;
@@ -1012,7 +1012,7 @@ async fn push_schema_to_server(
     // Create an update that properly handles deletions (using server state for CRDT consistency)
     let update = create_yjs_json_update(schema_json, base_state.as_deref())
         .map_err(|e| format!("Failed to create JSON update: {}", e))?;
-    let edit_url = format!("{}/nodes/{}/edit", server, encode_node_id(fs_root_id));
+    let edit_url = format!("{}/docs/{}/edit", server, encode_node_id(fs_root_id));
     let edit_req = EditRequest {
         update,
         author: Some("sync-client".to_string()),
@@ -1037,8 +1037,8 @@ async fn push_json_content(
     content: &str,
     state: &Arc<RwLock<SyncState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(node_id));
-    let edit_url = format!("{}/nodes/{}/edit", server, encode_node_id(node_id));
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
+    let edit_url = format!("{}/docs/{}/edit", server, encode_node_id(node_id));
     let mut attempts = 0;
     let max_attempts = 30; // 3 seconds max wait
 
@@ -1101,7 +1101,7 @@ async fn push_file_content(
     state: &Arc<RwLock<SyncState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // First check if there's existing content
-    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(node_id));
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
     let head_resp = client.get(&head_url).send().await;
 
     match head_resp {
@@ -1110,7 +1110,7 @@ async fn push_file_content(
             if let Some(parent_cid) = head.cid {
                 // Use replace endpoint
                 let replace_url = format!(
-                    "{}/nodes/{}/replace?parent_cid={}&author=sync-client",
+                    "{}/docs/{}/replace?parent_cid={}&author=sync-client",
                     server,
                     encode_node_id(node_id),
                     parent_cid
@@ -1136,7 +1136,7 @@ async fn push_file_content(
     // No existing content, use edit endpoint with retry for node creation
     debug!("Using edit endpoint for initial content: {}", node_id);
     let update = create_yjs_text_update(content);
-    let edit_url = format!("{}/nodes/{}/edit", server, encode_node_id(node_id));
+    let edit_url = format!("{}/docs/{}/edit", server, encode_node_id(node_id));
     let edit_req = EditRequest {
         update,
         author: Some("sync-client".to_string()),
@@ -1380,7 +1380,7 @@ async fn handle_schema_change(
     spawn_tasks: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Fetch current schema from server
-    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(fs_root_id));
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
     let resp = client.get(&head_url).send().await?;
 
     if !resp.status().is_success() {
@@ -1443,7 +1443,7 @@ async fn handle_schema_change(
             }
 
             // Fetch content from server
-            let file_head_url = format!("{}/nodes/{}/head", server, encode_node_id(&node_id));
+            let file_head_url = format!("{}/docs/{}/head", server, encode_node_id(&node_id));
             if let Ok(resp) = client.get(&file_head_url).send().await {
                 if resp.status().is_success() {
                     if let Ok(file_head) = resp.json::<HeadResponse>().await {
@@ -1551,7 +1551,7 @@ async fn initial_sync(
     file_path: &PathBuf,
     state: &Arc<RwLock<SyncState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(node_id));
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
     let resp = client.get(&head_url).send().await?;
 
     if !resp.status().is_success() {
@@ -1727,7 +1727,7 @@ async fn upload_task(
             Some(parent) => {
                 // Normal case: use replace endpoint
                 let replace_url = format!(
-                    "{}/nodes/{}/replace?parent_cid={}&author=sync-client",
+                    "{}/docs/{}/replace?parent_cid={}&author=sync-client",
                     server,
                     encode_node_id(&node_id),
                     parent
@@ -1775,7 +1775,7 @@ async fn upload_task(
                 // First commit: use edit endpoint with generated Yjs update
                 info!("Creating initial commit...");
                 let update = create_yjs_text_update(&content);
-                let edit_url = format!("{}/nodes/{}/edit", server, encode_node_id(&node_id));
+                let edit_url = format!("{}/docs/{}/edit", server, encode_node_id(&node_id));
                 let edit_req = EditRequest {
                     update,
                     author: Some("sync-client".to_string()),
@@ -1934,7 +1934,7 @@ async fn handle_server_edit(
     }
 
     // Safe to overwrite - fetch new content from server
-    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(node_id));
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
     let resp = match client.get(&head_url).send().await {
         Ok(r) => r,
         Err(e) => {
