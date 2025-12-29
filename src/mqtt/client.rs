@@ -21,6 +21,7 @@ pub struct IncomingMessage {
 /// MQTT client wrapper.
 pub struct MqttClient {
     client: AsyncClient,
+    client_id: String,
     event_loop: Arc<Mutex<EventLoop>>,
     message_tx: broadcast::Sender<IncomingMessage>,
 }
@@ -48,9 +49,15 @@ impl MqttClient {
 
         Ok(Self {
             client,
+            client_id: config.client_id,
             event_loop: Arc::new(Mutex::new(event_loop)),
             message_tx,
         })
+    }
+
+    /// Get the client ID.
+    pub fn client_id(&self) -> &str {
+        &self.client_id
     }
 
     /// Subscribe to a topic.
