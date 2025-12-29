@@ -1,4 +1,4 @@
-use super::{OrchestratorConfig, ProcessConfig};
+use super::{OrchestratorConfig, ProcessConfig, RestartMode};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -146,5 +146,99 @@ impl ProcessManager {
         }
 
         Ok(())
+    }
+
+    pub async fn run(&mut self) -> Result<(), String> {
+        // Start all processes
+        self.start_all().await?;
+
+        // Monitor loop
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let names: Vec<String> = self.processes.keys().cloned().collect();
+            for name in names {
+                if self.disabled.contains(&name) {
+                    continue;
+                }
+
+                let should_restart = {
+                    let process = match self.processes.get_mut(&name) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+
+                    if let Some(ref mut child) = process.handle {
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                let success = status.success();
+                                tracing::warn!(
+                                    "[orchestrator] Process '{}' exited with status: {}",
+                                    name,
+                                    status
+                                );
+
+                                process.handle = None;
+
+                                match process.config.restart.policy {
+                                    RestartMode::Always => true,
+                                    RestartMode::OnFailure => !success,
+                                    RestartMode::Never => {
+                                        process.state = ProcessState::Stopped;
+                                        false
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                // Still running - reset failure count if running long enough
+                                if let Some(start) = process.last_start {
+                                    if start.elapsed() > Duration::from_secs(30)
+                                        && process.consecutive_failures > 0
+                                    {
+                                        process.consecutive_failures = 0;
+                                    }
+                                }
+                                false
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "[orchestrator] Error checking process '{}': {}",
+                                    name,
+                                    e
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                };
+
+                if should_restart {
+                    let process = self.processes.get_mut(&name).unwrap();
+                    process.consecutive_failures += 1;
+                    process.state = ProcessState::Failed;
+
+                    let backoff = std::cmp::min(
+                        process.config.restart.backoff_ms
+                            * 2u64.pow(process.consecutive_failures.saturating_sub(1)),
+                        process.config.restart.max_backoff_ms,
+                    );
+
+                    tracing::info!(
+                        "[orchestrator] Restarting '{}' in {}ms (attempt {})",
+                        name,
+                        backoff,
+                        process.consecutive_failures
+                    );
+
+                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+
+                    if let Err(e) = self.spawn_process(&name).await {
+                        tracing::error!("[orchestrator] Failed to restart '{}': {}", name, e);
+                    }
+                }
+            }
+        }
     }
 }
