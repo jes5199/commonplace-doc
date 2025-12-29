@@ -1,7 +1,7 @@
 use super::{OrchestratorConfig, ProcessConfig};
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -129,6 +129,21 @@ impl ProcessManager {
         process.handle = Some(child);
         process.state = ProcessState::Running;
         process.last_start = Some(Instant::now());
+
+        Ok(())
+    }
+
+    pub async fn start_all(&mut self) -> Result<(), String> {
+        let order = self.config.startup_order()?;
+
+        for name in order {
+            if self.disabled.contains(&name) {
+                continue;
+            }
+            self.spawn_process(&name).await?;
+            // Small delay to let process initialize
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
         Ok(())
     }
