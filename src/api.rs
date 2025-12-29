@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -54,6 +54,13 @@ pub fn router(
         .route("/docs/:id", get(get_document))
         .route("/docs/:id", delete(delete_document))
         .route("/docs/:id/commit", post(create_commit))
+        // Node endpoints (for sync client compatibility)
+        .route("/nodes", post(create_node))
+        .route("/nodes/:id", get(get_node))
+        .route("/nodes/:id/head", get(get_node_head))
+        .route("/nodes/:id/edit", post(edit_node))
+        .route("/nodes/:id/replace", post(replace_node))
+        .route("/nodes/:id/fork", post(fork_node))
         .with_state(state)
 }
 
@@ -301,5 +308,336 @@ async fn create_commit(
     Ok(Json(CreateCommitResponse {
         cid: commit_cid,
         merge_cid,
+    }))
+}
+
+// ============================================================================
+// Node endpoints (for sync client compatibility)
+// ============================================================================
+
+#[derive(Deserialize)]
+struct CreateNodeRequest {
+    #[serde(rename = "type")]
+    #[allow(dead_code)]
+    node_type: Option<String>,
+    #[serde(default)]
+    content_type: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CreateNodeResponse {
+    id: String,
+}
+
+async fn create_node(
+    State(state): State<ApiState>,
+    Json(req): Json<CreateNodeRequest>,
+) -> Result<Json<CreateNodeResponse>, StatusCode> {
+    let content_type = req
+        .content_type
+        .as_deref()
+        .and_then(ContentType::from_mime)
+        .unwrap_or(ContentType::Text);
+
+    let id = state.doc_store.create_document(content_type).await;
+
+    Ok(Json(CreateNodeResponse { id }))
+}
+
+#[derive(Serialize)]
+struct NodeInfoResponse {
+    id: String,
+    #[serde(rename = "type")]
+    node_type: String,
+}
+
+async fn get_node(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<NodeInfoResponse>, StatusCode> {
+    let _doc = state
+        .doc_store
+        .get_document(&id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(NodeInfoResponse {
+        id: id.clone(),
+        node_type: "document".to_string(),
+    }))
+}
+
+#[derive(Serialize)]
+struct HeadResponse {
+    cid: Option<String>,
+    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+}
+
+async fn get_node_head(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<HeadResponse>, StatusCode> {
+    let doc = state
+        .doc_store
+        .get_document(&id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let cid = if let Some(store) = &state.commit_store {
+        store.get_document_head(&id).await.ok().flatten()
+    } else {
+        None
+    };
+
+    // Get Yjs state bytes if document has a ydoc
+    let state_bytes = state.doc_store.get_yjs_state(&id).await;
+    let state_b64 = state_bytes.map(|b| b64::encode(&b));
+
+    Ok(Json(HeadResponse {
+        cid,
+        content: doc.content,
+        state: state_b64,
+    }))
+}
+
+#[derive(Deserialize)]
+struct NodeEditRequest {
+    update: String,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Serialize)]
+struct NodeEditResponse {
+    cid: String,
+}
+
+async fn edit_node(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<NodeEditRequest>,
+) -> Result<Json<NodeEditResponse>, StatusCode> {
+    let commit_store = state
+        .commit_store
+        .as_ref()
+        .ok_or(StatusCode::NOT_IMPLEMENTED)?;
+
+    // Verify document exists
+    let _doc = state
+        .doc_store
+        .get_document(&id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let update_bytes = b64::decode(&req.update).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Get current head
+    let current_head = commit_store
+        .get_document_head(&id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let parents = current_head.into_iter().collect();
+    let author = req.author.unwrap_or_else(|| "anonymous".to_string());
+
+    let commit = Commit::new(parents, req.update, author, req.message);
+    let timestamp = commit.timestamp;
+
+    let cid = commit_store
+        .store_commit(&commit)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Apply update to document
+    state
+        .doc_store
+        .apply_yjs_update(&id, &update_bytes)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Update head
+    commit_store
+        .set_document_head(&id, &cid)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    broadcast_commit(&state, &id, &cid, timestamp);
+
+    Ok(Json(NodeEditResponse { cid }))
+}
+
+#[derive(Deserialize)]
+struct ReplaceParams {
+    parent_cid: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ReplaceResponse {
+    cid: String,
+    edit_cid: String,
+    summary: ReplaceSummary,
+}
+
+#[derive(Serialize)]
+struct ReplaceSummary {
+    chars_inserted: usize,
+    chars_deleted: usize,
+    operations: usize,
+}
+
+async fn replace_node(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(params): Query<ReplaceParams>,
+    body: String,
+) -> Result<Json<ReplaceResponse>, StatusCode> {
+    let commit_store = state
+        .commit_store
+        .as_ref()
+        .ok_or(StatusCode::NOT_IMPLEMENTED)?;
+
+    let doc = state
+        .doc_store
+        .get_document(&id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Generate diff
+    let diff_result = crate::diff::compute_diff_update(&doc.content, &body)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Determine parent
+    let parent = if let Some(p) = params.parent_cid {
+        Some(p)
+    } else {
+        commit_store
+            .get_document_head(&id)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    let parents: Vec<String> = parent.into_iter().collect();
+    let author = params.author.unwrap_or_else(|| "anonymous".to_string());
+
+    let commit = Commit::new(parents, diff_result.update_b64.clone(), author, None);
+    let timestamp = commit.timestamp;
+
+    let cid = commit_store
+        .store_commit(&commit)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Apply update
+    state
+        .doc_store
+        .apply_yjs_update(&id, &diff_result.update_bytes)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    commit_store
+        .set_document_head(&id, &cid)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    broadcast_commit(&state, &id, &cid, timestamp);
+
+    Ok(Json(ReplaceResponse {
+        cid: cid.clone(),
+        edit_cid: cid,
+        summary: ReplaceSummary {
+            chars_inserted: diff_result.summary.chars_inserted,
+            chars_deleted: diff_result.summary.chars_deleted,
+            operations: diff_result.operation_count,
+        },
+    }))
+}
+
+#[derive(Deserialize)]
+struct ForkParams {
+    at_commit: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ForkResponse {
+    id: String,
+    head: String,
+}
+
+async fn fork_node(
+    State(state): State<ApiState>,
+    Path(source_id): Path<String>,
+    Query(params): Query<ForkParams>,
+) -> Result<Json<ForkResponse>, StatusCode> {
+    let commit_store = state
+        .commit_store
+        .as_ref()
+        .ok_or(StatusCode::NOT_IMPLEMENTED)?;
+
+    // Get source document
+    let source_doc = state
+        .doc_store
+        .get_document(&source_id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Create new document with same content type
+    let new_id = state
+        .doc_store
+        .create_document(source_doc.content_type.clone())
+        .await;
+
+    // Get target commit (specified or HEAD)
+    let target_cid = if let Some(cid) = params.at_commit {
+        cid
+    } else {
+        commit_store
+            .get_document_head(&source_id)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?
+    };
+
+    // Replay commits to build state
+    let replayer = crate::replay::CommitReplayer::new(commit_store);
+    let (_content, state_bytes) = replayer
+        .get_content_and_state_at_commit(&source_id, &target_cid, &source_doc.content_type)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Apply the replayed state to the new document
+    state
+        .doc_store
+        .apply_yjs_update(&new_id, &state_bytes)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Create a root commit for the forked document with the full state
+    let update_b64 = b64::encode(&state_bytes);
+    let commit = Commit::new(
+        vec![],
+        update_b64,
+        "fork".to_string(),
+        Some(format!("Forked from {} at {}", source_id, target_cid)),
+    );
+
+    let new_cid = commit_store
+        .store_commit(&commit)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    commit_store
+        .set_document_head(&new_id, &new_cid)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(ForkResponse {
+        id: new_id,
+        head: new_cid,
     }))
 }

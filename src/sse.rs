@@ -40,6 +40,8 @@ pub fn router(
         .route("/documents/changes", get(get_documents_changes))
         .route("/documents/:id/stream", get(stream_document_changes))
         .route("/documents/stream", get(stream_documents_changes))
+        // Node SSE endpoints (for sync client compatibility)
+        .route("/sse/nodes/:id", get(stream_node))
         .with_state(state)
 }
 
@@ -274,4 +276,86 @@ fn parse_doc_ids(ids: &str) -> Vec<String> {
 
 fn map_store_error(_: StoreError) -> StatusCode {
     StatusCode::INTERNAL_SERVER_ERROR
+}
+
+// ============================================================================
+// Node SSE handlers (for sync client compatibility)
+// ============================================================================
+
+/// Edit event data for sync client compatibility
+#[derive(Serialize, Clone)]
+struct EditEventData {
+    source: String,
+    commit: CommitEventData,
+}
+
+#[derive(Serialize, Clone)]
+struct CommitEventData {
+    update: String,
+    parents: Vec<String>,
+    timestamp: u64,
+    author: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+/// Stream edit events for a node/document
+async fn stream_node(
+    State(state): State<SseState>,
+    Path(node_id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    // Verify node/document exists
+    if state.doc_store.get_document(&node_id).await.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let broadcaster = state
+        .broadcaster
+        .as_ref()
+        .ok_or(StatusCode::NOT_IMPLEMENTED)?;
+
+    let commit_store = state.commit_store.clone();
+    let mut receiver = broadcaster.subscribe();
+    let target_node_id = node_id.clone();
+
+    let stream = async_stream::stream! {
+        loop {
+            match receiver.recv().await {
+                Ok(notification) => {
+                    // Only emit events for this node
+                    if notification.doc_id != target_node_id {
+                        continue;
+                    }
+
+                    // Get the commit details from store
+                    if let Some(store) = &commit_store {
+                        if let Ok(commit) = store.get_commit(&notification.commit_id).await {
+                            let event_data = EditEventData {
+                                source: "server".to_string(),
+                                commit: CommitEventData {
+                                    update: commit.update,
+                                    parents: commit.parents,
+                                    timestamp: commit.timestamp,
+                                    author: commit.author,
+                                    message: commit.message,
+                                },
+                            };
+
+                            if let Ok(data) = serde_json::to_string(&event_data) {
+                                yield Ok(Event::default().event("edit").data(data));
+                            }
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30))))
 }

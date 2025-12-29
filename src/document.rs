@@ -234,6 +234,16 @@ impl DocumentStore {
         Ok(())
     }
 
+    /// Get the current Yjs state as bytes (for syncing).
+    /// Returns the full document state encoded as a Yjs update.
+    pub async fn get_yjs_state(&self, id: &str) -> Option<Vec<u8>> {
+        let documents = self.documents.read().await;
+        let doc = documents.get(id)?;
+        let ydoc = doc.ydoc.as_ref()?;
+        let txn = ydoc.transact();
+        Some(txn.encode_state_as_update_v1(&yrs::StateVector::default()))
+    }
+
     fn wrap_xml_root(inner: &str) -> String {
         if inner.is_empty() {
             return format!("{}<root/>", Self::XML_HEADER);
