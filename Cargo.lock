@@ -303,7 +303,6 @@ name = "commonplace-doc"
 version = "0.1.0"
 dependencies = [
  "async-stream",
- "async-trait",
  "axum",
  "base64",
  "clap",

@@ -30,7 +30,6 @@ path = "src/bin/orchestrator.rs"
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
-tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -44,7 +43,6 @@ redb = "2.0"
 sha2 = "0.10"
 hex = "0.4"
 clap = { version = "4.0", features = ["derive"] }
-async-trait = "0.1"
 similar = "2.4"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 notify = "6.1"
@@ -59,3 +57,4 @@ libc = "0.2"
 [dev-dependencies]
 http-body-util = "0.1"
 tempfile = "3.0"
+tower = { version = "0.4", features = ["util"] }
