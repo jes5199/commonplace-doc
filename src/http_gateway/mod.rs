@@ -19,8 +19,20 @@ pub struct HttpGateway {
 
 impl HttpGateway {
     /// Create a new HTTP gateway connected to MQTT
+    ///
+    /// This spawns the MQTT event loop in the background so that
+    /// publish/subscribe operations can actually execute.
     pub async fn new(config: MqttConfig) -> Result<Self, MqttError> {
         let client = Arc::new(MqttClient::connect(config).await?);
+
+        // Spawn the MQTT event loop so publishes/subscribes actually work
+        let client_for_loop = client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client_for_loop.run_event_loop().await {
+                tracing::error!("HTTP gateway MQTT event loop error: {}", e);
+            }
+        });
+
         Ok(Self { client })
     }
 
