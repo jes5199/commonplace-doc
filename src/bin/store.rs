@@ -99,6 +99,12 @@ async fn main() {
             }
         };
 
+    // Populate the EditsHandler's fs_root_content cache for path->UUID resolution
+    mqtt_service
+        .edits_handler()
+        .set_fs_root_content(content.clone())
+        .await;
+
     // Subscribe to store-level commands (e.g., create-document)
     if let Err(e) = mqtt_service.subscribe_store_commands().await {
         tracing::warn!("Failed to subscribe to store commands: {}", e);
