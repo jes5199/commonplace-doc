@@ -1899,8 +1899,14 @@ async fn upload_task(
                 };
             // Refresh from HEAD if server edits were skipped AND upload succeeded
             // IMPORTANT: Don't refresh after failed upload to avoid overwriting local edits
-            if should_refresh && json_upload_succeeded {
-                refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+            if should_refresh {
+                if json_upload_succeeded {
+                    refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+                } else {
+                    // Upload failed - re-set the flag so we try again next time
+                    let mut s = state.write().await;
+                    s.needs_head_refresh = true;
+                }
             }
             continue;
         }
