@@ -48,9 +48,6 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
     let commit_broadcaster = commit_store.as_ref().map(|_| CommitBroadcaster::new(1024));
     let node_registry = Arc::new(NodeRegistry::new());
 
-    // Track paths that should be subscribed to via MQTT
-    let mut mqtt_subscribe_paths: Vec<String> = Vec::new();
-
     // Initialize filesystem if --fs-root is specified
     if let Some(ref fs_root_id) = config.fs_root {
         let node_id = NodeId::new(fs_root_id);
@@ -63,9 +60,6 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
         {
             Ok(fs_node) => {
                 tracing::info!("Filesystem root initialized at node: {}", fs_root_id);
-
-                // Track for MQTT subscription
-                mqtt_subscribe_paths.push(fs_root_id.clone());
 
                 // Create and start the reconciler
                 let reconciler = Arc::new(FilesystemReconciler::new(
@@ -97,6 +91,10 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
     }
 
     // Initialize MQTT service if configured
+    // Note: MQTT topic subscriptions are managed via the MqttService API.
+    // The fs-root is a meta-schema document and is not subscribed to MQTT.
+    // Individual document paths (with extensions like .txt, .json) can be
+    // subscribed using mqtt_service.subscribe_path().
     if let Some(mqtt_config) = config.mqtt {
         match mqtt::MqttService::new(
             mqtt_config,
@@ -106,17 +104,8 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
         .await
         {
             Ok(mqtt_service) => {
-                tracing::info!("MQTT service connected");
+                tracing::info!("MQTT service connected and ready");
                 let mqtt_service = Arc::new(mqtt_service);
-
-                // Subscribe to all tracked paths
-                for path in &mqtt_subscribe_paths {
-                    if let Err(e) = mqtt_service.subscribe_path(path).await {
-                        tracing::warn!("Failed to subscribe MQTT to path {}: {}", path, e);
-                    } else {
-                        tracing::info!("MQTT subscribed to path: {}", path);
-                    }
-                }
 
                 // Start the event loop
                 let service_for_loop = mqtt_service.clone();
