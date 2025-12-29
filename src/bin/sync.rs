@@ -2111,13 +2111,18 @@ async fn refresh_from_head(
         }
     };
 
-    // Check if content differs from what we have
+    // Check if content differs from what we have, and update state BEFORE writing
+    // to prevent file watcher from re-uploading the refreshed content
     {
-        let s = state.read().await;
+        let mut s = state.write().await;
         if head.content == s.last_written_content {
             debug!("HEAD matches last_written_content, no refresh needed");
             return;
         }
+        // Update state BEFORE writing file - this way if watcher fires after write,
+        // echo detection will see matching content and skip upload
+        s.last_written_cid = head.cid.clone();
+        s.last_written_content = head.content.clone();
     }
 
     // Content differs - we need to write the new content
@@ -2129,6 +2134,10 @@ async fn refresh_from_head(
             Ok(decoded) => tokio::fs::write(file_path, &decoded).await,
             Err(e) => {
                 error!("Failed to decode base64 content for refresh: {}", e);
+                // Revert state on failure
+                let mut s = state.write().await;
+                s.last_written_cid = None;
+                s.last_written_content = String::new();
                 return;
             }
         }
@@ -2143,14 +2152,11 @@ async fn refresh_from_head(
 
     if let Err(e) = write_result {
         error!("Failed to write file for refresh: {}", e);
-        return;
-    }
-
-    // Update state
-    {
+        // Revert state on failure
         let mut s = state.write().await;
-        s.last_written_cid = head.cid.clone();
-        s.last_written_content = head.content.clone();
+        s.last_written_cid = None;
+        s.last_written_content = String::new();
+        return;
     }
 
     info!(
