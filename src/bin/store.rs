@@ -136,6 +136,22 @@ async fn main() {
         }
     };
 
+    // Subscribe to fs-root document itself (so we receive updates to filesystem structure)
+    if let Err(e) = mqtt_service.subscribe_path(&args.fs_root).await {
+        tracing::warn!("Failed to subscribe to fs-root {}: {}", args.fs_root, e);
+    } else {
+        tracing::info!("Subscribed to fs-root path: {}", args.fs_root);
+    }
+
+    // Subscribe to router documents
+    for router_id_str in &args.routers {
+        if let Err(e) = mqtt_service.subscribe_path(router_id_str).await {
+            tracing::warn!("Failed to subscribe to router {}: {}", router_id_str, e);
+        } else {
+            tracing::info!("Subscribed to router path: {}", router_id_str);
+        }
+    }
+
     // Subscribe to paths based on fs-root content
     // Parse the fs-root JSON to get document paths
     if let Some(ref fs_node) = fs_node {
