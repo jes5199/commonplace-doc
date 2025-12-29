@@ -52,7 +52,9 @@
       "mcp__plugin_beads_beads__set_context",
       "mcp__plugin_beads_beads__dep",
       "mcp__plugin_beads_beads__blocked",
-      "Bash(gh pr list:*)"
+      "Bash(gh pr list:*)",
+      "Bash(source:*)",
+      "Bash(tee:*)"
     ],
     "deny": [],
     "ask": []

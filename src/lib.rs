@@ -6,6 +6,7 @@ pub mod diff;
 pub mod document;
 pub mod events;
 pub mod fs;
+pub mod mqtt;
 pub mod node;
 pub mod replay;
 pub mod router;
@@ -36,6 +37,10 @@ pub struct RouterConfig {
     pub fs_root: Option<String>,
     /// Node IDs for router documents
     pub routers: Vec<String>,
+    /// MQTT configuration (if specified, enables MQTT transport)
+    pub mqtt: Option<mqtt::MqttConfig>,
+    /// Document paths to subscribe via MQTT (requires mqtt to be set)
+    pub mqtt_subscribe: Vec<String>,
 }
 
 /// Create a router with the given configuration.
@@ -46,8 +51,8 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
     let node_registry = Arc::new(NodeRegistry::new());
 
     // Initialize filesystem if --fs-root is specified
-    if let Some(fs_root_id) = config.fs_root {
-        let node_id = NodeId::new(&fs_root_id);
+    if let Some(ref fs_root_id) = config.fs_root {
+        let node_id = NodeId::new(fs_root_id);
 
         // Get or create the fs-root document node
         // Use Text type since the edit system uses TEXT-based Yjs updates
@@ -83,6 +88,37 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
             }
             Err(e) => {
                 tracing::error!("Failed to create fs-root node: {}", e);
+            }
+        }
+    }
+
+    // Initialize MQTT service if configured
+    if let Some(mqtt_config) = config.mqtt {
+        match mqtt::MqttService::new(mqtt_config, node_registry.clone(), commit_store.clone()).await
+        {
+            Ok(mqtt_service) => {
+                tracing::info!("MQTT service connected");
+                let mqtt_service = Arc::new(mqtt_service);
+
+                // Subscribe to configured document paths
+                for path in &config.mqtt_subscribe {
+                    if let Err(e) = mqtt_service.subscribe_path(path).await {
+                        tracing::warn!("Failed to subscribe MQTT to path {}: {}", path, e);
+                    } else {
+                        tracing::info!("MQTT subscribed to path: {}", path);
+                    }
+                }
+
+                // Start the event loop
+                let service_for_loop = mqtt_service.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = service_for_loop.run().await {
+                        tracing::error!("MQTT event loop error: {}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::error!("Failed to connect MQTT service: {}", e);
             }
         }
     }

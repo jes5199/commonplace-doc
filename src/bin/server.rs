@@ -1,5 +1,7 @@
 use clap::Parser;
-use commonplace_doc::{cli::Args, create_router_with_config, store::CommitStore, RouterConfig};
+use commonplace_doc::{
+    cli::Args, create_router_with_config, mqtt::MqttConfig, store::CommitStore, RouterConfig,
+};
 use std::net::SocketAddr;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -38,11 +40,32 @@ async fn main() {
         tracing::info!("Router document: {}", router_id);
     }
 
+    // Create MQTT config if broker URL is specified
+    let mqtt_config = args.mqtt_broker.as_ref().map(|broker_url| {
+        let client_id = args
+            .mqtt_client_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        tracing::info!("MQTT broker: {} (client: {})", broker_url, client_id);
+        MqttConfig {
+            broker_url: broker_url.clone(),
+            client_id,
+            ..Default::default()
+        }
+    });
+
+    // Log MQTT subscriptions if configured
+    for path in &args.mqtt_subscribe {
+        tracing::info!("MQTT subscribe: {}", path);
+    }
+
     // Build our application with routes
     let app = create_router_with_config(RouterConfig {
         commit_store,
         fs_root: args.fs_root,
         routers: args.routers,
+        mqtt: mqtt_config,
+        mqtt_subscribe: args.mqtt_subscribe,
     })
     .await;
 
