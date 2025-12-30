@@ -4,8 +4,9 @@
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use yrs::any::Any;
+use yrs::types::ToJson;
 use yrs::updates::decoder::Decode;
-use yrs::{Array, Doc, Map, Text, Transact, Update, WriteTxn};
+use yrs::{Array, Doc, Map, ReadTxn, Text, Transact, Update, WriteTxn};
 
 /// Name of the root text/map element in Yjs documents
 pub const TEXT_ROOT_NAME: &str = "content";
@@ -180,6 +181,110 @@ pub fn create_yjs_text_diff_update(
     Ok(base64_encode(&update_bytes))
 }
 
+/// Create a Yjs update for JSONL content (newline-delimited JSON).
+/// Each non-empty line is parsed as a JSON object and stored in a Y.Array.
+pub fn create_yjs_jsonl_update(
+    content: &str,
+    base_state: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let doc = Doc::with_client_id(1);
+
+    // Apply base state if provided
+    if let Some(state_b64) = base_state {
+        if let Ok(state_bytes) = base64_decode(state_b64) {
+            if !state_bytes.is_empty() {
+                if let Ok(update) = Update::decode_v1(&state_bytes) {
+                    let mut txn = doc.transact_mut();
+                    txn.apply_update(update);
+                }
+            }
+        }
+    }
+
+    let update = {
+        let mut txn = doc.transact_mut();
+        let array = txn.get_or_insert_array(TEXT_ROOT_NAME);
+
+        // Clear existing content
+        let len = array.len(&txn);
+        if len > 0 {
+            array.remove_range(&mut txn, 0, len);
+        }
+
+        // Parse each non-empty line as JSON
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_str(line)?;
+            let any_val = json_value_to_any(value);
+            array.push_back(&mut txn, any_val);
+        }
+
+        txn.encode_update_v1()
+    };
+
+    Ok(base64_encode(&update))
+}
+
+/// Convert Y.Array content to JSONL format (one JSON object per line).
+pub fn yjs_array_to_jsonl(state_b64: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let state_bytes = base64_decode(state_b64)?;
+
+    let doc = Doc::new();
+    if !state_bytes.is_empty() {
+        let update = Update::decode_v1(&state_bytes)?;
+        let mut txn = doc.transact_mut();
+        txn.apply_update(update);
+    }
+
+    let txn = doc.transact();
+    let array = txn
+        .get_array(TEXT_ROOT_NAME)
+        .ok_or("No content array found")?;
+
+    // Get JSON representation and convert to lines
+    let any_array = array.to_json(&txn);
+    let json_value = serde_json::to_value(&any_array)?;
+
+    let mut lines = Vec::new();
+    if let serde_json::Value::Array(items) = json_value {
+        for item in items {
+            lines.push(serde_json::to_string(&item)?);
+        }
+    }
+
+    Ok(lines.join("\n"))
+}
+
+/// Convert yrs::Any to serde_json::Value
+pub fn any_to_json_value(any: Any) -> serde_json::Value {
+    match any {
+        Any::Null | Any::Undefined => serde_json::Value::Null,
+        Any::Bool(b) => serde_json::Value::Bool(b),
+        Any::Number(n) => serde_json::json!(n),
+        Any::BigInt(i) => serde_json::json!(i),
+        Any::String(s) => serde_json::Value::String(s.to_string()),
+        Any::Buffer(b) => {
+            // Encode binary as base64 string
+            serde_json::Value::String(base64_encode(&b))
+        }
+        Any::Array(arr) => {
+            let items: Vec<serde_json::Value> =
+                arr.iter().cloned().map(any_to_json_value).collect();
+            serde_json::Value::Array(items)
+        }
+        Any::Map(map) => {
+            let obj: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), any_to_json_value(v.clone())))
+                .collect();
+            serde_json::Value::Object(obj)
+        }
+    }
+}
+
 /// Simple base64 encoding (matching server's b64 module)
 pub fn base64_encode(data: &[u8]) -> String {
     STANDARD.encode(data)
@@ -335,6 +440,96 @@ mod tests {
         fn test_base64_decode_invalid() {
             let result = base64_decode("not valid base64!!!");
             assert!(result.is_err());
+        }
+    }
+
+    mod jsonl {
+        use super::*;
+
+        #[test]
+        fn test_create_yjs_jsonl_update_empty() {
+            let result = create_yjs_jsonl_update("", None);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_create_yjs_jsonl_update_single_line() {
+            let result = create_yjs_jsonl_update(r#"{"key": "value"}"#, None);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_create_yjs_jsonl_update_multiple_lines() {
+            let content = r#"{"a": 1}
+{"b": 2}
+{"c": 3}"#;
+            let result = create_yjs_jsonl_update(content, None);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_create_yjs_jsonl_update_with_blank_lines() {
+            let content = r#"{"a": 1}
+
+{"b": 2}
+"#;
+            let result = create_yjs_jsonl_update(content, None);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_create_yjs_jsonl_update_invalid_json() {
+            let result = create_yjs_jsonl_update("not json", None);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_jsonl_roundtrip() {
+            let content = r#"{"a":1}
+{"b":2}
+{"c":3}"#;
+            let update = create_yjs_jsonl_update(content, None).unwrap();
+            let result = yjs_array_to_jsonl(&update).unwrap();
+            // Normalize and compare
+            let original_lines: Vec<&str> = content.lines().collect();
+            let result_lines: Vec<&str> = result.lines().collect();
+            assert_eq!(original_lines.len(), result_lines.len());
+            for (orig, res) in original_lines.iter().zip(result_lines.iter()) {
+                let orig_val: serde_json::Value = serde_json::from_str(orig).unwrap();
+                let res_val: serde_json::Value = serde_json::from_str(res).unwrap();
+                assert_eq!(orig_val, res_val);
+            }
+        }
+
+        #[test]
+        fn test_any_to_json_null() {
+            assert_eq!(any_to_json_value(Any::Null), serde_json::Value::Null);
+        }
+
+        #[test]
+        fn test_any_to_json_bool() {
+            assert_eq!(any_to_json_value(Any::Bool(true)), serde_json::json!(true));
+        }
+
+        #[test]
+        fn test_any_to_json_number() {
+            assert_eq!(
+                any_to_json_value(Any::Number(3.14)),
+                serde_json::json!(3.14)
+            );
+        }
+
+        #[test]
+        fn test_any_to_json_bigint() {
+            assert_eq!(any_to_json_value(Any::BigInt(42)), serde_json::json!(42));
+        }
+
+        #[test]
+        fn test_any_to_json_string() {
+            assert_eq!(
+                any_to_json_value(Any::String("hello".into())),
+                serde_json::json!("hello")
+            );
         }
     }
 }

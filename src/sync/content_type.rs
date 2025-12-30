@@ -43,6 +43,8 @@ const TEXT_EXTENSIONS: &[(&str, &str)] = &[
     ("less", "text/x-less"),
     // Data
     ("json", "application/json"),
+    ("jsonl", "application/x-ndjson"),
+    ("ndjson", "application/x-ndjson"),
     ("xml", "application/xml"),
     ("xhtml", "application/xhtml+xml"),
     ("yaml", "text/yaml"),
@@ -88,7 +90,9 @@ const BINARY_EXTENSIONS: &[&str] = &[
 
 /// Allowed file extensions for sync operations.
 /// Only files with these extensions will be synced.
-pub const ALLOWED_EXTENSIONS: &[&str] = &["json", "txt", "xml", "xhtml", "bin", "md"];
+pub const ALLOWED_EXTENSIONS: &[&str] = &[
+    "json", "jsonl", "ndjson", "txt", "xml", "xhtml", "bin", "md",
+];
 
 /// Check if a file path has an allowed extension for syncing.
 /// Returns true if the file should be synced, false otherwise.

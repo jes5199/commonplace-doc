@@ -53,7 +53,7 @@ impl DocumentStore {
             ContentType::Json => {
                 ydoc.get_or_insert_map(Self::TEXT_ROOT_NAME);
             }
-            ContentType::JsonArray => {
+            ContentType::JsonArray | ContentType::Jsonl => {
                 ydoc.get_or_insert_array(Self::TEXT_ROOT_NAME);
             }
             ContentType::Xml => {
@@ -108,7 +108,7 @@ impl DocumentStore {
             ContentType::Json => {
                 ydoc.get_or_insert_map(Self::TEXT_ROOT_NAME);
             }
-            ContentType::JsonArray => {
+            ContentType::JsonArray | ContentType::Jsonl => {
                 ydoc.get_or_insert_array(Self::TEXT_ROOT_NAME);
             }
             ContentType::Xml => {
@@ -178,6 +178,33 @@ impl DocumentStore {
                             .map_err(|e| ApplyError::Serialization(e.to_string()))?
                     }
                     _ => ContentType::JsonArray.default_content(),
+                }
+            }
+            ContentType::Jsonl => {
+                let root = txn
+                    .root_refs()
+                    .find(|(name, _)| *name == Self::TEXT_ROOT_NAME)
+                    .map(|(_, value)| value);
+
+                match root {
+                    Some(Value::YArray(array)) => {
+                        // Get JSON representation of the array
+                        let any_array = array.to_json(&txn);
+                        let json_value = serde_json::to_value(&any_array)
+                            .map_err(|e| ApplyError::Serialization(e.to_string()))?;
+                        // Convert to JSONL: one JSON object per line
+                        if let serde_json::Value::Array(items) = json_value {
+                            items
+                                .iter()
+                                .map(serde_json::to_string)
+                                .collect::<Result<Vec<_>, _>>()
+                                .map(|lines| lines.join("\n"))
+                                .map_err(|e| ApplyError::Serialization(e.to_string()))?
+                        } else {
+                            ContentType::Jsonl.default_content()
+                        }
+                    }
+                    _ => ContentType::Jsonl.default_content(),
                 }
             }
             ContentType::Xml => {
