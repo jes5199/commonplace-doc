@@ -20,6 +20,7 @@ pub use directory::{
     scan_directory, scan_directory_with_contents, schema_to_json, ScanError, ScanOptions,
     ScannedFile,
 };
+pub use sse::{handle_server_edit, refresh_from_head, sse_task, PENDING_WRITE_TIMEOUT};
 pub use state::{PendingWrite, SyncState};
 pub use types::{
     CommitData, DirEvent, EditEventData, EditRequest, EditResponse, FileEvent, ForkResponse,
