@@ -223,6 +223,7 @@ async fn main() -> ExitCode {
             args.use_paths,
             exec_cmd,
             args.exec_args,
+            true, // sandbox mode
         )
         .await;
 
@@ -255,6 +256,7 @@ async fn main() -> ExitCode {
                 args.use_paths,
                 exec_cmd,
                 args.exec_args,
+                false, // not sandbox mode
             )
             .await
         } else {
@@ -1061,6 +1063,7 @@ async fn run_exec_mode(
     use_paths: bool,
     exec_cmd: String,
     exec_args: Vec<String>,
+    sandbox: bool,
 ) -> Result<u8, Box<dyn std::error::Error>> {
     info!(
         "Starting commonplace-sync (exec mode): server={}, fs-root={}, directory={}, exec={}",
@@ -1558,9 +1561,9 @@ async fn run_exec_mode(
 
     info!("Launching: {} {:?}", program, args);
 
-    // Spawn the child process in the synced directory
-    let mut child = tokio::process::Command::new(&program)
-        .args(&args)
+    // Build the command
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&args)
         .current_dir(&directory)
         // Inherit stdin/stdout/stderr for interactive programs
         .stdin(std::process::Stdio::inherit())
@@ -1568,7 +1571,26 @@ async fn run_exec_mode(
         .stderr(std::process::Stdio::inherit())
         // Pass through key environment variables
         .env("COMMONPLACE_SERVER", &server)
-        .env("COMMONPLACE_NODE", &fs_root_id)
+        .env("COMMONPLACE_NODE", &fs_root_id);
+
+    // In sandbox mode, add commonplace binaries to PATH
+    if sandbox {
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(bin_dir) = exe_path.parent() {
+                let current_path = std::env::var_os("PATH").unwrap_or_default();
+                if let Ok(new_path) = std::env::join_paths(
+                    std::iter::once(bin_dir.to_path_buf())
+                        .chain(std::env::split_paths(&current_path)),
+                ) {
+                    cmd.env("PATH", &new_path);
+                    info!("Added {} to PATH for sandbox", bin_dir.display());
+                }
+            }
+        }
+    }
+
+    // Spawn the child process in the synced directory
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn command '{}': {}", program, e))?;
 
