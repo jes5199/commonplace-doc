@@ -18,6 +18,7 @@ import base64
 import uuid
 import time
 import threading
+import queue
 from typing import Callable, Optional
 from dataclasses import dataclass, field
 
@@ -108,6 +109,12 @@ class FileProcess:
         self._sync_state = SyncState()
         self._connected = threading.Event()
         self._ready = threading.Event()
+        self._shutdown = threading.Event()
+
+        # Work queue for thread-safe YDoc operations
+        # MQTT callbacks run in a background thread, but YDoc is not thread-safe.
+        # Commands are queued here and processed in the main thread.
+        self._work_queue: queue.Queue = queue.Queue()
 
     def register_command(self, verb: str, handler: Callable[[dict], None]) -> None:
         """
@@ -157,15 +164,44 @@ class FileProcess:
         print(f"[{self.path}] File process ready. Listening for commands...")
 
         if blocking:
-            try:
-                while True:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                print(f"\n[{self.path}] Shutting down...")
-                self.stop()
+            self._run_main_loop()
+
+    def _run_main_loop(self) -> None:
+        """Run the main event loop, processing queued work items."""
+        try:
+            while not self._shutdown.is_set():
+                try:
+                    # Wait for work with timeout to allow shutdown checks
+                    work_item = self._work_queue.get(timeout=0.1)
+                    self._process_work_item(work_item)
+                except queue.Empty:
+                    pass
+
+        except KeyboardInterrupt:
+            print(f"\n[{self.path}] Shutting down...")
+            self.stop()
+
+    def _process_work_item(self, item: tuple) -> None:
+        """Process a single work item from the queue."""
+        item_type, *args = item
+
+        if item_type == "command":
+            verb, payload, source = args
+            if verb in self._command_handlers:
+                print(f"[{self.path}] Received command: {verb} from {source or 'unknown'}")
+                self._command_handlers[verb](payload)
+            else:
+                print(f"[{self.path}] Unknown command: {verb}")
+
+        elif item_type == "edit":
+            # External edit from another client
+            update_bytes, author = args
+            Y.apply_update(self._ydoc, update_bytes)
+            print(f"[{self.path}] Applied edit from {author}")
 
     def stop(self) -> None:
         """Stop the file process and disconnect from MQTT."""
+        self._shutdown.set()
         self._mqtt.loop_stop()
         self._mqtt.disconnect()
 
@@ -179,21 +215,12 @@ class FileProcess:
         self._mqtt.subscribe(edits_topic(self.path), qos=1)
         print(f"[{self.path}] Subscribed to edits")
 
-        # NOTE: Sync is disabled due to protocol bug causing infinite loop.
-        # The store sends commit:null as response which is indistinguishable
-        # from a request, causing both sides to loop forever.
-        # TODO: Fix sync protocol to use distinct request/response types.
-        # self._mqtt.subscribe(sync_topic(self.path, self.client_id), qos=0)
-        # print(f"[{self.path}] Subscribed to sync channel")
+        # Subscribe to our sync response channel
+        self._mqtt.subscribe(sync_topic(self.path, self.client_id), qos=0)
+        print(f"[{self.path}] Subscribed to sync channel")
 
     def _sync_history(self) -> None:
         """Request HEAD to sync document history."""
-        # NOTE: Sync is disabled due to protocol bug causing infinite loop.
-        # See _claim_path for details.
-        print(f"[{self.path}] Sync disabled (protocol bug) - starting fresh")
-        self._ready.set()
-        return
-
         req_id = f"head-{uuid.uuid4()}"
 
         request = {
@@ -236,23 +263,21 @@ class FileProcess:
             print(f"[{self.path}] Error handling message on {topic}: {e}")
 
     def _handle_command(self, verb: str, payload: bytes) -> None:
-        """Dispatch command to registered handler."""
+        """Queue command for processing in main thread."""
         try:
             message = json.loads(payload)
             data = message.get("payload", {})
             source = message.get("source")
 
-            if verb in self._command_handlers:
-                print(f"[{self.path}] Received command: {verb} from {source or 'unknown'}")
-                self._command_handlers[verb](data)
-            else:
-                print(f"[{self.path}] Unknown command: {verb}")
+            # Queue the command for main thread processing
+            # (YDoc operations must happen in main thread)
+            self._work_queue.put(("command", verb, data, source))
 
         except json.JSONDecodeError as e:
             print(f"[{self.path}] Invalid command JSON: {e}")
 
     def _handle_edit(self, payload: bytes) -> None:
-        """Handle incoming edit from another client."""
+        """Queue incoming edit for processing in main thread."""
         try:
             message = json.loads(payload)
             update_b64 = message.get("update")
@@ -264,11 +289,9 @@ class FileProcess:
 
             if update_b64:
                 update_bytes = base64.b64decode(update_b64)
-                Y.apply_update(self._ydoc, update_bytes)
-                print(f"[{self.path}] Applied edit from {author}")
-
-                # Update HEAD if provided
-                # (In a full implementation, we'd track commit IDs)
+                # Queue the edit for main thread processing
+                # (YDoc operations must happen in main thread)
+                self._work_queue.put(("edit", update_bytes, author))
 
         except Exception as e:
             print(f"[{self.path}] Error applying edit: {e}")
@@ -280,7 +303,7 @@ class FileProcess:
             msg_type = message.get("type")
             req_id = message.get("req")
 
-            if msg_type == "head":
+            if msg_type == "head_response":
                 commit = message.get("commit")
                 if commit:
                     self._current_head = commit
@@ -289,6 +312,11 @@ class FileProcess:
                 else:
                     print(f"[{self.path}] Empty document (no HEAD)")
                 self._ready.set()
+
+            elif msg_type == "head":
+                # This is a request echo (we subscribed to our own topic)
+                # Ignore it - the server will respond with head_response
+                pass
 
             elif msg_type == "commit":
                 # Store commit for replay

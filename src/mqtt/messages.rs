@@ -50,13 +50,21 @@ pub struct CommandMessage {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SyncMessage {
     // ========== Requests (from client) ==========
-    /// Get current HEAD commit (request and response use same type)
-    /// Request: { "type": "head", "req": "..." }
-    /// Response: { "type": "head", "req": "...", "commit": "..." }
+    /// Request current HEAD commit
+    /// { "type": "head", "req": "..." }
     Head {
         /// Request ID for correlation
         req: String,
-        /// Current HEAD commit ID (only in response, None if empty)
+    },
+
+    /// Response to HEAD request
+    /// { "type": "head_response", "req": "...", "commit": "abc123" }
+    /// or { "type": "head_response", "req": "..." } if no commits exist
+    #[serde(rename = "head_response")]
+    HeadResponse {
+        /// Request ID for correlation
+        req: String,
+        /// Current HEAD commit ID (None if document has no commits)
         #[serde(skip_serializing_if = "Option::is_none")]
         commit: Option<String>,
     },
@@ -153,7 +161,8 @@ impl SyncMessage {
     /// Get the request ID from any sync message.
     pub fn req(&self) -> &str {
         match self {
-            SyncMessage::Head { req, .. } => req,
+            SyncMessage::Head { req } => req,
+            SyncMessage::HeadResponse { req, .. } => req,
             SyncMessage::Get { req, .. } => req,
             SyncMessage::Pull { req, .. } => req,
             SyncMessage::Ancestors { req, .. } => req,
@@ -164,26 +173,25 @@ impl SyncMessage {
     }
 
     /// Check if this is a request message (from client).
-    /// Head requests have commit=None, Head responses have commit=Some.
     pub fn is_request(&self) -> bool {
-        match self {
-            SyncMessage::Head { commit, .. } => commit.is_none(),
-            SyncMessage::Get { .. } | SyncMessage::Pull { .. } | SyncMessage::Ancestors { .. } => {
-                true
-            }
-            _ => false,
-        }
+        matches!(
+            self,
+            SyncMessage::Head { .. }
+                | SyncMessage::Get { .. }
+                | SyncMessage::Pull { .. }
+                | SyncMessage::Ancestors { .. }
+        )
     }
 
     /// Check if this is a response message (from doc store).
     pub fn is_response(&self) -> bool {
-        match self {
-            SyncMessage::Head { commit, .. } => commit.is_some(),
-            SyncMessage::Commit { .. } | SyncMessage::Done { .. } | SyncMessage::Error { .. } => {
-                true
-            }
-            _ => false,
-        }
+        matches!(
+            self,
+            SyncMessage::HeadResponse { .. }
+                | SyncMessage::Commit { .. }
+                | SyncMessage::Done { .. }
+                | SyncMessage::Error { .. }
+        )
     }
 }
 
@@ -210,26 +218,41 @@ mod tests {
     fn test_sync_head_request() {
         let msg = SyncMessage::Head {
             req: "r-001".to_string(),
-            commit: None,
         };
 
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"head\""));
         assert!(json.contains("\"req\":\"r-001\""));
-        // commit field should be omitted when None
+        // No commit field in request
         assert!(!json.contains("\"commit\""));
     }
 
     #[test]
-    fn test_sync_head_response() {
-        let msg = SyncMessage::Head {
+    fn test_sync_head_response_with_commit() {
+        let msg = SyncMessage::HeadResponse {
             req: "r-001".to_string(),
             commit: Some("abc123".to_string()),
         };
 
         let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"head\""));
+        assert!(json.contains("\"type\":\"head_response\""));
         assert!(json.contains("\"commit\":\"abc123\""));
+    }
+
+    #[test]
+    fn test_sync_head_response_empty() {
+        let msg = SyncMessage::HeadResponse {
+            req: "r-001".to_string(),
+            commit: None,
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"head_response\""));
+        // commit field should be omitted when None
+        assert!(!json.contains("\"commit\""));
+        // But it's still clearly a response due to type
+        assert!(msg.is_response());
+        assert!(!msg.is_request());
     }
 
     #[test]
@@ -264,16 +287,42 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_deserialize_head() {
+    fn test_sync_deserialize_head_request() {
         let json = r#"{"type":"head","req":"r-001"}"#;
         let msg: SyncMessage = serde_json::from_str(json).unwrap();
 
         match msg {
-            SyncMessage::Head { req, commit } => {
+            SyncMessage::Head { req } => {
                 assert_eq!(req, "r-001");
-                assert!(commit.is_none());
             }
             _ => panic!("Expected Head message"),
+        }
+    }
+
+    #[test]
+    fn test_sync_deserialize_head_response() {
+        // With commit
+        let json = r#"{"type":"head_response","req":"r-001","commit":"abc123"}"#;
+        let msg: SyncMessage = serde_json::from_str(json).unwrap();
+
+        match msg {
+            SyncMessage::HeadResponse { req, commit } => {
+                assert_eq!(req, "r-001");
+                assert_eq!(commit, Some("abc123".to_string()));
+            }
+            _ => panic!("Expected HeadResponse message"),
+        }
+
+        // Without commit (empty document)
+        let json = r#"{"type":"head_response","req":"r-002"}"#;
+        let msg: SyncMessage = serde_json::from_str(json).unwrap();
+
+        match msg {
+            SyncMessage::HeadResponse { req, commit } => {
+                assert_eq!(req, "r-002");
+                assert!(commit.is_none());
+            }
+            _ => panic!("Expected HeadResponse message"),
         }
     }
 
@@ -281,10 +330,14 @@ mod tests {
     fn test_is_request() {
         assert!(SyncMessage::Head {
             req: "r".to_string(),
+        }
+        .is_request());
+        assert!(!SyncMessage::HeadResponse {
+            req: "r".to_string(),
             commit: None,
         }
         .is_request());
-        assert!(!SyncMessage::Head {
+        assert!(!SyncMessage::HeadResponse {
             req: "r".to_string(),
             commit: Some("abc".to_string()),
         }

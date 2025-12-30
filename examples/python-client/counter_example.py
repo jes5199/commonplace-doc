@@ -69,13 +69,8 @@ class CounterExample(FileProcess):
         print(f"[{self.path}] Counter initialized to {self._counter}")
 
         if blocking:
-            import time
-            try:
-                while True:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                print(f"\n[{self.path}] Shutting down...")
-                self.stop()
+            # Use parent's main loop which processes the work queue
+            self._run_main_loop()
 
     def _sync_counter_from_doc(self) -> None:
         """Sync local counter state from the YDoc content."""
@@ -83,14 +78,15 @@ class CounterExample(FileProcess):
         if "counter" in content:
             self._counter = int(content["counter"])
 
-    def _handle_edit(self, payload: bytes) -> None:
-        """Handle incoming edit from another client, updating local counter."""
-        # Call parent to apply the Yjs update
-        super()._handle_edit(payload)
+    def _process_work_item(self, item: tuple) -> None:
+        """Process work item, syncing counter after edits."""
+        # Call parent to apply the Yjs update or handle command
+        super()._process_work_item(item)
 
-        # Update our local counter from the updated document
-        self._sync_counter_from_doc()
-        print(f"[{self.path}] Counter synced to {self._counter}")
+        # If it was an edit, sync our local counter from the updated document
+        if item[0] == "edit":
+            self._sync_counter_from_doc()
+            print(f"[{self.path}] Counter synced to {self._counter}")
 
     def _on_increment(self, payload: dict) -> None:
         """Handle increment command."""
@@ -100,13 +96,11 @@ class CounterExample(FileProcess):
 
         print(f"[{self.path}] Counter: {old_value} + {amount} = {self._counter}")
 
-        # NOTE: publish_edit is disabled due to y_py thread safety issue.
-        # y_py panics when YDoc is accessed from MQTT callback thread.
-        # TODO: Use queue to dispatch edits to main thread.
-        # self.publish_edit(
-        #     {"counter": self._counter},
-        #     message=f"Increment by {amount}",
-        # )
+        # Publish the edit (persist the new value)
+        self.publish_edit(
+            {"counter": self._counter},
+            message=f"Increment by {amount}",
+        )
 
         # Broadcast the change event
         self.broadcast_event("value-changed", {
@@ -123,11 +117,11 @@ class CounterExample(FileProcess):
 
         print(f"[{self.path}] Counter: {old_value} - {amount} = {self._counter}")
 
-        # NOTE: publish_edit disabled - see _on_increment comment
-        # self.publish_edit(
-        #     {"counter": self._counter},
-        #     message=f"Decrement by {amount}",
-        # )
+        # Publish the edit
+        self.publish_edit(
+            {"counter": self._counter},
+            message=f"Decrement by {amount}",
+        )
 
         # Broadcast the change event
         self.broadcast_event("value-changed", {
@@ -143,11 +137,11 @@ class CounterExample(FileProcess):
 
         print(f"[{self.path}] Counter reset: {old_value} -> 0")
 
-        # NOTE: publish_edit disabled - see _on_increment comment
-        # self.publish_edit(
-        #     {"counter": self._counter},
-        #     message="Reset counter",
-        # )
+        # Publish the edit
+        self.publish_edit(
+            {"counter": self._counter},
+            message="Reset counter",
+        )
 
         # Broadcast the change event
         self.broadcast_event("value-changed", {

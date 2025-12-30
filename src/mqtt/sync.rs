@@ -112,16 +112,7 @@ impl SyncHandler {
         );
 
         match message {
-            SyncMessage::Head { req, commit: None } => {
-                self.handle_head(&topic.path, client_id, &req).await
-            }
-            SyncMessage::Head {
-                commit: Some(_), ..
-            } => {
-                // Head response shouldn't be received by doc store
-                warn!("Received unexpected Head response message");
-                Ok(())
-            }
+            SyncMessage::Head { req } => self.handle_head(&topic.path, client_id, &req).await,
             SyncMessage::Get { req, commits } => {
                 self.handle_get(&topic.path, client_id, &req, commits).await
             }
@@ -133,9 +124,12 @@ impl SyncHandler {
                 self.handle_ancestors(&topic.path, client_id, &req, &commit, depth)
                     .await
             }
-            _ => {
+            SyncMessage::HeadResponse { .. }
+            | SyncMessage::Commit { .. }
+            | SyncMessage::Done { .. }
+            | SyncMessage::Error { .. } => {
                 // Response messages shouldn't be received by the doc store
-                warn!("Received unexpected sync response message");
+                warn!("Received unexpected sync response message: {:?}", message);
                 Ok(())
             }
         }
@@ -152,7 +146,7 @@ impl SyncHandler {
             None
         };
 
-        let response = SyncMessage::Head {
+        let response = SyncMessage::HeadResponse {
             req: req.to_string(),
             commit,
         };
