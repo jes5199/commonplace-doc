@@ -90,6 +90,12 @@ struct Args {
     /// Additional arguments to pass to the exec command (after --)
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     exec_args: Vec<String>,
+
+    /// Run in sandbox mode: creates a temporary directory, syncs content there,
+    /// runs the command in isolation, then cleans up on exit.
+    /// Implies --exec and conflicts with --directory (uses temp dir instead).
+    #[arg(long, conflicts_with = "directory", requires = "exec")]
+    sandbox: bool,
 }
 
 /// Filename for the local schema JSON file written during directory sync
@@ -135,15 +141,17 @@ async fn main() -> ExitCode {
 
     let args = Args::parse();
 
-    // Validate that either --file or --directory is provided
-    if args.file.is_none() && args.directory.is_none() {
-        error!("Either --file or --directory must be provided");
+    // Validate that either --file, --directory, or --sandbox is provided
+    if args.file.is_none() && args.directory.is_none() && !args.sandbox {
+        error!("Either --file, --directory, or --sandbox must be provided");
         return ExitCode::from(1);
     }
 
-    // Exec mode requires --directory (doesn't make sense with single file)
-    if args.exec.is_some() && args.directory.is_none() {
-        error!("--exec requires --directory (exec mode doesn't support single file sync)");
+    // Exec mode requires --directory or --sandbox (doesn't make sense with single file)
+    if args.exec.is_some() && args.directory.is_none() && !args.sandbox {
+        error!(
+            "--exec requires --directory or --sandbox (exec mode doesn't support single file sync)"
+        );
         return ExitCode::from(1);
     }
 
@@ -182,7 +190,51 @@ async fn main() -> ExitCode {
     };
 
     // Route to appropriate mode
-    let result = if let Some(directory) = args.directory {
+    let result = if args.sandbox {
+        // Sandbox mode: create temp directory, sync there, run command, clean up
+        let sandbox_dir =
+            std::env::temp_dir().join(format!("commonplace-sandbox-{}", uuid::Uuid::new_v4()));
+        info!("Creating sandbox directory: {}", sandbox_dir.display());
+
+        if let Err(e) = std::fs::create_dir_all(&sandbox_dir) {
+            error!("Failed to create sandbox directory: {}", e);
+            return ExitCode::from(1);
+        }
+
+        // Always ignore the schema file (.commonplace.json) when scanning
+        let mut ignore_patterns = args.ignore;
+        ignore_patterns.push(SCHEMA_FILENAME.to_string());
+
+        let scan_options = ScanOptions {
+            include_hidden: args.include_hidden,
+            ignore_patterns,
+        };
+
+        // exec is required by clap when sandbox is set
+        let exec_cmd = args.exec.expect("--sandbox requires --exec");
+
+        let exec_result = run_exec_mode(
+            client,
+            args.server,
+            node_id,
+            sandbox_dir.clone(),
+            scan_options,
+            args.initial_sync,
+            args.use_paths,
+            exec_cmd,
+            args.exec_args,
+            true, // sandbox mode
+        )
+        .await;
+
+        // Clean up sandbox directory
+        info!("Cleaning up sandbox directory: {}", sandbox_dir.display());
+        if let Err(e) = std::fs::remove_dir_all(&sandbox_dir) {
+            warn!("Failed to clean up sandbox directory: {}", e);
+        }
+
+        exec_result
+    } else if let Some(directory) = args.directory {
         // Always ignore the schema file (.commonplace.json) when scanning
         let mut ignore_patterns = args.ignore;
         ignore_patterns.push(SCHEMA_FILENAME.to_string());
@@ -204,6 +256,7 @@ async fn main() -> ExitCode {
                 args.use_paths,
                 exec_cmd,
                 args.exec_args,
+                false, // not sandbox mode
             )
             .await
         } else {
@@ -1010,6 +1063,7 @@ async fn run_exec_mode(
     use_paths: bool,
     exec_cmd: String,
     exec_args: Vec<String>,
+    sandbox: bool,
 ) -> Result<u8, Box<dyn std::error::Error>> {
     info!(
         "Starting commonplace-sync (exec mode): server={}, fs-root={}, directory={}, exec={}",
@@ -1507,9 +1561,9 @@ async fn run_exec_mode(
 
     info!("Launching: {} {:?}", program, args);
 
-    // Spawn the child process in the synced directory
-    let mut child = tokio::process::Command::new(&program)
-        .args(&args)
+    // Build the command
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&args)
         .current_dir(&directory)
         // Inherit stdin/stdout/stderr for interactive programs
         .stdin(std::process::Stdio::inherit())
@@ -1517,7 +1571,26 @@ async fn run_exec_mode(
         .stderr(std::process::Stdio::inherit())
         // Pass through key environment variables
         .env("COMMONPLACE_SERVER", &server)
-        .env("COMMONPLACE_NODE", &fs_root_id)
+        .env("COMMONPLACE_NODE", &fs_root_id);
+
+    // In sandbox mode, add commonplace binaries to PATH
+    if sandbox {
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(bin_dir) = exe_path.parent() {
+                let current_path = std::env::var_os("PATH").unwrap_or_default();
+                if let Ok(new_path) = std::env::join_paths(
+                    std::iter::once(bin_dir.to_path_buf())
+                        .chain(std::env::split_paths(&current_path)),
+                ) {
+                    cmd.env("PATH", &new_path);
+                    info!("Added {} to PATH for sandbox", bin_dir.display());
+                }
+            }
+        }
+    }
+
+    // Spawn the child process in the synced directory
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn command '{}': {}", program, e))?;
 
