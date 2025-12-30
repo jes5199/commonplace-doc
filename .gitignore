@@ -2,3 +2,9 @@
 *.skill
 .claude/wiggum-loop.local.md
 .worktrees/
+
+# Python
+__pycache__/
+*.pyc
+uv.lock
+.venv/

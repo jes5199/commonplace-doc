@@ -179,12 +179,21 @@ class FileProcess:
         self._mqtt.subscribe(edits_topic(self.path), qos=1)
         print(f"[{self.path}] Subscribed to edits")
 
-        # Subscribe to our sync response channel
-        self._mqtt.subscribe(sync_topic(self.path, self.client_id), qos=0)
-        print(f"[{self.path}] Subscribed to sync channel")
+        # NOTE: Sync is disabled due to protocol bug causing infinite loop.
+        # The store sends commit:null as response which is indistinguishable
+        # from a request, causing both sides to loop forever.
+        # TODO: Fix sync protocol to use distinct request/response types.
+        # self._mqtt.subscribe(sync_topic(self.path, self.client_id), qos=0)
+        # print(f"[{self.path}] Subscribed to sync channel")
 
     def _sync_history(self) -> None:
         """Request HEAD to sync document history."""
+        # NOTE: Sync is disabled due to protocol bug causing infinite loop.
+        # See _claim_path for details.
+        print(f"[{self.path}] Sync disabled (protocol bug) - starting fresh")
+        self._ready.set()
+        return
+
         req_id = f"head-{uuid.uuid4()}"
 
         request = {

@@ -100,11 +100,13 @@ class CounterExample(FileProcess):
 
         print(f"[{self.path}] Counter: {old_value} + {amount} = {self._counter}")
 
-        # Publish the edit (persist the new value)
-        self.publish_edit(
-            {"counter": self._counter},
-            message=f"Increment by {amount}",
-        )
+        # NOTE: publish_edit is disabled due to y_py thread safety issue.
+        # y_py panics when YDoc is accessed from MQTT callback thread.
+        # TODO: Use queue to dispatch edits to main thread.
+        # self.publish_edit(
+        #     {"counter": self._counter},
+        #     message=f"Increment by {amount}",
+        # )
 
         # Broadcast the change event
         self.broadcast_event("value-changed", {
@@ -121,11 +123,11 @@ class CounterExample(FileProcess):
 
         print(f"[{self.path}] Counter: {old_value} - {amount} = {self._counter}")
 
-        # Publish the edit
-        self.publish_edit(
-            {"counter": self._counter},
-            message=f"Decrement by {amount}",
-        )
+        # NOTE: publish_edit disabled - see _on_increment comment
+        # self.publish_edit(
+        #     {"counter": self._counter},
+        #     message=f"Decrement by {amount}",
+        # )
 
         # Broadcast the change event
         self.broadcast_event("value-changed", {
@@ -141,11 +143,11 @@ class CounterExample(FileProcess):
 
         print(f"[{self.path}] Counter reset: {old_value} -> 0")
 
-        # Publish the edit
-        self.publish_edit(
-            {"counter": self._counter},
-            message="Reset counter",
-        )
+        # NOTE: publish_edit disabled - see _on_increment comment
+        # self.publish_edit(
+        #     {"counter": self._counter},
+        #     message="Reset counter",
+        # )
 
         # Broadcast the change event
         self.broadcast_event("value-changed", {
