@@ -10,6 +10,7 @@ pub mod http_gateway;
 pub mod mqtt;
 pub mod orchestrator;
 pub mod replay;
+pub mod services;
 pub mod sse;
 pub mod store;
 pub mod sync;

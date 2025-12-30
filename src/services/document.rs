@@ -1,0 +1,552 @@
+//! Document service layer.
+//!
+//! This module contains the business logic for document operations,
+//! separating it from HTTP handler concerns. The service orchestrates
+//! between DocumentStore, CommitStore, and CommitBroadcaster.
+
+use std::sync::Arc;
+
+use crate::commit::Commit;
+use crate::document::{ApplyError, ContentType, Document, DocumentStore};
+use crate::events::{CommitBroadcaster, CommitNotification};
+use crate::store::CommitStore;
+use crate::{b64, diff, replay::CommitReplayer};
+
+/// Errors that can occur in service operations.
+#[derive(Debug)]
+pub enum ServiceError {
+    /// Document not found
+    NotFound,
+    /// Commit store not available (persistence disabled)
+    NoPersistence,
+    /// Invalid input data
+    InvalidInput(String),
+    /// Internal error
+    Internal(String),
+    /// Conflict (e.g., concurrent modification)
+    Conflict,
+}
+
+impl From<ApplyError> for ServiceError {
+    fn from(e: ApplyError) -> Self {
+        match e {
+            ApplyError::NotFound => ServiceError::NotFound,
+            ApplyError::MissingYDoc => ServiceError::Internal("Missing YDoc".to_string()),
+            ApplyError::InvalidUpdate(msg) => ServiceError::InvalidInput(msg),
+            ApplyError::Serialization(msg) => ServiceError::Internal(msg),
+        }
+    }
+}
+
+/// Result of a document edit operation.
+pub struct EditResult {
+    /// Commit ID of the created commit
+    pub cid: String,
+    /// Timestamp of the commit
+    pub timestamp: u64,
+}
+
+/// Result of creating a commit with optional merge.
+pub struct CommitResult {
+    /// The main commit CID (edit commit if merging)
+    pub cid: String,
+    /// The merge commit CID (if a merge was required)
+    pub merge_cid: Option<String>,
+}
+
+/// Result of a replace operation.
+pub struct ReplaceResult {
+    /// The merge/head commit CID
+    pub cid: String,
+    /// The edit commit CID
+    pub edit_cid: String,
+    /// Summary statistics
+    pub chars_inserted: usize,
+    pub chars_deleted: usize,
+    pub operations: usize,
+}
+
+/// Result of a fork operation.
+pub struct ForkResult {
+    /// ID of the new document
+    pub id: String,
+    /// HEAD commit of the new document
+    pub head: String,
+}
+
+/// Document head information.
+pub struct HeadInfo {
+    /// Current commit ID (if persistence enabled)
+    pub cid: Option<String>,
+    /// Document content
+    pub content: String,
+    /// Base64-encoded Yjs state (if available)
+    pub state: Option<String>,
+}
+
+/// Service for document operations.
+///
+/// Encapsulates business logic for document CRUD and commit operations,
+/// orchestrating between stores and handling broadcasting.
+pub struct DocumentService {
+    doc_store: Arc<DocumentStore>,
+    commit_store: Option<Arc<CommitStore>>,
+    commit_broadcaster: Option<CommitBroadcaster>,
+}
+
+impl DocumentService {
+    /// Create a new document service.
+    pub fn new(
+        doc_store: Arc<DocumentStore>,
+        commit_store: Option<Arc<CommitStore>>,
+        commit_broadcaster: Option<CommitBroadcaster>,
+    ) -> Self {
+        Self {
+            doc_store,
+            commit_store,
+            commit_broadcaster,
+        }
+    }
+
+    /// Broadcast a commit notification.
+    fn broadcast_commit(&self, doc_id: &str, commit_id: &str, timestamp: u64) {
+        if let Some(broadcaster) = self.commit_broadcaster.as_ref() {
+            broadcaster.notify(CommitNotification {
+                doc_id: doc_id.to_string(),
+                commit_id: commit_id.to_string(),
+                timestamp,
+            });
+        }
+    }
+
+    /// Broadcast multiple commit notifications.
+    fn broadcast_commits(&self, doc_id: &str, commits: &[(String, u64)]) {
+        for (commit_id, timestamp) in commits {
+            self.broadcast_commit(doc_id, commit_id, *timestamp);
+        }
+    }
+
+    // ========================================================================
+    // Basic CRUD operations
+    // ========================================================================
+
+    /// Create a new document with the specified content type.
+    pub async fn create_document(&self, content_type: ContentType) -> String {
+        self.doc_store.create_document(content_type).await
+    }
+
+    /// Get a document by ID.
+    pub async fn get_document(&self, id: &str) -> Result<Document, ServiceError> {
+        self.doc_store
+            .get_document(id)
+            .await
+            .ok_or(ServiceError::NotFound)
+    }
+
+    /// Delete a document by ID.
+    pub async fn delete_document(&self, id: &str) -> bool {
+        self.doc_store.delete_document(id).await
+    }
+
+    // ========================================================================
+    // HEAD operations
+    // ========================================================================
+
+    /// Get document HEAD information.
+    ///
+    /// If `at_commit` is specified, replays history to return state at that commit.
+    pub async fn get_head(
+        &self,
+        id: &str,
+        at_commit: Option<&str>,
+    ) -> Result<HeadInfo, ServiceError> {
+        let doc = self.get_document(id).await?;
+
+        // If at_commit is specified, replay commits to get historical state
+        if let Some(target_cid) = at_commit {
+            let commit_store = self
+                .commit_store
+                .as_ref()
+                .ok_or(ServiceError::NoPersistence)?;
+            let replayer = CommitReplayer::new(commit_store);
+
+            let (content, state_bytes) = replayer
+                .get_content_and_state_at_commit(id, target_cid, &doc.content_type)
+                .await
+                .map_err(|_| ServiceError::NotFound)?;
+
+            return Ok(HeadInfo {
+                cid: Some(target_cid.to_string()),
+                content,
+                state: Some(b64::encode(&state_bytes)),
+            });
+        }
+
+        // Default: return current HEAD
+        let cid = if let Some(store) = &self.commit_store {
+            store.get_document_head(id).await.ok().flatten()
+        } else {
+            None
+        };
+
+        let state_bytes = self.doc_store.get_yjs_state(id).await;
+        let state_b64 = state_bytes.map(|b| b64::encode(&b));
+
+        Ok(HeadInfo {
+            cid,
+            content: doc.content,
+            state: state_b64,
+        })
+    }
+
+    // ========================================================================
+    // Edit operations
+    // ========================================================================
+
+    /// Apply an edit to a document.
+    ///
+    /// Creates a commit, applies the Yjs update, sets HEAD, and broadcasts.
+    pub async fn edit_document(
+        &self,
+        id: &str,
+        update_b64: &str,
+        author: Option<String>,
+        message: Option<String>,
+    ) -> Result<EditResult, ServiceError> {
+        let commit_store = self
+            .commit_store
+            .as_ref()
+            .ok_or(ServiceError::NoPersistence)?;
+
+        // Verify document exists
+        self.get_document(id).await?;
+
+        let update_bytes = b64::decode(update_b64)
+            .map_err(|_| ServiceError::InvalidInput("Invalid base64".to_string()))?;
+
+        // Get current head
+        let current_head = commit_store
+            .get_document_head(id)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        let parents = current_head.into_iter().collect();
+        let author = author.unwrap_or_else(|| "anonymous".to_string());
+
+        let commit = Commit::new(parents, update_b64.to_string(), author, message);
+        let timestamp = commit.timestamp;
+
+        let cid = commit_store
+            .store_commit(&commit)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        // Apply update to document
+        self.doc_store.apply_yjs_update(id, &update_bytes).await?;
+
+        // Update head
+        commit_store
+            .set_document_head(id, &cid)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        self.broadcast_commit(id, &cid, timestamp);
+
+        Ok(EditResult { cid, timestamp })
+    }
+
+    /// Create a commit with optional merge handling.
+    ///
+    /// This handles the complex case where `parent_cid` specifies a non-HEAD parent,
+    /// requiring creation of both an edit commit and a merge commit.
+    pub async fn create_commit(
+        &self,
+        id: &str,
+        update_b64: &str,
+        author: String,
+        message: Option<String>,
+        parent_cid: Option<String>,
+    ) -> Result<CommitResult, ServiceError> {
+        let commit_store = self
+            .commit_store
+            .as_ref()
+            .ok_or(ServiceError::NoPersistence)?;
+
+        // Verify document exists
+        self.get_document(id).await?;
+
+        let author = if author.is_empty() {
+            "anonymous".to_string()
+        } else {
+            author
+        };
+
+        let update_bytes = b64::decode(update_b64)
+            .map_err(|_| ServiceError::InvalidInput("Invalid base64".to_string()))?;
+
+        let current_head = commit_store
+            .get_document_head(id)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        let mut notifications: Vec<(String, u64)> = Vec::new();
+
+        let (commit_cid, merge_cid) = if let Some(parent) = parent_cid {
+            // Case: Create edit commit + merge commit
+            let edit_commit = Commit::new(
+                vec![parent.clone()],
+                update_b64.to_string(),
+                author.clone(),
+                message.clone(),
+            );
+            let edit_timestamp = edit_commit.timestamp;
+
+            let edit_cid = commit_store
+                .store_commit(&edit_commit)
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+            notifications.push((edit_cid.clone(), edit_timestamp));
+
+            // Then create a merge commit with both the edit and current head as parents
+            let merge_parents = if let Some(head_cid) = current_head.as_ref() {
+                vec![edit_cid.clone(), head_cid.clone()]
+            } else {
+                // No current head - just make the edit commit the head
+                self.doc_store.apply_yjs_update(id, &update_bytes).await?;
+
+                commit_store
+                    .set_document_head(id, &edit_cid)
+                    .await
+                    .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+                self.broadcast_commits(id, &notifications);
+                return Ok(CommitResult {
+                    cid: edit_cid,
+                    merge_cid: None,
+                });
+            };
+
+            let merge_commit = Commit::new(
+                merge_parents,
+                String::new(), // Empty update for merge
+                author,
+                Some("Merge commit".to_string()),
+            );
+            let merge_timestamp = merge_commit.timestamp;
+
+            let merge_cid = commit_store
+                .store_commit(&merge_commit)
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+            notifications.push((merge_cid.clone(), merge_timestamp));
+
+            // Validate monotonic descent for the merge commit
+            commit_store
+                .validate_monotonic_descent(id, &merge_cid)
+                .await
+                .map_err(|_| ServiceError::Conflict)?;
+
+            self.doc_store.apply_yjs_update(id, &update_bytes).await?;
+
+            commit_store
+                .set_document_head(id, &merge_cid)
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+            (edit_cid, Some(merge_cid))
+        } else {
+            // Case: Simple commit
+            let parents = current_head.clone().into_iter().collect();
+            let commit = Commit::new(parents, update_b64.to_string(), author, message);
+            let commit_timestamp = commit.timestamp;
+
+            let cid = commit_store
+                .store_commit(&commit)
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+            // Validate monotonic descent
+            commit_store
+                .validate_monotonic_descent(id, &cid)
+                .await
+                .map_err(|_| ServiceError::Conflict)?;
+
+            self.doc_store.apply_yjs_update(id, &update_bytes).await?;
+
+            commit_store
+                .set_document_head(id, &cid)
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+            notifications.push((cid.clone(), commit_timestamp));
+            (cid, None)
+        };
+
+        self.broadcast_commits(id, &notifications);
+
+        Ok(CommitResult {
+            cid: commit_cid,
+            merge_cid,
+        })
+    }
+
+    /// Fork a document, optionally at a specific commit.
+    pub async fn fork_document(
+        &self,
+        source_id: &str,
+        at_commit: Option<String>,
+    ) -> Result<ForkResult, ServiceError> {
+        let commit_store = self
+            .commit_store
+            .as_ref()
+            .ok_or(ServiceError::NoPersistence)?;
+
+        let source_doc = self.get_document(source_id).await?;
+
+        // Create new document with same content type
+        let new_id = self
+            .doc_store
+            .create_document(source_doc.content_type.clone())
+            .await;
+
+        // Get target commit (specified or HEAD)
+        let target_cid = if let Some(cid) = at_commit {
+            cid
+        } else {
+            commit_store
+                .get_document_head(source_id)
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?
+                .ok_or(ServiceError::NotFound)?
+        };
+
+        // Replay commits to build state
+        let replayer = CommitReplayer::new(commit_store);
+        let (_content, state_bytes) = replayer
+            .get_content_and_state_at_commit(source_id, &target_cid, &source_doc.content_type)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        // Apply the replayed state to the new document
+        self.doc_store
+            .apply_yjs_update(&new_id, &state_bytes)
+            .await?;
+
+        // Create a root commit for the forked document
+        let update_b64 = b64::encode(&state_bytes);
+        let commit = Commit::new(
+            vec![],
+            update_b64,
+            "fork".to_string(),
+            Some(format!("Forked from {} at {}", source_id, target_cid)),
+        );
+
+        let new_cid = commit_store
+            .store_commit(&commit)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        commit_store
+            .set_document_head(&new_id, &new_cid)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        Ok(ForkResult {
+            id: new_id,
+            head: new_cid,
+        })
+    }
+
+    /// Replace document content with diff computation.
+    ///
+    /// Handles optional parent_cid for offline sync scenarios where the client's
+    /// view may have diverged from HEAD.
+    pub async fn replace_content(
+        &self,
+        id: &str,
+        new_content: &str,
+        parent_cid: Option<String>,
+        author: Option<String>,
+    ) -> Result<ReplaceResult, ServiceError> {
+        let commit_store = self
+            .commit_store
+            .as_ref()
+            .ok_or(ServiceError::NoPersistence)?;
+
+        let doc = self.get_document(id).await?;
+
+        // Get current HEAD to check if parent_cid differs
+        let current_head = commit_store
+            .get_document_head(id)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        // Determine parents and compute diff appropriately
+        let (diff_result, parents) = if let Some(ref parent) = parent_cid {
+            // Check if parent differs from current HEAD
+            let parent_differs = current_head.as_ref() != Some(parent);
+
+            if parent_differs {
+                // Parent differs from HEAD - use historical state for proper CRDT merge
+                let replayer = CommitReplayer::new(commit_store);
+                let (old_content, base_state_bytes) = replayer
+                    .get_content_and_state_at_commit(id, parent, &doc.content_type)
+                    .await
+                    .map_err(|_| ServiceError::NotFound)?;
+
+                let diff = diff::compute_diff_update_with_base(
+                    &base_state_bytes,
+                    &old_content,
+                    new_content,
+                )
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+                // Include BOTH parents for merge commit
+                let mut merge_parents = vec![parent.clone()];
+                if let Some(head) = current_head {
+                    merge_parents.push(head);
+                }
+                (diff, merge_parents)
+            } else {
+                // Parent matches HEAD - use current content for diff
+                let diff = diff::compute_diff_update(&doc.content, new_content)
+                    .map_err(|e| ServiceError::Internal(e.to_string()))?;
+                (diff, vec![parent.clone()])
+            }
+        } else {
+            // No parent specified - use current content and HEAD as parent
+            let diff = diff::compute_diff_update(&doc.content, new_content)
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+            (diff, current_head.into_iter().collect())
+        };
+
+        let author = author.unwrap_or_else(|| "anonymous".to_string());
+        let commit = Commit::new(parents, diff_result.update_b64.clone(), author, None);
+        let timestamp = commit.timestamp;
+
+        let cid = commit_store
+            .store_commit(&commit)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        // Apply update
+        self.doc_store
+            .apply_yjs_update(id, &diff_result.update_bytes)
+            .await?;
+
+        commit_store
+            .set_document_head(id, &cid)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        self.broadcast_commit(id, &cid, timestamp);
+
+        Ok(ReplaceResult {
+            cid: cid.clone(),
+            edit_cid: cid,
+            chars_inserted: diff_result.summary.chars_inserted,
+            chars_deleted: diff_result.summary.chars_deleted,
+            operations: diff_result.operation_count,
+        })
+    }
+}

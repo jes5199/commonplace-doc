@@ -8,20 +8,15 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::b64;
 use crate::commit::Commit;
 use crate::document::{ContentType, DocumentStore};
 use crate::events::{CommitBroadcaster, CommitNotification};
+use crate::services::{DocumentService, ServiceError};
 use crate::store::CommitStore;
-use crate::{b64, document::ApplyError};
 
-#[derive(Clone)]
-pub struct ApiState {
-    pub doc_store: Arc<DocumentStore>,
-    pub commit_store: Option<Arc<CommitStore>>,
-    pub commit_broadcaster: Option<CommitBroadcaster>,
-    pub fs_root: Option<String>,
-}
-
+/// Broadcast a commit notification to subscribers.
+/// Used by path-based handlers that aren't yet migrated to DocumentService.
 fn broadcast_commit(state: &ApiState, doc_id: &str, commit_id: &str, timestamp: u64) {
     if let Some(broadcaster) = state.commit_broadcaster.as_ref() {
         broadcaster.notify(CommitNotification {
@@ -32,9 +27,31 @@ fn broadcast_commit(state: &ApiState, doc_id: &str, commit_id: &str, timestamp: 
     }
 }
 
-fn broadcast_commits(state: &ApiState, doc_id: &str, commits: &[(String, u64)]) {
-    for (commit_id, timestamp) in commits {
-        broadcast_commit(state, doc_id, commit_id, *timestamp);
+#[derive(Clone)]
+pub struct ApiState {
+    pub doc_store: Arc<DocumentStore>,
+    pub commit_store: Option<Arc<CommitStore>>,
+    pub commit_broadcaster: Option<CommitBroadcaster>,
+    pub fs_root: Option<String>,
+    pub service: Arc<DocumentService>,
+}
+
+impl ServiceError {
+    /// Convert a ServiceError to an HTTP StatusCode.
+    fn status_code(&self) -> StatusCode {
+        match self {
+            ServiceError::NotFound => StatusCode::NOT_FOUND,
+            ServiceError::NoPersistence => StatusCode::NOT_IMPLEMENTED,
+            ServiceError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+            ServiceError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ServiceError::Conflict => StatusCode::CONFLICT,
+        }
+    }
+}
+
+impl IntoResponse for ServiceError {
+    fn into_response(self) -> Response {
+        (self.status_code(), format!("{:?}", self)).into_response()
     }
 }
 
@@ -44,11 +61,18 @@ pub fn router(
     commit_broadcaster: Option<CommitBroadcaster>,
     fs_root: Option<String>,
 ) -> Router {
+    let service = Arc::new(DocumentService::new(
+        doc_store.clone(),
+        commit_store.clone(),
+        commit_broadcaster.clone(),
+    ));
+
     let state = ApiState {
         doc_store,
         commit_store,
         commit_broadcaster,
         fs_root,
+        service,
     };
 
     Router::new()
@@ -176,172 +200,22 @@ async fn create_commit(
     State(state): State<ApiState>,
     Path(doc_id): Path<String>,
     Json(req): Json<CreateCommitRequest>,
-) -> Result<Json<CreateCommitResponse>, StatusCode> {
-    // Check if commit store is available
-    let commit_store = state
-        .commit_store
-        .as_ref()
-        .ok_or(StatusCode::NOT_IMPLEMENTED)?;
-
-    // Check if document exists
-    let _doc = state
-        .doc_store
-        .get_document(&doc_id)
-        .await
-        .ok_or(StatusCode::NOT_FOUND)?;
-
+) -> Result<Json<CreateCommitResponse>, ServiceError> {
     // Only support "update" verb for now
     if req.verb != "update" {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ServiceError::InvalidInput(
+            "Only 'update' verb is supported".to_string(),
+        ));
     }
 
-    let author = if req.author.is_empty() {
-        "anonymous".to_string()
-    } else {
-        req.author
-    };
-
-    let update_bytes = b64::decode(&req.value).map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    // Get current head commit (if any)
-    let current_head = commit_store
-        .get_document_head(&doc_id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let mut notifications: Vec<(String, u64)> = Vec::new();
-
-    let (commit_cid, merge_cid) = if let Some(parent_cid) = req.parent_cid {
-        // Case 4b: Create edit commit + merge commit
-
-        // First, create the edit commit as a child of the specified parent
-        let edit_commit = Commit::new(
-            vec![parent_cid.clone()],
-            req.value.clone(),
-            author.clone(),
-            req.message.clone(),
-        );
-        let edit_timestamp = edit_commit.timestamp;
-
-        let edit_cid = commit_store
-            .store_commit(&edit_commit)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        notifications.push((edit_cid.clone(), edit_timestamp));
-
-        // Then create a merge commit with both the edit and current head as parents
-        let merge_parents = if let Some(head_cid) = current_head.as_ref() {
-            vec![edit_cid.clone(), head_cid.clone()]
-        } else {
-            // If there's no current head, just make the edit commit the head
-            state
-                .doc_store
-                .apply_yjs_update(&doc_id, &update_bytes)
-                .await
-                .map_err(|e| match e {
-                    ApplyError::NotFound => StatusCode::NOT_FOUND,
-                    ApplyError::MissingYDoc => StatusCode::INTERNAL_SERVER_ERROR,
-                    ApplyError::InvalidUpdate(_) => StatusCode::BAD_REQUEST,
-                    ApplyError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
-                })?;
-
-            commit_store
-                .set_document_head(&doc_id, &edit_cid)
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-            broadcast_commits(&state, &doc_id, &notifications);
-            return Ok(Json(CreateCommitResponse {
-                cid: edit_cid,
-                merge_cid: None,
-            }));
-        };
-
-        let merge_commit = Commit::new(
-            merge_parents,
-            String::new(), // Empty update for merge
-            author,
-            Some("Merge commit".to_string()),
-        );
-        let merge_timestamp = merge_commit.timestamp;
-
-        let merge_cid = commit_store
-            .store_commit(&merge_commit)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        notifications.push((merge_cid.clone(), merge_timestamp));
-
-        // Validate monotonic descent for the merge commit
-        commit_store
-            .validate_monotonic_descent(&doc_id, &merge_cid)
-            .await
-            .map_err(|_| StatusCode::CONFLICT)?;
-
-        state
-            .doc_store
-            .apply_yjs_update(&doc_id, &update_bytes)
-            .await
-            .map_err(|e| match e {
-                ApplyError::NotFound => StatusCode::NOT_FOUND,
-                ApplyError::MissingYDoc => StatusCode::INTERNAL_SERVER_ERROR,
-                ApplyError::InvalidUpdate(_) => StatusCode::BAD_REQUEST,
-                ApplyError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            })?;
-
-        // Update document head to merge commit
-        commit_store
-            .set_document_head(&doc_id, &merge_cid)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        (edit_cid, Some(merge_cid))
-    } else {
-        // Case 4a: Simple commit
-
-        // Create commit with current head as parent
-        let parents = current_head.clone().into_iter().collect();
-
-        let commit = Commit::new(parents, req.value, author, req.message);
-        let commit_timestamp = commit.timestamp;
-
-        let cid = commit_store
-            .store_commit(&commit)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        // Validate monotonic descent
-        commit_store
-            .validate_monotonic_descent(&doc_id, &cid)
-            .await
-            .map_err(|_| StatusCode::CONFLICT)?;
-
-        state
-            .doc_store
-            .apply_yjs_update(&doc_id, &update_bytes)
-            .await
-            .map_err(|e| match e {
-                ApplyError::NotFound => StatusCode::NOT_FOUND,
-                ApplyError::MissingYDoc => StatusCode::INTERNAL_SERVER_ERROR,
-                ApplyError::InvalidUpdate(_) => StatusCode::BAD_REQUEST,
-                ApplyError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            })?;
-
-        // Update document head
-        commit_store
-            .set_document_head(&doc_id, &cid)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        notifications.push((cid.clone(), commit_timestamp));
-
-        (cid, None)
-    };
-
-    broadcast_commits(&state, &doc_id, &notifications);
+    let result = state
+        .service
+        .create_commit(&doc_id, &req.value, req.author, req.message, req.parent_cid)
+        .await?;
 
     Ok(Json(CreateCommitResponse {
-        cid: commit_cid,
-        merge_cid,
+        cid: result.cid,
+        merge_cid: result.merge_cid,
     }))
 }
 
@@ -389,48 +263,16 @@ async fn get_doc_head(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Query(params): Query<DocHeadParams>,
-) -> Result<Json<DocHeadResponse>, StatusCode> {
-    let doc = state
-        .doc_store
-        .get_document(&id)
-        .await
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    // If at_commit is specified, replay commits to get historical state
-    if let Some(target_cid) = params.at_commit {
-        let commit_store = state
-            .commit_store
-            .as_ref()
-            .ok_or(StatusCode::NOT_IMPLEMENTED)?;
-
-        let replayer = crate::replay::CommitReplayer::new(commit_store);
-        let (content, state_bytes) = replayer
-            .get_content_and_state_at_commit(&id, &target_cid, &doc.content_type)
-            .await
-            .map_err(|_| StatusCode::NOT_FOUND)?;
-
-        return Ok(Json(DocHeadResponse {
-            cid: Some(target_cid),
-            content,
-            state: Some(b64::encode(&state_bytes)),
-        }));
-    }
-
-    // Default: return current HEAD
-    let cid = if let Some(store) = &state.commit_store {
-        store.get_document_head(&id).await.ok().flatten()
-    } else {
-        None
-    };
-
-    // Get Yjs state bytes if document has a ydoc
-    let state_bytes = state.doc_store.get_yjs_state(&id).await;
-    let state_b64 = state_bytes.map(|b| b64::encode(&b));
+) -> Result<Json<DocHeadResponse>, ServiceError> {
+    let head = state
+        .service
+        .get_head(&id, params.at_commit.as_deref())
+        .await?;
 
     Ok(Json(DocHeadResponse {
-        cid,
-        content: doc.content,
-        state: state_b64,
+        cid: head.cid,
+        content: head.content,
+        state: head.state,
     }))
 }
 
@@ -452,54 +294,13 @@ async fn edit_doc(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(req): Json<DocEditRequest>,
-) -> Result<Json<DocEditResponse>, StatusCode> {
-    let commit_store = state
-        .commit_store
-        .as_ref()
-        .ok_or(StatusCode::NOT_IMPLEMENTED)?;
+) -> Result<Json<DocEditResponse>, ServiceError> {
+    let result = state
+        .service
+        .edit_document(&id, &req.update, req.author, req.message)
+        .await?;
 
-    // Verify document exists
-    let _doc = state
-        .doc_store
-        .get_document(&id)
-        .await
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let update_bytes = b64::decode(&req.update).map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    // Get current head
-    let current_head = commit_store
-        .get_document_head(&id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let parents = current_head.into_iter().collect();
-    let author = req.author.unwrap_or_else(|| "anonymous".to_string());
-
-    let commit = Commit::new(parents, req.update, author, req.message);
-    let timestamp = commit.timestamp;
-
-    let cid = commit_store
-        .store_commit(&commit)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Apply update to document
-    state
-        .doc_store
-        .apply_yjs_update(&id, &update_bytes)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Update head
-    commit_store
-        .set_document_head(&id, &cid)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    broadcast_commit(&state, &id, &cid, timestamp);
-
-    Ok(Json(DocEditResponse { cid }))
+    Ok(Json(DocEditResponse { cid: result.cid }))
 }
 
 #[derive(Deserialize)]
@@ -528,92 +329,19 @@ async fn replace_doc(
     Path(id): Path<String>,
     Query(params): Query<ReplaceParams>,
     body: String,
-) -> Result<Json<ReplaceResponse>, StatusCode> {
-    let commit_store = state
-        .commit_store
-        .as_ref()
-        .ok_or(StatusCode::NOT_IMPLEMENTED)?;
-
-    let doc = state
-        .doc_store
-        .get_document(&id)
-        .await
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    // Get current HEAD to check if parent_cid differs
-    let current_head = commit_store
-        .get_document_head(&id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Determine parents and compute diff appropriately
-    let (diff_result, parents) = if let Some(ref parent_cid) = params.parent_cid {
-        // Check if parent differs from current HEAD
-        let parent_differs = current_head.as_ref() != Some(parent_cid);
-
-        if parent_differs {
-            // Parent differs from HEAD - use historical state for proper CRDT merge
-            // This ensures offline client changes merge correctly with concurrent server changes
-            let replayer = crate::replay::CommitReplayer::new(commit_store);
-            let (old_content, base_state_bytes) = replayer
-                .get_content_and_state_at_commit(&id, parent_cid, &doc.content_type)
-                .await
-                .map_err(|_| StatusCode::NOT_FOUND)?;
-
-            let diff =
-                crate::diff::compute_diff_update_with_base(&base_state_bytes, &old_content, &body)
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-            // Include BOTH parents for merge commit: client's parent AND current HEAD
-            // This preserves concurrent edits in the commit graph for proper history replay
-            let mut merge_parents = vec![parent_cid.clone()];
-            if let Some(head) = current_head {
-                merge_parents.push(head);
-            }
-            (diff, merge_parents)
-        } else {
-            // Parent matches HEAD - use current content for diff
-            let diff = crate::diff::compute_diff_update(&doc.content, &body)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            (diff, vec![parent_cid.clone()])
-        }
-    } else {
-        // No parent specified - use current content and HEAD as parent
-        let diff = crate::diff::compute_diff_update(&doc.content, &body)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        (diff, current_head.into_iter().collect())
-    };
-    let author = params.author.unwrap_or_else(|| "anonymous".to_string());
-
-    let commit = Commit::new(parents, diff_result.update_b64.clone(), author, None);
-    let timestamp = commit.timestamp;
-
-    let cid = commit_store
-        .store_commit(&commit)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Apply update
-    state
-        .doc_store
-        .apply_yjs_update(&id, &diff_result.update_bytes)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    commit_store
-        .set_document_head(&id, &cid)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    broadcast_commit(&state, &id, &cid, timestamp);
+) -> Result<Json<ReplaceResponse>, ServiceError> {
+    let result = state
+        .service
+        .replace_content(&id, &body, params.parent_cid, params.author)
+        .await?;
 
     Ok(Json(ReplaceResponse {
-        cid: cid.clone(),
-        edit_cid: cid,
+        cid: result.cid,
+        edit_cid: result.edit_cid,
         summary: ReplaceSummary {
-            chars_inserted: diff_result.summary.chars_inserted,
-            chars_deleted: diff_result.summary.chars_deleted,
-            operations: diff_result.operation_count,
+            chars_inserted: result.chars_inserted,
+            chars_deleted: result.chars_deleted,
+            operations: result.operations,
         },
     }))
 }
@@ -633,72 +361,15 @@ async fn fork_doc(
     State(state): State<ApiState>,
     Path(source_id): Path<String>,
     Query(params): Query<ForkParams>,
-) -> Result<Json<ForkResponse>, StatusCode> {
-    let commit_store = state
-        .commit_store
-        .as_ref()
-        .ok_or(StatusCode::NOT_IMPLEMENTED)?;
-
-    // Get source document
-    let source_doc = state
-        .doc_store
-        .get_document(&source_id)
-        .await
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    // Create new document with same content type
-    let new_id = state
-        .doc_store
-        .create_document(source_doc.content_type.clone())
-        .await;
-
-    // Get target commit (specified or HEAD)
-    let target_cid = if let Some(cid) = params.at_commit {
-        cid
-    } else {
-        commit_store
-            .get_document_head(&source_id)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::NOT_FOUND)?
-    };
-
-    // Replay commits to build state
-    let replayer = crate::replay::CommitReplayer::new(commit_store);
-    let (_content, state_bytes) = replayer
-        .get_content_and_state_at_commit(&source_id, &target_cid, &source_doc.content_type)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Apply the replayed state to the new document
-    state
-        .doc_store
-        .apply_yjs_update(&new_id, &state_bytes)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Create a root commit for the forked document with the full state
-    let update_b64 = b64::encode(&state_bytes);
-    let commit = Commit::new(
-        vec![],
-        update_b64,
-        "fork".to_string(),
-        Some(format!("Forked from {} at {}", source_id, target_cid)),
-    );
-
-    let new_cid = commit_store
-        .store_commit(&commit)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    commit_store
-        .set_document_head(&new_id, &new_cid)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+) -> Result<Json<ForkResponse>, ServiceError> {
+    let result = state
+        .service
+        .fork_document(&source_id, params.at_commit)
+        .await?;
 
     Ok(Json(ForkResponse {
-        id: new_id,
-        head: new_cid,
+        id: result.id,
+        head: result.head,
     }))
 }
 
