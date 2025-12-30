@@ -2,6 +2,7 @@ pub mod api;
 pub mod b64;
 pub mod cli;
 pub mod commit;
+pub mod content_type;
 pub mod diff;
 pub mod document;
 pub mod events;
@@ -17,7 +18,8 @@ pub mod store;
 pub mod sync;
 
 use axum::{routing::get, Router};
-use document::{ContentType, DocumentStore};
+use content_type::ContentType;
+use document::DocumentStore;
 use events::CommitBroadcaster;
 use fs::FilesystemReconciler;
 use services::DocumentService;

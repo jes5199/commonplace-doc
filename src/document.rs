@@ -9,52 +9,8 @@ use yrs::Transact;
 use yrs::Value;
 use yrs::WriteTxn;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ContentType {
-    Json,
-    JsonArray,
-    Xml,
-    Text,
-}
-
-impl ContentType {
-    pub fn from_mime(mime: &str) -> Option<Self> {
-        let mut parts = mime.split(';').map(|part| part.trim());
-        let base = parts.next().unwrap_or_default();
-        let params: Vec<&str> = parts.collect();
-
-        match base {
-            "application/json" => {
-                if params.iter().any(|p| p.eq_ignore_ascii_case("root=array")) {
-                    Some(ContentType::JsonArray)
-                } else {
-                    Some(ContentType::Json)
-                }
-            }
-            "application/xml" | "text/xml" => Some(ContentType::Xml),
-            "text/plain" => Some(ContentType::Text),
-            _ => None,
-        }
-    }
-
-    pub fn to_mime(&self) -> &'static str {
-        match self {
-            ContentType::Json => "application/json",
-            ContentType::JsonArray => "application/json;root=array",
-            ContentType::Xml => "application/xml",
-            ContentType::Text => "text/plain",
-        }
-    }
-
-    pub fn default_content(&self) -> String {
-        match self {
-            ContentType::Json => "{}".to_string(),
-            ContentType::JsonArray => "[]".to_string(),
-            ContentType::Xml => r#"<?xml version="1.0" encoding="UTF-8"?><root/>"#.to_string(),
-            ContentType::Text => String::new(),
-        }
-    }
-}
+// Re-export ContentType for backward compatibility
+pub use crate::content_type::ContentType;
 
 #[derive(Clone)]
 pub struct Document {
