@@ -27,6 +27,6 @@ pub use urls::{
     encode_node_id, encode_path, normalize_path,
 };
 pub use yjs::{
-    base64_decode, base64_encode, create_yjs_json_update, create_yjs_text_update,
-    json_value_to_any, TEXT_ROOT_NAME,
+    base64_decode, base64_encode, create_yjs_json_update, create_yjs_text_diff_update,
+    create_yjs_text_update, json_value_to_any, TEXT_ROOT_NAME,
 };

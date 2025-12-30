@@ -540,18 +540,42 @@ async fn replace_doc(
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    // Generate diff
-    let diff_result = crate::diff::compute_diff_update(&doc.content, &body)
+    // Get current HEAD to check if parent_cid differs
+    let current_head = commit_store
+        .get_document_head(&id)
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Determine parent
-    let parent = if let Some(p) = params.parent_cid {
-        Some(p)
+    // Determine parent and compute diff appropriately
+    let (diff_result, parent) = if let Some(ref parent_cid) = params.parent_cid {
+        // Check if parent differs from current HEAD
+        let parent_differs = current_head.as_ref() != Some(parent_cid);
+
+        if parent_differs {
+            // Parent differs from HEAD - use historical state for proper CRDT merge
+            // This ensures offline client changes merge correctly with concurrent server changes
+            let replayer = crate::replay::CommitReplayer::new(commit_store);
+            let (old_content, base_state_bytes) = replayer
+                .get_content_and_state_at_commit(&id, parent_cid, &doc.content_type)
+                .await
+                .map_err(|_| StatusCode::NOT_FOUND)?;
+
+            let diff =
+                crate::diff::compute_diff_update_with_base(&base_state_bytes, &old_content, &body)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            (diff, Some(parent_cid.clone()))
+        } else {
+            // Parent matches HEAD - use current content for diff
+            let diff = crate::diff::compute_diff_update(&doc.content, &body)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            (diff, Some(parent_cid.clone()))
+        }
     } else {
-        commit_store
-            .get_document_head(&id)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        // No parent specified - use current content and HEAD as parent
+        let diff = crate::diff::compute_diff_update(&doc.content, &body)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        (diff, current_head)
     };
 
     let parents: Vec<String> = parent.into_iter().collect();

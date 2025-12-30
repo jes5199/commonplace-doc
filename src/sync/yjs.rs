@@ -117,6 +117,69 @@ pub fn json_value_to_any(value: serde_json::Value) -> Any {
     }
 }
 
+/// Create a Yjs update that transforms text from old content to new content,
+/// using a base Yjs state to ensure proper CRDT merge with concurrent edits.
+///
+/// This function:
+/// 1. Applies the base state to a fresh Yjs document
+/// 2. Computes character-level diff from old_content to new_content
+/// 3. Applies diff operations to the Yjs document
+/// 4. Returns the update that can be merged with any concurrent changes
+pub fn create_yjs_text_diff_update(
+    base_state_b64: &str,
+    old_content: &str,
+    new_content: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use similar::{ChangeTag, TextDiff};
+
+    // Decode base state
+    let base_state_bytes = base64_decode(base_state_b64)?;
+
+    // Create doc and apply base state
+    let doc = Doc::with_client_id(2); // Different client ID for merge
+    let text = doc.get_or_insert_text(TEXT_ROOT_NAME);
+
+    if !base_state_bytes.is_empty() {
+        let update = Update::decode_v1(&base_state_bytes)
+            .map_err(|e| format!("Failed to decode base state: {}", e))?;
+        let mut txn = doc.transact_mut();
+        txn.apply_update(update);
+    }
+
+    // Compute character-level diff
+    let diff = TextDiff::from_chars(old_content, new_content);
+
+    // Apply diff operations
+    let update_bytes = {
+        let mut txn = doc.transact_mut();
+        let mut pos = 0u32;
+
+        for change in diff.iter_all_changes() {
+            match change.tag() {
+                ChangeTag::Equal => {
+                    // Move position forward by the number of chars
+                    pos += change.value().chars().count() as u32;
+                }
+                ChangeTag::Delete => {
+                    // Delete characters at current position
+                    let len = change.value().chars().count() as u32;
+                    text.remove_range(&mut txn, pos, len);
+                    // Position stays the same after delete
+                }
+                ChangeTag::Insert => {
+                    // Insert characters at current position
+                    text.insert(&mut txn, pos, change.value());
+                    pos += change.value().chars().count() as u32;
+                }
+            }
+        }
+
+        txn.encode_update_v1()
+    };
+
+    Ok(base64_encode(&update_bytes))
+}
+
 /// Simple base64 encoding (matching server's b64 module)
 pub fn base64_encode(data: &[u8]) -> String {
     STANDARD.encode(data)
