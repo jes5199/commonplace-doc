@@ -690,3 +690,118 @@ async fn test_head_at_commit_returns_historical_state() {
     let current_json: serde_json::Value = serde_json::from_str(&current_body).unwrap();
     assert_eq!(current_json["content"].as_str().unwrap(), "hello world");
 }
+
+#[tokio::test]
+async fn test_head_at_commit_rejects_foreign_cid() {
+    // Security test: at_commit must belong to the requested document's history
+    let (app, _dir) = create_app_with_commit_store();
+
+    // Create first document and make a commit
+    let create1_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/docs")
+                .header("content-type", "text/plain")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let create1_body = body_to_string(create1_response.into_body()).await;
+    let doc1_id = serde_json::from_str::<serde_json::Value>(&create1_body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Make a commit to doc1
+    let yjs_doc1 = yrs::Doc::new();
+    let text1 = yjs_doc1.get_or_insert_text("content");
+    let mut txn1 = yjs_doc1.transact_mut();
+    text1.insert(&mut txn1, 0, "doc1 content");
+    let update1 = txn1.encode_update_v1();
+    drop(txn1);
+    let update1_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &update1);
+
+    let commit1_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/docs/{}/edit", doc1_id))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "update": update1_b64 }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(commit1_response.status(), StatusCode::OK);
+    let commit1_body = body_to_string(commit1_response.into_body()).await;
+    let doc1_cid = serde_json::from_str::<serde_json::Value>(&commit1_body).unwrap()["cid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Create second document
+    let create2_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/docs")
+                .header("content-type", "text/plain")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let create2_body = body_to_string(create2_response.into_body()).await;
+    let doc2_id = serde_json::from_str::<serde_json::Value>(&create2_body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Make a commit to doc2 so it has a HEAD
+    let yjs_doc2 = yrs::Doc::new();
+    let text2 = yjs_doc2.get_or_insert_text("content");
+    let mut txn2 = yjs_doc2.transact_mut();
+    text2.insert(&mut txn2, 0, "doc2 content");
+    let update2 = txn2.encode_update_v1();
+    drop(txn2);
+    let update2_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &update2);
+
+    let commit2_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/docs/{}/edit", doc2_id))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "update": update2_b64 }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(commit2_response.status(), StatusCode::OK);
+
+    // Try to get doc2's HEAD at doc1's CID - should be rejected
+    let foreign_cid_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/docs/{}/head?at_commit={}", doc2_id, doc1_cid))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Security: Must reject foreign CID with 404
+    assert_eq!(foreign_cid_response.status(), StatusCode::NOT_FOUND);
+}

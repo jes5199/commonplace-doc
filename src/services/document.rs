@@ -194,6 +194,15 @@ impl DocumentService {
                 .ok_or(ServiceError::NoPersistence)?;
             let replayer = CommitReplayer::new(commit_store);
 
+            // Verify the commit belongs to this document's history
+            if !replayer
+                .verify_commit_in_history(id, target_cid)
+                .await
+                .map_err(|_| ServiceError::NotFound)?
+            {
+                return Err(ServiceError::NotFound);
+            }
+
             let (content, state_bytes) = replayer
                 .get_content_and_state_at_commit(id, target_cid, &doc.content_type)
                 .await
@@ -467,6 +476,16 @@ impl DocumentService {
 
         // Replay commits to build state
         let replayer = CommitReplayer::new(commit_store);
+
+        // Verify the commit belongs to the source document's history
+        if !replayer
+            .verify_commit_in_history(source_id, &target_cid)
+            .await
+            .map_err(|_| ServiceError::NotFound)?
+        {
+            return Err(ServiceError::NotFound);
+        }
+
         let (_content, state_bytes) = replayer
             .get_content_and_state_at_commit(source_id, &target_cid, &source_doc.content_type)
             .await
@@ -534,6 +553,16 @@ impl DocumentService {
             if parent_differs {
                 // Parent differs from HEAD - use historical state for proper CRDT merge
                 let replayer = CommitReplayer::new(commit_store);
+
+                // Verify the commit belongs to this document's history
+                if !replayer
+                    .verify_commit_in_history(id, parent)
+                    .await
+                    .map_err(|_| ServiceError::NotFound)?
+                {
+                    return Err(ServiceError::NotFound);
+                }
+
                 let (old_content, base_state_bytes) = replayer
                     .get_content_and_state_at_commit(id, parent, &doc.content_type)
                     .await
