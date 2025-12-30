@@ -125,3 +125,15 @@ pub struct CmdArgs {
     #[clap(long, default_value = "commonplace-cmd")]
     pub source: String,
 }
+
+/// CLI arguments for commonplace-link (create document aliases)
+#[derive(Parser, Debug)]
+#[clap(name = "commonplace-link")]
+#[clap(about = "Create a link to a commonplace document (like ln)", long_about = None)]
+pub struct LinkArgs {
+    /// Source file path (must exist in schema)
+    pub source: PathBuf,
+
+    /// Target link path (must not exist)
+    pub target: PathBuf,
+}

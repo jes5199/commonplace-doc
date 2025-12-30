@@ -51,8 +51,11 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
     let commit_broadcaster = commit_store.as_ref().map(|_| CommitBroadcaster::new(1024));
 
     // Initialize filesystem if --fs-root is specified
-    // Capture fs-root content for MQTT handlers
-    let fs_root_context: Option<(String, String)> = if let Some(ref fs_root_id) = config.fs_root {
+    // Capture fs-root content for MQTT handlers and reconciler for DocumentService
+    let (fs_root_context, reconciler): (
+        Option<(String, String)>,
+        Option<Arc<FilesystemReconciler>>,
+    ) = if let Some(ref fs_root_id) = config.fs_root {
         // Get or create the fs-root document
         // Use Json type since the fs-root schema is a JSON map structure
         let fs_doc = doc_store
@@ -75,9 +78,9 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
             }
         }
 
-        Some((fs_root_id.clone(), content))
+        (Some((fs_root_id.clone(), content)), Some(reconciler))
     } else {
-        None
+        (None, None)
     };
 
     // Initialize MQTT service if configured
@@ -139,11 +142,23 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
     }
 
     // Create shared service for handlers
-    let service = Arc::new(DocumentService::new(
-        doc_store.clone(),
-        commit_store.clone(),
-        commit_broadcaster.clone(),
-    ));
+    let service = Arc::new(
+        if let (Some(reconciler), Some(ref fs_root_id)) = (reconciler, &config.fs_root) {
+            DocumentService::with_reconciler(
+                doc_store.clone(),
+                commit_store.clone(),
+                commit_broadcaster.clone(),
+                reconciler,
+                fs_root_id.clone(),
+            )
+        } else {
+            DocumentService::new(
+                doc_store.clone(),
+                commit_store.clone(),
+                commit_broadcaster.clone(),
+            )
+        },
+    );
 
     Router::new()
         .route("/health", get(health_check))
@@ -152,6 +167,7 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
             commit_store.clone(),
             commit_broadcaster.clone(),
             config.fs_root.clone(),
+            service.clone(),
         ))
         .merge(files::router(
             doc_store.clone(),
@@ -189,6 +205,7 @@ pub fn create_router_with_store(store: Option<CommitStore>) -> Router {
             commit_store.clone(),
             commit_broadcaster.clone(),
             None, // No fs-root in this variant
+            service.clone(),
         ))
         .merge(files::router(
             doc_store.clone(),

@@ -35,6 +35,10 @@ path = "src/bin/cmd.rs"
 name = "commonplace-mcp"
 path = "src/bin/mcp.rs"
 
+[[bin]]
+name = "commonplace-link"
+path = "src/bin/link.rs"
+
 [dependencies]
 rmcp = { version = "0.12", features = ["server", "transport-io"] }
 axum = "0.7"

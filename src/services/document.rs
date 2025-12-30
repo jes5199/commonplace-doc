@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::commit::Commit;
 use crate::document::{ApplyError, ContentType, Document, DocumentStore};
 use crate::events::{CommitBroadcaster, CommitNotification};
+use crate::fs::FilesystemReconciler;
 use crate::store::CommitStore;
 use crate::{b64, diff, replay::CommitReplayer};
 
@@ -92,6 +93,10 @@ pub struct DocumentService {
     doc_store: Arc<DocumentStore>,
     commit_store: Option<Arc<CommitStore>>,
     commit_broadcaster: Option<CommitBroadcaster>,
+    /// Filesystem reconciler (if fs-root is configured)
+    reconciler: Option<Arc<FilesystemReconciler>>,
+    /// Filesystem root document ID (for triggering reconciliation)
+    fs_root_id: Option<String>,
 }
 
 impl DocumentService {
@@ -105,6 +110,25 @@ impl DocumentService {
             doc_store,
             commit_store,
             commit_broadcaster,
+            reconciler: None,
+            fs_root_id: None,
+        }
+    }
+
+    /// Create a new document service with filesystem reconciler.
+    pub fn with_reconciler(
+        doc_store: Arc<DocumentStore>,
+        commit_store: Option<Arc<CommitStore>>,
+        commit_broadcaster: Option<CommitBroadcaster>,
+        reconciler: Arc<FilesystemReconciler>,
+        fs_root_id: String,
+    ) -> Self {
+        Self {
+            doc_store,
+            commit_store,
+            commit_broadcaster,
+            reconciler: Some(reconciler),
+            fs_root_id: Some(fs_root_id),
         }
     }
 
@@ -252,7 +276,28 @@ impl DocumentService {
 
         self.broadcast_commit(id, &cid, timestamp);
 
+        // Trigger filesystem reconciliation if this is the fs-root document
+        self.maybe_reconcile(id).await;
+
         Ok(EditResult { cid, timestamp })
+    }
+
+    /// Trigger filesystem reconciliation if the edited document is the fs-root.
+    async fn maybe_reconcile(&self, doc_id: &str) {
+        if let (Some(reconciler), Some(fs_root_id)) = (&self.reconciler, &self.fs_root_id) {
+            if doc_id == fs_root_id {
+                // Get the updated content
+                if let Some(doc) = self.doc_store.get_document(doc_id).await {
+                    if !doc.content.is_empty() && doc.content != "{}" {
+                        if let Err(e) = reconciler.reconcile(&doc.content).await {
+                            tracing::warn!("Filesystem reconciliation failed: {}", e);
+                        } else {
+                            tracing::debug!("Filesystem reconciliation completed for {}", doc_id);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Create a commit with optional merge handling.
@@ -540,6 +585,9 @@ impl DocumentService {
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
         self.broadcast_commit(id, &cid, timestamp);
+
+        // Trigger filesystem reconciliation if this is the fs-root document
+        self.maybe_reconcile(id).await;
 
         Ok(ReplaceResult {
             cid: cid.clone(),

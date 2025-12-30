@@ -46,13 +46,8 @@ pub fn router(
     commit_store: Option<Arc<CommitStore>>,
     commit_broadcaster: Option<CommitBroadcaster>,
     fs_root: Option<String>,
+    service: Arc<DocumentService>,
 ) -> Router {
-    let service = Arc::new(DocumentService::new(
-        doc_store.clone(),
-        commit_store.clone(),
-        commit_broadcaster.clone(),
-    ));
-
     let state = ApiState {
         doc_store,
         commit_store,

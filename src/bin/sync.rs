@@ -213,13 +213,21 @@ async fn main() -> ExitCode {
         // exec is required by clap when sandbox is set
         let exec_cmd = args.exec.expect("--sandbox requires --exec");
 
+        // Sandbox mode defaults to pulling server content (since local sandbox is empty)
+        // User can still override with explicit --initial-sync if needed
+        let initial_sync = if args.initial_sync == "skip" {
+            "server".to_string()
+        } else {
+            args.initial_sync
+        };
+
         let exec_result = run_exec_mode(
             client,
             args.server,
             node_id,
             sandbox_dir.clone(),
             scan_options,
-            args.initial_sync,
+            initial_sync,
             args.use_paths,
             exec_cmd,
             args.exec_args,
