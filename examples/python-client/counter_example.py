@@ -168,11 +168,21 @@ def main():
     # Read environment variables for defaults
     default_path = os.environ.get("COMMONPLACE_PATH", "examples/counter.json")
 
-    # Parse COMMONPLACE_MQTT if present (format: host:port)
+    # Parse COMMONPLACE_MQTT if present (format: host:port or mqtt://host:port)
     mqtt_env = os.environ.get("COMMONPLACE_MQTT", "")
+    # Strip URL schemes if present
+    for scheme in ("mqtt://", "tcp://", "ssl://"):
+        if mqtt_env.startswith(scheme):
+            mqtt_env = mqtt_env[len(scheme):]
+            break
     if mqtt_env and ":" in mqtt_env:
         default_broker, port_str = mqtt_env.rsplit(":", 1)
-        default_port = int(port_str)
+        try:
+            default_port = int(port_str)
+        except ValueError:
+            # Port not a number, use whole thing as broker
+            default_broker = mqtt_env
+            default_port = 1883
     else:
         default_broker = mqtt_env if mqtt_env else "localhost"
         default_port = 1883
