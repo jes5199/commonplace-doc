@@ -372,6 +372,11 @@ async fn get_doc_info(
     }))
 }
 
+#[derive(Deserialize)]
+struct DocHeadParams {
+    at_commit: Option<String>,
+}
+
 #[derive(Serialize)]
 struct DocHeadResponse {
     cid: Option<String>,
@@ -383,6 +388,7 @@ struct DocHeadResponse {
 async fn get_doc_head(
     State(state): State<ApiState>,
     Path(id): Path<String>,
+    Query(params): Query<DocHeadParams>,
 ) -> Result<Json<DocHeadResponse>, StatusCode> {
     let doc = state
         .doc_store
@@ -390,6 +396,27 @@ async fn get_doc_head(
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    // If at_commit is specified, replay commits to get historical state
+    if let Some(target_cid) = params.at_commit {
+        let commit_store = state
+            .commit_store
+            .as_ref()
+            .ok_or(StatusCode::NOT_IMPLEMENTED)?;
+
+        let replayer = crate::replay::CommitReplayer::new(commit_store);
+        let (content, state_bytes) = replayer
+            .get_content_and_state_at_commit(&id, &target_cid, &doc.content_type)
+            .await
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+
+        return Ok(Json(DocHeadResponse {
+            cid: Some(target_cid),
+            content,
+            state: Some(b64::encode(&state_bytes)),
+        }));
+    }
+
+    // Default: return current HEAD
     let cid = if let Some(store) = &state.commit_store {
         store.get_document_head(&id).await.ok().flatten()
     } else {

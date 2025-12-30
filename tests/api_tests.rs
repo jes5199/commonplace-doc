@@ -4,9 +4,11 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use tower::util::ServiceExt;
+use yrs::updates::decoder::Decode;
 use yrs::Map;
 use yrs::Text;
 use yrs::Transact;
+use yrs::Update;
 use yrs::XmlElementPrelim;
 use yrs::XmlFragment;
 use yrs::XmlTextPrelim;
@@ -562,4 +564,129 @@ async fn test_xml_document_yjs_commit_updates_document_body() {
         body,
         r#"<?xml version="1.0" encoding="UTF-8"?><root><hello>world</hello></root>"#
     );
+}
+
+#[tokio::test]
+async fn test_head_at_commit_returns_historical_state() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    // Create a text document
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/docs")
+                .header("content-type", "text/plain")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(create_response.status(), StatusCode::OK);
+    let create_body = body_to_string(create_response.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&create_body).unwrap();
+    let doc_id = json["id"].as_str().unwrap().to_string();
+
+    // First commit: "hello"
+    let ydoc1 = yrs::Doc::new();
+    let text1 = ydoc1.get_or_insert_text("content");
+    let mut txn1 = ydoc1.transact_mut();
+    text1.push(&mut txn1, "hello");
+    let update1 = txn1.encode_update_v1();
+    let update1_b64 = commonplace_doc::b64::encode(&update1);
+
+    let commit1_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/docs/{}/commit", doc_id))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "verb": "update",
+                        "value": update1_b64,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(commit1_response.status(), StatusCode::OK);
+    let commit1_body = body_to_string(commit1_response.into_body()).await;
+    let commit1_json: serde_json::Value = serde_json::from_str(&commit1_body).unwrap();
+    let cid1 = commit1_json["cid"].as_str().unwrap().to_string();
+
+    // Second commit: append " world"
+    let ydoc2 = yrs::Doc::new();
+    let text2 = ydoc2.get_or_insert_text("content");
+    {
+        let mut txn = ydoc2.transact_mut();
+        txn.apply_update(Update::decode_v1(&update1).unwrap());
+    }
+    let mut txn2 = ydoc2.transact_mut();
+    text2.push(&mut txn2, " world");
+    let update2 = txn2.encode_update_v1();
+    let update2_b64 = commonplace_doc::b64::encode(&update2);
+
+    let commit2_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/docs/{}/commit", doc_id))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "verb": "update",
+                        "value": update2_b64,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(commit2_response.status(), StatusCode::OK);
+
+    // Fetch HEAD at first commit (historical state)
+    let head_at_cid1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/docs/{}/head?at_commit={}", doc_id, cid1))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(head_at_cid1.status(), StatusCode::OK);
+    let head1_body = body_to_string(head_at_cid1.into_body()).await;
+    let head1_json: serde_json::Value = serde_json::from_str(&head1_body).unwrap();
+    assert_eq!(head1_json["content"].as_str().unwrap(), "hello");
+    assert_eq!(head1_json["cid"].as_str().unwrap(), cid1);
+
+    // Fetch current HEAD (should be "hello world")
+    let current_head = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/docs/{}/head", doc_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(current_head.status(), StatusCode::OK);
+    let current_body = body_to_string(current_head.into_body()).await;
+    let current_json: serde_json::Value = serde_json::from_str(&current_body).unwrap();
+    assert_eq!(current_json["content"].as_str().unwrap(), "hello world");
 }
