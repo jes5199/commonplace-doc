@@ -5,6 +5,7 @@ pub mod commit;
 pub mod diff;
 pub mod document;
 pub mod events;
+pub mod files;
 pub mod fs;
 pub mod http_gateway;
 pub mod mqtt;
@@ -19,6 +20,7 @@ use axum::{routing::get, Router};
 use document::{ContentType, DocumentStore};
 use events::CommitBroadcaster;
 use fs::FilesystemReconciler;
+use services::DocumentService;
 use std::sync::Arc;
 use store::CommitStore;
 use tower_http::cors::CorsLayer;
@@ -134,6 +136,13 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
         }
     }
 
+    // Create shared service for handlers
+    let service = Arc::new(DocumentService::new(
+        doc_store.clone(),
+        commit_store.clone(),
+        commit_broadcaster.clone(),
+    ));
+
     Router::new()
         .route("/health", get(health_check))
         .merge(api::router(
@@ -141,6 +150,13 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
             commit_store.clone(),
             commit_broadcaster.clone(),
             config.fs_root.clone(),
+        ))
+        .merge(files::router(
+            doc_store.clone(),
+            commit_store.clone(),
+            commit_broadcaster.clone(),
+            config.fs_root.clone(),
+            service,
         ))
         .merge(sse::router(
             doc_store,
@@ -158,6 +174,12 @@ pub fn create_router_with_store(store: Option<CommitStore>) -> Router {
     let commit_store = store.map(Arc::new);
     let commit_broadcaster = commit_store.as_ref().map(|_| CommitBroadcaster::new(1024));
 
+    let service = Arc::new(DocumentService::new(
+        doc_store.clone(),
+        commit_store.clone(),
+        commit_broadcaster.clone(),
+    ));
+
     Router::new()
         .route("/health", get(health_check))
         .merge(api::router(
@@ -165,6 +187,13 @@ pub fn create_router_with_store(store: Option<CommitStore>) -> Router {
             commit_store.clone(),
             commit_broadcaster.clone(),
             None, // No fs-root in this variant
+        ))
+        .merge(files::router(
+            doc_store.clone(),
+            commit_store.clone(),
+            commit_broadcaster.clone(),
+            None, // No fs-root in this variant
+            service,
         ))
         .merge(sse::router(
             doc_store,
