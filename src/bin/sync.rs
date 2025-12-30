@@ -21,6 +21,7 @@ use reqwest::Client;
 use reqwest_eventsource::{Event as SseEvent, EventSource};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -32,6 +33,7 @@ use tracing::{debug, error, info, warn};
 #[derive(Parser, Debug)]
 #[command(name = "commonplace-sync")]
 #[command(about = "Sync a local file or directory with a Commonplace document node")]
+#[command(trailing_var_arg = true)]
 struct Args {
     /// Server URL (also reads from COMMONPLACE_SERVER env var)
     #[arg(
@@ -78,6 +80,17 @@ struct Args {
     /// This requires the server to have --fs-root configured
     #[arg(long, default_value = "false")]
     use_paths: bool,
+
+    /// Run a command in the synced directory context.
+    /// Sync will continue running while the command executes.
+    /// When the command exits, sync shuts down and propagates the exit code.
+    /// Use `--` to separate sync args from command args.
+    #[arg(long, value_name = "COMMAND")]
+    exec: Option<String>,
+
+    /// Additional arguments to pass to the exec command (after --)
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    exec_args: Vec<String>,
 }
 
 /// Pending write from server - used for barrier-based echo detection
@@ -186,7 +199,7 @@ async fn fork_node(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ExitCode {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -200,7 +213,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Validate that either --file or --directory is provided
     if args.file.is_none() && args.directory.is_none() {
         error!("Either --file or --directory must be provided");
-        return Err("Either --file or --directory must be provided".into());
+        return ExitCode::from(1);
+    }
+
+    // Exec mode requires --directory (doesn't make sense with single file)
+    if args.exec.is_some() && args.directory.is_none() {
+        error!("--exec requires --directory (exec mode doesn't support single file sync)");
+        return ExitCode::from(1);
     }
 
     // Create HTTP client
@@ -215,7 +234,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, Some(source)) => {
             // Fork first, then sync to new node
             info!("Forking from node {}...", source);
-            fork_node(&client, &args.server, source, args.at_commit.as_deref()).await?
+            match fork_node(&client, &args.server, source, args.at_commit.as_deref()).await {
+                Ok(id) => id,
+                Err(e) => {
+                    error!("Fork failed: {}", e);
+                    return ExitCode::from(1);
+                }
+            }
         }
         (Some(node), Some(source)) => {
             // Both provided - use --node but warn
@@ -227,33 +252,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         (None, None) => {
             error!("Either --node or --fork-from must be provided");
-            return Err("Either --node or --fork-from must be provided".into());
+            return ExitCode::from(1);
         }
     };
 
     // Route to appropriate mode
-    if let Some(directory) = args.directory {
+    let result = if let Some(directory) = args.directory {
         // Always ignore the schema file (.commonplace.json) when scanning
         let mut ignore_patterns = args.ignore;
         ignore_patterns.push(SCHEMA_FILENAME.to_string());
 
-        run_directory_mode(
-            client,
-            args.server,
-            node_id,
-            directory,
-            ScanOptions {
-                include_hidden: args.include_hidden,
-                ignore_patterns,
-            },
-            args.initial_sync,
-            args.use_paths,
-        )
-        .await
+        let scan_options = ScanOptions {
+            include_hidden: args.include_hidden,
+            ignore_patterns,
+        };
+
+        if let Some(exec_cmd) = args.exec {
+            // Exec mode: sync directory, run command, exit when command exits
+            run_exec_mode(
+                client,
+                args.server,
+                node_id,
+                directory,
+                scan_options,
+                args.initial_sync,
+                args.use_paths,
+                exec_cmd,
+                args.exec_args,
+            )
+            .await
+        } else {
+            // Normal directory sync mode
+            run_directory_mode(
+                client,
+                args.server,
+                node_id,
+                directory,
+                scan_options,
+                args.initial_sync,
+                args.use_paths,
+            )
+            .await
+            .map(|_| 0u8)
+        }
     } else if let Some(file) = args.file {
-        run_file_mode(client, args.server, node_id, file).await
+        run_file_mode(client, args.server, node_id, file)
+            .await
+            .map(|_| 0u8)
     } else {
         unreachable!("Validated above")
+    };
+
+    match result {
+        Ok(code) => ExitCode::from(code),
+        Err(e) => {
+            error!("Error: {}", e);
+            ExitCode::from(1)
+        }
     }
 }
 
@@ -1013,6 +1068,596 @@ async fn run_directory_mode(
 
     info!("Goodbye!");
     Ok(())
+}
+
+/// Run exec mode: sync directory, run command, exit when command exits
+///
+/// This mode is designed for workflows where a user wants to work on synced files
+/// with their preferred editor/tool, and have everything tear down cleanly when done.
+#[allow(clippy::too_many_arguments)]
+async fn run_exec_mode(
+    client: Client,
+    server: String,
+    fs_root_id: String,
+    directory: PathBuf,
+    options: ScanOptions,
+    initial_sync_strategy: String,
+    use_paths: bool,
+    exec_cmd: String,
+    exec_args: Vec<String>,
+) -> Result<u8, Box<dyn std::error::Error>> {
+    info!(
+        "Starting commonplace-sync (exec mode): server={}, fs-root={}, directory={}, exec={}",
+        server,
+        fs_root_id,
+        directory.display(),
+        exec_cmd
+    );
+
+    // Verify directory exists or create it
+    if !directory.exists() {
+        info!("Creating directory: {}", directory.display());
+        tokio::fs::create_dir_all(&directory).await?;
+    }
+    if !directory.is_dir() {
+        error!("Not a directory: {}", directory.display());
+        return Err(format!("Not a directory: {}", directory.display()).into());
+    }
+
+    // Verify fs-root document exists (or create it)
+    let doc_url = format!("{}/docs/{}/info", server, encode_node_id(&fs_root_id));
+    let resp = client.get(&doc_url).send().await?;
+    if !resp.status().is_success() {
+        // Create the document
+        info!("Creating fs-root document: {}", fs_root_id);
+        let create_url = format!("{}/docs", server);
+        let create_resp = client
+            .post(&create_url)
+            .json(&serde_json::json!({
+                "type": "document",
+                "id": fs_root_id,
+                "content_type": "application/json"
+            }))
+            .send()
+            .await?;
+        if !create_resp.status().is_success() {
+            let status = create_resp.status();
+            let body = create_resp.text().await.unwrap_or_default();
+            return Err(format!("Failed to create fs-root document: {} - {}", status, body).into());
+        }
+    }
+    info!("Connected to fs-root document: {}", fs_root_id);
+
+    // Check if server has existing schema FIRST (needed for server strategy)
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(&fs_root_id));
+    let head_resp = client.get(&head_url).send().await?;
+    let server_has_content = if head_resp.status().is_success() {
+        let head: HeadResponse = head_resp.json().await?;
+        !head.content.is_empty() && head.content != "{}"
+    } else {
+        false
+    };
+
+    // If strategy is "server" and server has content, pull server files first
+    let file_states: Arc<RwLock<HashMap<String, FileSyncState>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
+    if initial_sync_strategy == "server" && server_has_content {
+        info!("Pulling server schema first (initial-sync=server)...");
+        handle_schema_change(
+            &client,
+            &server,
+            &fs_root_id,
+            &directory,
+            &file_states,
+            false,
+            use_paths,
+        )
+        .await?;
+        info!("Server files pulled to local directory");
+    }
+
+    // Scan directory and generate FS schema
+    info!("Scanning directory...");
+    let schema = scan_directory(&directory, &options).map_err(|e| format!("Scan error: {}", e))?;
+    let schema_json = schema_to_json(&schema)?;
+    info!(
+        "Directory scanned: generated {} bytes of schema JSON",
+        schema_json.len()
+    );
+
+    // Decide whether to push local schema based on strategy
+    let should_push_schema = match initial_sync_strategy.as_str() {
+        "local" => true,
+        "server" => !server_has_content,
+        "skip" => !server_has_content,
+        _ => !server_has_content,
+    };
+
+    if should_push_schema {
+        info!("Pushing filesystem schema to server...");
+        push_schema_to_server(&client, &server, &fs_root_id, &schema_json).await?;
+        info!("Schema pushed successfully");
+
+        if let Err(e) = write_schema_file(&directory, &schema_json).await {
+            warn!("Failed to write schema file: {}", e);
+        }
+    } else {
+        info!(
+            "Server already has content, skipping schema push (strategy={})",
+            initial_sync_strategy
+        );
+
+        let head_url = format!("{}/docs/{}/head", server, encode_node_id(&fs_root_id));
+        if let Ok(resp) = client.get(&head_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(head) = resp.json::<HeadResponse>().await {
+                    if let Err(e) = write_schema_file(&directory, &head.content).await {
+                        warn!("Failed to write schema file: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Sync file contents (reusing logic from run_directory_mode)
+    info!("Syncing file contents...");
+    let files = scan_directory_with_contents(&directory, &options)
+        .map_err(|e| format!("Scan error: {}", e))?;
+
+    for file in &files {
+        let identifier = if use_paths {
+            file.relative_path.clone()
+        } else {
+            format!("{}:{}", fs_root_id, file.relative_path)
+        };
+        info!("Syncing file: {} -> {}", file.relative_path, identifier);
+
+        sleep(Duration::from_millis(100)).await;
+
+        let file_path = directory.join(&file.relative_path);
+
+        let state = {
+            let states = file_states.read().await;
+            if let Some(existing) = states.get(&file.relative_path) {
+                existing.state.clone()
+            } else {
+                Arc::new(RwLock::new(SyncState::new()))
+            }
+        };
+
+        let file_head_url = build_head_url(&server, &identifier, use_paths);
+        let file_head_resp = client.get(&file_head_url).send().await;
+
+        if let Ok(resp) = file_head_resp {
+            if resp.status().is_success() {
+                let head: HeadResponse = resp.json().await?;
+                if head.content.is_empty() || initial_sync_strategy == "local" {
+                    info!(
+                        "Pushing initial content for: {} ({} bytes)",
+                        identifier,
+                        file.content.len()
+                    );
+                    if !file.is_binary && file.content_type.starts_with("application/json") {
+                        push_json_content(
+                            &client,
+                            &server,
+                            &identifier,
+                            &file.content,
+                            &state,
+                            use_paths,
+                        )
+                        .await?;
+                    } else {
+                        push_file_content(
+                            &client,
+                            &server,
+                            &identifier,
+                            &file.content,
+                            &state,
+                            use_paths,
+                        )
+                        .await?;
+                    }
+                } else {
+                    if initial_sync_strategy == "server" {
+                        if file.is_binary {
+                            use base64::{engine::general_purpose::STANDARD, Engine};
+                            if let Ok(decoded) = STANDARD.decode(&head.content) {
+                                tokio::fs::write(&file_path, &decoded).await?;
+                            }
+                        } else {
+                            tokio::fs::write(&file_path, &head.content).await?;
+                        }
+                    }
+                    let mut s = state.write().await;
+                    s.last_written_cid = head.cid;
+                    if initial_sync_strategy == "skip" {
+                        s.last_written_content = file.content.clone();
+                    } else {
+                        s.last_written_content = head.content;
+                    }
+                }
+            } else {
+                info!("Node not ready, will push with retries for: {}", identifier);
+                if !file.is_binary && file.content_type.starts_with("application/json") {
+                    push_json_content(
+                        &client,
+                        &server,
+                        &identifier,
+                        &file.content,
+                        &state,
+                        use_paths,
+                    )
+                    .await?;
+                } else {
+                    push_file_content(
+                        &client,
+                        &server,
+                        &identifier,
+                        &file.content,
+                        &state,
+                        use_paths,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        {
+            let mut states = file_states.write().await;
+            states.insert(
+                file.relative_path.clone(),
+                FileSyncState {
+                    relative_path: file.relative_path.clone(),
+                    identifier: identifier.clone(),
+                    state,
+                    task_handles: Vec::new(),
+                    use_paths,
+                },
+            );
+        }
+    }
+
+    info!("Initial sync complete: {} files synced", files.len());
+
+    // Start directory watcher
+    let (dir_tx, mut dir_rx) = mpsc::channel::<DirEvent>(100);
+    let watcher_handle = tokio::spawn(directory_watcher_task(
+        directory.clone(),
+        dir_tx,
+        options.clone(),
+    ));
+
+    // Start SSE task for fs-root
+    let sse_handle = tokio::spawn(directory_sse_task(
+        client.clone(),
+        server.clone(),
+        fs_root_id.clone(),
+        directory.clone(),
+        file_states.clone(),
+        use_paths,
+    ));
+
+    // Start file sync tasks for each file
+    {
+        let mut states = file_states.write().await;
+        for (relative_path, file_state) in states.iter_mut() {
+            let file_path = directory.join(relative_path);
+            file_state.task_handles = spawn_file_sync_tasks(
+                client.clone(),
+                server.clone(),
+                file_state.identifier.clone(),
+                file_path,
+                file_state.state.clone(),
+                file_state.use_paths,
+            );
+        }
+    }
+
+    // Start directory event handler (same logic as run_directory_mode)
+    let dir_event_handle = tokio::spawn({
+        let client = client.clone();
+        let server = server.clone();
+        let fs_root_id = fs_root_id.clone();
+        let directory = directory.clone();
+        let options = options.clone();
+        let file_states = file_states.clone();
+        async move {
+            while let Some(event) = dir_rx.recv().await {
+                match event {
+                    DirEvent::Created(path) => {
+                        debug!("Directory event: file created: {}", path.display());
+
+                        // Calculate relative path
+                        let relative_path = match path.strip_prefix(&directory) {
+                            Ok(rel) => normalize_path(&rel.to_string_lossy()),
+                            Err(_) => continue,
+                        };
+
+                        // Check if file matches ignore patterns
+                        let file_name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let should_ignore = options.ignore_patterns.iter().any(|pattern| {
+                            if pattern == &file_name {
+                                true
+                            } else if pattern.contains('*') {
+                                let parts: Vec<&str> = pattern.split('*').collect();
+                                if parts.len() == 2 {
+                                    file_name.starts_with(parts[0]) && file_name.ends_with(parts[1])
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        });
+                        if should_ignore {
+                            debug!(
+                                "Ignoring new file (matches ignore pattern): {}",
+                                relative_path
+                            );
+                            continue;
+                        }
+
+                        // Skip hidden files unless configured to include them
+                        if !options.include_hidden && file_name.starts_with('.') {
+                            debug!("Ignoring hidden file: {}", relative_path);
+                            continue;
+                        }
+
+                        // Skip files with disallowed extensions
+                        if !is_allowed_extension(&path) {
+                            debug!("Ignoring file with disallowed extension: {}", relative_path);
+                            continue;
+                        }
+
+                        // Check if we already have sync tasks for this file
+                        let already_tracked = {
+                            let states = file_states.read().await;
+                            states.contains_key(&relative_path)
+                        };
+
+                        if !already_tracked && path.is_file() {
+                            // New file - push schema first so server creates the node
+                            let identifier = if use_paths {
+                                relative_path.clone()
+                            } else {
+                                format!("{}:{}", fs_root_id, relative_path)
+                            };
+                            let state = Arc::new(RwLock::new(SyncState::new()));
+
+                            // Push updated schema FIRST so server reconciler creates the node
+                            if let Ok(schema) = scan_directory(&directory, &options) {
+                                if let Ok(json) = schema_to_json(&schema) {
+                                    if let Err(e) =
+                                        push_schema_to_server(&client, &server, &fs_root_id, &json)
+                                            .await
+                                    {
+                                        warn!("Failed to push updated schema: {}", e);
+                                    }
+                                }
+                            }
+
+                            // Wait briefly for server to reconcile and create the node
+                            sleep(Duration::from_millis(100)).await;
+
+                            // Now push initial content (handle binary files)
+                            if let Ok(raw_content) = tokio::fs::read(&path).await {
+                                let content_info = detect_from_path(&path);
+                                let is_binary =
+                                    content_info.is_binary || is_binary_content(&raw_content);
+
+                                let content = if is_binary {
+                                    use base64::{engine::general_purpose::STANDARD, Engine};
+                                    STANDARD.encode(&raw_content)
+                                } else {
+                                    String::from_utf8_lossy(&raw_content).to_string()
+                                };
+
+                                if let Err(e) =
+                                    if !is_binary && content_info.mime_type == "application/json" {
+                                        push_json_content(
+                                            &client,
+                                            &server,
+                                            &identifier,
+                                            &content,
+                                            &state,
+                                            use_paths,
+                                        )
+                                        .await
+                                    } else {
+                                        push_file_content(
+                                            &client,
+                                            &server,
+                                            &identifier,
+                                            &content,
+                                            &state,
+                                            use_paths,
+                                        )
+                                        .await
+                                    }
+                                {
+                                    warn!("Failed to push new file content: {}", e);
+                                }
+                            }
+
+                            // Spawn sync tasks for the new file
+                            let task_handles = spawn_file_sync_tasks(
+                                client.clone(),
+                                server.clone(),
+                                identifier.clone(),
+                                path.clone(),
+                                state.clone(),
+                                use_paths,
+                            );
+
+                            // Add to file_states with task handles
+                            {
+                                let mut states = file_states.write().await;
+                                states.insert(
+                                    relative_path.clone(),
+                                    FileSyncState {
+                                        relative_path: relative_path.clone(),
+                                        identifier,
+                                        state,
+                                        task_handles,
+                                        use_paths,
+                                    },
+                                );
+                            }
+
+                            info!("Started sync for new local file: {}", relative_path);
+                        }
+                    }
+                    DirEvent::Modified(path) => {
+                        debug!("Directory event: file modified: {}", path.display());
+                        // Modified files are handled by per-file watchers
+                        // Just update schema in case metadata changed
+                        if let Ok(schema) = scan_directory(&directory, &options) {
+                            if let Ok(json) = schema_to_json(&schema) {
+                                if let Err(e) =
+                                    push_schema_to_server(&client, &server, &fs_root_id, &json)
+                                        .await
+                                {
+                                    warn!("Failed to push updated schema: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    DirEvent::Deleted(path) => {
+                        debug!("Directory event: file deleted: {}", path.display());
+
+                        let relative_path = match path.strip_prefix(&directory) {
+                            Ok(rel) => normalize_path(&rel.to_string_lossy()),
+                            Err(_) => {
+                                warn!("Could not strip prefix from deleted path");
+                                continue;
+                            }
+                        };
+
+                        // Stop sync tasks for this file and remove from file_states
+                        {
+                            let mut states = file_states.write().await;
+                            if let Some(file_state) = states.remove(&relative_path) {
+                                info!("Stopping sync tasks for deleted file: {}", relative_path);
+                                for handle in file_state.task_handles {
+                                    handle.abort();
+                                }
+                            }
+                        }
+
+                        // Rescan and push updated schema
+                        if let Ok(schema) = scan_directory(&directory, &options) {
+                            if let Ok(json) = schema_to_json(&schema) {
+                                if let Err(e) =
+                                    push_schema_to_server(&client, &server, &fs_root_id, &json)
+                                        .await
+                                {
+                                    warn!("Failed to push updated schema: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Build the command to execute
+    // Parse exec_cmd - if it contains spaces and no exec_args, treat as shell command
+    let (program, args) = if exec_args.is_empty() && exec_cmd.contains(' ') {
+        // Treat as shell command
+        if cfg!(target_os = "windows") {
+            ("cmd".to_string(), vec!["/C".to_string(), exec_cmd])
+        } else {
+            ("sh".to_string(), vec!["-c".to_string(), exec_cmd])
+        }
+    } else {
+        // Direct command with optional args
+        (exec_cmd, exec_args)
+    };
+
+    info!("Launching: {} {:?}", program, args);
+
+    // Spawn the child process in the synced directory
+    let mut child = tokio::process::Command::new(&program)
+        .args(&args)
+        .current_dir(&directory)
+        // Inherit stdin/stdout/stderr for interactive programs
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        // Pass through key environment variables
+        .env("COMMONPLACE_SERVER", &server)
+        .env("COMMONPLACE_NODE", &fs_root_id)
+        .spawn()
+        .map_err(|e| format!("Failed to spawn command '{}': {}", program, e))?;
+
+    // Wait for child to exit OR signal
+    let exit_code = tokio::select! {
+        status = child.wait() => {
+            match status {
+                Ok(s) => {
+                    let code = s.code().unwrap_or(1) as u8;
+                    info!("Command exited with code: {}", code);
+                    code
+                }
+                Err(e) => {
+                    error!("Failed to wait for command: {}", e);
+                    1
+                }
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received Ctrl+C, terminating child process...");
+            // Try to kill the child gracefully
+            #[cfg(unix)]
+            {
+                // Send SIGTERM to child
+                if let Some(pid) = child.id() {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGTERM);
+                    }
+                }
+                // Wait briefly for graceful shutdown
+                tokio::select! {
+                    _ = child.wait() => {}
+                    _ = sleep(Duration::from_secs(5)) => {
+                        // Force kill after timeout
+                        let _ = child.kill().await;
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill().await;
+            }
+            130 // Standard exit code for Ctrl+C
+        }
+    };
+
+    info!("Shutting down sync...");
+
+    // Cancel all tasks
+    watcher_handle.abort();
+    sse_handle.abort();
+    dir_event_handle.abort();
+
+    // Abort all per-file sync tasks
+    {
+        let states = file_states.read().await;
+        for file_state in states.values() {
+            for handle in &file_state.task_handles {
+                handle.abort();
+            }
+        }
+    }
+
+    info!("Goodbye!");
+    Ok(exit_code)
 }
 
 /// Push filesystem schema JSON to the fs-root node
