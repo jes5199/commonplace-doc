@@ -6,6 +6,7 @@
 
 use clap::Parser;
 use commonplace_doc::fs::{Entry, FsSchema};
+use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
 use commonplace_doc::sync::{
     build_edit_url, build_fork_url, build_head_url, build_replace_url, build_sse_url,
     create_yjs_json_update, create_yjs_text_update, detect_from_path, encode_node_id,
@@ -101,6 +102,10 @@ struct SyncState {
     /// Flag indicating a server edit was skipped while barrier was up
     /// upload_task should refresh HEAD after clearing barrier if this is true
     needs_head_refresh: bool,
+    /// Persistent state file for offline change detection (file mode only)
+    state_file: Option<SyncStateFile>,
+    /// Path to save the state file
+    state_file_path: Option<PathBuf>,
 }
 
 impl SyncState {
@@ -111,6 +116,35 @@ impl SyncState {
             current_write_id: 0,
             pending_write: None,
             needs_head_refresh: false,
+            state_file: None,
+            state_file_path: None,
+        }
+    }
+
+    fn with_state_file(state_file: SyncStateFile, state_file_path: PathBuf) -> Self {
+        Self {
+            last_written_cid: state_file.last_synced_cid.clone(),
+            last_written_content: String::new(),
+            current_write_id: 0,
+            pending_write: None,
+            needs_head_refresh: false,
+            state_file: Some(state_file),
+            state_file_path: Some(state_file_path),
+        }
+    }
+
+    /// Update state file after successful sync and save to disk
+    async fn mark_synced(&mut self, cid: &str, content_hash: &str, relative_path: &str) {
+        if let Some(ref mut state_file) = self.state_file {
+            state_file.mark_synced(cid.to_string());
+            state_file.update_file(relative_path, content_hash.to_string());
+
+            // Save to disk
+            if let Some(ref path) = self.state_file_path {
+                if let Err(e) = state_file.save(path).await {
+                    warn!("Failed to save state file: {}", e);
+                }
+            }
         }
     }
 }
@@ -241,8 +275,36 @@ async fn run_file_mode(
     }
     info!("Connected to document {}", node_id);
 
-    // Initialize shared state
-    let state = Arc::new(RwLock::new(SyncState::new()));
+    // Load or create state file for offline change detection
+    let state_file_path = SyncStateFile::state_file_path(&file);
+    let state_file = SyncStateFile::load_or_create(&file, &server, &node_id)
+        .await
+        .map_err(|e| format!("Failed to load state file: {}", e))?;
+
+    // Check for offline local changes
+    if let Some(last_cid) = &state_file.last_synced_cid {
+        if file.exists() {
+            let current_content = tokio::fs::read(&file).await?;
+            let current_hash = compute_content_hash(&current_content);
+            let file_name = file.file_name().unwrap_or_default().to_string_lossy();
+
+            if state_file.has_file_changed(&file_name, &current_hash) {
+                info!(
+                    "Detected offline local changes (last synced at {})",
+                    last_cid
+                );
+                // TODO: Fetch historical Yjs state at last_synced_cid
+                // and merge local changes via CRDT. For now, log the detection.
+                // The merge logic will be implemented in a follow-up commit.
+            }
+        }
+    }
+
+    // Initialize shared state with loaded state file
+    let state = Arc::new(RwLock::new(SyncState::with_state_file(
+        state_file,
+        state_file_path,
+    )));
 
     // Perform initial sync
     initial_sync(&client, &server, &node_id, &file, &state).await?;
@@ -1406,6 +1468,8 @@ async fn handle_schema_change(
                             current_write_id: 0,
                             pending_write: None,
                             needs_head_refresh: false,
+                            state_file: None, // Directory mode doesn't use state files yet
+                            state_file_path: None,
                         }));
 
                         info!("Created local file: {}", file_path.display());
@@ -1488,15 +1552,21 @@ async fn initial_sync(
     let head: HeadResponse = resp.json().await?;
 
     // Write content to file, handling binary content (base64-encoded on server)
+    // Track the bytes we actually write to disk for proper hash computation
     use base64::{engine::general_purpose::STANDARD, Engine};
     let content_info = detect_from_path(file_path);
-    if content_info.is_binary {
+    let bytes_written: Vec<u8> = if content_info.is_binary {
         // Extension indicates binary - decode base64
         match STANDARD.decode(&head.content) {
-            Ok(decoded) => tokio::fs::write(file_path, &decoded).await?,
+            Ok(decoded) => {
+                tokio::fs::write(file_path, &decoded).await?;
+                decoded
+            }
             Err(e) => {
                 warn!("Failed to decode binary content: {}", e);
-                tokio::fs::write(file_path, &head.content).await?;
+                let bytes = head.content.as_bytes().to_vec();
+                tokio::fs::write(file_path, &bytes).await?;
+                bytes
             }
         }
     } else {
@@ -1505,18 +1575,32 @@ async fn initial_sync(
         match STANDARD.decode(&head.content) {
             Ok(decoded) if is_binary_content(&decoded) => {
                 tokio::fs::write(file_path, &decoded).await?;
+                decoded
             }
             _ => {
-                tokio::fs::write(file_path, &head.content).await?;
+                let bytes = head.content.as_bytes().to_vec();
+                tokio::fs::write(file_path, &bytes).await?;
+                bytes
             }
         }
-    }
+    };
 
-    // Update state
+    // Update state and persist to state file
     {
         let mut s = state.write().await;
         s.last_written_cid = head.cid.clone();
         s.last_written_content = head.content.clone();
+
+        // Save to state file for offline change detection
+        // Use the actual bytes written to disk, not the server response
+        if let Some(ref cid) = head.cid {
+            let content_hash = compute_content_hash(&bytes_written);
+            let file_name = file_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string());
+            s.mark_synced(cid, &content_hash, &file_name).await;
+        }
     }
 
     match &head.cid {
@@ -1866,10 +1950,23 @@ async fn upload_task(
                                         &result.cid[..8.min(result.cid.len())]
                                     );
 
-                                    // Update state
+                                    // Update state and persist to state file
+                                    // Hash the raw file bytes, not the (possibly base64) content
+                                    let cid = result.cid.clone();
+                                    let file_bytes = tokio::fs::read(&file_path).await.ok();
+                                    let content_hash = file_bytes
+                                        .as_ref()
+                                        .map(|b| compute_content_hash(b))
+                                        .unwrap_or_default();
+                                    let file_name = file_path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "file".to_string());
+
                                     let mut s = state.write().await;
                                     s.last_written_cid = Some(result.cid);
                                     s.last_written_content = content;
+                                    s.mark_synced(&cid, &content_hash, &file_name).await;
                                     upload_succeeded = true;
                                 }
                                 Err(e) => {
@@ -1909,10 +2006,23 @@ async fn upload_task(
                                         &result.cid[..8.min(result.cid.len())]
                                     );
 
-                                    // Update state
+                                    // Update state and persist to state file
+                                    // Hash the raw file bytes, not the (possibly base64) content
+                                    let cid = result.cid.clone();
+                                    let file_bytes = tokio::fs::read(&file_path).await.ok();
+                                    let content_hash = file_bytes
+                                        .as_ref()
+                                        .map(|b| compute_content_hash(b))
+                                        .unwrap_or_default();
+                                    let file_name = file_path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "file".to_string());
+
                                     let mut s = state.write().await;
                                     s.last_written_cid = Some(result.cid);
                                     s.last_written_content = content;
+                                    s.mark_synced(&cid, &content_hash, &file_name).await;
                                     upload_succeeded = true;
                                 }
                                 Err(e) => {

@@ -6,6 +6,7 @@ pub mod dir_sync;
 pub mod directory;
 pub mod file_sync;
 pub mod sse;
+pub mod state_file;
 pub mod types;
 pub mod urls;
 pub mod yjs;
