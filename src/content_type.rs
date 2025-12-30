@@ -16,6 +16,8 @@ pub enum ContentType {
     Json,
     /// JSON array (`[]`) using Y.Array
     JsonArray,
+    /// JSONL/NDJSON (one JSON object per line) using Y.Array
+    Jsonl,
     /// XML document using Y.XmlFragment
     Xml,
     /// Plain text using Y.Text
@@ -48,6 +50,9 @@ impl ContentType {
                     Some(ContentType::Json)
                 }
             }
+            "application/x-ndjson" | "application/jsonl" | "application/x-jsonlines" => {
+                Some(ContentType::Jsonl)
+            }
             "application/xml" | "text/xml" => Some(ContentType::Xml),
             "text/plain" => Some(ContentType::Text),
             _ => None,
@@ -67,6 +72,7 @@ impl ContentType {
         match self {
             ContentType::Json => "application/json",
             ContentType::JsonArray => "application/json;root=array",
+            ContentType::Jsonl => "application/x-ndjson",
             ContentType::Xml => "application/xml",
             ContentType::Text => "text/plain",
         }
@@ -76,12 +82,14 @@ impl ContentType {
     ///
     /// - Json: `{}`
     /// - JsonArray: `[]`
+    /// - Jsonl: empty string (no lines)
     /// - Xml: `<?xml version="1.0" encoding="UTF-8"?><root/>`
     /// - Text: empty string
     pub fn default_content(&self) -> String {
         match self {
             ContentType::Json => "{}".to_string(),
             ContentType::JsonArray => "[]".to_string(),
+            ContentType::Jsonl => String::new(),
             ContentType::Xml => r#"<?xml version="1.0" encoding="UTF-8"?><root/>"#.to_string(),
             ContentType::Text => String::new(),
         }
@@ -163,11 +171,33 @@ mod tests {
         for ct in [
             ContentType::Json,
             ContentType::JsonArray,
+            ContentType::Jsonl,
             ContentType::Xml,
             ContentType::Text,
         ] {
             let mime = ct.to_mime();
             assert_eq!(ContentType::from_mime(mime), Some(ct));
         }
+    }
+
+    #[test]
+    fn test_from_mime_jsonl() {
+        assert_eq!(
+            ContentType::from_mime("application/x-ndjson"),
+            Some(ContentType::Jsonl)
+        );
+        assert_eq!(
+            ContentType::from_mime("application/jsonl"),
+            Some(ContentType::Jsonl)
+        );
+        assert_eq!(
+            ContentType::from_mime("application/x-jsonlines"),
+            Some(ContentType::Jsonl)
+        );
+    }
+
+    #[test]
+    fn test_jsonl_default_content() {
+        assert_eq!(ContentType::Jsonl.default_content(), "");
     }
 }
