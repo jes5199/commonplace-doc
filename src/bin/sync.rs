@@ -447,6 +447,8 @@ struct FileSyncState {
     task_handles: Vec<JoinHandle<()>>,
     /// Whether to use path-based API (/files/*) or ID-based API (/docs/*)
     use_paths: bool,
+    /// Content hash for fork detection (SHA-256 hex)
+    content_hash: Option<String>,
 }
 
 /// Spawn sync tasks (watcher, upload, SSE) for a single file.
@@ -761,6 +763,7 @@ async fn run_directory_mode(
 
         // Store state for this file (tasks will be spawned after initial sync)
         {
+            let content_hash = compute_content_hash(file.content.as_bytes());
             let mut states = file_states.write().await;
             states.insert(
                 file.relative_path.clone(),
@@ -770,6 +773,7 @@ async fn run_directory_mode(
                     state,
                     task_handles: Vec::new(), // Will be populated after initial sync
                     use_paths,
+                    content_hash: Some(content_hash),
                 },
             );
         }
@@ -879,7 +883,27 @@ async fn run_directory_mode(
                         };
 
                         if !already_tracked && path.is_file() {
-                            // New file - push schema first so server creates the node
+                            // Read file content first (needed for both hash check and push)
+                            let raw_content = match tokio::fs::read(&path).await {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    warn!("Failed to read new file {}: {}", path.display(), e);
+                                    continue;
+                                }
+                            };
+
+                            // Compute content hash and check for matching file (fork detection)
+                            let content_hash = compute_content_hash(&raw_content);
+                            let matching_source = {
+                                let states = file_states.read().await;
+                                states
+                                    .iter()
+                                    .find(|(_, state)| {
+                                        state.content_hash.as_ref() == Some(&content_hash)
+                                    })
+                                    .map(|(_, state)| state.identifier.clone())
+                            };
+
                             let identifier = if use_paths {
                                 relative_path.clone()
                             } else {
@@ -887,23 +911,75 @@ async fn run_directory_mode(
                             };
                             let state = Arc::new(RwLock::new(SyncState::new()));
 
-                            // Push updated schema FIRST so server reconciler creates the node
-                            if let Ok(schema) = scan_directory(&directory, &options) {
-                                if let Ok(json) = schema_to_json(&schema) {
-                                    if let Err(e) =
-                                        push_schema_to_server(&client, &server, &fs_root_id, &json)
-                                            .await
-                                    {
-                                        warn!("Failed to push updated schema: {}", e);
+                            // If content matches an existing file, try to fork it
+                            let forked_successfully = if let Some(source_id) = matching_source {
+                                info!(
+                                    "New file {} has identical content to {}, forking...",
+                                    relative_path, source_id
+                                );
+
+                                // Convert Result to avoid holding Box<dyn Error> across await
+                                let fork_result = fork_node(&client, &server, &source_id, None)
+                                    .await
+                                    .map_err(|e| e.to_string());
+
+                                match fork_result {
+                                    Ok(forked_id) => {
+                                        info!(
+                                            "Forked {} -> {} for new file {}",
+                                            source_id, forked_id, relative_path
+                                        );
+                                        // Update schema to point to forked node
+                                        if let Ok(schema) = scan_directory(&directory, &options) {
+                                            if let Ok(json) = schema_to_json(&schema) {
+                                                if let Err(e) = push_schema_to_server(
+                                                    &client,
+                                                    &server,
+                                                    &fs_root_id,
+                                                    &json,
+                                                )
+                                                .await
+                                                {
+                                                    warn!("Failed to push updated schema: {}", e);
+                                                }
+                                            }
+                                        }
+                                        true
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Fork failed for {}, falling back to new document: {}",
+                                            relative_path, e
+                                        );
+                                        false
                                     }
                                 }
-                            }
+                            } else {
+                                false
+                            };
 
-                            // Wait briefly for server to reconcile and create the node
-                            sleep(Duration::from_millis(100)).await;
+                            // If fork didn't succeed (no match or fork failed), create document normally
+                            if !forked_successfully {
+                                // Push updated schema FIRST so server reconciler creates the node
+                                if let Ok(schema) = scan_directory(&directory, &options) {
+                                    if let Ok(json) = schema_to_json(&schema) {
+                                        if let Err(e) = push_schema_to_server(
+                                            &client,
+                                            &server,
+                                            &fs_root_id,
+                                            &json,
+                                        )
+                                        .await
+                                        {
+                                            warn!("Failed to push updated schema: {}", e);
+                                        }
+                                    }
+                                }
 
-                            // Now push initial content (handle binary files)
-                            if let Ok(raw_content) = tokio::fs::read(&path).await {
+                                // Wait briefly for server to reconcile and create the node
+                                sleep(Duration::from_millis(100)).await;
+
+                                // Now push initial content (handle binary files)
                                 let content_info = detect_from_path(&path);
                                 let is_binary =
                                     content_info.is_binary || is_binary_content(&raw_content);
@@ -963,6 +1039,7 @@ async fn run_directory_mode(
                                         state,
                                         task_handles,
                                         use_paths,
+                                        content_hash: Some(content_hash),
                                     },
                                 );
                             }
@@ -1284,6 +1361,7 @@ async fn run_exec_mode(
         }
 
         {
+            let content_hash = compute_content_hash(file.content.as_bytes());
             let mut states = file_states.write().await;
             states.insert(
                 file.relative_path.clone(),
@@ -1293,6 +1371,7 @@ async fn run_exec_mode(
                     state,
                     task_handles: Vec::new(),
                     use_paths,
+                    content_hash: Some(content_hash),
                 },
             );
         }
@@ -1400,7 +1479,27 @@ async fn run_exec_mode(
                         };
 
                         if !already_tracked && path.is_file() {
-                            // New file - push schema first so server creates the node
+                            // Read file content first (needed for both hash check and push)
+                            let raw_content = match tokio::fs::read(&path).await {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    warn!("Failed to read new file {}: {}", path.display(), e);
+                                    continue;
+                                }
+                            };
+
+                            // Compute content hash and check for matching file (fork detection)
+                            let content_hash = compute_content_hash(&raw_content);
+                            let matching_source = {
+                                let states = file_states.read().await;
+                                states
+                                    .iter()
+                                    .find(|(_, state)| {
+                                        state.content_hash.as_ref() == Some(&content_hash)
+                                    })
+                                    .map(|(_, state)| state.identifier.clone())
+                            };
+
                             let identifier = if use_paths {
                                 relative_path.clone()
                             } else {
@@ -1408,23 +1507,75 @@ async fn run_exec_mode(
                             };
                             let state = Arc::new(RwLock::new(SyncState::new()));
 
-                            // Push updated schema FIRST so server reconciler creates the node
-                            if let Ok(schema) = scan_directory(&directory, &options) {
-                                if let Ok(json) = schema_to_json(&schema) {
-                                    if let Err(e) =
-                                        push_schema_to_server(&client, &server, &fs_root_id, &json)
-                                            .await
-                                    {
-                                        warn!("Failed to push updated schema: {}", e);
+                            // If content matches an existing file, try to fork it
+                            let forked_successfully = if let Some(source_id) = matching_source {
+                                info!(
+                                    "New file {} has identical content to {}, forking...",
+                                    relative_path, source_id
+                                );
+
+                                // Convert Result to avoid holding Box<dyn Error> across await
+                                let fork_result = fork_node(&client, &server, &source_id, None)
+                                    .await
+                                    .map_err(|e| e.to_string());
+
+                                match fork_result {
+                                    Ok(forked_id) => {
+                                        info!(
+                                            "Forked {} -> {} for new file {}",
+                                            source_id, forked_id, relative_path
+                                        );
+                                        // Update schema to point to forked node
+                                        if let Ok(schema) = scan_directory(&directory, &options) {
+                                            if let Ok(json) = schema_to_json(&schema) {
+                                                if let Err(e) = push_schema_to_server(
+                                                    &client,
+                                                    &server,
+                                                    &fs_root_id,
+                                                    &json,
+                                                )
+                                                .await
+                                                {
+                                                    warn!("Failed to push updated schema: {}", e);
+                                                }
+                                            }
+                                        }
+                                        true
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Fork failed for {}, falling back to new document: {}",
+                                            relative_path, e
+                                        );
+                                        false
                                     }
                                 }
-                            }
+                            } else {
+                                false
+                            };
 
-                            // Wait briefly for server to reconcile and create the node
-                            sleep(Duration::from_millis(100)).await;
+                            // If fork didn't succeed (no match or fork failed), create document normally
+                            if !forked_successfully {
+                                // Push updated schema FIRST so server reconciler creates the node
+                                if let Ok(schema) = scan_directory(&directory, &options) {
+                                    if let Ok(json) = schema_to_json(&schema) {
+                                        if let Err(e) = push_schema_to_server(
+                                            &client,
+                                            &server,
+                                            &fs_root_id,
+                                            &json,
+                                        )
+                                        .await
+                                        {
+                                            warn!("Failed to push updated schema: {}", e);
+                                        }
+                                    }
+                                }
 
-                            // Now push initial content (handle binary files)
-                            if let Ok(raw_content) = tokio::fs::read(&path).await {
+                                // Wait briefly for server to reconcile and create the node
+                                sleep(Duration::from_millis(100)).await;
+
+                                // Now push initial content (handle binary files)
                                 let content_info = detect_from_path(&path);
                                 let is_binary =
                                     content_info.is_binary || is_binary_content(&raw_content);
@@ -1484,6 +1635,7 @@ async fn run_exec_mode(
                                         state,
                                         task_handles,
                                         use_paths,
+                                        content_hash: Some(content_hash),
                                     },
                                 );
                             }
@@ -2034,6 +2186,9 @@ async fn handle_schema_change(
                         };
                         write_result?;
 
+                        // Compute content hash before moving file_head.content
+                        let content_hash = compute_content_hash(file_head.content.as_bytes());
+
                         // Add to file states
                         let state = Arc::new(RwLock::new(SyncState {
                             last_written_cid: file_head.cid.clone(),
@@ -2060,7 +2215,6 @@ async fn handle_schema_change(
                         } else {
                             Vec::new()
                         };
-
                         let mut states = file_states.write().await;
                         states.insert(
                             path.clone(),
@@ -2070,6 +2224,7 @@ async fn handle_schema_change(
                                 state,
                                 task_handles,
                                 use_paths,
+                                content_hash: Some(content_hash),
                             },
                         );
                     }
