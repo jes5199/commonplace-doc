@@ -31,7 +31,12 @@ path = "src/bin/orchestrator.rs"
 name = "commonplace-cmd"
 path = "src/bin/cmd.rs"
 
+[[bin]]
+name = "commonplace-mcp"
+path = "src/bin/mcp.rs"
+
 [dependencies]
+rmcp = { version = "0.12", features = ["server", "transport-io"] }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
