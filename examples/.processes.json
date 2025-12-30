@@ -1,0 +1,9 @@
+{
+  "processes": {
+    "counter": {
+      "command": "uv run python counter_example.py",
+      "owns": "counter.json",
+      "cwd": "/home/jes/commonplace/examples/python-client"
+    }
+  }
+}

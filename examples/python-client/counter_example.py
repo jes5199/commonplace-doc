@@ -163,25 +163,38 @@ class CounterExample(FileProcess):
 def main():
     """Run the counter example."""
     import argparse
+    import os
+
+    # Read environment variables for defaults
+    default_path = os.environ.get("COMMONPLACE_PATH", "examples/counter.json")
+
+    # Parse COMMONPLACE_MQTT if present (format: host:port)
+    mqtt_env = os.environ.get("COMMONPLACE_MQTT", "")
+    if mqtt_env and ":" in mqtt_env:
+        default_broker, port_str = mqtt_env.rsplit(":", 1)
+        default_port = int(port_str)
+    else:
+        default_broker = mqtt_env if mqtt_env else "localhost"
+        default_port = 1883
 
     parser = argparse.ArgumentParser(
         description="Counter example demonstrating external process as first-class citizen"
     )
     parser.add_argument(
         "--path",
-        default="examples/counter.json",
-        help="Path to own (default: examples/counter.json)",
+        default=default_path,
+        help=f"Path to own (default: {default_path})",
     )
     parser.add_argument(
         "--broker",
-        default="localhost",
-        help="MQTT broker host (default: localhost)",
+        default=default_broker,
+        help=f"MQTT broker host (default: {default_broker})",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=1883,
-        help="MQTT broker port (default: 1883)",
+        default=default_port,
+        help=f"MQTT broker port (default: {default_port})",
     )
 
     args = parser.parse_args()
