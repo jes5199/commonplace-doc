@@ -227,6 +227,34 @@ impl DocumentStore {
         Some(txn.encode_state_as_update_v1(&yrs::StateVector::default()))
     }
 
+    /// Set document content directly (for initialization/migration).
+    ///
+    /// This creates a Yjs update from the current content to the new content
+    /// and applies it. Used by the reconciler for schema migration.
+    pub async fn set_content(&self, id: &str, new_content: &str) -> Result<(), ApplyError> {
+        use crate::diff;
+
+        let mut documents = self.documents.write().await;
+        let doc = documents.get_mut(id).ok_or(ApplyError::NotFound)?;
+
+        // Compute diff from current to new content
+        let diff_result = diff::compute_diff_update(&doc.content, new_content)
+            .map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
+
+        // Apply the update
+        let ydoc = doc.ydoc.as_ref().ok_or(ApplyError::MissingYDoc)?.clone();
+        let update = yrs::Update::decode_v1(&diff_result.update_bytes)
+            .map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
+
+        let mut txn = ydoc.transact_mut();
+        txn.apply_update(update);
+
+        // Update content
+        doc.content = new_content.to_string();
+
+        Ok(())
+    }
+
     fn wrap_xml_root(inner: &str) -> String {
         if inner.is_empty() {
             return format!("{}<root/>", Self::XML_HEADER);

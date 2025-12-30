@@ -9,5 +9,5 @@ mod reconciler;
 mod schema;
 
 pub use error::FsError;
-pub use reconciler::FilesystemReconciler;
+pub use reconciler::{FilesystemReconciler, MigrationResult};
 pub use schema::{DirEntry, DocEntry, Entry, FsSchema};
