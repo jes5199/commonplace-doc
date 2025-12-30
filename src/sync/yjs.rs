@@ -212,9 +212,9 @@ mod tests {
 
         #[test]
         fn test_json_value_to_any_float() {
-            let any = json_value_to_any(serde_json::json!(3.14));
+            let any = json_value_to_any(serde_json::json!(2.5));
             match any {
-                Any::Number(n) => assert!((n - 3.14).abs() < 0.001),
+                Any::Number(n) => assert!((n - 2.5).abs() < 0.001),
                 _ => panic!("Expected Number"),
             }
         }
