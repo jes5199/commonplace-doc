@@ -10,6 +10,7 @@ pub mod state;
 pub mod state_file;
 pub mod types;
 pub mod urls;
+pub mod watcher;
 pub mod yjs;
 
 pub use content_type::{
@@ -28,6 +29,7 @@ pub use urls::{
     build_edit_url, build_fork_url, build_head_url, build_replace_url, build_sse_url,
     encode_node_id, encode_path, normalize_path,
 };
+pub use watcher::{directory_watcher_task, file_watcher_task};
 pub use yjs::{
     base64_decode, base64_encode, create_yjs_json_update, create_yjs_text_diff_update,
     create_yjs_text_update, json_value_to_any, TEXT_ROOT_NAME,

@@ -9,15 +9,13 @@ use commonplace_doc::fs::{Entry, FsSchema};
 use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
 use commonplace_doc::sync::{
     build_edit_url, build_fork_url, build_head_url, build_replace_url, build_sse_url,
-    create_yjs_json_update, create_yjs_text_update, detect_from_path, encode_node_id,
-    is_allowed_extension, is_binary_content, normalize_path, scan_directory,
-    scan_directory_with_contents, schema_to_json, DirEvent, EditEventData, EditRequest,
-    EditResponse, FileEvent, ForkResponse, HeadResponse, PendingWrite, ReplaceResponse,
-    ScanOptions, SyncState,
+    create_yjs_json_update, create_yjs_text_update, detect_from_path, directory_watcher_task,
+    encode_node_id, file_watcher_task, is_allowed_extension, is_binary_content, normalize_path,
+    scan_directory, scan_directory_with_contents, schema_to_json, DirEvent, EditEventData,
+    EditRequest, EditResponse, FileEvent, ForkResponse, HeadResponse, PendingWrite,
+    ReplaceResponse, ScanOptions, SyncState,
 };
 use futures::StreamExt;
-use notify::event::{ModifyKind, RenameMode};
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use reqwest::Client;
 use reqwest_eventsource::{Event as SseEvent, EventSource};
 use std::collections::HashMap;
@@ -1772,126 +1770,6 @@ async fn push_file_content(
     }
 }
 
-/// Task that watches a directory for create/delete events
-async fn directory_watcher_task(
-    directory: PathBuf,
-    tx: mpsc::Sender<DirEvent>,
-    options: ScanOptions,
-) {
-    let (notify_tx, mut notify_rx) = mpsc::channel::<Result<Event, notify::Error>>(100);
-
-    let mut watcher = match RecommendedWatcher::new(
-        move |res| {
-            let _ = notify_tx.blocking_send(res);
-        },
-        Config::default().with_poll_interval(Duration::from_millis(500)),
-    ) {
-        Ok(w) => w,
-        Err(e) => {
-            error!("Failed to create directory watcher: {}", e);
-            return;
-        }
-    };
-
-    if let Err(e) = watcher.watch(&directory, RecursiveMode::Recursive) {
-        error!("Failed to watch directory {}: {}", directory.display(), e);
-        return;
-    }
-
-    info!("Watching directory: {}", directory.display());
-
-    let debounce_duration = Duration::from_millis(500);
-    let mut pending_events: HashMap<PathBuf, DirEvent> = HashMap::new();
-    let mut debounce_timer: Option<tokio::time::Instant> = None;
-
-    loop {
-        tokio::select! {
-            Some(res) = notify_rx.recv() => {
-                match res {
-                    Ok(event) => {
-                        for path in event.paths {
-                            // Skip hidden files if not configured
-                            if let Some(name) = path.file_name() {
-                                let name_str = name.to_string_lossy();
-                                if !options.include_hidden && name_str.starts_with('.') {
-                                    continue;
-                                }
-                            }
-
-                            // Handle rename events specially - treat as delete+create
-                            // so that sync tasks are properly stopped/started
-                            let dir_event = if event.kind.is_create() {
-                                Some(DirEvent::Created(path.clone()))
-                            } else if let EventKind::Modify(ModifyKind::Name(rename_mode)) =
-                                event.kind
-                            {
-                                // Rename events: treat as delete (old path) or create (new path)
-                                match rename_mode {
-                                    RenameMode::From => {
-                                        // Source of rename - file moved away
-                                        debug!("Rename from (treating as delete): {}", path.display());
-                                        Some(DirEvent::Deleted(path.clone()))
-                                    }
-                                    RenameMode::To => {
-                                        // Destination of rename - file moved here
-                                        debug!("Rename to (treating as create): {}", path.display());
-                                        Some(DirEvent::Created(path.clone()))
-                                    }
-                                    RenameMode::Both | RenameMode::Any | RenameMode::Other => {
-                                        // Platform couldn't determine direction - check if path exists
-                                        if path.exists() {
-                                            debug!(
-                                                "Rename (path exists, treating as create): {}",
-                                                path.display()
-                                            );
-                                            Some(DirEvent::Created(path.clone()))
-                                        } else {
-                                            debug!(
-                                                "Rename (path gone, treating as delete): {}",
-                                                path.display()
-                                            );
-                                            Some(DirEvent::Deleted(path.clone()))
-                                        }
-                                    }
-                                }
-                            } else if event.kind.is_modify() {
-                                Some(DirEvent::Modified(path.clone()))
-                            } else if event.kind.is_remove() {
-                                Some(DirEvent::Deleted(path.clone()))
-                            } else {
-                                None
-                            };
-
-                            if let Some(evt) = dir_event {
-                                pending_events.insert(path, evt);
-                                debounce_timer = Some(tokio::time::Instant::now() + debounce_duration);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Directory watcher error: {}", e);
-                    }
-                }
-            }
-            _ = async {
-                if let Some(deadline) = debounce_timer {
-                    tokio::time::sleep_until(deadline).await;
-                    true
-                } else {
-                    std::future::pending::<bool>().await
-                }
-            } => {
-                debounce_timer = None;
-                for (_, event) in pending_events.drain() {
-                    if tx.send(event).await.is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// SSE task for directory-level events (watching fs-root)
 async fn directory_sse_task(
     client: Client,
@@ -2235,72 +2113,6 @@ async fn initial_sync(
     }
 
     Ok(())
-}
-
-/// Task that watches the local file for changes
-async fn file_watcher_task(file_path: PathBuf, tx: mpsc::Sender<FileEvent>) {
-    // Create a channel for notify events
-    let (notify_tx, mut notify_rx) = mpsc::channel::<Result<Event, notify::Error>>(100);
-
-    // Create watcher
-    let mut watcher = match RecommendedWatcher::new(
-        move |res| {
-            let _ = notify_tx.blocking_send(res);
-        },
-        Config::default().with_poll_interval(Duration::from_millis(100)),
-    ) {
-        Ok(w) => w,
-        Err(e) => {
-            error!("Failed to create file watcher: {}", e);
-            return;
-        }
-    };
-
-    // Watch the file
-    if let Err(e) = watcher.watch(&file_path, RecursiveMode::NonRecursive) {
-        error!("Failed to watch file {}: {}", file_path.display(), e);
-        return;
-    }
-
-    info!("Watching file: {}", file_path.display());
-
-    // Debounce timer
-    let debounce_duration = Duration::from_millis(100);
-    let mut debounce_timer: Option<tokio::time::Instant> = None;
-
-    loop {
-        tokio::select! {
-            Some(res) = notify_rx.recv() => {
-                match res {
-                    Ok(event) => {
-                        // Check if this is a modify event
-                        if event.kind.is_modify() {
-                            debug!("File modified event: {:?}", event);
-                            // Reset debounce timer
-                            debounce_timer = Some(tokio::time::Instant::now() + debounce_duration);
-                        }
-                    }
-                    Err(e) => {
-                        warn!("File watcher error: {}", e);
-                    }
-                }
-            }
-            _ = async {
-                if let Some(deadline) = debounce_timer {
-                    tokio::time::sleep_until(deadline).await;
-                    true
-                } else {
-                    std::future::pending::<bool>().await
-                }
-            } => {
-                // Debounce period elapsed, send event
-                debounce_timer = None;
-                if tx.send(FileEvent::Modified).await.is_err() {
-                    break;
-                }
-            }
-        }
-    }
 }
 
 /// Number of retries when content differs during a pending write (handles partial writes)
