@@ -546,8 +546,8 @@ async fn replace_doc(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Determine parent and compute diff appropriately
-    let (diff_result, parent) = if let Some(ref parent_cid) = params.parent_cid {
+    // Determine parents and compute diff appropriately
+    let (diff_result, parents) = if let Some(ref parent_cid) = params.parent_cid {
         // Check if parent differs from current HEAD
         let parent_differs = current_head.as_ref() != Some(parent_cid);
 
@@ -564,21 +564,25 @@ async fn replace_doc(
                 crate::diff::compute_diff_update_with_base(&base_state_bytes, &old_content, &body)
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-            (diff, Some(parent_cid.clone()))
+            // Include BOTH parents for merge commit: client's parent AND current HEAD
+            // This preserves concurrent edits in the commit graph for proper history replay
+            let mut merge_parents = vec![parent_cid.clone()];
+            if let Some(head) = current_head {
+                merge_parents.push(head);
+            }
+            (diff, merge_parents)
         } else {
             // Parent matches HEAD - use current content for diff
             let diff = crate::diff::compute_diff_update(&doc.content, &body)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            (diff, Some(parent_cid.clone()))
+            (diff, vec![parent_cid.clone()])
         }
     } else {
         // No parent specified - use current content and HEAD as parent
         let diff = crate::diff::compute_diff_update(&doc.content, &body)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        (diff, current_head)
+        (diff, current_head.into_iter().collect())
     };
-
-    let parents: Vec<String> = parent.into_iter().collect();
     let author = params.author.unwrap_or_else(|| "anonymous".to_string());
 
     let commit = Commit::new(parents, diff_result.update_b64.clone(), author, None);
