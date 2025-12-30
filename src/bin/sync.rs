@@ -7,15 +7,17 @@
 use clap::Parser;
 use commonplace_doc::fs::{Entry, FsSchema};
 use commonplace_doc::sync::{
-    detect_from_path, is_allowed_extension, is_binary_content, scan_directory,
-    scan_directory_with_contents, schema_to_json, ScanOptions,
+    build_edit_url, build_fork_url, build_head_url, build_replace_url, build_sse_url,
+    create_yjs_json_update, create_yjs_text_update, detect_from_path, encode_node_id,
+    is_allowed_extension, is_binary_content, normalize_path, scan_directory,
+    scan_directory_with_contents, schema_to_json, DirEvent, EditEventData, EditRequest,
+    EditResponse, FileEvent, ForkResponse, HeadResponse, ReplaceResponse, ScanOptions,
 };
 use futures::StreamExt;
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use reqwest::Client;
 use reqwest_eventsource::{Event as SseEvent, EventSource};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,85 +26,6 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
-use yrs::any::Any;
-use yrs::updates::decoder::Decode;
-use yrs::{Array, Doc, Map, Text, Transact, Update, WriteTxn};
-
-/// URL-encode a node ID for use in URL paths.
-/// Node IDs for nested files contain `/` (e.g., `fs-root:notes/idea.md`) which
-/// must be percent-encoded to avoid breaking Axum's path parameter routing.
-fn encode_node_id(node_id: &str) -> String {
-    urlencoding::encode(node_id).into_owned()
-}
-
-/// URL-encode a path for use in `/files/*path` endpoints.
-/// Each path segment is encoded individually to preserve the `/` separators
-/// while encoding special characters within segments.
-fn encode_path(path: &str) -> String {
-    path.split('/')
-        .map(|segment| urlencoding::encode(segment).into_owned())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-/// Normalize a path to use forward slashes regardless of OS.
-///
-/// Schema paths always use forward slashes, but on Windows `to_string_lossy()`
-/// produces backslashes. This normalizes to forward slashes so node IDs match
-/// between the client and server.
-fn normalize_path(path: &str) -> String {
-    path.replace('\\', "/")
-}
-
-// ============================================================================
-// URL builders - choose between path-based (/files/*) and ID-based (/docs/:id)
-// ============================================================================
-
-/// Build URL for getting document HEAD
-fn build_head_url(server: &str, path_or_id: &str, use_paths: bool) -> String {
-    if use_paths {
-        format!("{}/files/{}/head", server, encode_path(path_or_id))
-    } else {
-        format!("{}/docs/{}/head", server, encode_node_id(path_or_id))
-    }
-}
-
-/// Build URL for document edit
-fn build_edit_url(server: &str, path_or_id: &str, use_paths: bool) -> String {
-    if use_paths {
-        format!("{}/files/{}/edit", server, encode_path(path_or_id))
-    } else {
-        format!("{}/docs/{}/edit", server, encode_node_id(path_or_id))
-    }
-}
-
-/// Build URL for document replace
-fn build_replace_url(server: &str, path_or_id: &str, parent_cid: &str, use_paths: bool) -> String {
-    if use_paths {
-        format!(
-            "{}/files/{}/replace?parent_cid={}&author=sync-client",
-            server,
-            encode_path(path_or_id),
-            parent_cid
-        )
-    } else {
-        format!(
-            "{}/docs/{}/replace?parent_cid={}&author=sync-client",
-            server,
-            encode_node_id(path_or_id),
-            parent_cid
-        )
-    }
-}
-
-/// Build URL for SSE subscription
-fn build_sse_url(server: &str, path_or_id: &str, use_paths: bool) -> String {
-    if use_paths {
-        format!("{}/sse/files/{}", server, encode_path(path_or_id))
-    } else {
-        format!("{}/sse/docs/{}", server, encode_node_id(path_or_id))
-    }
-}
 
 /// Commonplace Sync - Keep a local file or directory in sync with a server document
 #[derive(Parser, Debug)]
@@ -192,204 +115,8 @@ impl SyncState {
     }
 }
 
-/// Response from GET /docs/:id/head
-#[derive(Debug, Deserialize)]
-struct HeadResponse {
-    cid: Option<String>,
-    content: String,
-    /// Yjs state bytes at HEAD (base64 encoded, for CRDT-compatible diffs)
-    #[serde(default)]
-    state: Option<String>,
-}
-
-/// Response from POST /docs/:id/replace
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct ReplaceResponse {
-    cid: String,
-    edit_cid: String,
-    summary: ReplaceSummary,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct ReplaceSummary {
-    chars_inserted: usize,
-    chars_deleted: usize,
-    operations: usize,
-}
-
-/// SSE edit event data
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct EditEventData {
-    source: String,
-    commit: CommitData,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct CommitData {
-    update: String,
-    parents: Vec<String>,
-    timestamp: u64,
-    author: String,
-    message: Option<String>,
-}
-
-/// Request for POST /docs/:id/edit (initial commit)
-#[derive(Debug, Serialize)]
-struct EditRequest {
-    update: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    author: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
-}
-
-/// Response from POST /docs/:id/edit
-#[derive(Debug, Deserialize)]
-struct EditResponse {
-    cid: String,
-}
-
-/// Response from POST /docs/:id/fork
-#[derive(Debug, Deserialize)]
-struct ForkResponse {
-    id: String,
-    head: String,
-}
-
-/// File watcher events
-#[derive(Debug)]
-enum FileEvent {
-    Modified,
-}
-
-/// Text root name used in Yrs documents (must match server)
-const TEXT_ROOT_NAME: &str = "content";
-
 /// Filename for the local schema JSON file written during directory sync
 const SCHEMA_FILENAME: &str = ".commonplace.json";
-
-/// Create a Yjs update that sets the full text content
-fn create_yjs_text_update(content: &str) -> String {
-    let doc = Doc::with_client_id(1);
-    let text = doc.get_or_insert_text(TEXT_ROOT_NAME);
-    let update = {
-        let mut txn = doc.transact_mut();
-        text.push(&mut txn, content);
-        txn.encode_update_v1()
-    };
-    base64_encode(&update)
-}
-
-/// Create a Yjs update that applies a full JSON replacement.
-/// Supports object roots (Y.Map) and array roots (Y.Array).
-///
-/// When base_state is provided, it applies the state first so that removals
-/// create proper CRDT tombstones for the server's existing items.
-fn create_yjs_json_update(
-    new_json: &str,
-    base_state: Option<&str>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let new_value: serde_json::Value = serde_json::from_str(new_json)?;
-
-    let doc = Doc::with_client_id(1);
-
-    // Apply base state if provided (critical for proper deletion tombstones)
-    if let Some(state_b64) = base_state {
-        if let Ok(state_bytes) = base64_decode(state_b64) {
-            if !state_bytes.is_empty() {
-                if let Ok(update) = Update::decode_v1(&state_bytes) {
-                    let mut txn = doc.transact_mut();
-                    txn.apply_update(update);
-                }
-            }
-        }
-    }
-
-    let update = {
-        let mut txn = doc.transact_mut();
-
-        match new_value {
-            serde_json::Value::Object(obj) => {
-                let map = txn.get_or_insert_map(TEXT_ROOT_NAME);
-                let existing_keys: std::collections::HashSet<String> =
-                    map.keys(&txn).map(|k| k.to_string()).collect();
-                let new_keys: std::collections::HashSet<String> = obj.keys().cloned().collect();
-
-                for key in existing_keys.difference(&new_keys) {
-                    map.remove(&mut txn, key.as_str());
-                }
-
-                for (key, val) in obj {
-                    let any_val = json_value_to_any(val);
-                    map.insert(&mut txn, key.as_str(), any_val);
-                }
-            }
-            serde_json::Value::Array(items) => {
-                let array = txn.get_or_insert_array(TEXT_ROOT_NAME);
-                let len = array.len(&txn);
-                if len > 0 {
-                    array.remove_range(&mut txn, 0, len);
-                }
-                for item in items {
-                    let any_val = json_value_to_any(item);
-                    array.push_back(&mut txn, any_val);
-                }
-            }
-            _ => {
-                return Err("JSON root must be an object or array".into());
-            }
-        }
-
-        txn.encode_update_v1()
-    };
-
-    Ok(base64_encode(&update))
-}
-
-/// Convert serde_json::Value to yrs::Any
-fn json_value_to_any(value: serde_json::Value) -> Any {
-    match value {
-        serde_json::Value::Null => Any::Null,
-        serde_json::Value::Bool(b) => Any::Bool(b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Any::BigInt(i)
-            } else if let Some(f) = n.as_f64() {
-                Any::Number(f)
-            } else {
-                Any::Null
-            }
-        }
-        serde_json::Value::String(s) => Any::String(s.into()),
-        serde_json::Value::Array(arr) => {
-            let items: Vec<Any> = arr.into_iter().map(json_value_to_any).collect();
-            Any::Array(items.into())
-        }
-        serde_json::Value::Object(obj) => {
-            let mut map = std::collections::HashMap::new();
-            for (k, v) in obj {
-                map.insert(k, json_value_to_any(v));
-            }
-            Any::Map(map.into())
-        }
-    }
-}
-
-/// Simple base64 encoding (matching server's b64 module)
-fn base64_encode(data: &[u8]) -> String {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    STANDARD.encode(data)
-}
-
-/// Simple base64 decoding (matching server's b64 module)
-fn base64_decode(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    STANDARD.decode(data)
-}
 
 /// Fork a source node and return the new node ID
 async fn fork_node(
@@ -398,10 +125,7 @@ async fn fork_node(
     source_node: &str,
     at_commit: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut fork_url = format!("{}/docs/{}/fork", server, encode_node_id(source_node));
-    if let Some(commit) = at_commit {
-        fork_url = format!("{}?at_commit={}", fork_url, commit);
-    }
+    let fork_url = build_fork_url(server, source_node, at_commit);
 
     let resp = client.post(&fork_url).send().await?;
 
@@ -1362,14 +1086,6 @@ async fn push_file_content(
             return Ok(());
         }
     }
-}
-
-/// Directory-level events
-#[derive(Debug)]
-enum DirEvent {
-    Created(PathBuf),
-    Modified(PathBuf),
-    Deleted(PathBuf),
 }
 
 /// Task that watches a directory for create/delete events
