@@ -32,12 +32,41 @@ pub const DIR_DEBOUNCE_MS: u64 = 500;
 ///
 /// # Behavior
 ///
-/// - Watches for modify events on the file
+/// - Watches the parent directory to catch atomic write patterns (rename to target)
+/// - Filters events to only handle changes to the target file
 /// - Debounces events with a 100ms delay
 /// - Sends `FileEvent::Modified` after debounce period
 /// - Logs errors but continues watching on watcher errors
 /// - Exits when the receiver is dropped
+///
+/// # Atomic Write Support
+///
+/// Many editors use atomic writes: write to temp file, then rename to target.
+/// This replaces the inode, so we watch the parent directory instead of the file
+/// itself to reliably detect these changes.
 pub async fn file_watcher_task(file_path: PathBuf, tx: mpsc::Sender<FileEvent>) {
+    // Get the parent directory - we watch this to catch atomic renames
+    let parent_dir = match file_path.parent() {
+        Some(p) if p.as_os_str().is_empty() => PathBuf::from("."),
+        Some(p) => p.to_path_buf(),
+        None => {
+            error!(
+                "Cannot watch file without parent directory: {}",
+                file_path.display()
+            );
+            return;
+        }
+    };
+
+    // Canonicalize the file path for reliable comparison
+    let canonical_file_path = match file_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            // File might not exist yet, use the original path
+            file_path.clone()
+        }
+    };
+
     // Create a channel for notify events
     let (notify_tx, mut notify_rx) = mpsc::channel::<Result<Event, notify::Error>>(100);
 
@@ -55,26 +84,91 @@ pub async fn file_watcher_task(file_path: PathBuf, tx: mpsc::Sender<FileEvent>) 
         }
     };
 
-    // Watch the file
-    if let Err(e) = watcher.watch(&file_path, RecursiveMode::NonRecursive) {
-        error!("Failed to watch file {}: {}", file_path.display(), e);
+    // Watch the parent directory (non-recursive) to catch atomic renames
+    if let Err(e) = watcher.watch(&parent_dir, RecursiveMode::NonRecursive) {
+        error!(
+            "Failed to watch directory {} for file {}: {}",
+            parent_dir.display(),
+            file_path.display(),
+            e
+        );
         return;
     }
 
-    info!("Watching file: {}", file_path.display());
+    info!(
+        "Watching file: {} (via parent dir: {})",
+        file_path.display(),
+        parent_dir.display()
+    );
 
     // Debounce timer
     let debounce_duration = Duration::from_millis(FILE_DEBOUNCE_MS);
     let mut debounce_timer: Option<tokio::time::Instant> = None;
+
+    // Helper to check if an event path matches our target file
+    let matches_target = |event_path: &PathBuf| -> bool {
+        // Try canonical comparison first
+        if let Ok(canonical) = event_path.canonicalize() {
+            if canonical == canonical_file_path {
+                return true;
+            }
+        }
+        // Fall back to file name comparison
+        event_path.file_name() == file_path.file_name() && event_path.parent() == file_path.parent()
+    };
 
     loop {
         tokio::select! {
             Some(res) = notify_rx.recv() => {
                 match res {
                     Ok(event) => {
-                        // Check if this is a modify event
-                        if event.kind.is_modify() {
-                            debug!("File modified event: {:?}", event);
+                        // Check if any event path matches our target file
+                        let affects_target = event.paths.iter().any(&matches_target);
+                        if !affects_target {
+                            continue;
+                        }
+
+                        // Handle atomic writes: editors often write to temp file then rename
+                        let should_trigger = match event.kind {
+                            // Explicit rename handling - atomic write pattern
+                            EventKind::Modify(ModifyKind::Name(rename_mode)) => {
+                                match rename_mode {
+                                    RenameMode::To => {
+                                        // File was renamed TO this path - atomic write complete
+                                        debug!("File rename to (atomic write): {:?}", event);
+                                        true
+                                    }
+                                    RenameMode::From => {
+                                        // File was renamed FROM this path - it's gone
+                                        debug!("File rename from (file removed): {:?}", event);
+                                        false
+                                    }
+                                    RenameMode::Both | RenameMode::Any | RenameMode::Other => {
+                                        // Platform couldn't determine direction - check if file exists
+                                        if file_path.exists() {
+                                            debug!("File rename (path exists): {:?}", event);
+                                            true
+                                        } else {
+                                            debug!("File rename (path gone): {:?}", event);
+                                            false
+                                        }
+                                    }
+                                }
+                            }
+                            // Handle create events - file may have been deleted and recreated
+                            EventKind::Create(_) => {
+                                debug!("File created (possible delete+create pattern): {:?}", event);
+                                true
+                            }
+                            // Standard modification
+                            _ if event.kind.is_modify() => {
+                                debug!("File modified event: {:?}", event);
+                                true
+                            }
+                            _ => false,
+                        };
+
+                        if should_trigger {
                             // Reset debounce timer
                             debounce_timer = Some(tokio::time::Instant::now() + debounce_duration);
                         }
@@ -242,6 +336,182 @@ pub async fn directory_watcher_task(
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Test that file_watcher_task detects atomic write patterns (write temp, rename to target).
+    #[tokio::test]
+    async fn test_file_watcher_detects_atomic_write() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let target_path = temp_dir.path().join("target.txt");
+
+        // Create the initial file
+        fs::write(&target_path, "initial content").expect("Failed to write initial file");
+
+        let (tx, mut rx) = mpsc::channel::<FileEvent>(10);
+
+        // Start the watcher task
+        let target_path_clone = target_path.clone();
+        let watcher_handle = tokio::spawn(async move {
+            file_watcher_task(target_path_clone, tx).await;
+        });
+
+        // Give the watcher time to start
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Perform atomic write: write to temp file, then rename to target
+        let temp_file_path = temp_dir.path().join(".target.txt.tmp");
+        fs::write(&temp_file_path, "new content via atomic write").expect("Failed to write temp");
+        fs::rename(&temp_file_path, &target_path).expect("Failed to rename");
+
+        // Wait for the event with timeout
+        let result = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+
+        // Cleanup
+        watcher_handle.abort();
+
+        match result {
+            Ok(Some(FileEvent::Modified)) => {
+                // Success - watcher detected the change
+            }
+            Ok(None) => panic!("Channel closed without receiving event"),
+            Err(_) => panic!("Timeout waiting for file modification event after atomic write"),
+        }
+    }
+
+    /// Test that file_watcher_task detects delete + create pattern.
+    #[tokio::test]
+    async fn test_file_watcher_detects_delete_create() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let target_path = temp_dir.path().join("target.txt");
+
+        // Create the initial file
+        fs::write(&target_path, "initial content").expect("Failed to write initial file");
+
+        let (tx, mut rx) = mpsc::channel::<FileEvent>(10);
+
+        // Start the watcher task
+        let target_path_clone = target_path.clone();
+        let watcher_handle = tokio::spawn(async move {
+            file_watcher_task(target_path_clone, tx).await;
+        });
+
+        // Give the watcher time to start
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Perform delete + create
+        fs::remove_file(&target_path).expect("Failed to delete");
+        fs::write(&target_path, "recreated content").expect("Failed to recreate");
+
+        // Wait for the event with timeout
+        let result = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+
+        // Cleanup
+        watcher_handle.abort();
+
+        match result {
+            Ok(Some(FileEvent::Modified)) => {
+                // Success - watcher detected the change
+            }
+            Ok(None) => panic!("Channel closed without receiving event"),
+            Err(_) => panic!("Timeout waiting for file modification event after delete+create"),
+        }
+    }
+
+    /// Test that file_watcher_task continues working after atomic write.
+    #[tokio::test]
+    async fn test_file_watcher_continues_after_atomic_write() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let target_path = temp_dir.path().join("target.txt");
+
+        // Create the initial file
+        fs::write(&target_path, "initial").expect("Failed to write initial file");
+
+        let (tx, mut rx) = mpsc::channel::<FileEvent>(10);
+
+        // Start the watcher task
+        let target_path_clone = target_path.clone();
+        let watcher_handle = tokio::spawn(async move {
+            file_watcher_task(target_path_clone, tx).await;
+        });
+
+        // Give the watcher time to start
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // First atomic write
+        let temp_file_path = temp_dir.path().join(".target.txt.tmp1");
+        fs::write(&temp_file_path, "first update").expect("Failed to write temp");
+        fs::rename(&temp_file_path, &target_path).expect("Failed to rename");
+
+        // Wait for first event
+        let result1 = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            matches!(result1, Ok(Some(FileEvent::Modified))),
+            "First atomic write not detected"
+        );
+
+        // Give debounce time to reset
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Second atomic write - watcher should still be working
+        let temp_file_path2 = temp_dir.path().join(".target.txt.tmp2");
+        fs::write(&temp_file_path2, "second update").expect("Failed to write temp2");
+        fs::rename(&temp_file_path2, &target_path).expect("Failed to rename2");
+
+        // Wait for second event
+        let result2 = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+
+        // Cleanup
+        watcher_handle.abort();
+
+        assert!(
+            matches!(result2, Ok(Some(FileEvent::Modified))),
+            "Second atomic write not detected - watcher may have lost track of file"
+        );
+    }
+
+    /// Test that file_watcher_task detects regular modifications.
+    #[tokio::test]
+    async fn test_file_watcher_detects_regular_modify() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let target_path = temp_dir.path().join("target.txt");
+
+        // Create the initial file
+        fs::write(&target_path, "initial content").expect("Failed to write initial file");
+
+        let (tx, mut rx) = mpsc::channel::<FileEvent>(10);
+
+        // Start the watcher task
+        let target_path_clone = target_path.clone();
+        let watcher_handle = tokio::spawn(async move {
+            file_watcher_task(target_path_clone, tx).await;
+        });
+
+        // Give the watcher time to start
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Regular in-place modification
+        fs::write(&target_path, "modified content").expect("Failed to modify file");
+
+        // Wait for the event with timeout
+        let result = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+
+        // Cleanup
+        watcher_handle.abort();
+
+        match result {
+            Ok(Some(FileEvent::Modified)) => {
+                // Success - watcher detected the change
+            }
+            Ok(None) => panic!("Channel closed without receiving event"),
+            Err(_) => panic!("Timeout waiting for file modification event"),
         }
     }
 }
