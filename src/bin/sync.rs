@@ -638,20 +638,44 @@ async fn run_directory_mode(
     let files = scan_directory_with_contents(&directory, &options)
         .map_err(|e| format!("Scan error: {}", e))?;
 
+    // Wait for reconciler to process the schema and create documents
+    sleep(Duration::from_millis(100)).await;
+
+    // When not using paths, fetch the updated schema to get UUIDs assigned by reconciler
+    // Build a map of relative_path -> node_id for UUID resolution
+    // This recursively follows node-backed directories to get all UUIDs
+    let uuid_map = if !use_paths {
+        let map = build_uuid_map_recursive(&client, &server, &fs_root_id).await;
+        info!(
+            "Resolved {} UUIDs from server schema for initial sync",
+            map.len()
+        );
+        for (path, uuid) in &map {
+            debug!("  UUID map: {} -> {}", path, uuid);
+        }
+        map
+    } else {
+        std::collections::HashMap::new()
+    };
+
     // Sync each file (file_states was created earlier for server-first pull)
     for file in &files {
         // When use_paths=true, use relative path directly for /files/* endpoints
-        // When use_paths=false, derive node ID as fs_root_id:path for /docs/* endpoints
+        // When use_paths=false, use UUID from schema if available, otherwise derive as fs_root_id:path
         let identifier = if use_paths {
             file.relative_path.clone()
+        } else if let Some(uuid) = uuid_map.get(&file.relative_path) {
+            info!("Using UUID for {}: {}", file.relative_path, uuid);
+            uuid.clone()
         } else {
-            format!("{}:{}", fs_root_id, file.relative_path)
+            let derived = format!("{}:{}", fs_root_id, file.relative_path);
+            warn!(
+                "No UUID found for {}, using derived ID: {}",
+                file.relative_path, derived
+            );
+            derived
         };
         info!("Syncing file: {} -> {}", file.relative_path, identifier);
-
-        // Get or create the node (server's reconciler should have created it)
-        // Wait a moment for reconciler
-        sleep(Duration::from_millis(100)).await;
 
         let file_path = directory.join(&file.relative_path);
 
@@ -918,7 +942,8 @@ async fn run_directory_mode(
                                     .map(|(_, state)| state.identifier.clone())
                             };
 
-                            let identifier = if use_paths {
+                            // Initial identifier - may be updated after schema push if not using paths
+                            let mut identifier = if use_paths {
                                 relative_path.clone()
                             } else {
                                 format!("{}:{}", fs_root_id, relative_path)
@@ -958,6 +983,8 @@ async fn run_directory_mode(
                                                 }
                                             }
                                         }
+                                        // Use the forked ID as the identifier
+                                        identifier = forked_id;
                                         true
                                     }
                                     Err(e) => {
@@ -992,6 +1019,30 @@ async fn run_directory_mode(
 
                                 // Wait briefly for server to reconcile and create the node
                                 sleep(Duration::from_millis(100)).await;
+
+                                // When not using paths, fetch the UUID from the updated schema
+                                // The reconciler assigns UUIDs to new entries, so we need to look them up
+                                if !use_paths {
+                                    if let Some(uuid) = fetch_node_id_from_schema(
+                                        &client,
+                                        &server,
+                                        &fs_root_id,
+                                        &relative_path,
+                                    )
+                                    .await
+                                    {
+                                        info!(
+                                            "Resolved UUID for {}: {} -> {}",
+                                            relative_path, identifier, uuid
+                                        );
+                                        identifier = uuid;
+                                    } else {
+                                        warn!(
+                                            "Could not resolve UUID for {}, using derived ID: {}",
+                                            relative_path, identifier
+                                        );
+                                    }
+                                }
 
                                 // Now push initial content (handle binary files)
                                 let content_info = detect_from_path(&path);
@@ -1275,15 +1326,43 @@ async fn run_exec_mode(
     let files = scan_directory_with_contents(&directory, &options)
         .map_err(|e| format!("Scan error: {}", e))?;
 
+    // Wait for reconciler to process the schema and create documents
+    sleep(Duration::from_millis(100)).await;
+
+    // When not using paths, fetch the updated schema to get UUIDs assigned by reconciler
+    // Build a map of relative_path -> node_id for UUID resolution
+    // This recursively follows node-backed directories to get all UUIDs
+    let uuid_map = if !use_paths {
+        let map = build_uuid_map_recursive(&client, &server, &fs_root_id).await;
+        info!(
+            "Resolved {} UUIDs from server schema for initial sync",
+            map.len()
+        );
+        for (path, uuid) in &map {
+            debug!("  UUID map: {} -> {}", path, uuid);
+        }
+        map
+    } else {
+        std::collections::HashMap::new()
+    };
+
     for file in &files {
+        // When use_paths=true, use relative path directly for /files/* endpoints
+        // When use_paths=false, use UUID from schema if available, otherwise derive as fs_root_id:path
         let identifier = if use_paths {
             file.relative_path.clone()
+        } else if let Some(uuid) = uuid_map.get(&file.relative_path) {
+            info!("Using UUID for {}: {}", file.relative_path, uuid);
+            uuid.clone()
         } else {
-            format!("{}:{}", fs_root_id, file.relative_path)
+            let derived = format!("{}:{}", fs_root_id, file.relative_path);
+            warn!(
+                "No UUID found for {}, using derived ID: {}",
+                file.relative_path, derived
+            );
+            derived
         };
         info!("Syncing file: {} -> {}", file.relative_path, identifier);
-
-        sleep(Duration::from_millis(100)).await;
 
         let file_path = directory.join(&file.relative_path);
 
@@ -1514,7 +1593,8 @@ async fn run_exec_mode(
                                     .map(|(_, state)| state.identifier.clone())
                             };
 
-                            let identifier = if use_paths {
+                            // Initial identifier - may be updated after schema push if not using paths
+                            let mut identifier = if use_paths {
                                 relative_path.clone()
                             } else {
                                 format!("{}:{}", fs_root_id, relative_path)
@@ -1554,6 +1634,8 @@ async fn run_exec_mode(
                                                 }
                                             }
                                         }
+                                        // Use the forked ID as the identifier
+                                        identifier = forked_id;
                                         true
                                     }
                                     Err(e) => {
@@ -1588,6 +1670,30 @@ async fn run_exec_mode(
 
                                 // Wait briefly for server to reconcile and create the node
                                 sleep(Duration::from_millis(100)).await;
+
+                                // When not using paths, fetch the UUID from the updated schema
+                                // The reconciler assigns UUIDs to new entries, so we need to look them up
+                                if !use_paths {
+                                    if let Some(uuid) = fetch_node_id_from_schema(
+                                        &client,
+                                        &server,
+                                        &fs_root_id,
+                                        &relative_path,
+                                    )
+                                    .await
+                                    {
+                                        info!(
+                                            "Resolved UUID for {}: {} -> {}",
+                                            relative_path, identifier, uuid
+                                        );
+                                        identifier = uuid;
+                                    } else {
+                                        warn!(
+                                            "Could not resolve UUID for {}, using derived ID: {}",
+                                            relative_path, identifier
+                                        );
+                                    }
+                                }
 
                                 // Now push initial content (handle binary files)
                                 let content_info = detect_from_path(&path);
@@ -2272,6 +2378,133 @@ fn collect_paths_from_entry(
         }
         Entry::Doc(doc) => {
             paths.push((prefix.to_string(), doc.node_id.clone()));
+        }
+    }
+}
+
+/// Fetch the node_id (UUID) for a file path from the server's schema.
+///
+/// After pushing a schema update, the server's reconciler creates documents with UUIDs.
+/// This function fetches the updated schema and looks up the UUID for the given path.
+/// Returns None if the path is not found or if the node_id is not set.
+async fn fetch_node_id_from_schema(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    relative_path: &str,
+) -> Option<String> {
+    // Build the full UUID map recursively (follows node-backed directories)
+    let uuid_map = build_uuid_map_recursive(client, server, fs_root_id).await;
+    uuid_map.get(relative_path).cloned()
+}
+
+/// Recursively build a map of relative paths to UUIDs by fetching all schemas.
+///
+/// This function follows node-backed directories and fetches their schemas
+/// to build a complete map of all file paths to their UUIDs.
+async fn build_uuid_map_recursive(
+    client: &Client,
+    server: &str,
+    doc_id: &str,
+) -> std::collections::HashMap<String, String> {
+    let mut uuid_map = std::collections::HashMap::new();
+    build_uuid_map_from_doc(client, server, doc_id, "", &mut uuid_map).await;
+    uuid_map
+}
+
+/// Helper function to recursively build the UUID map from a document and its children.
+#[async_recursion::async_recursion]
+async fn build_uuid_map_from_doc(
+    client: &Client,
+    server: &str,
+    doc_id: &str,
+    path_prefix: &str,
+    uuid_map: &mut std::collections::HashMap<String, String>,
+) {
+    // Fetch the schema from this document
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(doc_id));
+    let resp = match client.get(&head_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to fetch schema for {}: {}", doc_id, e);
+            return;
+        }
+    };
+
+    if !resp.status().is_success() {
+        warn!(
+            "Failed to fetch schema: {} (status {})",
+            doc_id,
+            resp.status()
+        );
+        return;
+    }
+
+    let head: HeadResponse = match resp.json().await {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("Failed to parse schema response for {}: {}", doc_id, e);
+            return;
+        }
+    };
+
+    let schema: FsSchema = match serde_json::from_str(&head.content) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("Document {} is not a schema ({}), skipping", doc_id, e);
+            return;
+        }
+    };
+
+    // Traverse the schema and collect UUIDs
+    if let Some(ref root) = schema.root {
+        collect_paths_with_node_backed_dirs(client, server, root, path_prefix, uuid_map).await;
+    }
+}
+
+/// Recursively collect paths from an entry, following node-backed directories.
+#[async_recursion::async_recursion]
+async fn collect_paths_with_node_backed_dirs(
+    client: &Client,
+    server: &str,
+    entry: &Entry,
+    prefix: &str,
+    uuid_map: &mut std::collections::HashMap<String, String>,
+) {
+    match entry {
+        Entry::Dir(dir) => {
+            // If this is a node-backed directory (entries: null, node_id: Some),
+            // fetch its schema and continue recursively
+            if dir.entries.is_none() {
+                if let Some(ref node_id) = dir.node_id {
+                    // This is a node-backed directory - fetch its schema
+                    build_uuid_map_from_doc(client, server, node_id, prefix, uuid_map).await;
+                }
+            } else if let Some(ref entries) = dir.entries {
+                // Inline directory - traverse its entries
+                for (name, child) in entries {
+                    let child_path = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", prefix, name)
+                    };
+                    collect_paths_with_node_backed_dirs(
+                        client,
+                        server,
+                        child,
+                        &child_path,
+                        uuid_map,
+                    )
+                    .await;
+                }
+            }
+        }
+        Entry::Doc(doc) => {
+            // This is a file - add it to the map if it has a node_id
+            if let Some(ref node_id) = doc.node_id {
+                debug!("Found UUID: {} -> {}", prefix, node_id);
+                uuid_map.insert(prefix.to_string(), node_id.clone());
+            }
         }
     }
 }

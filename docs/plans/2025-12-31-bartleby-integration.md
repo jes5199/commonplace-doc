@@ -151,9 +151,13 @@ cd ~/bartleby && ./run.sh &
 
 Or use the Task tool with `run_in_background: true` for each.
 
+## Blockers
+
+~~1. **CP-9u1 (P1)**: Sync client uses derived IDs instead of UUIDs from schema.~~ **FIXED** - Sync client now recursively fetches schemas from node-backed directories to resolve UUIDs.
+
 ## Known Limitations
 
-1. **Bartleby hardcodes WORKING_DIR** - Requires symlink workaround; feature request filed for env var override
+1. **~~Bartleby hardcodes WORKING_DIR~~** - FIXED: Now supports `BARTLEBY_WORKING_DIR` env var (commit 8abec04)
 2. **Sync latency** - File changes take a moment to propagate through SSE
 3. **Binary files** - Commonplace sync may not handle binary files well
 4. **Conflict resolution** - If both bartleby and commonplace edit same file simultaneously, conflicts possible
