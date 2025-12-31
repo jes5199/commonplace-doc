@@ -9,6 +9,62 @@ use std::io;
 use std::path::Path;
 use thiserror::Error;
 
+/// Schema filename for preserving node_ids
+const SCHEMA_FILENAME: &str = ".commonplace.json";
+
+/// Extract node_ids from an existing schema, building a path -> node_id map.
+fn extract_node_ids(entry: &Entry, prefix: &str) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+
+    match entry {
+        Entry::Doc(doc) => {
+            if let Some(ref node_id) = doc.node_id {
+                result.insert(prefix.to_string(), node_id.clone());
+            }
+        }
+        Entry::Dir(dir) => {
+            // Also capture directory node_ids
+            if let Some(ref node_id) = dir.node_id {
+                result.insert(prefix.to_string(), node_id.clone());
+            }
+            if let Some(ref entries) = dir.entries {
+                for (name, child) in entries {
+                    let child_path = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", prefix, name)
+                    };
+                    result.extend(extract_node_ids(child, &child_path));
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Load existing node_ids from .commonplace.json if present.
+fn load_existing_node_ids(directory: &Path) -> HashMap<String, String> {
+    let schema_path = directory.join(SCHEMA_FILENAME);
+    if !schema_path.exists() {
+        return HashMap::new();
+    }
+
+    match fs::read_to_string(&schema_path) {
+        Ok(content) => match serde_json::from_str::<FsSchema>(&content) {
+            Ok(schema) => {
+                if let Some(ref root) = schema.root {
+                    extract_node_ids(root, "")
+                } else {
+                    HashMap::new()
+                }
+            }
+            Err(_) => HashMap::new(),
+        },
+        Err(_) => HashMap::new(),
+    }
+}
+
 /// Normalize a path to use forward slashes regardless of OS.
 ///
 /// Schema paths always use forward slashes, so relative paths must be
@@ -64,12 +120,18 @@ pub struct ScannedFile {
 ///
 /// This walks the directory tree recursively, skipping symlinks,
 /// and builds an FsSchema that can be serialized to JSON.
+///
+/// If a `.commonplace.json` file exists in the directory, existing
+/// node_ids will be preserved for files that still exist.
 pub fn scan_directory(path: &Path, options: &ScanOptions) -> Result<FsSchema, ScanError> {
     if !path.is_dir() {
         return Err(ScanError::NotDirectory(path.display().to_string()));
     }
 
-    let root_entry = scan_dir_recursive(path, options)?;
+    // Load existing node_ids to preserve them
+    let existing_node_ids = load_existing_node_ids(path);
+
+    let root_entry = scan_dir_recursive(path, path, options, &existing_node_ids)?;
 
     Ok(FsSchema {
         version: 1,
@@ -78,8 +140,19 @@ pub fn scan_directory(path: &Path, options: &ScanOptions) -> Result<FsSchema, Sc
 }
 
 /// Recursively scan a directory and build an Entry tree.
-fn scan_dir_recursive(current: &Path, options: &ScanOptions) -> Result<Entry, ScanError> {
+fn scan_dir_recursive(
+    root: &Path,
+    current: &Path,
+    options: &ScanOptions,
+    existing_node_ids: &HashMap<String, String>,
+) -> Result<Entry, ScanError> {
     let mut entries: HashMap<String, Entry> = HashMap::new();
+
+    // Compute relative path for this directory (for looking up node_ids)
+    let dir_relative = current
+        .strip_prefix(root)
+        .map(|p| normalize_path(&p.to_string_lossy()))
+        .unwrap_or_default();
 
     let read_dir = fs::read_dir(current)?;
 
@@ -106,9 +179,20 @@ fn scan_dir_recursive(current: &Path, options: &ScanOptions) -> Result<Entry, Sc
 
         let entry_path = entry.path();
 
+        // Compute relative path for this entry
+        let relative_path = if dir_relative.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", dir_relative, name)
+        };
+
         if file_type.is_dir() {
             // Recursively scan subdirectory
-            let sub_entry = scan_dir_recursive(&entry_path, options)?;
+            let sub_entry = scan_dir_recursive(root, &entry_path, options, existing_node_ids)?;
+
+            // Note: We do NOT preserve directory node_id when we have inline entries
+            // A directory can have EITHER entries (inline) OR node_id (node-backed), not both
+            // Since we're scanning the filesystem and populating entries, it's an inline directory
             entries.insert(name, sub_entry);
         } else if file_type.is_file() {
             // Skip files with disallowed extensions
@@ -129,8 +213,12 @@ fn scan_dir_recursive(current: &Path, options: &ScanOptions) -> Result<Entry, Sc
             } else {
                 content_info.mime_type.clone()
             };
+
+            // Look up existing node_id for this file
+            let node_id = existing_node_ids.get(&relative_path).cloned();
+
             let doc_entry = Entry::Doc(DocEntry {
-                node_id: None, // Use derived ID
+                node_id,
                 content_type: Some(content_type),
             });
             entries.insert(name, doc_entry);
@@ -138,6 +226,9 @@ fn scan_dir_recursive(current: &Path, options: &ScanOptions) -> Result<Entry, Sc
         // Skip other types (sockets, devices, etc.)
     }
 
+    // Note: We do NOT preserve directory node_id when we have inline entries
+    // A directory can have EITHER entries (inline) OR node_id (node-backed), not both
+    // Since we're scanning the filesystem and populating entries, it's an inline directory
     Ok(Entry::Dir(DirEntry {
         entries: Some(entries),
         node_id: None,
@@ -528,5 +619,151 @@ mod tests {
         let paths: Vec<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
         assert!(paths.contains(&"allowed.txt"));
         assert!(!paths.contains(&"code.rs"));
+    }
+
+    #[test]
+    fn test_scan_preserves_existing_node_ids() {
+        let temp = TempDir::new().unwrap();
+
+        // Create files
+        File::create(temp.path().join("file1.txt"))
+            .unwrap()
+            .write_all(b"content1")
+            .unwrap();
+        File::create(temp.path().join("file2.txt"))
+            .unwrap()
+            .write_all(b"content2")
+            .unwrap();
+
+        // Create subdirectory with file
+        fs::create_dir(temp.path().join("subdir")).unwrap();
+        File::create(temp.path().join("subdir/nested.txt"))
+            .unwrap()
+            .write_all(b"nested content")
+            .unwrap();
+
+        // Create existing .commonplace.json with node_ids
+        let existing_schema = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "file1.txt": {
+                        "type": "doc",
+                        "node_id": "uuid-for-file1",
+                        "content_type": "text/plain"
+                    },
+                    "subdir": {
+                        "type": "dir",
+                        "entries": {
+                            "nested.txt": {
+                                "type": "doc",
+                                "node_id": "uuid-for-nested",
+                                "content_type": "text/plain"
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        File::create(temp.path().join(".commonplace.json"))
+            .unwrap()
+            .write_all(existing_schema.as_bytes())
+            .unwrap();
+
+        // Scan should preserve existing node_ids
+        let schema = scan_directory(temp.path(), &ScanOptions::default()).unwrap();
+
+        if let Some(Entry::Dir(root)) = &schema.root {
+            let entries = root.entries.as_ref().unwrap();
+
+            // file1.txt should have preserved node_id
+            if let Some(Entry::Doc(doc)) = entries.get("file1.txt") {
+                assert_eq!(doc.node_id.as_deref(), Some("uuid-for-file1"));
+            } else {
+                panic!("Expected file1.txt to be a Doc");
+            }
+
+            // file2.txt should have None (not in existing schema)
+            if let Some(Entry::Doc(doc)) = entries.get("file2.txt") {
+                assert_eq!(doc.node_id, None);
+            } else {
+                panic!("Expected file2.txt to be a Doc");
+            }
+
+            // nested.txt should have preserved node_id
+            if let Some(Entry::Dir(subdir)) = entries.get("subdir") {
+                let sub_entries = subdir.entries.as_ref().unwrap();
+                if let Some(Entry::Doc(doc)) = sub_entries.get("nested.txt") {
+                    assert_eq!(doc.node_id.as_deref(), Some("uuid-for-nested"));
+                } else {
+                    panic!("Expected nested.txt to be a Doc");
+                }
+            } else {
+                panic!("Expected subdir to be a Dir");
+            }
+        } else {
+            panic!("Expected root to be a Dir");
+        }
+    }
+
+    #[test]
+    fn test_scan_preserves_shared_node_ids() {
+        let temp = TempDir::new().unwrap();
+
+        // Create two files that should share a node_id (link scenario)
+        File::create(temp.path().join("file_a.txt"))
+            .unwrap()
+            .write_all(b"content a")
+            .unwrap();
+        File::create(temp.path().join("file_b.txt"))
+            .unwrap()
+            .write_all(b"content b")
+            .unwrap();
+
+        // Create existing .commonplace.json with shared node_id
+        let existing_schema = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "file_a.txt": {
+                        "type": "doc",
+                        "node_id": "shared-uuid",
+                        "content_type": "text/plain"
+                    },
+                    "file_b.txt": {
+                        "type": "doc",
+                        "node_id": "shared-uuid",
+                        "content_type": "text/plain"
+                    }
+                }
+            }
+        }"#;
+        File::create(temp.path().join(".commonplace.json"))
+            .unwrap()
+            .write_all(existing_schema.as_bytes())
+            .unwrap();
+
+        // Scan should preserve both node_ids (even though they're the same)
+        let schema = scan_directory(temp.path(), &ScanOptions::default()).unwrap();
+
+        if let Some(Entry::Dir(root)) = &schema.root {
+            let entries = root.entries.as_ref().unwrap();
+
+            if let Some(Entry::Doc(doc_a)) = entries.get("file_a.txt") {
+                assert_eq!(doc_a.node_id.as_deref(), Some("shared-uuid"));
+            } else {
+                panic!("Expected file_a.txt to be a Doc");
+            }
+
+            if let Some(Entry::Doc(doc_b)) = entries.get("file_b.txt") {
+                assert_eq!(doc_b.node_id.as_deref(), Some("shared-uuid"));
+            } else {
+                panic!("Expected file_b.txt to be a Doc");
+            }
+        } else {
+            panic!("Expected root to be a Dir");
+        }
     }
 }
