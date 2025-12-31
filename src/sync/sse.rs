@@ -142,17 +142,57 @@ pub async fn refresh_from_head(
         }
     };
 
-    // Check if content differs from what we have, and update state BEFORE writing
-    // to prevent file watcher from re-uploading the refreshed content
+    // Read current local file to check for pending changes
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let content_info = detect_from_path(file_path);
+    let local_content = match std::fs::read(file_path) {
+        Ok(bytes) => {
+            if content_info.is_binary || is_binary_content(&bytes) {
+                Some(STANDARD.encode(&bytes))
+            } else {
+                Some(String::from_utf8_lossy(&bytes).to_string())
+            }
+        }
+        Err(e) => {
+            // File missing or unreadable - treat as no pending changes so we can
+            // recreate it from server HEAD
+            debug!(
+                "Local file not readable for refresh check ({}), will recreate from HEAD",
+                e
+            );
+            None
+        }
+    };
+
+    // Check for pending local changes and if HEAD differs from our state
     {
         let mut s = state.write().await;
-        if head.content == s.last_written_content {
+
+        // If local file exists and differs from what we last wrote, there are pending changes.
+        // Don't overwrite them - let the next upload cycle handle merging.
+        // If local file is missing (None), proceed with refresh to recreate it.
+        if let Some(ref local) = local_content {
+            if local != &s.last_written_content {
+                debug!(
+                    "Skipping refresh - local file has pending changes (local {} bytes != last_written {} bytes)",
+                    local.len(),
+                    s.last_written_content.len()
+                );
+                return false; // Caller will re-set needs_head_refresh
+            }
+        }
+
+        // Only skip write if local file exists AND matches what we expect.
+        // If local file is missing, we must write to recreate it.
+        if local_content.is_some() && head.content == s.last_written_content {
             // Content matches, but still update CID in case server advanced to new commit
             // with identical content (e.g., concurrent edits that merge to same text)
             debug!("HEAD matches last_written_content, updating CID only");
             s.last_written_cid = head.cid.clone();
             return true; // Success - content already matches
         }
+
+        // No pending local changes and HEAD differs - safe to write
         // Update state BEFORE writing file - this way if watcher fires after write,
         // echo detection will see matching content and skip upload
         s.last_written_cid = head.cid.clone();
@@ -161,8 +201,7 @@ pub async fn refresh_from_head(
 
     // Content differs - we need to write the new content
     // Use similar logic to handle_server_edit for binary detection
-    let content_info = detect_from_path(file_path);
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    // (content_info and STANDARD already available from above)
     let write_result = if content_info.is_binary {
         match STANDARD.decode(&head.content) {
             Ok(decoded) => tokio::fs::write(file_path, &decoded).await,
