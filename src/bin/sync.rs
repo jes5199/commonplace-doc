@@ -801,7 +801,17 @@ async fn run_directory_mode(
 
         // Store state for this file (tasks will be spawned after initial sync)
         {
-            let content_hash = compute_content_hash(file.content.as_bytes());
+            // For binary files, decode base64 to get raw bytes for consistent hashing
+            // New file detection hashes raw bytes, so we must do the same here
+            let content_hash = if file.is_binary {
+                use base64::{engine::general_purpose::STANDARD, Engine};
+                match STANDARD.decode(&file.content) {
+                    Ok(raw_bytes) => compute_content_hash(&raw_bytes),
+                    Err(_) => compute_content_hash(file.content.as_bytes()),
+                }
+            } else {
+                compute_content_hash(file.content.as_bytes())
+            };
             let mut states = file_states.write().await;
             states.insert(
                 file.relative_path.clone(),
@@ -1454,7 +1464,17 @@ async fn run_exec_mode(
         }
 
         {
-            let content_hash = compute_content_hash(file.content.as_bytes());
+            // For binary files, decode base64 to get raw bytes for consistent hashing
+            // New file detection hashes raw bytes, so we must do the same here
+            let content_hash = if file.is_binary {
+                use base64::{engine::general_purpose::STANDARD, Engine};
+                match STANDARD.decode(&file.content) {
+                    Ok(raw_bytes) => compute_content_hash(&raw_bytes),
+                    Err(_) => compute_content_hash(file.content.as_bytes()),
+                }
+            } else {
+                compute_content_hash(file.content.as_bytes())
+            };
             let mut states = file_states.write().await;
             states.insert(
                 file.relative_path.clone(),
@@ -2279,15 +2299,16 @@ async fn handle_schema_change(
                         // Detect if file is binary and decode base64 if needed
                         // Use both extension-based detection AND try decoding as base64
                         // to handle files that were uploaded as binary via content sniffing
+                        // Track actual bytes written for consistent hash computation
                         use base64::{engine::general_purpose::STANDARD, Engine};
                         let content_info = detect_from_path(&file_path);
-                        let write_result = if content_info.is_binary {
+                        let bytes_written: Vec<u8> = if content_info.is_binary {
                             // Extension indicates binary - decode base64
                             match STANDARD.decode(&file_head.content) {
-                                Ok(decoded) => tokio::fs::write(&file_path, &decoded).await,
+                                Ok(decoded) => decoded,
                                 Err(e) => {
                                     warn!("Failed to decode binary content: {}", e);
-                                    tokio::fs::write(&file_path, &file_head.content).await
+                                    file_head.content.as_bytes().to_vec()
                                 }
                             }
                         } else {
@@ -2296,18 +2317,18 @@ async fn handle_schema_change(
                             match STANDARD.decode(&file_head.content) {
                                 Ok(decoded) if is_binary_content(&decoded) => {
                                     // Successfully decoded and content is binary
-                                    tokio::fs::write(&file_path, &decoded).await
+                                    decoded
                                 }
                                 _ => {
                                     // Not base64 or not binary - write as text
-                                    tokio::fs::write(&file_path, &file_head.content).await
+                                    file_head.content.as_bytes().to_vec()
                                 }
                             }
                         };
-                        write_result?;
+                        tokio::fs::write(&file_path, &bytes_written).await?;
 
-                        // Compute content hash before moving file_head.content
-                        let content_hash = compute_content_hash(file_head.content.as_bytes());
+                        // Hash the actual bytes written to disk for consistent fork detection
+                        let content_hash = compute_content_hash(&bytes_written);
 
                         // Add to file states
                         let state = Arc::new(RwLock::new(SyncState {
