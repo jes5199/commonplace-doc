@@ -514,8 +514,8 @@ mod tests {
         #[test]
         fn test_any_to_json_number() {
             assert_eq!(
-                any_to_json_value(Any::Number(3.14)),
-                serde_json::json!(3.14)
+                any_to_json_value(Any::Number(1.234)),
+                serde_json::json!(1.234)
             );
         }
 
