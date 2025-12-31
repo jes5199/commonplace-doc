@@ -369,4 +369,22 @@ mod tests {
         assert_eq!(process.document_path, "examples/test.json");
         assert_eq!(process.state, DiscoveredProcessState::Stopped);
     }
+
+    #[test]
+    fn test_add_directory_attached_process() {
+        let mut manager = DiscoveredProcessManager::new("localhost:1883".to_string());
+
+        let config = DiscoveredProcess {
+            command: CommandSpec::Simple("sync --sandbox".to_string()),
+            owns: None,
+            cwd: PathBuf::from("/tmp"),
+        };
+
+        // For directory-attached, document_path is just the directory
+        manager.add_process("sandbox".to_string(), "examples".to_string(), config);
+
+        assert_eq!(manager.processes().len(), 1);
+        let process = manager.processes().get("sandbox").unwrap();
+        assert_eq!(process.document_path, "examples");
+    }
 }
