@@ -6,6 +6,8 @@ use std::path::PathBuf;
 pub struct OrchestratorConfig {
     #[serde(default = "default_mqtt_broker")]
     pub mqtt_broker: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_server: Option<String>,
     pub processes: HashMap<String, ProcessConfig>,
 }
 
@@ -69,6 +71,32 @@ impl OrchestratorConfig {
         let content = std::fs::read_to_string(path)?;
         let config: Self = serde_json::from_str(&content)?;
         Ok(config)
+    }
+
+    /// Resolve the HTTP server URL with fallback chain:
+    /// 1. Parse --port from http process args
+    /// 2. Use http_server config field
+    /// 3. Default to http://localhost:3000
+    pub fn resolve_server_url(&self) -> String {
+        // Try to parse port from http process args
+        if let Some(http_config) = self.processes.get("http") {
+            let args = &http_config.args;
+            for (i, arg) in args.iter().enumerate() {
+                if arg == "--port" || arg == "-p" {
+                    if let Some(port) = args.get(i + 1) {
+                        return format!("http://localhost:{}", port);
+                    }
+                }
+            }
+        }
+
+        // Fall back to explicit http_server field
+        if let Some(ref url) = self.http_server {
+            return url.clone();
+        }
+
+        // Default
+        "http://localhost:3000".to_string()
     }
 
     /// Returns process names in dependency order (dependencies first)
@@ -202,5 +230,36 @@ mod tests {
         }"#;
         let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
         assert!(config.startup_order().is_err());
+    }
+
+    #[test]
+    fn test_resolve_server_url_from_http_args() {
+        let json = r#"{
+            "processes": {
+                "http": {
+                    "command": "commonplace-http",
+                    "args": ["--port", "8080"]
+                }
+            }
+        }"#;
+        let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.resolve_server_url(), "http://localhost:8080");
+    }
+
+    #[test]
+    fn test_resolve_server_url_from_explicit_field() {
+        let json = r#"{
+            "http_server": "http://example.com:3000",
+            "processes": {}
+        }"#;
+        let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.resolve_server_url(), "http://example.com:3000");
+    }
+
+    #[test]
+    fn test_resolve_server_url_default() {
+        let json = r#"{ "processes": {} }"#;
+        let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.resolve_server_url(), "http://localhost:3000");
     }
 }
