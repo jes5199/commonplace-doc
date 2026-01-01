@@ -25,9 +25,32 @@ use tracing::{debug, error, info, warn};
 /// Filename for the local schema JSON file in directory sync mode
 pub const SCHEMA_FILENAME: &str = ".commonplace.json";
 
-/// Write the schema JSON to the local .commonplace.json file
+/// Write the schema JSON to the local .commonplace.json file.
+///
+/// This function compares the new schema with the existing local file
+/// and skips the write if they are semantically equivalent, preventing
+/// unnecessary file system events that could cause feedback loops.
 pub async fn write_schema_file(directory: &Path, schema_json: &str) -> Result<(), std::io::Error> {
     let schema_path = directory.join(SCHEMA_FILENAME);
+
+    // Check if existing schema is the same (prevents feedback loops)
+    if schema_path.exists() {
+        if let Ok(existing) = tokio::fs::read_to_string(&schema_path).await {
+            // Compare as parsed JSON to ignore whitespace/formatting differences
+            let existing_parsed: Result<serde_json::Value, _> = serde_json::from_str(&existing);
+            let new_parsed: Result<serde_json::Value, _> = serde_json::from_str(schema_json);
+            if let (Ok(existing_json), Ok(new_json)) = (existing_parsed, new_parsed) {
+                if existing_json == new_json {
+                    tracing::debug!(
+                        "Schema unchanged, skipping write to {}",
+                        schema_path.display()
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     tokio::fs::write(&schema_path, schema_json).await?;
     info!("Wrote schema to {}", schema_path.display());
     Ok(())

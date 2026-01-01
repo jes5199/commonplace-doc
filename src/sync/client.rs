@@ -44,6 +44,10 @@ pub async fn fork_node(
 }
 
 /// Push a schema JSON document to the fs-root node on the server.
+///
+/// This function compares the new schema with the current server content
+/// and skips the update if they are semantically equivalent, preventing
+/// unnecessary SSE events that could cause feedback loops.
 pub async fn push_schema_to_server(
     client: &Client,
     server: &str,
@@ -53,12 +57,25 @@ pub async fn push_schema_to_server(
     // First fetch current server content and state to detect deletions
     let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
     let head_resp = client.get(&head_url).send().await?;
-    let (_old_content, base_state) = if head_resp.status().is_success() {
+    let (old_content, base_state) = if head_resp.status().is_success() {
         let head: HeadResponse = head_resp.json().await?;
         (Some(head.content), head.state)
     } else {
         (None, None)
     };
+
+    // Skip update if schema hasn't changed (prevents feedback loops)
+    // Compare as parsed JSON to ignore whitespace/formatting differences
+    if let Some(ref old) = old_content {
+        let old_parsed: Result<serde_json::Value, _> = serde_json::from_str(old);
+        let new_parsed: Result<serde_json::Value, _> = serde_json::from_str(schema_json);
+        if let (Ok(old_json), Ok(new_json)) = (old_parsed, new_parsed) {
+            if old_json == new_json {
+                tracing::debug!("Schema unchanged, skipping push to server");
+                return Ok(());
+            }
+        }
+    }
 
     // Create an update that properly handles deletions (using server state for CRDT consistency)
     let update = create_yjs_json_update(schema_json, base_state.as_deref())
