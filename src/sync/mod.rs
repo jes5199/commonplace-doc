@@ -16,8 +16,8 @@ pub mod yjs;
 pub use client::{fork_node, push_file_content, push_json_content, push_schema_to_server};
 pub use dir_sync::{
     build_uuid_map_from_doc, build_uuid_map_recursive, collect_paths_from_entry,
-    collect_paths_with_node_backed_dirs, fetch_node_id_from_schema, write_schema_file,
-    SCHEMA_FILENAME,
+    collect_paths_with_node_backed_dirs, fetch_node_id_from_schema, handle_schema_change,
+    write_schema_file, SCHEMA_FILENAME,
 };
 pub use file_sync::{
     initial_sync, spawn_file_sync_tasks, upload_task, BARRIER_RETRY_COUNT, BARRIER_RETRY_DELAY,
