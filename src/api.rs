@@ -67,6 +67,8 @@ pub fn router(
         .route("/docs/:id/edit", post(edit_doc))
         .route("/docs/:id/replace", post(replace_doc))
         .route("/docs/:id/fork", post(fork_doc))
+        // fs-root discovery endpoint
+        .route("/fs-root", get(get_fs_root))
         .with_state(state)
 }
 
@@ -118,6 +120,26 @@ async fn create_doc(
     let id = state.doc_store.create_document(content_type).await;
 
     Ok(Json(CreateDocResponse { id }))
+}
+
+/// Response for GET /fs-root
+#[derive(Serialize)]
+struct FsRootResponse {
+    id: String,
+}
+
+/// Get the fs-root document ID.
+///
+/// Returns the document ID for the fs-root, allowing clients to discover
+/// it without needing to specify --node. Only works if server was started
+/// with --fs-root.
+async fn get_fs_root(State(state): State<ApiState>) -> Result<Json<FsRootResponse>, StatusCode> {
+    let id = state
+        .fs_root
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    Ok(Json(FsRootResponse { id: id.clone() }))
 }
 
 async fn get_doc_content(
