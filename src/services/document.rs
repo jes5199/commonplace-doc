@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use tracing::debug;
+
 use crate::commit::Commit;
 use crate::document::{ApplyError, ContentType, Document, DocumentStore};
 use crate::events::{CommitBroadcaster, CommitNotification};
@@ -559,6 +561,12 @@ impl DocumentService {
 
             if parent_differs {
                 // Parent differs from HEAD - use historical state for proper CRDT merge
+                debug!(
+                    "MERGE PATH: parent {} differs from HEAD {:?} for doc {}",
+                    parent,
+                    current_head.as_ref().map(|s| &s[..8.min(s.len())]),
+                    id
+                );
                 let replayer = CommitReplayer::new(commit_store);
 
                 // Verify the commit belongs to this document's history
@@ -575,6 +583,15 @@ impl DocumentService {
                     .await
                     .map_err(|_| ServiceError::NotFound)?;
 
+                debug!(
+                    "MERGE: parent content = {:?} ({} bytes), new content = {:?} ({} bytes), base_state = {} bytes",
+                    &old_content[..old_content.len().min(50)],
+                    old_content.len(),
+                    &new_content[..new_content.len().min(50)],
+                    new_content.len(),
+                    base_state_bytes.len()
+                );
+
                 let diff = if is_json_type {
                     // JSON documents use Y.Map/Y.Array - use JSON update with base state
                     let base_state_b64 = b64::encode(&base_state_bytes);
@@ -589,10 +606,23 @@ impl DocumentService {
                     .map_err(|e| ServiceError::Internal(e.to_string()))?
                 };
 
+                debug!(
+                    "MERGE: diff computed - {} inserted, {} deleted, {} ops, update_bytes = {} bytes",
+                    diff.summary.chars_inserted,
+                    diff.summary.chars_deleted,
+                    diff.operation_count,
+                    diff.update_bytes.len()
+                );
+
                 // Include BOTH parents for merge commit
                 let mut merge_parents = vec![parent.clone()];
-                if let Some(head) = current_head {
-                    merge_parents.push(head);
+                if let Some(ref head) = current_head {
+                    merge_parents.push(head.clone());
+                    debug!(
+                        "MERGE: creating merge commit with parents [{}, {}]",
+                        &parent[..8.min(parent.len())],
+                        &head[..8.min(head.len())]
+                    );
                 }
                 (diff, merge_parents)
             } else {
@@ -606,8 +636,21 @@ impl DocumentService {
                         .map(|b| b64::encode(&b));
                     compute_json_diff(new_content, &doc.content, base_state.as_deref())?
                 } else {
-                    diff::compute_diff_update(&doc.content, new_content)
-                        .map_err(|e| ServiceError::Internal(e.to_string()))?
+                    // Text/XML: use server's actual Yjs state for proper CRDT merge
+                    let base_state = self.doc_store.get_yjs_state(id).await;
+                    match base_state {
+                        Some(state_bytes) => diff::compute_diff_update_with_base(
+                            &state_bytes,
+                            &doc.content,
+                            new_content,
+                        )
+                        .map_err(|e| ServiceError::Internal(e.to_string()))?,
+                        None => {
+                            // No Yjs state yet - use fresh doc (initial content)
+                            diff::compute_diff_update(&doc.content, new_content)
+                                .map_err(|e| ServiceError::Internal(e.to_string()))?
+                        }
+                    }
                 };
                 (diff, vec![parent.clone()])
             }
@@ -622,8 +665,19 @@ impl DocumentService {
                     .map(|b| b64::encode(&b));
                 compute_json_diff(new_content, &doc.content, base_state.as_deref())?
             } else {
-                diff::compute_diff_update(&doc.content, new_content)
-                    .map_err(|e| ServiceError::Internal(e.to_string()))?
+                // Text/XML: use server's actual Yjs state for proper CRDT merge
+                let base_state = self.doc_store.get_yjs_state(id).await;
+                match base_state {
+                    Some(state_bytes) => {
+                        diff::compute_diff_update_with_base(&state_bytes, &doc.content, new_content)
+                            .map_err(|e| ServiceError::Internal(e.to_string()))?
+                    }
+                    None => {
+                        // No Yjs state yet - use fresh doc (initial content)
+                        diff::compute_diff_update(&doc.content, new_content)
+                            .map_err(|e| ServiceError::Internal(e.to_string()))?
+                    }
+                }
             };
             (diff, current_head.into_iter().collect())
         };
@@ -638,9 +692,33 @@ impl DocumentService {
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
         // Apply update
+        let content_before = self
+            .doc_store
+            .get_document(id)
+            .await
+            .map(|d| d.content.clone())
+            .unwrap_or_default();
+        debug!(
+            "APPLY: doc content BEFORE update = {:?} ({} bytes)",
+            &content_before[..content_before.len().min(50)],
+            content_before.len()
+        );
+
         self.doc_store
             .apply_yjs_update(id, &diff_result.update_bytes)
             .await?;
+
+        let content_after = self
+            .doc_store
+            .get_document(id)
+            .await
+            .map(|d| d.content.clone())
+            .unwrap_or_default();
+        debug!(
+            "APPLY: doc content AFTER update = {:?} ({} bytes)",
+            &content_after[..content_after.len().min(50)],
+            content_after.len()
+        );
 
         commit_store
             .set_document_head(id, &cid)
