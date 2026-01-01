@@ -376,9 +376,17 @@ pub async fn upload_task(
         }
 
         // After successful upload, refresh from HEAD if server edits were skipped
-        // IMPORTANT: Only refresh after successful upload to avoid overwriting
-        // local edits when upload fails
-        if should_refresh {
+        // IMPORTANT: Re-check needs_head_refresh here since SSE events might have
+        // arrived DURING our upload (race condition fix for CP-f20).
+        // Only refresh after successful upload to avoid overwriting local edits.
+        let needs_refresh = {
+            let mut s = state.write().await;
+            let needs = should_refresh || s.needs_head_refresh;
+            s.needs_head_refresh = false;
+            needs
+        };
+
+        if needs_refresh {
             if upload_succeeded {
                 let refresh_succeeded =
                     refresh_from_head(&client, &server, &identifier, &file_path, &state, use_paths)
