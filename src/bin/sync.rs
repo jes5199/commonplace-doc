@@ -94,6 +94,34 @@ struct Args {
     sandbox: bool,
 }
 
+/// Discover the fs-root document ID from the server.
+///
+/// Queries the GET /fs-root endpoint to get the fs-root ID.
+/// This allows sync to work with --use-paths without requiring --node.
+async fn discover_fs_root(
+    client: &Client,
+    server: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!("{}/fs-root", server);
+    let resp = client.get(&url).send().await?;
+
+    if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return Err("Server was not started with --fs-root".into());
+    }
+
+    if !resp.status().is_success() {
+        return Err(format!("Failed to discover fs-root: HTTP {}", resp.status()).into());
+    }
+
+    #[derive(serde::Deserialize)]
+    struct FsRootResponse {
+        id: String,
+    }
+
+    let response: FsRootResponse = resp.json().await?;
+    Ok(response.id)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Initialize tracing
@@ -155,8 +183,24 @@ async fn main() -> ExitCode {
             n.clone()
         }
         (None, None) => {
-            error!("Either --node or --fork-from must be provided");
-            return ExitCode::from(1);
+            // No node specified - try to discover fs-root from server (only with --use-paths)
+            if args.use_paths {
+                info!("Discovering fs-root from server...");
+                match discover_fs_root(&client, &args.server).await {
+                    Ok(id) => {
+                        info!("Discovered fs-root: {}", id);
+                        id
+                    }
+                    Err(e) => {
+                        error!("Failed to discover fs-root: {}", e);
+                        error!("Either specify --node or ensure server was started with --fs-root");
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                error!("Either --node or --fork-from must be provided");
+                return ExitCode::from(1);
+            }
         }
     };
 
