@@ -74,6 +74,73 @@ async fn main() {
         }
     }
 
+    // Handle --recursive mode (discover all processes.json files from fs-root)
+    if args.recursive {
+        tracing::info!("[orchestrator] Recursive discovery mode");
+        tracing::info!("[orchestrator] Server: {}", args.server);
+
+        let mut discovered_manager =
+            DiscoveredProcessManager::new(broker_raw.to_string(), args.server.clone());
+
+        let client = reqwest::Client::new();
+
+        // Get fs-root ID from server
+        let fs_root_url = format!("{}/fs-root", args.server);
+        let fs_root_id = match client.get(&fs_root_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                #[derive(serde::Deserialize)]
+                struct FsRootResponse {
+                    id: String,
+                }
+                match resp.json::<FsRootResponse>().await {
+                    Ok(r) => r.id,
+                    Err(e) => {
+                        tracing::error!("[orchestrator] Failed to parse fs-root response: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Ok(resp) => {
+                tracing::error!(
+                    "[orchestrator] Failed to get fs-root: HTTP {}",
+                    resp.status()
+                );
+                tracing::error!("[orchestrator] Make sure server was started with --fs-root");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                tracing::error!("[orchestrator] Failed to connect to server: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        tracing::info!("[orchestrator] Using fs-root: {}", fs_root_id);
+
+        // Create shutdown signal
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let _ = signal::ctrl_c().await;
+            tracing::info!("[orchestrator] Received Ctrl+C");
+            let _ = shutdown_tx.send(());
+        });
+
+        // Run the recursive watcher with shutdown handling
+        tokio::select! {
+            result = discovered_manager.run_with_recursive_watch(&client, &fs_root_id) => {
+                if let Err(e) = result {
+                    tracing::error!("[orchestrator] Recursive watch failed: {}", e);
+                }
+            }
+            _ = shutdown_rx => {
+                tracing::info!("[orchestrator] Shutting down...");
+            }
+        }
+
+        discovered_manager.shutdown().await;
+        return;
+    }
+
     // Handle --watch-processes mode (dynamic process management)
     if let Some(ref doc_path) = args.watch_processes {
         tracing::info!("[orchestrator] Dynamic process mode: watching {}", doc_path);

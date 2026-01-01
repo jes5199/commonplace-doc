@@ -32,6 +32,9 @@ pub struct ManagedDiscoveredProcess {
     pub name: String,
     /// The document path this process owns
     pub document_path: String,
+    /// The base_path (source) this process was loaded from
+    /// Used to track which processes.json file defined this process
+    pub source_path: String,
     /// Configuration for this process
     pub config: DiscoveredProcess,
     /// Child process handle
@@ -94,10 +97,17 @@ impl DiscoveredProcessManager {
     /// * `name` - Unique name for this process
     /// * `document_path` - Full document path (e.g., "examples/counter.json")
     /// * `config` - Process configuration from `.processes.json`
-    pub fn add_process(&mut self, name: String, document_path: String, config: DiscoveredProcess) {
+    pub fn add_process(
+        &mut self,
+        name: String,
+        document_path: String,
+        source_path: String,
+        config: DiscoveredProcess,
+    ) {
         let process = ManagedDiscoveredProcess {
             name: name.clone(),
             document_path,
+            source_path,
             config,
             handle: None,
             state: DiscoveredProcessState::Stopped,
@@ -147,31 +157,70 @@ impl DiscoveredProcessManager {
         let config = &process.config;
         let document_path = &process.document_path;
 
-        // Build command
-        let program = config.command.program();
-        if program.is_empty() {
-            return Err(format!("Empty command for process: {}", name));
-        }
+        // Build command - either from sandbox-exec or command field
+        let mut cmd = if let Some(ref exec_cmd) = config.sandbox_exec {
+            // sandbox-exec: construct commonplace-sync --sandbox --exec "<cmd>"
+            // Find commonplace-sync in the same directory as the orchestrator
+            let sync_path = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("commonplace-sync")))
+                .unwrap_or_else(|| PathBuf::from("commonplace-sync"));
 
-        let mut cmd = Command::new(program);
-        cmd.args(config.command.args());
-        cmd.current_dir(&config.cwd);
+            let mut cmd = Command::new(&sync_path);
+            cmd.args(["--sandbox", "--exec", exec_cmd]);
 
-        // Set environment variables
+            // Set cwd if specified, otherwise use current directory
+            if let Some(ref cwd) = config.cwd {
+                cmd.current_dir(cwd);
+            }
+
+            tracing::info!(
+                "[discovery] Starting sandbox process '{}' (path: {}, exec: {})",
+                name,
+                document_path,
+                exec_cmd
+            );
+            cmd
+        } else if let Some(ref command_spec) = config.command {
+            // Traditional command field
+            let program = command_spec.program();
+            if program.is_empty() {
+                return Err(format!("Empty command for process: {}", name));
+            }
+
+            let mut cmd = Command::new(program);
+            cmd.args(command_spec.args());
+
+            // cwd is required for command-style processes
+            let cwd = config
+                .cwd
+                .as_ref()
+                .ok_or_else(|| format!("Process '{}' with command requires cwd", name))?;
+            cmd.current_dir(cwd);
+
+            tracing::info!(
+                "[discovery] Starting process '{}' (path: {}, cwd: {:?})",
+                name,
+                document_path,
+                cwd
+            );
+            cmd
+        } else {
+            return Err(format!(
+                "Process '{}' must have either 'command' or 'sandbox-exec'",
+                name
+            ));
+        };
+
+        // Set environment variables for both modes
         cmd.env("COMMONPLACE_PATH", document_path);
         cmd.env("COMMONPLACE_MQTT", &mqtt_broker);
         cmd.env("COMMONPLACE_SERVER", &self.server_url);
+        cmd.env("COMMONPLACE_INITIAL_SYNC", "server");
 
         // Capture stdout/stderr
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-
-        tracing::info!(
-            "[discovery] Starting process '{}' (path: {}, cwd: {:?})",
-            name,
-            document_path,
-            config.cwd
-        );
 
         let mut child = cmd
             .spawn()
@@ -310,35 +359,52 @@ impl DiscoveredProcessManager {
     /// Reconcile running processes with a new configuration.
     ///
     /// This is the core method for dynamic process management. It:
-    /// - Stops processes that were removed from the config
+    /// - Stops processes that were removed from the config (only from this source)
     /// - Starts processes that were added to the config
     /// - Restarts processes where the command/cwd changed
     ///
     /// # Arguments
     /// * `config` - The new ProcessesConfig to reconcile against
-    /// * `base_path` - Base path for constructing document paths
+    /// * `base_path` - Base path for constructing document paths (also used as source identifier)
     pub async fn reconcile_config(
         &mut self,
         config: &ProcessesConfig,
         base_path: &str,
     ) -> Result<(), String> {
-        let current_names: HashSet<String> = self.processes.keys().cloned().collect();
+        // Only consider processes that came from this same source (base_path)
+        let current_names_from_source: HashSet<String> = self
+            .processes
+            .iter()
+            .filter(|(_, p)| p.source_path == base_path)
+            .map(|(name, _)| name.clone())
+            .collect();
+
         let new_names: HashSet<String> = config.processes.keys().cloned().collect();
 
-        // Find processes to remove (in current but not in new)
-        let to_remove: Vec<String> = current_names.difference(&new_names).cloned().collect();
+        // Find processes to remove (in current from this source but not in new)
+        let to_remove: Vec<String> = current_names_from_source
+            .difference(&new_names)
+            .cloned()
+            .collect();
 
-        // Find processes to add (in new but not in current)
-        let to_add: Vec<String> = new_names.difference(&current_names).cloned().collect();
+        // Find processes to add (in new but not currently managed from this source)
+        let to_add: Vec<String> = new_names
+            .difference(&current_names_from_source)
+            .cloned()
+            .collect();
 
         // Find processes that exist in both and may need restart
-        let to_check: Vec<String> = current_names.intersection(&new_names).cloned().collect();
+        let to_check: Vec<String> = current_names_from_source
+            .intersection(&new_names)
+            .cloned()
+            .collect();
 
-        // Remove old processes
+        // Remove processes that were in this source but are no longer defined
         for name in &to_remove {
             tracing::info!(
-                "[discovery] Removing process '{}' (no longer in config)",
-                name
+                "[discovery] Removing process '{}' (no longer in config at {})",
+                name,
+                base_path
             );
             self.remove_process(name).await;
         }
@@ -360,13 +426,27 @@ impl DiscoveredProcessManager {
                 self.remove_process(name).await;
 
                 // Add with new config
-                let document_path = if let Some(ref owns) = new_config.owns {
+                // Priority: explicit path > owns > base_path (processes.json location)
+                // sandbox-exec processes sync at the directory containing their processes.json
+                let document_path = if let Some(ref explicit_path) = new_config.path {
+                    if explicit_path == "/" || explicit_path.is_empty() {
+                        base_path.to_string()
+                    } else {
+                        format!("{}/{}", base_path, explicit_path.trim_start_matches('/'))
+                    }
+                } else if let Some(ref owns) = new_config.owns {
                     format!("{}/{}", base_path, owns)
                 } else {
+                    // sandbox-exec and command processes sync at base_path
                     base_path.to_string()
                 };
 
-                self.add_process(name.clone(), document_path, new_config.clone());
+                self.add_process(
+                    name.clone(),
+                    document_path,
+                    base_path.to_string(),
+                    new_config.clone(),
+                );
 
                 // Start it
                 if let Err(e) = self.spawn_process(name).await {
@@ -378,14 +458,28 @@ impl DiscoveredProcessManager {
         // Add new processes
         for name in &to_add {
             let new_config = &config.processes[name];
-            let document_path = if let Some(ref owns) = new_config.owns {
+            // Priority: explicit path > owns > base_path (processes.json location)
+            // sandbox-exec processes sync at the directory containing their processes.json
+            let document_path = if let Some(ref explicit_path) = new_config.path {
+                if explicit_path == "/" || explicit_path.is_empty() {
+                    base_path.to_string()
+                } else {
+                    format!("{}/{}", base_path, explicit_path.trim_start_matches('/'))
+                }
+            } else if let Some(ref owns) = new_config.owns {
                 format!("{}/{}", base_path, owns)
             } else {
+                // sandbox-exec and command processes sync at base_path
                 base_path.to_string()
             };
 
             tracing::info!("[discovery] Adding new process '{}' from config", name);
-            self.add_process(name.clone(), document_path, new_config.clone());
+            self.add_process(
+                name.clone(),
+                document_path,
+                base_path.to_string(),
+                new_config.clone(),
+            );
 
             if let Err(e) = self.spawn_process(name).await {
                 tracing::error!("[discovery] Failed to start new process '{}': {}", name, e);
@@ -398,9 +492,20 @@ impl DiscoveredProcessManager {
     /// Check if a process configuration has changed in a way that requires restart.
     fn process_config_changed(current: &DiscoveredProcess, new: &DiscoveredProcess) -> bool {
         // Check if command changed
-        let current_cmd = (current.command.program(), current.command.args());
-        let new_cmd = (new.command.program(), new.command.args());
+        let current_cmd = current
+            .command
+            .as_ref()
+            .map(|c| (c.program().to_string(), c.args().join(" ")));
+        let new_cmd = new
+            .command
+            .as_ref()
+            .map(|c| (c.program().to_string(), c.args().join(" ")));
         if current_cmd != new_cmd {
+            return true;
+        }
+
+        // Check if sandbox-exec changed
+        if current.sandbox_exec != new.sandbox_exec {
             return true;
         }
 
@@ -415,6 +520,82 @@ impl DiscoveredProcessManager {
         }
 
         false
+    }
+
+    // Note: find_processes_json_recursive was replaced by discover_all_processes_json
+    // which handles async fetching of subdirectory schemas.
+
+    /// Recursively discover all processes.json files from a root schema.
+    ///
+    /// This fetches schemas for subdirectories with node_ids and finds all processes.json.
+    async fn discover_all_processes_json(
+        client: &Client,
+        server_url: &str,
+        root_id: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        let mut results = Vec::new();
+        let mut to_visit: Vec<(String, String)> = vec![("/".to_string(), root_id.to_string())];
+
+        while let Some((path, node_id)) = to_visit.pop() {
+            // Fetch this node's schema
+            let url = format!("{}/docs/{}/head", server_url, node_id);
+            let resp = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| format!("Failed to fetch {}: {}", url, e))?;
+
+            if !resp.status().is_success() {
+                tracing::warn!(
+                    "[discovery] Failed to fetch schema for {}: HTTP {}",
+                    path,
+                    resp.status()
+                );
+                continue;
+            }
+
+            #[derive(Deserialize)]
+            struct HeadResponse {
+                content: String,
+            }
+
+            let head: HeadResponse = resp
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+            let schema: serde_json::Value = serde_json::from_str(&head.content)
+                .map_err(|e| format!("Failed to parse schema: {}", e))?;
+
+            // Check for processes.json at this level
+            if let Some(root) = schema.get("root") {
+                if let Some(entries) = root.get("entries").and_then(|e| e.as_object()) {
+                    for (name, entry) in entries {
+                        let entry_type = entry.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                        if name == "processes.json" && entry_type == "doc" {
+                            if let Some(pj_node_id) = entry.get("node_id").and_then(|n| n.as_str())
+                            {
+                                results.push((path.clone(), pj_node_id.to_string()));
+                            }
+                        } else if entry_type == "dir" {
+                            // Subdirectory - check if it has a node_id to recurse into
+                            if let Some(sub_node_id) = entry.get("node_id").and_then(|n| n.as_str())
+                            {
+                                let sub_path = if path == "/" {
+                                    format!("/{}", name)
+                                } else {
+                                    format!("{}/{}", path, name)
+                                };
+                                to_visit.push((sub_path, sub_node_id.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     /// Watch a .processes.json document for changes and dynamically update processes.
@@ -625,6 +806,173 @@ impl DiscoveredProcessManager {
         self.watch_document(client, document_path, use_paths).await
     }
 
+    /// Run with recursive discovery of all processes.json files.
+    ///
+    /// This discovers all processes.json files in the filesystem tree starting from
+    /// the given fs-root, and watches each one for changes. Each processes.json
+    /// controls processes that sync at its containing directory.
+    pub async fn run_with_recursive_watch(
+        &mut self,
+        client: &Client,
+        fs_root_id: &str,
+    ) -> Result<(), String> {
+        tracing::info!(
+            "[discovery] Starting recursive discovery from fs-root: {}",
+            fs_root_id
+        );
+
+        // Discover all processes.json files
+        let processes_json_files =
+            Self::discover_all_processes_json(client, &self.server_url, fs_root_id).await?;
+
+        if processes_json_files.is_empty() {
+            tracing::warn!("[discovery] No processes.json files found in filesystem tree");
+            // Still watch the root for changes
+        } else {
+            tracing::info!(
+                "[discovery] Found {} processes.json file(s): {:?}",
+                processes_json_files.len(),
+                processes_json_files
+                    .iter()
+                    .map(|(p, _)| p)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // Fetch and reconcile each processes.json
+        for (base_path, pj_node_id) in &processes_json_files {
+            let url = format!("{}/docs/{}/head", self.server_url, pj_node_id);
+            match self.fetch_and_reconcile(client, &url, base_path).await {
+                Ok(_) => tracing::info!(
+                    "[discovery] Loaded processes from {}/processes.json",
+                    base_path
+                ),
+                Err(e) => tracing::warn!(
+                    "[discovery] Failed to load {}/processes.json: {}",
+                    base_path,
+                    e
+                ),
+            }
+        }
+
+        // Track watched documents: node_id -> base_path
+        let mut watched: HashMap<String, String> = processes_json_files
+            .iter()
+            .map(|(base_path, node_id)| (node_id.clone(), base_path.clone()))
+            .collect();
+
+        // Also watch the fs-root for structural changes
+        let fs_root_sse_url = format!("{}/sse/docs/{}", self.server_url, fs_root_id);
+
+        // Monitor interval for checking process health
+        let mut monitor_interval = tokio::time::interval(Duration::from_millis(500));
+
+        // Re-discovery interval (check for new/removed processes.json files)
+        let mut discovery_interval = tokio::time::interval(Duration::from_secs(30));
+
+        loop {
+            let request_builder = client.get(&fs_root_sse_url);
+
+            let mut es = match EventSource::new(request_builder) {
+                Ok(es) => es,
+                Err(e) => {
+                    tracing::error!(
+                        "[discovery] Failed to create EventSource for fs-root: {}",
+                        e
+                    );
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            let mut sse_closed = false;
+
+            loop {
+                tokio::select! {
+                    // Periodic health check for process restarts
+                    _ = monitor_interval.tick() => {
+                        self.check_and_restart().await;
+                    }
+
+                    // Periodic re-discovery of processes.json files
+                    _ = discovery_interval.tick() => {
+                        match Self::discover_all_processes_json(client, &self.server_url, fs_root_id).await {
+                            Ok(new_files) => {
+                                // Check for new processes.json files
+                                for (base_path, node_id) in &new_files {
+                                    if !watched.contains_key(node_id) {
+                                        tracing::info!("[discovery] Found new processes.json at {}", base_path);
+                                        let url = format!("{}/docs/{}/head", self.server_url, node_id);
+                                        if let Err(e) = self.fetch_and_reconcile(client, &url, base_path).await {
+                                            tracing::warn!("[discovery] Failed to load {}: {}", base_path, e);
+                                        }
+                                        watched.insert(node_id.clone(), base_path.clone());
+                                    }
+                                }
+
+                                // Check for removed processes.json files
+                                let new_ids: HashSet<_> = new_files.iter().map(|(_, id)| id.clone()).collect();
+                                let removed: Vec<_> = watched.keys()
+                                    .filter(|id| !new_ids.contains(*id))
+                                    .cloned()
+                                    .collect();
+                                for node_id in removed {
+                                    if let Some(base_path) = watched.remove(&node_id) {
+                                        tracing::info!("[discovery] processes.json removed at {}", base_path);
+                                        // Remove processes that were from this base_path
+                                        let to_remove: Vec<_> = self.processes.iter()
+                                            .filter(|(_, p)| p.document_path.starts_with(&base_path))
+                                            .map(|(n, _)| n.clone())
+                                            .collect();
+                                        for name in to_remove {
+                                            self.remove_process(&name).await;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("[discovery] Re-discovery failed: {}", e);
+                            }
+                        }
+                    }
+
+                    // SSE event from fs-root (structural changes)
+                    event = es.next() => {
+                        match event {
+                            Some(Ok(SseEvent::Open)) => {
+                                tracing::info!("[discovery] SSE connection opened for fs-root");
+                            }
+                            Some(Ok(SseEvent::Message(msg))) => {
+                                if msg.event == "edit" {
+                                    tracing::info!("[discovery] fs-root schema changed, re-discovering...");
+                                    // Trigger immediate re-discovery
+                                    discovery_interval.reset();
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!("[discovery] SSE error: {}", e);
+                                sse_closed = true;
+                            }
+                            None => {
+                                tracing::info!("[discovery] SSE stream ended");
+                                sse_closed = true;
+                            }
+                        }
+
+                        if sse_closed {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if sse_closed {
+                tracing::info!("[discovery] Reconnecting to fs-root SSE...");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+
     /// Gracefully shutdown all managed processes.
     pub async fn shutdown(&mut self) {
         tracing::info!("[discovery] Shutting down all discovered processes...");
@@ -695,17 +1043,25 @@ mod tests {
         );
 
         let config = DiscoveredProcess {
-            command: CommandSpec::Simple("python test.py".to_string()),
+            command: Some(CommandSpec::Simple("python test.py".to_string())),
+            sandbox_exec: None,
+            path: None,
             owns: Some("test.json".to_string()),
-            cwd: PathBuf::from("/tmp"),
+            cwd: Some(PathBuf::from("/tmp")),
         };
 
-        manager.add_process("test".to_string(), "examples/test.json".to_string(), config);
+        manager.add_process(
+            "test".to_string(),
+            "examples/test.json".to_string(),
+            "examples".to_string(),
+            config,
+        );
 
         assert_eq!(manager.processes().len(), 1);
         let process = manager.processes().get("test").unwrap();
         assert_eq!(process.name, "test");
         assert_eq!(process.document_path, "examples/test.json");
+        assert_eq!(process.source_path, "examples");
         assert_eq!(process.state, DiscoveredProcessState::Stopped);
     }
 
@@ -717,13 +1073,20 @@ mod tests {
         );
 
         let config = DiscoveredProcess {
-            command: CommandSpec::Simple("sync --sandbox".to_string()),
+            command: Some(CommandSpec::Simple("sync --sandbox".to_string())),
+            sandbox_exec: None,
+            path: None,
             owns: None,
-            cwd: PathBuf::from("/tmp"),
+            cwd: Some(PathBuf::from("/tmp")),
         };
 
         // For directory-attached, document_path is just the directory
-        manager.add_process("sandbox".to_string(), "examples".to_string(), config);
+        manager.add_process(
+            "sandbox".to_string(),
+            "examples".to_string(),
+            "examples".to_string(),
+            config,
+        );
 
         assert_eq!(manager.processes().len(), 1);
         let process = manager.processes().get("sandbox").unwrap();

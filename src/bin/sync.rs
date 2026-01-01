@@ -39,9 +39,14 @@ struct Args {
     )]
     server: String,
 
-    /// Node ID to sync with (reads from COMMONPLACE_NODE or COMMONPLACE_PATH env vars; optional if --fork-from is provided)
+    /// Node ID (UUID) to sync with (reads from COMMONPLACE_NODE env var; optional if --path or --fork-from is provided)
     #[arg(short, long, env = "COMMONPLACE_NODE")]
     node: Option<String>,
+
+    /// Path relative to fs-root to sync with (reads from COMMONPLACE_PATH env var; resolved to UUID)
+    /// Example: "bartleby" or "workspace/bartleby"
+    #[arg(short, long, env = "COMMONPLACE_PATH", conflicts_with = "node")]
+    path: Option<String>,
 
     /// Local file path to sync (mutually exclusive with --directory)
     #[arg(short, long, conflicts_with = "directory")]
@@ -68,7 +73,7 @@ struct Args {
     ignore: Vec<String>,
 
     /// Initial sync strategy when both sides have content
-    #[arg(long, default_value = "skip", value_parser = ["local", "server", "skip"])]
+    #[arg(long, default_value = "skip", value_parser = ["local", "server", "skip"], env = "COMMONPLACE_INITIAL_SYNC")]
     initial_sync: String,
 
     /// Use path-based API endpoints (/files/*path) instead of ID-based endpoints
@@ -122,6 +127,104 @@ async fn discover_fs_root(
     Ok(response.id)
 }
 
+/// Resolve a path relative to fs-root to a UUID.
+///
+/// Traverses the fs-root schema to find the document ID for the given path.
+/// For example, "bartleby" finds schema.root.entries["bartleby"].node_id
+/// For nested paths like "foo/bar", follows intermediate node_ids.
+async fn resolve_path_to_uuid(
+    client: &Client,
+    server: &str,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // Get the fs-root document ID
+    let fs_root_id = discover_fs_root(client, server).await?;
+
+    // Split path into segments
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    if segments.is_empty() {
+        // Empty path means fs-root itself
+        return Ok(fs_root_id);
+    }
+
+    // Start traversal from fs-root
+    let mut current_id = fs_root_id;
+
+    for (i, segment) in segments.iter().enumerate() {
+        // Fetch the current document's schema
+        let url = format!("{}/docs/{}/head", server, current_id);
+        let resp = client.get(&url).send().await?;
+
+        if !resp.status().is_success() {
+            return Err(format!(
+                "Failed to fetch schema for '{}': HTTP {}",
+                segments[..=i].join("/"),
+                resp.status()
+            )
+            .into());
+        }
+
+        #[derive(serde::Deserialize)]
+        struct HeadResponse {
+            content: String,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct Schema {
+            root: SchemaRoot,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct SchemaRoot {
+            entries: Option<std::collections::HashMap<String, SchemaEntry>>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct SchemaEntry {
+            node_id: Option<String>,
+        }
+
+        let head: HeadResponse = resp.json().await?;
+        let schema: Schema = serde_json::from_str(&head.content)?;
+
+        // Look up the segment in entries
+        let entries = schema.root.entries.ok_or_else(|| {
+            format!(
+                "Path '{}' not found: '{}' has no entries",
+                path,
+                segments[..i].join("/")
+            )
+        })?;
+
+        let entry = entries.get(*segment).ok_or_else(|| {
+            let available: Vec<_> = entries.keys().collect();
+            format!(
+                "Path '{}' not found: no entry '{}' in '{}'. Available: {:?}",
+                path,
+                segment,
+                if i == 0 {
+                    "fs-root".to_string()
+                } else {
+                    segments[..i].join("/")
+                },
+                available
+            )
+        })?;
+
+        let node_id = entry.node_id.clone().ok_or_else(|| {
+            format!(
+                "Path '{}' not found: entry '{}' has no node_id",
+                path, segment
+            )
+        })?;
+
+        current_id = node_id;
+    }
+
+    Ok(current_id)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Initialize tracing
@@ -133,12 +236,6 @@ async fn main() -> ExitCode {
         .init();
 
     let args = Args::parse();
-
-    // COMMONPLACE_PATH is an alias for --node (for conductor compatibility)
-    let node = args
-        .node
-        .clone()
-        .or_else(|| std::env::var("COMMONPLACE_PATH").ok());
 
     // Validate that either --file, --directory, or --sandbox is provided
     if args.file.is_none() && args.directory.is_none() && !args.sandbox {
@@ -158,50 +255,52 @@ async fn main() -> ExitCode {
     let client = Client::new();
 
     // Determine the node ID to sync with
-    let node_id = match (&node, &args.fork_from) {
-        (Some(n), None) => {
-            // Direct sync to existing node
-            n.clone()
-        }
-        (None, Some(source)) => {
-            // Fork first, then sync to new node
-            info!("Forking from node {}...", source);
-            match fork_node(&client, &args.server, source, args.at_commit.as_deref()).await {
-                Ok(id) => id,
-                Err(e) => {
-                    error!("Fork failed: {}", e);
-                    return ExitCode::from(1);
-                }
+    // Priority: --node > --path > --fork-from > --use-paths discovery
+    let node_id = if let Some(ref node) = args.node {
+        // Direct UUID provided
+        node.clone()
+    } else if let Some(ref path) = args.path {
+        // Path provided - resolve to UUID
+        info!("Resolving path '{}' to UUID...", path);
+        match resolve_path_to_uuid(&client, &args.server, path).await {
+            Ok(id) => {
+                info!("Resolved '{}' -> {}", path, id);
+                id
             }
-        }
-        (Some(n), Some(source)) => {
-            // Both provided - use --node but warn
-            warn!(
-                "--node and --fork-from both provided; using --node={} (ignoring --fork-from={})",
-                n, source
-            );
-            n.clone()
-        }
-        (None, None) => {
-            // No node specified - try to discover fs-root from server (only with --use-paths)
-            if args.use_paths {
-                info!("Discovering fs-root from server...");
-                match discover_fs_root(&client, &args.server).await {
-                    Ok(id) => {
-                        info!("Discovered fs-root: {}", id);
-                        id
-                    }
-                    Err(e) => {
-                        error!("Failed to discover fs-root: {}", e);
-                        error!("Either specify --node or ensure server was started with --fs-root");
-                        return ExitCode::from(1);
-                    }
-                }
-            } else {
-                error!("Either --node or --fork-from must be provided");
+            Err(e) => {
+                error!("Failed to resolve path '{}': {}", path, e);
                 return ExitCode::from(1);
             }
         }
+    } else if let Some(ref source) = args.fork_from {
+        // Fork from another node
+        info!("Forking from node {}...", source);
+        match fork_node(&client, &args.server, source, args.at_commit.as_deref()).await {
+            Ok(id) => id,
+            Err(e) => {
+                error!("Fork failed: {}", e);
+                return ExitCode::from(1);
+            }
+        }
+    } else if args.use_paths {
+        // No node specified - try to discover fs-root from server
+        info!("Discovering fs-root from server...");
+        match discover_fs_root(&client, &args.server).await {
+            Ok(id) => {
+                info!("Discovered fs-root: {}", id);
+                id
+            }
+            Err(e) => {
+                error!("Failed to discover fs-root: {}", e);
+                error!(
+                    "Either specify --node, --path, or ensure server was started with --fs-root"
+                );
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        error!("Either --node, --path, or --fork-from must be provided");
+        return ExitCode::from(1);
     };
 
     // Route to appropriate mode
@@ -910,6 +1009,10 @@ async fn run_exec_mode(
         .env("COMMONPLACE_SERVER", &server)
         .env("COMMONPLACE_NODE", &fs_root_id);
 
+    // Make child a process group leader so we can kill the whole tree
+    #[cfg(unix)]
+    cmd.process_group(0);
+
     // In sandbox mode, add commonplace binaries to PATH
     if sandbox {
         if let Ok(exe_path) = std::env::current_exe() {
@@ -946,22 +1049,48 @@ async fn run_exec_mode(
                 }
             }
         }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received Ctrl+C, terminating child process...");
-            // Try to kill the child gracefully
+        _ = async {
+            // Handle both SIGINT (Ctrl+C) and SIGTERM
             #[cfg(unix)]
             {
-                // Send SIGTERM to child
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+                let mut sigint = signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
+                tokio::select! {
+                    _ = sigterm.recv() => info!("Received SIGTERM"),
+                    _ = sigint.recv() => info!("Received SIGINT"),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.ok();
+            }
+        } => {
+            info!("Terminating child process...");
+            // Try to kill the child and its descendants gracefully
+            #[cfg(unix)]
+            {
+                // Send SIGTERM to entire process group (negative PID)
                 if let Some(pid) = child.id() {
+                    info!("Sending SIGTERM to process group {}", pid);
                     unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
+                        // Negative PID kills the entire process group
+                        libc::kill(-(pid as i32), libc::SIGTERM);
                     }
                 }
                 // Wait briefly for graceful shutdown
                 tokio::select! {
-                    _ = child.wait() => {}
+                    _ = child.wait() => {
+                        info!("Child process exited gracefully");
+                    }
                     _ = sleep(Duration::from_secs(5)) => {
-                        // Force kill after timeout
+                        // Force kill the process group after timeout
+                        if let Some(pid) = child.id() {
+                            info!("Force killing process group {}", pid);
+                            unsafe {
+                                libc::kill(-(pid as i32), libc::SIGKILL);
+                            }
+                        }
                         let _ = child.kill().await;
                     }
                 }

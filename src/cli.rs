@@ -113,6 +113,11 @@ pub struct OrchestratorArgs {
     /// Use path-based endpoints instead of document IDs (used with --watch-processes)
     #[clap(long)]
     pub use_paths: bool,
+
+    /// Recursively discover all processes.json files in the filesystem tree
+    /// When specified, uses --server's fs-root as the starting point
+    #[clap(long)]
+    pub recursive: bool,
 }
 
 /// CLI arguments for commonplace-cmd (send commands to paths)

@@ -19,13 +19,33 @@ pub struct ProcessesConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredProcess {
     /// Command to run (either a string or array of strings)
-    pub command: CommandSpec,
+    /// Mutually exclusive with sandbox_exec
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<CommandSpec>,
+
+    /// Convenience field: exec command to run in a commonplace-sync sandbox
+    /// When set, orchestrator constructs: commonplace-sync --sandbox --exec "<value>"
+    /// and sets COMMONPLACE_PATH=<process_name>, COMMONPLACE_SERVER, COMMONPLACE_INITIAL_SYNC
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "sandbox-exec"
+    )]
+    pub sandbox_exec: Option<String>,
+
+    /// Override the path for sandbox-exec (defaults to process name)
+    /// Use "/" to mount at root, or "parent/child" for nested paths
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+
     /// Relative path within same directory that this process owns (file-attached).
     /// If absent, process is directory-attached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owns: Option<String>,
-    /// Required absolute path on host for working directory
-    pub cwd: PathBuf,
+
+    /// Working directory (optional for sandbox-exec, required for command)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
 }
 
 /// Command specification - supports both simple string and array formats.
@@ -93,11 +113,11 @@ mod tests {
         assert_eq!(config.processes.len(), 1);
 
         let counter = &config.processes["counter"];
-        assert!(matches!(counter.command, CommandSpec::Simple(_)));
-        assert_eq!(counter.command.program(), "python");
-        assert_eq!(counter.command.args(), vec!["counter.py"]);
+        assert!(matches!(counter.command, Some(CommandSpec::Simple(_))));
+        assert_eq!(counter.command.as_ref().unwrap().program(), "python");
+        assert_eq!(counter.command.as_ref().unwrap().args(), vec!["counter.py"]);
         assert_eq!(counter.owns, Some("counter.json".to_string()));
-        assert_eq!(counter.cwd, PathBuf::from("/home/user/examples"));
+        assert_eq!(counter.cwd, Some(PathBuf::from("/home/user/examples")));
     }
 
     #[test]
@@ -116,11 +136,14 @@ mod tests {
         assert_eq!(config.processes.len(), 1);
 
         let server = &config.processes["server"];
-        assert!(matches!(server.command, CommandSpec::Array(_)));
-        assert_eq!(server.command.program(), "node");
-        assert_eq!(server.command.args(), vec!["server.js", "--port", "3000"]);
+        assert!(matches!(server.command, Some(CommandSpec::Array(_))));
+        assert_eq!(server.command.as_ref().unwrap().program(), "node");
+        assert_eq!(
+            server.command.as_ref().unwrap().args(),
+            vec!["server.js", "--port", "3000"]
+        );
         assert_eq!(server.owns, Some("state.json".to_string()));
-        assert_eq!(server.cwd, PathBuf::from("/opt/app"));
+        assert_eq!(server.cwd, Some(PathBuf::from("/opt/app")));
     }
 
     #[test]
@@ -180,7 +203,7 @@ mod tests {
 
         let sandbox = &config.processes["sandbox"];
         assert!(sandbox.owns.is_none());
-        assert_eq!(sandbox.cwd, PathBuf::from("/home/user/sandbox"));
+        assert_eq!(sandbox.cwd, Some(PathBuf::from("/home/user/sandbox")));
     }
 
     #[test]
