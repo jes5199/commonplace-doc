@@ -10,8 +10,8 @@ use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
 use commonplace_doc::sync::{
     build_head_url, build_replace_url, build_uuid_map_recursive, collect_paths_from_entry,
     detect_from_path, directory_watcher_task, encode_node_id, fetch_node_id_from_schema,
-    file_watcher_task, fork_node, is_allowed_extension, is_binary_content, normalize_path,
-    push_file_content, push_json_content, push_schema_to_server, scan_directory,
+    file_watcher_task, fork_node, initial_sync, is_allowed_extension, is_binary_content,
+    normalize_path, push_file_content, push_json_content, push_schema_to_server, scan_directory,
     scan_directory_with_contents, schema_to_json, sse_task, upload_task, DirEvent, FileEvent,
     FileSyncState, HeadResponse, ReplaceResponse, ScanOptions, SyncState,
 };
@@ -2152,87 +2152,6 @@ async fn handle_schema_change(
                 }
             }
         }
-    }
-
-    Ok(())
-}
-
-/// Perform initial sync: fetch HEAD and write to local file
-async fn initial_sync(
-    client: &Client,
-    server: &str,
-    node_id: &str,
-    file_path: &PathBuf,
-    state: &Arc<RwLock<SyncState>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
-    let resp = client.get(&head_url).send().await?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Failed to get HEAD: {}", resp.status()).into());
-    }
-
-    let head: HeadResponse = resp.json().await?;
-
-    // Write content to file, handling binary content (base64-encoded on server)
-    // Track the bytes we actually write to disk for proper hash computation
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let content_info = detect_from_path(file_path);
-    let bytes_written: Vec<u8> = if content_info.is_binary {
-        // Extension indicates binary - decode base64
-        match STANDARD.decode(&head.content) {
-            Ok(decoded) => {
-                tokio::fs::write(file_path, &decoded).await?;
-                decoded
-            }
-            Err(e) => {
-                warn!("Failed to decode binary content: {}", e);
-                let bytes = head.content.as_bytes().to_vec();
-                tokio::fs::write(file_path, &bytes).await?;
-                bytes
-            }
-        }
-    } else {
-        // Extension says text, but try decoding as base64 in case
-        // this was a binary file detected by content sniffing
-        match STANDARD.decode(&head.content) {
-            Ok(decoded) if is_binary_content(&decoded) => {
-                tokio::fs::write(file_path, &decoded).await?;
-                decoded
-            }
-            _ => {
-                let bytes = head.content.as_bytes().to_vec();
-                tokio::fs::write(file_path, &bytes).await?;
-                bytes
-            }
-        }
-    };
-
-    // Update state and persist to state file
-    {
-        let mut s = state.write().await;
-        s.last_written_cid = head.cid.clone();
-        s.last_written_content = head.content.clone();
-
-        // Save to state file for offline change detection
-        // Use the actual bytes written to disk, not the server response
-        if let Some(ref cid) = head.cid {
-            let content_hash = compute_content_hash(&bytes_written);
-            let file_name = file_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "file".to_string());
-            s.mark_synced(cid, &content_hash, &file_name).await;
-        }
-    }
-
-    match &head.cid {
-        Some(cid) => info!(
-            "Initial sync complete: {} bytes at {}",
-            head.content.len(),
-            cid
-        ),
-        None => info!("Initial sync complete: empty document (no commits yet)"),
     }
 
     Ok(())

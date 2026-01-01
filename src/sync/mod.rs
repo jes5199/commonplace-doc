@@ -18,7 +18,7 @@ pub use dir_sync::{
     build_uuid_map_from_doc, build_uuid_map_recursive, collect_paths_from_entry,
     collect_paths_with_node_backed_dirs, fetch_node_id_from_schema,
 };
-pub use file_sync::{upload_task, BARRIER_RETRY_COUNT, BARRIER_RETRY_DELAY};
+pub use file_sync::{initial_sync, upload_task, BARRIER_RETRY_COUNT, BARRIER_RETRY_DELAY};
 
 pub use content_type::{
     detect_from_path, is_allowed_extension, is_binary_content, ContentTypeInfo,

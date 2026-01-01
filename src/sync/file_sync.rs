@@ -4,9 +4,9 @@
 
 use crate::sync::state_file::compute_content_hash;
 use crate::sync::{
-    build_edit_url, build_replace_url, create_yjs_text_update, detect_from_path, is_binary_content,
-    push_json_content, refresh_from_head, EditRequest, EditResponse, FileEvent, ReplaceResponse,
-    SyncState, PENDING_WRITE_TIMEOUT,
+    build_edit_url, build_replace_url, create_yjs_text_update, detect_from_path, encode_node_id,
+    is_binary_content, push_json_content, refresh_from_head, EditRequest, EditResponse, FileEvent,
+    HeadResponse, ReplaceResponse, SyncState, PENDING_WRITE_TIMEOUT,
 };
 use reqwest::Client;
 use std::path::PathBuf;
@@ -396,4 +396,85 @@ pub async fn upload_task(
             }
         }
     }
+}
+
+/// Perform initial sync: fetch HEAD and write to local file
+pub async fn initial_sync(
+    client: &Client,
+    server: &str,
+    node_id: &str,
+    file_path: &PathBuf,
+    state: &Arc<RwLock<SyncState>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
+    let resp = client.get(&head_url).send().await?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Failed to get HEAD: {}", resp.status()).into());
+    }
+
+    let head: HeadResponse = resp.json().await?;
+
+    // Write content to file, handling binary content (base64-encoded on server)
+    // Track the bytes we actually write to disk for proper hash computation
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let content_info = detect_from_path(file_path);
+    let bytes_written: Vec<u8> = if content_info.is_binary {
+        // Extension indicates binary - decode base64
+        match STANDARD.decode(&head.content) {
+            Ok(decoded) => {
+                tokio::fs::write(file_path, &decoded).await?;
+                decoded
+            }
+            Err(e) => {
+                warn!("Failed to decode binary content: {}", e);
+                let bytes = head.content.as_bytes().to_vec();
+                tokio::fs::write(file_path, &bytes).await?;
+                bytes
+            }
+        }
+    } else {
+        // Extension says text, but try decoding as base64 in case
+        // this was a binary file detected by content sniffing
+        match STANDARD.decode(&head.content) {
+            Ok(decoded) if is_binary_content(&decoded) => {
+                tokio::fs::write(file_path, &decoded).await?;
+                decoded
+            }
+            _ => {
+                let bytes = head.content.as_bytes().to_vec();
+                tokio::fs::write(file_path, &bytes).await?;
+                bytes
+            }
+        }
+    };
+
+    // Update state and persist to state file
+    {
+        let mut s = state.write().await;
+        s.last_written_cid = head.cid.clone();
+        s.last_written_content = head.content.clone();
+
+        // Save to state file for offline change detection
+        // Use the actual bytes written to disk, not the server response
+        if let Some(ref cid) = head.cid {
+            let content_hash = compute_content_hash(&bytes_written);
+            let file_name = file_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string());
+            s.mark_synced(cid, &content_hash, &file_name).await;
+        }
+    }
+
+    match &head.cid {
+        Some(cid) => info!(
+            "Initial sync complete: {} bytes at {}",
+            head.content.len(),
+            cid
+        ),
+        None => info!("Initial sync complete: empty document (no commits yet)"),
+    }
+
+    Ok(())
 }
