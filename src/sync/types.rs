@@ -81,7 +81,10 @@ pub struct ForkResponse {
 /// File watcher events
 #[derive(Debug)]
 pub enum FileEvent {
-    Modified,
+    /// File was modified. Contains the raw file content captured at notification time.
+    /// Capturing content immediately prevents race conditions where SSE might overwrite
+    /// the file before the upload task reads it.
+    Modified(Vec<u8>),
 }
 
 /// Directory watcher events

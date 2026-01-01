@@ -186,9 +186,21 @@ pub async fn file_watcher_task(file_path: PathBuf, tx: mpsc::Sender<FileEvent>) 
                     std::future::pending::<bool>().await
                 }
             } => {
-                // Debounce period elapsed, send event
+                // Debounce period elapsed - capture content BEFORE sending event
+                // This prevents race conditions where SSE might overwrite the file
+                // between event dispatch and upload_task reading the file.
                 debounce_timer = None;
-                if tx.send(FileEvent::Modified).await.is_err() {
+
+                // Read file content immediately to capture user's edit
+                let content = match tokio::fs::read(&file_path).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("Failed to read file for upload: {}", e);
+                        continue;
+                    }
+                };
+
+                if tx.send(FileEvent::Modified(content)).await.is_err() {
                     break;
                 }
             }
@@ -378,8 +390,9 @@ mod tests {
         watcher_handle.abort();
 
         match result {
-            Ok(Some(FileEvent::Modified)) => {
-                // Success - watcher detected the change
+            Ok(Some(FileEvent::Modified(content))) => {
+                // Success - watcher detected the change and captured content
+                assert!(!content.is_empty(), "Captured content should not be empty");
             }
             Ok(None) => panic!("Channel closed without receiving event"),
             Err(_) => panic!("Timeout waiting for file modification event after atomic write"),
@@ -417,8 +430,9 @@ mod tests {
         watcher_handle.abort();
 
         match result {
-            Ok(Some(FileEvent::Modified)) => {
-                // Success - watcher detected the change
+            Ok(Some(FileEvent::Modified(content))) => {
+                // Success - watcher detected the change and captured content
+                assert!(!content.is_empty(), "Captured content should not be empty");
             }
             Ok(None) => panic!("Channel closed without receiving event"),
             Err(_) => panic!("Timeout waiting for file modification event after delete+create"),
@@ -453,7 +467,7 @@ mod tests {
         // Wait for first event
         let result1 = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
         assert!(
-            matches!(result1, Ok(Some(FileEvent::Modified))),
+            matches!(result1, Ok(Some(FileEvent::Modified(_)))),
             "First atomic write not detected"
         );
 
@@ -472,7 +486,7 @@ mod tests {
         watcher_handle.abort();
 
         assert!(
-            matches!(result2, Ok(Some(FileEvent::Modified))),
+            matches!(result2, Ok(Some(FileEvent::Modified(_)))),
             "Second atomic write not detected - watcher may have lost track of file"
         );
     }
@@ -507,8 +521,9 @@ mod tests {
         watcher_handle.abort();
 
         match result {
-            Ok(Some(FileEvent::Modified)) => {
-                // Success - watcher detected the change
+            Ok(Some(FileEvent::Modified(content))) => {
+                // Success - watcher detected the change and captured content
+                assert!(!content.is_empty(), "Captured content should not be empty");
             }
             Ok(None) => panic!("Channel closed without receiving event"),
             Err(_) => panic!("Timeout waiting for file modification event"),

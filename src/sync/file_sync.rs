@@ -33,15 +33,11 @@ pub async fn upload_task(
     mut rx: mpsc::Receiver<FileEvent>,
     use_paths: bool,
 ) {
-    while let Some(_event) = rx.recv().await {
-        // Read current file content as bytes
-        let raw_content = match tokio::fs::read(&file_path).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Failed to read file: {}", e);
-                continue;
-            }
-        };
+    while let Some(event) = rx.recv().await {
+        // Extract captured content from the event
+        // The watcher captures content at notification time to prevent race conditions
+        // where SSE might overwrite the file between event dispatch and us reading it.
+        let FileEvent::Modified(raw_content) = event;
 
         // Detect if file is binary and convert accordingly
         let content_info = detect_from_path(&file_path);
