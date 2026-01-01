@@ -1,0 +1,28 @@
+# Bartleby changes for CP-6pd: Use cwd instead of BARTLEBY_WORKING_DIR
+
+## File: bartleby.py
+
+### Change 1: Remove os import (line 7)
+Remove: import os
+
+### Change 2: Update WORKING_DIR (lines 13-15)
+Old:
+```python
+# File paths
+BASE_DIR = Path(__file__).parent
+WORKING_DIR = Path(os.environ.get("BARTLEBY_WORKING_DIR", BASE_DIR / "working")).resolve()
+```
+
+New:
+```python
+# File paths - uses current working directory (set by orchestrator via cwd)
+WORKING_DIR = Path.cwd().resolve()
+```
+
+## Rationale
+When the orchestrator spawns bartleby with `cwd` set to the workspace directory,
+bartleby will naturally use that as its working directory. This is simpler and
+more transparent than relying on environment variables.
+
+The orchestrator config sets: "cwd": "/path/to/workspace"
+Bartleby then uses Path.cwd() to get the workspace directory.

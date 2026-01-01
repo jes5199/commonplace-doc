@@ -1,11 +1,221 @@
 //! HTTP client operations for the sync client.
 //!
-//! This module will contain the SyncClient trait and implementation
-//! for HTTP operations. Currently a placeholder for future refactoring.
-//!
-//! TODO: Extract from src/bin/sync.rs:
-//! - SyncClient trait definition
-//! - HTTP GET/POST implementations
-//! - Mock support for testing
+//! This module contains functions for interacting with the Commonplace server
+//! via HTTP: forking nodes, pushing content, and syncing schemas.
 
-// Placeholder module - async HTTP operations to be extracted in Phase 2
+use crate::sync::{
+    build_edit_url, build_fork_url, build_head_url, build_replace_url, create_yjs_json_update,
+    create_yjs_text_update, encode_node_id, EditRequest, EditResponse, ForkResponse, HeadResponse,
+    ReplaceResponse, SyncState,
+};
+use reqwest::Client;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tokio::time::sleep;
+use tracing::{debug, info, warn};
+
+/// Fork a node on the server, optionally at a specific commit.
+pub async fn fork_node(
+    client: &Client,
+    server: &str,
+    source_node: &str,
+    at_commit: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let fork_url = build_fork_url(server, source_node, at_commit);
+
+    let resp = client.post(&fork_url).send().await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Fork failed: {} - {}", status, body).into());
+    }
+
+    let fork_response: ForkResponse = resp.json().await?;
+    info!(
+        "Forked node {} -> {} (at commit {})",
+        source_node,
+        fork_response.id,
+        &fork_response.head[..8.min(fork_response.head.len())]
+    );
+
+    Ok(fork_response.id)
+}
+
+/// Push a schema JSON document to the fs-root node on the server.
+pub async fn push_schema_to_server(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    schema_json: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // First fetch current server content and state to detect deletions
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
+    let head_resp = client.get(&head_url).send().await?;
+    let (_old_content, base_state) = if head_resp.status().is_success() {
+        let head: HeadResponse = head_resp.json().await?;
+        (Some(head.content), head.state)
+    } else {
+        (None, None)
+    };
+
+    // Create an update that properly handles deletions (using server state for CRDT consistency)
+    let update = create_yjs_json_update(schema_json, base_state.as_deref())
+        .map_err(|e| format!("Failed to create JSON update: {}", e))?;
+    let edit_url = format!("{}/docs/{}/edit", server, encode_node_id(fs_root_id));
+    let edit_req = EditRequest {
+        update,
+        author: Some("sync-client".to_string()),
+        message: Some("Update filesystem schema".to_string()),
+    };
+
+    let resp = client.post(&edit_url).json(&edit_req).send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Failed to push schema: {} - {}", status, body).into());
+    }
+
+    Ok(())
+}
+
+/// Push JSON content to a node using Y.Map/Y.Array updates.
+pub async fn push_json_content(
+    client: &Client,
+    server: &str,
+    identifier: &str,
+    content: &str,
+    state: &Arc<RwLock<SyncState>>,
+    use_paths: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let head_url = build_head_url(server, identifier, use_paths);
+    let edit_url = build_edit_url(server, identifier, use_paths);
+    let mut attempts = 0;
+    let max_attempts = 30; // 3 seconds max wait
+
+    loop {
+        let head_resp = client.get(&head_url).send().await?;
+        if head_resp.status() == reqwest::StatusCode::NOT_FOUND && attempts < max_attempts {
+            attempts += 1;
+            info!(
+                "Identifier {} not found, waiting for reconciler (attempt {}/{})",
+                identifier, attempts, max_attempts
+            );
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
+        let base_state = if head_resp.status().is_success() {
+            let head: HeadResponse = head_resp.json().await?;
+            head.state
+        } else {
+            None
+        };
+
+        let update = create_yjs_json_update(content, base_state.as_deref())?;
+        let edit_req = EditRequest {
+            update,
+            author: Some("sync-client".to_string()),
+            message: Some("Sync JSON content".to_string()),
+        };
+
+        let resp = client.post(&edit_url).json(&edit_req).send().await?;
+        if resp.status().is_success() {
+            let result: EditResponse = resp.json().await?;
+            let mut s = state.write().await;
+            s.last_written_cid = Some(result.cid);
+            s.last_written_content = content.to_string();
+            return Ok(());
+        }
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND && attempts < max_attempts {
+            attempts += 1;
+            info!(
+                "Identifier {} not found, waiting for reconciler (attempt {}/{})",
+                identifier, attempts, max_attempts
+            );
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Failed to push JSON content: {}", body).into());
+    }
+}
+
+/// Push file content to a node (text files use replace/edit endpoints).
+pub async fn push_file_content(
+    client: &Client,
+    server: &str,
+    identifier: &str,
+    content: &str,
+    state: &Arc<RwLock<SyncState>>,
+    use_paths: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // First check if there's existing content
+    let head_url = build_head_url(server, identifier, use_paths);
+    let head_resp = client.get(&head_url).send().await;
+
+    match head_resp {
+        Ok(resp) if resp.status().is_success() => {
+            let head: HeadResponse = resp.json().await?;
+            if let Some(parent_cid) = head.cid {
+                // Use replace endpoint
+                let replace_url = build_replace_url(server, identifier, &parent_cid, use_paths);
+                let resp = client
+                    .post(&replace_url)
+                    .header("content-type", "text/plain")
+                    .body(content.to_string())
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    let result: ReplaceResponse = resp.json().await?;
+                    let mut s = state.write().await;
+                    s.last_written_cid = Some(result.cid);
+                    s.last_written_content = content.to_string();
+                }
+                return Ok(());
+            }
+        }
+        _ => {}
+    }
+
+    // No existing content, use edit endpoint with retry for node creation
+    debug!("Using edit endpoint for initial content: {}", identifier);
+    let update = create_yjs_text_update(content);
+    let edit_url = build_edit_url(server, identifier, use_paths);
+    let edit_req = EditRequest {
+        update,
+        author: Some("sync-client".to_string()),
+        message: Some("Initial file content".to_string()),
+    };
+
+    // Retry loop: wait for node to be created by reconciler
+    // The reconciler processes schema changes asynchronously, so we need to wait
+    let mut attempts = 0;
+    let max_attempts = 30; // 3 seconds max wait
+    loop {
+        let resp = client.post(&edit_url).json(&edit_req).send().await?;
+        if resp.status().is_success() {
+            let result: EditResponse = resp.json().await?;
+            let mut s = state.write().await;
+            s.last_written_cid = Some(result.cid);
+            s.last_written_content = content.to_string();
+            info!("Successfully pushed content for: {}", identifier);
+            return Ok(());
+        } else if resp.status() == reqwest::StatusCode::NOT_FOUND && attempts < max_attempts {
+            // Node not created yet by reconciler, wait and retry
+            attempts += 1;
+            info!(
+                "Identifier {} not found, waiting for reconciler (attempt {}/{})",
+                identifier, attempts, max_attempts
+            );
+            sleep(Duration::from_millis(100)).await;
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            warn!("Failed to push content for {}: {}", identifier, body);
+            return Ok(());
+        }
+    }
+}

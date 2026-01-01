@@ -1,0 +1,8 @@
+{
+  "processes": {
+    "bartleby": {
+      "command": "/home/jes/bartleby/bartleby.py",
+      "cwd": "/home/jes/commonplace/workspace/bartleby"
+    }
+  }
+}

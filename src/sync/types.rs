@@ -2,7 +2,11 @@
 //!
 //! This module contains request/response types for the sync client API.
 
+use crate::sync::SyncState;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 
 /// Response from GET /docs/:id/head
 #[derive(Debug, Deserialize)]
@@ -86,4 +90,24 @@ pub enum DirEvent {
     Created(std::path::PathBuf),
     Modified(std::path::PathBuf),
     Deleted(std::path::PathBuf),
+}
+
+/// Sync state for a single file in directory mode.
+///
+/// Tracks the synchronization state and resources for an individual file
+/// being synced as part of a directory.
+pub struct FileSyncState {
+    /// Relative path from directory root
+    #[allow(dead_code)]
+    pub relative_path: String,
+    /// Identifier - either path (for /files/* API) or node ID (for /docs/* API)
+    pub identifier: String,
+    /// Sync state for this file
+    pub state: Arc<RwLock<SyncState>>,
+    /// Task handles for cleanup on deletion
+    pub task_handles: Vec<JoinHandle<()>>,
+    /// Whether to use path-based API (/files/*) or ID-based API (/docs/*)
+    pub use_paths: bool,
+    /// Content hash for fork detection (SHA-256 hex)
+    pub content_hash: Option<String>,
 }

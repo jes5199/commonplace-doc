@@ -1,0 +1,13 @@
+Here's what I found in the tmux-sessions directory:
+
+## Session 0 - 7 Windows (0-6)
+
+| Window | Name | Activity |
+|--------|------|----------|
+| **0** | wimble | **Codex Review Loop** - Just completed work on maximum elongation detection for Venus/Mercury. Created PR #194, ran local codex review, merged it, and installed the new binary. The feature adds max elongation detection using Chebyshev derivative root-finding. |
+| **1** | dirigible | **Crescent Moon Rendering** - Working on a Venus gates diagram UI. Recent changes include adding a date param for testing (`?date=2025-01-01`), showing countdown to nearest events (gates, cazimi, underworld), and improving crescent moon rendering using overlapping circles geometry. |
+| **2** | starloom | **Inanna CSV Generation Optimization** - Refactored the CSV generation script to use wimble's new `maxElongation` query instead of hourly sampling. Achieved ~42x speedup (from ~4 hours to ~6 minutes for 56 cycles). Just regenerated all Inanna CSV files. |
+| **3** | claude | **Working Directory Handling** - A Claude Code session in `~/file-tmux-file` discussing how the program handles different working directories. Just asked whether it should use absolute paths instead of relative. |
+| **4** | bartleby | **Superpowers Repo** - Updated the README for the bartleby project, added `BARTLEBY_WORKING_DIR` environment variable support, then switched to using `Path.cwd()` for working directory. Also looked up the superpowers marketplace repo name (`obra/superpowers-marketplace`). |
+| **5** | commonplace | **README Creation** - Setting up bartleby with file-tmux-file integration. Fixed a bug where bartleby was looking at the wrong directory (needed to use cwd, not BARTLEBY_WORKING_DIR). Currently waiting for bartleby to process a prompt asking it to look at the tmux windows. |
+| **6** | claude | **Text-to-Telegram Project** - Brainstorming a new project: a Telegram chatbot that uses text files for I/O (similar to file-tmux-file). Designing single-chat focus, append-only logs, line-by-line input consumption, CLI config with fallback, and escape sequences for multi-line messages. |
