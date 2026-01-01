@@ -780,13 +780,28 @@ pub async fn sync_schema(
             initial_sync_strategy
         );
 
-        // Fetch and write the server's schema to local .commonplace.json file
+        // Check if local schema file already exists
+        let local_schema_path = directory.join(SCHEMA_FILENAME);
+        let local_schema_exists = local_schema_path.exists();
+
+        // Fetch server schema
         let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
         if let Ok(resp) = client.get(&head_url).send().await {
             if resp.status().is_success() {
                 if let Ok(head) = resp.json::<HeadResponse>().await {
-                    if let Err(e) = write_schema_file(directory, &head.content).await {
-                        warn!("Failed to write schema file: {}", e);
+                    if local_schema_exists {
+                        // Don't overwrite local schema - it may have been modified
+                        // by commonplace-link or manual edits. Use --initial-sync local
+                        // to push local changes to server, or delete .commonplace.json
+                        // to reset to server state.
+                        debug!(
+                            "Local schema exists, preserving it (use --initial-sync local to push changes)"
+                        );
+                    } else {
+                        // No local schema exists, write server's schema
+                        if let Err(e) = write_schema_file(directory, &head.content).await {
+                            warn!("Failed to write schema file: {}", e);
+                        }
                     }
                     return Ok(head.content);
                 }
