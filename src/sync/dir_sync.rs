@@ -33,6 +33,209 @@ pub async fn write_schema_file(directory: &Path, schema_json: &str) -> Result<()
     Ok(())
 }
 
+/// Write nested .commonplace.json files for all node-backed directories.
+///
+/// When receiving a schema from the server that contains node-backed directories,
+/// this function fetches each directory's content and writes it to a local
+/// .commonplace.json file inside that subdirectory. This preserves the subdirectory
+/// schemas locally so they can be restored if the server's database is cleared.
+pub async fn write_nested_schemas(
+    client: &Client,
+    server: &str,
+    directory: &Path,
+    schema: &FsSchema,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(ref root) = schema.root {
+        write_nested_schemas_recursive(client, server, directory, root, directory).await?;
+    }
+    Ok(())
+}
+
+/// Recursively traverse the schema and write nested schemas for node-backed directories.
+#[async_recursion::async_recursion]
+async fn write_nested_schemas_recursive(
+    client: &Client,
+    server: &str,
+    _base_dir: &Path,
+    entry: &Entry,
+    current_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Entry::Dir(dir) = entry {
+        // Handle node-backed directory - fetch and write its schema
+        if let Some(ref node_id) = dir.node_id {
+            // Fetch the directory's schema from server
+            let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
+            if let Ok(resp) = client.get(&head_url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(head) = resp.json::<HeadResponse>().await {
+                        // Only write if content is valid schema
+                        if !head.content.is_empty() && head.content != "{}" {
+                            if let Ok(sub_schema) = serde_json::from_str::<FsSchema>(&head.content)
+                            {
+                                // Create directory if it doesn't exist
+                                if !current_dir.exists() {
+                                    if let Err(e) = tokio::fs::create_dir_all(current_dir).await {
+                                        warn!(
+                                            "Failed to create directory for nested schema {:?}: {}",
+                                            current_dir, e
+                                        );
+                                    }
+                                }
+                                // Write the schema to the subdirectory
+                                if current_dir.exists() {
+                                    if let Err(e) =
+                                        write_schema_file(current_dir, &head.content).await
+                                    {
+                                        warn!(
+                                            "Failed to write nested schema to {:?}: {}",
+                                            current_dir, e
+                                        );
+                                    }
+                                }
+                                // Recursively handle any nested node-backed directories
+                                if let Some(ref sub_root) = sub_schema.root {
+                                    write_nested_schemas_recursive(
+                                        client,
+                                        server,
+                                        _base_dir,
+                                        sub_root,
+                                        current_dir,
+                                    )
+                                    .await?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle inline entries - traverse subdirectories
+        if let Some(ref entries) = dir.entries {
+            for (name, child) in entries {
+                if let Entry::Dir(_) = child {
+                    let child_dir = current_dir.join(name);
+                    write_nested_schemas_recursive(client, server, _base_dir, child, &child_dir)
+                        .await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Push nested .commonplace.json files from local subdirectories to their server documents.
+///
+/// This function walks the directory tree looking for subdirectories that have:
+/// 1. A local .commonplace.json file
+/// 2. A corresponding node_id in the parent's schema
+///
+/// For each match, it pushes the local nested schema to the server document.
+/// This restores node-backed directory contents after a server database clear.
+pub async fn push_nested_schemas(
+    client: &Client,
+    server: &str,
+    directory: &Path,
+    schema: &FsSchema,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut pushed_count = 0;
+    if let Some(ref root) = schema.root {
+        pushed_count =
+            push_nested_schemas_recursive(client, server, directory, root, directory).await?;
+    }
+    if pushed_count > 0 {
+        info!("Pushed {} nested schemas to server", pushed_count);
+    }
+    Ok(pushed_count)
+}
+
+/// Recursively push nested schemas for node-backed directories.
+#[async_recursion::async_recursion]
+async fn push_nested_schemas_recursive(
+    client: &Client,
+    server: &str,
+    _base_dir: &Path,
+    entry: &Entry,
+    current_dir: &Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut pushed_count = 0;
+
+    if let Entry::Dir(dir) = entry {
+        // Handle node-backed directory - check for local schema and push
+        if let Some(ref node_id) = dir.node_id {
+            let nested_schema_path = current_dir.join(SCHEMA_FILENAME);
+            if nested_schema_path.exists() {
+                // Read the local nested schema
+                if let Ok(local_schema) = tokio::fs::read_to_string(&nested_schema_path).await {
+                    // Validate it's a proper schema
+                    if let Ok(parsed_schema) = serde_json::from_str::<FsSchema>(&local_schema) {
+                        // Check if server document is empty or has different content
+                        let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
+                        let should_push = if let Ok(resp) = client.get(&head_url).send().await {
+                            if resp.status().is_success() {
+                                if let Ok(head) = resp.json::<HeadResponse>().await {
+                                    // Push if server is empty or has trivial content
+                                    head.content.is_empty() || head.content == "{}"
+                                } else {
+                                    true
+                                }
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        };
+
+                        if should_push {
+                            info!(
+                                "Pushing nested schema from {:?} to document {}",
+                                nested_schema_path, node_id
+                            );
+                            if let Err(e) =
+                                push_schema_to_server(client, server, node_id, &local_schema).await
+                            {
+                                warn!(
+                                    "Failed to push nested schema for {}: {}",
+                                    current_dir.display(),
+                                    e
+                                );
+                            } else {
+                                pushed_count += 1;
+                            }
+                        }
+
+                        // Recursively handle any nested node-backed directories within this schema
+                        if let Some(ref sub_root) = parsed_schema.root {
+                            pushed_count += push_nested_schemas_recursive(
+                                client,
+                                server,
+                                _base_dir,
+                                sub_root,
+                                current_dir,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle inline entries - traverse subdirectories
+        if let Some(ref entries) = dir.entries {
+            for (name, child) in entries {
+                if let Entry::Dir(_) = child {
+                    let child_dir = current_dir.join(name);
+                    pushed_count +=
+                        push_nested_schemas_recursive(client, server, _base_dir, child, &child_dir)
+                            .await?;
+                }
+            }
+        }
+    }
+
+    Ok(pushed_count)
+}
+
 /// Recursively collect file paths from an entry, including explicit node_id if present.
 /// Returns Vec<(path, explicit_node_id)> where explicit_node_id is Some if DocEntry has node_id.
 pub fn collect_paths_from_entry(
@@ -365,6 +568,13 @@ pub async fn handle_schema_change(
                 }
             }
         }
+    }
+
+    // Write nested schemas for node-backed directories to local subdirectories.
+    // This persists subdirectory schemas so they survive server restarts.
+    // NOTE: This must be called AFTER the file sync loop above which creates directories.
+    if let Err(e) = write_nested_schemas(client, server, directory, &schema).await {
+        warn!("Failed to write nested schemas: {}", e);
     }
 
     Ok(())
@@ -773,6 +983,13 @@ pub async fn sync_schema(
         if let Err(e) = write_schema_file(directory, &schema_json).await {
             warn!("Failed to write schema file: {}", e);
         }
+
+        // Push nested schemas from local subdirectories to their server documents.
+        // This restores node-backed directory contents after a server database clear.
+        if let Err(e) = push_nested_schemas(client, server, directory, &schema).await {
+            warn!("Failed to push nested schemas: {}", e);
+        }
+
         Ok(schema_json)
     } else {
         info!(
@@ -789,6 +1006,10 @@ pub async fn sync_schema(
         if let Ok(resp) = client.get(&head_url).send().await {
             if resp.status().is_success() {
                 if let Ok(head) = resp.json::<HeadResponse>().await {
+                    // Parse the server schema for nested schema operations
+                    let server_schema: FsSchema = serde_json::from_str(&head.content)
+                        .map_err(|e| format!("Failed to parse server schema: {}", e))?;
+
                     if local_schema_exists {
                         // Don't overwrite local schema - it may have been modified
                         // by commonplace-link or manual edits. Use --initial-sync local
@@ -803,6 +1024,15 @@ pub async fn sync_schema(
                             warn!("Failed to write schema file: {}", e);
                         }
                     }
+
+                    // Write nested schemas for node-backed directories to local subdirectories.
+                    // This persists subdirectory schemas so they survive server restarts.
+                    if let Err(e) =
+                        write_nested_schemas(client, server, directory, &server_schema).await
+                    {
+                        warn!("Failed to write nested schemas: {}", e);
+                    }
+
                     return Ok(head.content);
                 }
             }
