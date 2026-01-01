@@ -79,6 +79,9 @@ struct CreateDocRequest {
     doc_type: Option<String>,
     #[serde(default)]
     content_type: Option<String>,
+    /// Optional initial content for the document
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -118,6 +121,18 @@ async fn create_doc(
 
     // Create document
     let id = state.doc_store.create_document(content_type).await;
+
+    // Set initial content if provided
+    if let Some(Json(ref req)) = body {
+        if let Some(ref content) = req.content {
+            if let Err(e) = state.doc_store.set_content(&id, content).await {
+                tracing::warn!("Failed to set initial content for document {}: {:?}", id, e);
+                // Delete the document we just created since we couldn't set the content
+                state.doc_store.delete_document(&id).await;
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
 
     Ok(Json(CreateDocResponse { id }))
 }
