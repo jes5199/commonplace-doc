@@ -13,6 +13,9 @@ pub mod urls;
 pub mod watcher;
 pub mod yjs;
 
+pub use client::{fork_node, push_file_content, push_json_content, push_schema_to_server};
+pub use file_sync::{upload_task, BARRIER_RETRY_COUNT, BARRIER_RETRY_DELAY};
+
 pub use content_type::{
     detect_from_path, is_allowed_extension, is_binary_content, ContentTypeInfo,
 };
