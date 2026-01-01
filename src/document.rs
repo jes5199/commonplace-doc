@@ -231,19 +231,53 @@ impl DocumentStore {
     ///
     /// This creates a Yjs update from the current content to the new content
     /// and applies it. Used by the reconciler for schema migration.
+    ///
+    /// The update method is content-type aware:
+    /// - Text/Xml: uses character-level text diff (Y.Text operations)
+    /// - Json/JsonArray: uses Y.Map/Y.Array operations to preserve JSON structure
+    /// - Jsonl: uses Y.Array with line-based parsing for newline-delimited JSON
     pub async fn set_content(&self, id: &str, new_content: &str) -> Result<(), ApplyError> {
-        use crate::diff;
+        use crate::sync::yjs::{
+            base64_decode, base64_encode, create_yjs_json_update, create_yjs_jsonl_update,
+        };
 
         let mut documents = self.documents.write().await;
         let doc = documents.get_mut(id).ok_or(ApplyError::NotFound)?;
+        let ydoc = doc.ydoc.as_ref().ok_or(ApplyError::MissingYDoc)?.clone();
 
-        // Compute diff from current to new content
-        let diff_result = diff::compute_diff_update(&doc.content, new_content)
-            .map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
+        // Get current Yjs state as base64 for structured content types
+        let base_state_b64 = {
+            let txn = ydoc.transact();
+            let state_bytes = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+            base64_encode(&state_bytes)
+        };
+
+        // Create update based on content type
+        let update_bytes = match doc.content_type {
+            ContentType::Text | ContentType::Xml => {
+                // Use text diff for text-based content
+                use crate::diff;
+                let diff_result = diff::compute_diff_update(&doc.content, new_content)
+                    .map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
+                diff_result.update_bytes
+            }
+            ContentType::Json | ContentType::JsonArray => {
+                // Use Y.Map/Y.Array operations for JSON objects/arrays
+                // create_yjs_json_update handles both object roots (Y.Map) and array roots (Y.Array)
+                let update_b64 = create_yjs_json_update(new_content, Some(&base_state_b64))
+                    .map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
+                base64_decode(&update_b64).map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?
+            }
+            ContentType::Jsonl => {
+                // Use Y.Array with line-based parsing for JSONL (newline-delimited JSON)
+                let update_b64 = create_yjs_jsonl_update(new_content, Some(&base_state_b64))
+                    .map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
+                base64_decode(&update_b64).map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?
+            }
+        };
 
         // Apply the update
-        let ydoc = doc.ydoc.as_ref().ok_or(ApplyError::MissingYDoc)?.clone();
-        let update = yrs::Update::decode_v1(&diff_result.update_bytes)
+        let update = yrs::Update::decode_v1(&update_bytes)
             .map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
 
         let mut txn = ydoc.transact_mut();
@@ -400,5 +434,72 @@ mod tests {
         // Document should be retrievable
         let doc = store.get_document(&uuid).await;
         assert!(doc.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_set_content_json_preserves_structure() {
+        // This test verifies CP-ia7 fix: set_content should use Y.Map for JSON,
+        // not text diff which corrupts the version field.
+        let store = DocumentStore::new();
+        let id = store.create_document(ContentType::Json).await;
+
+        // Set initial JSON content
+        let initial = r#"{"version":1,"data":"test"}"#;
+        store.set_content(&id, initial).await.unwrap();
+
+        // Update to new content
+        let updated = r#"{"version":1,"data":"updated","extra":"field"}"#;
+        store.set_content(&id, updated).await.unwrap();
+
+        // Verify the content is correct (not corrupted)
+        let doc = store.get_document(&id).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&doc.content).unwrap();
+
+        // The key test: version field should still be integer 1, not corrupted to "ve"
+        assert_eq!(
+            parsed["version"], 1,
+            "version field should be integer 1, not corrupted"
+        );
+        assert_eq!(parsed["data"], "updated");
+        assert_eq!(parsed["extra"], "field");
+    }
+
+    #[tokio::test]
+    async fn test_set_content_text_uses_diff() {
+        let store = DocumentStore::new();
+        let id = store.create_document(ContentType::Text).await;
+
+        store.set_content(&id, "hello").await.unwrap();
+        store.set_content(&id, "hello world").await.unwrap();
+
+        let doc = store.get_document(&id).await.unwrap();
+        assert_eq!(doc.content, "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_set_content_json_array_preserves_structure() {
+        // This test verifies JsonArray uses create_yjs_json_update (not create_yjs_jsonl_update)
+        // which correctly handles array roots. Using JSONL would nest the array: [[1,2,3]].
+        let store = DocumentStore::new();
+        let id = store.create_document(ContentType::JsonArray).await;
+
+        // Set JSON array content
+        let initial = r#"[1,2,3]"#;
+        store.set_content(&id, initial).await.unwrap();
+
+        // Update to new array content
+        let updated = r#"[1,2,3,4,5]"#;
+        store.set_content(&id, updated).await.unwrap();
+
+        // Verify the content is correct (not nested as [[1,2,3,4,5]])
+        let doc = store.get_document(&id).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&doc.content).unwrap();
+
+        // Should be a flat array, not nested
+        assert!(parsed.is_array(), "should be an array");
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 5, "should have 5 elements, not be nested");
+        assert_eq!(arr[0], 1);
+        assert_eq!(arr[4], 5);
     }
 }
