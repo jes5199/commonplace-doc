@@ -11,6 +11,7 @@ use crate::document::{ApplyError, ContentType, Document, DocumentStore};
 use crate::events::{CommitBroadcaster, CommitNotification};
 use crate::fs::FilesystemReconciler;
 use crate::store::CommitStore;
+use crate::sync::{base64_decode, create_yjs_json_update};
 use crate::{b64, diff, replay::CommitReplayer};
 
 /// Errors that can occur in service operations.
@@ -545,6 +546,12 @@ impl DocumentService {
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
+        // Check if this is a JSON document type (uses Y.Map/Y.Array instead of Y.Text)
+        let is_json_type = matches!(
+            doc.content_type,
+            ContentType::Json | ContentType::JsonArray | ContentType::Jsonl
+        );
+
         // Determine parents and compute diff appropriately
         let (diff_result, parents) = if let Some(ref parent) = parent_cid {
             // Check if parent differs from current HEAD
@@ -568,12 +575,19 @@ impl DocumentService {
                     .await
                     .map_err(|_| ServiceError::NotFound)?;
 
-                let diff = diff::compute_diff_update_with_base(
-                    &base_state_bytes,
-                    &old_content,
-                    new_content,
-                )
-                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+                let diff = if is_json_type {
+                    // JSON documents use Y.Map/Y.Array - use JSON update with base state
+                    let base_state_b64 = b64::encode(&base_state_bytes);
+                    compute_json_diff(new_content, &old_content, Some(&base_state_b64))?
+                } else {
+                    // Text/XML documents use Y.Text - use character-level diff
+                    diff::compute_diff_update_with_base(
+                        &base_state_bytes,
+                        &old_content,
+                        new_content,
+                    )
+                    .map_err(|e| ServiceError::Internal(e.to_string()))?
+                };
 
                 // Include BOTH parents for merge commit
                 let mut merge_parents = vec![parent.clone()];
@@ -583,14 +597,34 @@ impl DocumentService {
                 (diff, merge_parents)
             } else {
                 // Parent matches HEAD - use current content for diff
-                let diff = diff::compute_diff_update(&doc.content, new_content)
-                    .map_err(|e| ServiceError::Internal(e.to_string()))?;
+                let diff = if is_json_type {
+                    // Get current Yjs state for proper CRDT merge
+                    let base_state = self
+                        .doc_store
+                        .get_yjs_state(id)
+                        .await
+                        .map(|b| b64::encode(&b));
+                    compute_json_diff(new_content, &doc.content, base_state.as_deref())?
+                } else {
+                    diff::compute_diff_update(&doc.content, new_content)
+                        .map_err(|e| ServiceError::Internal(e.to_string()))?
+                };
                 (diff, vec![parent.clone()])
             }
         } else {
             // No parent specified - use current content and HEAD as parent
-            let diff = diff::compute_diff_update(&doc.content, new_content)
-                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+            let diff = if is_json_type {
+                // Get current Yjs state for proper CRDT merge
+                let base_state = self
+                    .doc_store
+                    .get_yjs_state(id)
+                    .await
+                    .map(|b| b64::encode(&b));
+                compute_json_diff(new_content, &doc.content, base_state.as_deref())?
+            } else {
+                diff::compute_diff_update(&doc.content, new_content)
+                    .map_err(|e| ServiceError::Internal(e.to_string()))?
+            };
             (diff, current_head.into_iter().collect())
         };
 
@@ -626,4 +660,39 @@ impl DocumentService {
             operations: diff_result.operation_count,
         })
     }
+}
+
+/// Compute a JSON diff using Y.Map/Y.Array updates instead of Y.Text.
+///
+/// Returns a DiffResult compatible with the text diff output.
+fn compute_json_diff(
+    new_content: &str,
+    old_content: &str,
+    base_state_b64: Option<&str>,
+) -> Result<diff::DiffResult, ServiceError> {
+    let update_b64 = create_yjs_json_update(new_content, base_state_b64)
+        .map_err(|e| ServiceError::Internal(format!("JSON update failed: {}", e)))?;
+
+    let update_bytes = base64_decode(&update_b64)
+        .map_err(|e| ServiceError::Internal(format!("Base64 decode failed: {}", e)))?;
+
+    // Estimate changes based on content length difference
+    let old_len = old_content.len();
+    let new_len = new_content.len();
+    let (chars_inserted, chars_deleted) = if new_len > old_len {
+        (new_len - old_len, 0)
+    } else {
+        (0, old_len - new_len)
+    };
+
+    Ok(diff::DiffResult {
+        update_bytes,
+        update_b64,
+        operation_count: 1, // JSON replace is effectively one operation
+        summary: diff::DiffSummary {
+            chars_inserted,
+            chars_deleted,
+            unchanged_chars: old_len.min(new_len),
+        },
+    })
 }

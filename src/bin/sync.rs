@@ -2231,12 +2231,8 @@ async fn handle_schema_change(
         return Ok(());
     }
 
-    // Write the schema to local .commonplace.json file
-    if let Err(e) = write_schema_file(directory, &head.content).await {
-        warn!("Failed to write schema file: {}", e);
-    }
-
-    // Parse schema
+    // Parse and validate schema BEFORE writing to disk
+    // This prevents corrupting the local schema file with invalid/empty server content
     let schema: FsSchema = match serde_json::from_str(&head.content) {
         Ok(s) => s,
         Err(e) => {
@@ -2244,6 +2240,21 @@ async fn handle_schema_change(
             return Ok(());
         }
     };
+
+    // Validate that schema has a populated root with entries - don't overwrite with empty/minimal schemas
+    let has_valid_root = match &schema.root {
+        Some(Entry::Dir(dir)) => dir.entries.is_some() || dir.node_id.is_some(),
+        _ => false,
+    };
+    if !has_valid_root {
+        warn!("Server returned schema without valid root (missing entries or node_id), not overwriting local schema");
+        return Ok(());
+    }
+
+    // Only write valid schema to local .commonplace.json file
+    if let Err(e) = write_schema_file(directory, &head.content).await {
+        warn!("Failed to write schema file: {}", e);
+    }
 
     // Collect all paths from schema (with explicit node_id if present)
     let mut schema_paths: Vec<(String, Option<String>)> = Vec::new();

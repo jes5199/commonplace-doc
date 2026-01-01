@@ -805,3 +805,140 @@ async fn test_head_at_commit_rejects_foreign_cid() {
     // Security: Must reject foreign CID with 404
     assert_eq!(foreign_cid_response.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn test_replace_json_document() {
+    // CP-2u5: Replace endpoint should work for JSON documents (not just text)
+    let (app, _dir) = create_app_with_commit_store();
+
+    // Create a JSON document
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/docs")
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(create_response.status(), StatusCode::OK);
+    let create_body = body_to_string(create_response.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&create_body).unwrap();
+    let doc_id = json["id"].as_str().unwrap().to_string();
+
+    // Verify initial content is empty JSON object
+    let get_initial = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/docs/{}", doc_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_initial.status(), StatusCode::OK);
+    let initial_body = body_to_string(get_initial.into_body()).await;
+    assert_eq!(initial_body, "{}");
+
+    // Replace with new JSON content using /replace endpoint
+    let new_content = r#"{"name":"test","value":42}"#;
+    let replace_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/docs/{}/replace", doc_id))
+                .header("content-type", "text/plain")
+                .body(Body::from(new_content))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(replace_response.status(), StatusCode::OK);
+    let replace_body = body_to_string(replace_response.into_body()).await;
+    let replace_json: serde_json::Value = serde_json::from_str(&replace_body).unwrap();
+    assert!(replace_json["cid"].is_string());
+
+    // Verify the document content was actually updated
+    let get_after = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/docs/{}", doc_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_after.status(), StatusCode::OK);
+    let after_body = body_to_string(get_after.into_body()).await;
+
+    // Parse both as JSON and compare (ordering may differ)
+    let expected: serde_json::Value = serde_json::from_str(new_content).unwrap();
+    let actual: serde_json::Value = serde_json::from_str(&after_body).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn test_replace_text_document() {
+    // Ensure text documents still work with replace endpoint
+    let (app, _dir) = create_app_with_commit_store();
+
+    // Create a text document
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/docs")
+                .header("content-type", "text/plain")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(create_response.status(), StatusCode::OK);
+    let create_body = body_to_string(create_response.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&create_body).unwrap();
+    let doc_id = json["id"].as_str().unwrap().to_string();
+
+    // Replace with new text content
+    let new_content = "Hello, World!";
+    let replace_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/docs/{}/replace", doc_id))
+                .header("content-type", "text/plain")
+                .body(Body::from(new_content))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(replace_response.status(), StatusCode::OK);
+
+    // Verify the document content was updated
+    let get_after = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/docs/{}", doc_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_after.status(), StatusCode::OK);
+    let after_body = body_to_string(get_after.into_body()).await;
+    assert_eq!(after_body, new_content);
+}
