@@ -117,3 +117,77 @@ payload: { "message": "...", "path": "..." }
   the commit store is enabled.
 - Derived document nodes are independent and may outlive the filesystem
   JSON entry that referenced them.
+
+## File Linking (Shared UUIDs)
+
+Multiple files can sync to the same document by sharing a `node_id`. This
+enables bi-directional file linking where edits to any linked file propagate
+to all others via the shared document.
+
+### Use Case
+
+Link `telegram/content.txt` and `bartleby/prompts.txt` so telegram messages
+become bartleby's input:
+
+```json
+{
+  "version": 1,
+  "root": {
+    "type": "dir",
+    "entries": {
+      "bartleby": {
+        "type": "dir",
+        "entries": {
+          "prompts.txt": {
+            "type": "doc",
+            "node_id": "0b250a22-3163-49df-8634-534585865cdd"
+          }
+        }
+      },
+      "telegram": {
+        "type": "dir",
+        "entries": {
+          "content.txt": {
+            "type": "doc",
+            "node_id": "0b250a22-3163-49df-8634-534585865cdd"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Both files share the same UUID. When the reconciler creates documents, it
+respects pre-set `node_id` values. Sync will push/pull both files to the
+same document.
+
+### Setup Workflow (Current Workaround)
+
+Until CP-81o and CP-7gx are implemented, manual setup is required:
+
+1. Edit `.commonplace.json` with shared UUIDs
+2. Start server WITHOUT `--fs-root`:
+   ```bash
+   cargo run --bin commonplace-server -- --database ./data.redb
+   ```
+3. Create fs-root document:
+   ```bash
+   FS_ROOT=$(cat .commonplace.json | curl -s -X POST http://localhost:3000/docs \
+     -H "Content-Type: application/json" -d @- | jq -r '.id')
+   ```
+4. Restart server WITH `--fs-root`:
+   ```bash
+   cargo run --bin commonplace-server -- --database ./data.redb --fs-root "$FS_ROOT"
+   ```
+5. Run sync:
+   ```bash
+   cargo run --bin commonplace-sync -- --directory ./workspace \
+     --server http://localhost:3000 --node "$FS_ROOT"
+   ```
+
+### Known Limitations
+
+- **CP-81o**: Server doesn't expose fs-root ID at `/fs-root` endpoint
+- **CP-7gx**: Sync `--use-paths` still requires `--node`
+- **CP-eoy**: `commonplace-link` tool only works within same directory
