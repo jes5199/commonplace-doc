@@ -11,10 +11,9 @@ use commonplace_doc::sync::{
     detect_from_path, directory_sse_task, directory_watcher_task, encode_node_id,
     ensure_fs_root_exists, file_watcher_task, fork_node, handle_file_created, handle_file_deleted,
     handle_file_modified, handle_schema_change, initial_sync, is_binary_content, push_file_content,
-    push_json_content, push_schema_to_server, scan_directory, scan_directory_with_contents,
-    schema_to_json, spawn_file_sync_tasks, sse_task, upload_task, write_schema_file, DirEvent,
-    FileEvent, FileSyncState, HeadResponse, ReplaceResponse, ScanOptions, SyncState,
-    SCHEMA_FILENAME,
+    push_json_content, scan_directory_with_contents, spawn_file_sync_tasks, sse_task, sync_schema,
+    upload_task, DirEvent, FileEvent, FileSyncState, HeadResponse, ReplaceResponse, ScanOptions,
+    SyncState, SCHEMA_FILENAME,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -465,51 +464,17 @@ async fn run_directory_mode(
         info!("Server files pulled to local directory");
     }
 
-    // Scan directory and generate FS schema
-    info!("Scanning directory...");
-    let schema = scan_directory(&directory, &options).map_err(|e| format!("Scan error: {}", e))?;
-    let schema_json = schema_to_json(&schema)?;
-    info!(
-        "Directory scanned: generated {} bytes of schema JSON",
-        schema_json.len()
-    );
-
-    // Decide whether to push local schema based on strategy
-    let should_push_schema = match initial_sync_strategy.as_str() {
-        "local" => true,
-        "server" => !server_has_content,
-        "skip" => !server_has_content,
-        _ => !server_has_content,
-    };
-
-    if should_push_schema {
-        // Push schema to fs-root node
-        info!("Pushing filesystem schema to server...");
-        push_schema_to_server(&client, &server, &fs_root_id, &schema_json).await?;
-        info!("Schema pushed successfully");
-
-        // Write the schema to local .commonplace.json file
-        if let Err(e) = write_schema_file(&directory, &schema_json).await {
-            warn!("Failed to write schema file: {}", e);
-        }
-    } else {
-        info!(
-            "Server already has content, skipping schema push (strategy={})",
-            initial_sync_strategy
-        );
-
-        // Fetch and write the server's schema to local .commonplace.json file
-        let head_url = format!("{}/docs/{}/head", server, encode_node_id(&fs_root_id));
-        if let Ok(resp) = client.get(&head_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(head) = resp.json::<HeadResponse>().await {
-                    if let Err(e) = write_schema_file(&directory, &head.content).await {
-                        warn!("Failed to write schema file: {}", e);
-                    }
-                }
-            }
-        }
-    }
+    // Synchronize schema between local and server
+    sync_schema(
+        &client,
+        &server,
+        &fs_root_id,
+        &directory,
+        &options,
+        &initial_sync_strategy,
+        server_has_content,
+    )
+    .await?;
 
     // Scan files with contents and push each one
     info!("Syncing file contents...");
@@ -878,50 +843,19 @@ async fn run_exec_mode(
         info!("Server files pulled to local directory");
     }
 
-    // Scan directory and generate FS schema
-    info!("Scanning directory...");
-    let schema = scan_directory(&directory, &options).map_err(|e| format!("Scan error: {}", e))?;
-    let schema_json = schema_to_json(&schema)?;
-    info!(
-        "Directory scanned: generated {} bytes of schema JSON",
-        schema_json.len()
-    );
+    // Synchronize schema between local and server
+    sync_schema(
+        &client,
+        &server,
+        &fs_root_id,
+        &directory,
+        &options,
+        &initial_sync_strategy,
+        server_has_content,
+    )
+    .await?;
 
-    // Decide whether to push local schema based on strategy
-    let should_push_schema = match initial_sync_strategy.as_str() {
-        "local" => true,
-        "server" => !server_has_content,
-        "skip" => !server_has_content,
-        _ => !server_has_content,
-    };
-
-    if should_push_schema {
-        info!("Pushing filesystem schema to server...");
-        push_schema_to_server(&client, &server, &fs_root_id, &schema_json).await?;
-        info!("Schema pushed successfully");
-
-        if let Err(e) = write_schema_file(&directory, &schema_json).await {
-            warn!("Failed to write schema file: {}", e);
-        }
-    } else {
-        info!(
-            "Server already has content, skipping schema push (strategy={})",
-            initial_sync_strategy
-        );
-
-        let head_url = format!("{}/docs/{}/head", server, encode_node_id(&fs_root_id));
-        if let Ok(resp) = client.get(&head_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(head) = resp.json::<HeadResponse>().await {
-                    if let Err(e) = write_schema_file(&directory, &head.content).await {
-                        warn!("Failed to write schema file: {}", e);
-                    }
-                }
-            }
-        }
-    }
-
-    // Sync file contents (reusing logic from run_directory_mode)
+    // Sync file contents
     info!("Syncing file contents...");
     let files = scan_directory_with_contents(&directory, &options)
         .map_err(|e| format!("Scan error: {}", e))?;

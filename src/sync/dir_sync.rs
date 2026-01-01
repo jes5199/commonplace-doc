@@ -728,6 +728,73 @@ pub async fn ensure_fs_root_exists(
     Ok(())
 }
 
+/// Synchronize schema between local directory and server.
+///
+/// Based on the initial sync strategy:
+/// - "local": Always push local schema
+/// - "server": Only push if server is empty
+/// - "skip": Only push if server is empty
+///
+/// Returns the schema JSON that was pushed or fetched.
+pub async fn sync_schema(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    directory: &Path,
+    options: &ScanOptions,
+    initial_sync_strategy: &str,
+    server_has_content: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // Scan directory and generate FS schema
+    info!("Scanning directory...");
+    let schema = scan_directory(directory, options).map_err(|e| format!("Scan error: {}", e))?;
+    let schema_json = schema_to_json(&schema)?;
+    info!(
+        "Directory scanned: generated {} bytes of schema JSON",
+        schema_json.len()
+    );
+
+    // Decide whether to push local schema based on strategy
+    let should_push_schema = match initial_sync_strategy {
+        "local" => true,
+        "server" => !server_has_content,
+        "skip" => !server_has_content,
+        _ => !server_has_content,
+    };
+
+    if should_push_schema {
+        // Push schema to fs-root node
+        info!("Pushing filesystem schema to server...");
+        push_schema_to_server(client, server, fs_root_id, &schema_json).await?;
+        info!("Schema pushed successfully");
+
+        // Write the schema to local .commonplace.json file
+        if let Err(e) = write_schema_file(directory, &schema_json).await {
+            warn!("Failed to write schema file: {}", e);
+        }
+        Ok(schema_json)
+    } else {
+        info!(
+            "Server already has content, skipping schema push (strategy={})",
+            initial_sync_strategy
+        );
+
+        // Fetch and write the server's schema to local .commonplace.json file
+        let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
+        if let Ok(resp) = client.get(&head_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(head) = resp.json::<HeadResponse>().await {
+                    if let Err(e) = write_schema_file(directory, &head.content).await {
+                        warn!("Failed to write schema file: {}", e);
+                    }
+                    return Ok(head.content);
+                }
+            }
+        }
+        Ok(schema_json)
+    }
+}
+
 /// Check if the server has existing schema content.
 ///
 /// Returns true if the server has non-empty, non-trivial content.

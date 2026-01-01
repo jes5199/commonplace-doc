@@ -18,7 +18,7 @@ pub use dir_sync::{
     build_uuid_map_from_doc, build_uuid_map_recursive, check_server_has_content,
     collect_paths_from_entry, collect_paths_with_node_backed_dirs, directory_sse_task,
     ensure_fs_root_exists, fetch_node_id_from_schema, handle_file_created, handle_file_deleted,
-    handle_file_modified, handle_schema_change, write_schema_file, SCHEMA_FILENAME,
+    handle_file_modified, handle_schema_change, sync_schema, write_schema_file, SCHEMA_FILENAME,
 };
 pub use file_sync::{
     initial_sync, spawn_file_sync_tasks, upload_task, BARRIER_RETRY_COUNT, BARRIER_RETRY_DELAY,
