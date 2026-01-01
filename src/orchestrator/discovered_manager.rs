@@ -4,8 +4,13 @@
 //! discovered from `.processes.json` files. For config parsing and discovery logic,
 //! see the `discovery` module.
 
-use super::discovery::DiscoveredProcess;
-use std::collections::HashMap;
+use super::discovery::{DiscoveredProcess, ProcessesConfig};
+use futures::StreamExt;
+use reqwest::Client;
+use reqwest_eventsource::{Event as SseEvent, EventSource};
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -300,6 +305,324 @@ impl DiscoveredProcessManager {
             tokio::time::sleep(Duration::from_millis(500)).await;
             self.check_and_restart().await;
         }
+    }
+
+    /// Reconcile running processes with a new configuration.
+    ///
+    /// This is the core method for dynamic process management. It:
+    /// - Stops processes that were removed from the config
+    /// - Starts processes that were added to the config
+    /// - Restarts processes where the command/cwd changed
+    ///
+    /// # Arguments
+    /// * `config` - The new ProcessesConfig to reconcile against
+    /// * `base_path` - Base path for constructing document paths
+    pub async fn reconcile_config(
+        &mut self,
+        config: &ProcessesConfig,
+        base_path: &str,
+    ) -> Result<(), String> {
+        let current_names: HashSet<String> = self.processes.keys().cloned().collect();
+        let new_names: HashSet<String> = config.processes.keys().cloned().collect();
+
+        // Find processes to remove (in current but not in new)
+        let to_remove: Vec<String> = current_names.difference(&new_names).cloned().collect();
+
+        // Find processes to add (in new but not in current)
+        let to_add: Vec<String> = new_names.difference(&current_names).cloned().collect();
+
+        // Find processes that exist in both and may need restart
+        let to_check: Vec<String> = current_names.intersection(&new_names).cloned().collect();
+
+        // Remove old processes
+        for name in &to_remove {
+            tracing::info!(
+                "[discovery] Removing process '{}' (no longer in config)",
+                name
+            );
+            self.remove_process(name).await;
+        }
+
+        // Check for changed processes that need restart
+        for name in &to_check {
+            let new_config = &config.processes[name];
+            let current = &self.processes[name];
+
+            let needs_restart = Self::process_config_changed(&current.config, new_config);
+
+            if needs_restart {
+                tracing::info!(
+                    "[discovery] Restarting process '{}' (configuration changed)",
+                    name
+                );
+
+                // Stop the old process
+                self.remove_process(name).await;
+
+                // Add with new config
+                let document_path = if let Some(ref owns) = new_config.owns {
+                    format!("{}/{}", base_path, owns)
+                } else {
+                    base_path.to_string()
+                };
+
+                self.add_process(name.clone(), document_path, new_config.clone());
+
+                // Start it
+                if let Err(e) = self.spawn_process(name).await {
+                    tracing::error!("[discovery] Failed to restart '{}': {}", name, e);
+                }
+            }
+        }
+
+        // Add new processes
+        for name in &to_add {
+            let new_config = &config.processes[name];
+            let document_path = if let Some(ref owns) = new_config.owns {
+                format!("{}/{}", base_path, owns)
+            } else {
+                base_path.to_string()
+            };
+
+            tracing::info!("[discovery] Adding new process '{}' from config", name);
+            self.add_process(name.clone(), document_path, new_config.clone());
+
+            if let Err(e) = self.spawn_process(name).await {
+                tracing::error!("[discovery] Failed to start new process '{}': {}", name, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if a process configuration has changed in a way that requires restart.
+    fn process_config_changed(current: &DiscoveredProcess, new: &DiscoveredProcess) -> bool {
+        // Check if command changed
+        let current_cmd = (current.command.program(), current.command.args());
+        let new_cmd = (new.command.program(), new.command.args());
+        if current_cmd != new_cmd {
+            return true;
+        }
+
+        // Check if cwd changed
+        if current.cwd != new.cwd {
+            return true;
+        }
+
+        // Check if owns changed
+        if current.owns != new.owns {
+            return true;
+        }
+
+        false
+    }
+
+    /// Watch a .processes.json document for changes and dynamically update processes.
+    ///
+    /// This method subscribes to the SSE stream for a document and calls
+    /// `reconcile_config` whenever the document changes.
+    ///
+    /// # Arguments
+    /// * `client` - HTTP client for making requests
+    /// * `document_path` - The document path to watch (e.g., "examples/.processes.json")
+    /// * `use_paths` - Whether to use path-based endpoints
+    pub async fn watch_document(
+        &mut self,
+        client: &Client,
+        document_path: &str,
+        use_paths: bool,
+    ) -> Result<(), String> {
+        // Build SSE URL
+        let sse_url = if use_paths {
+            format!(
+                "{}/sse/files/{}",
+                self.server_url,
+                urlencoding::encode(document_path)
+            )
+        } else {
+            format!(
+                "{}/sse/docs/{}",
+                self.server_url,
+                urlencoding::encode(document_path)
+            )
+        };
+
+        // Build HEAD URL
+        let head_url = if use_paths {
+            format!(
+                "{}/files/{}",
+                self.server_url,
+                urlencoding::encode(document_path)
+            )
+        } else {
+            format!(
+                "{}/docs/{}/head",
+                self.server_url,
+                urlencoding::encode(document_path)
+            )
+        };
+
+        // Extract base path from document path (parent directory)
+        let base_path = PathBuf::from(document_path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Do initial fetch and reconcile
+        tracing::info!("[discovery] Fetching initial config from {}", head_url);
+        match self
+            .fetch_and_reconcile(client, &head_url, &base_path)
+            .await
+        {
+            Ok(_) => tracing::info!("[discovery] Initial config loaded"),
+            Err(e) => {
+                tracing::warn!("[discovery] Failed to load initial config: {}", e);
+                // Continue anyway - we'll get updates via SSE
+            }
+        }
+
+        // Subscribe to SSE for updates
+        tracing::info!("[discovery] Watching document via SSE: {}", sse_url);
+
+        // Monitor interval for checking process health
+        let mut monitor_interval = tokio::time::interval(Duration::from_millis(500));
+
+        loop {
+            let request_builder = client.get(&sse_url);
+
+            let mut es = match EventSource::new(request_builder) {
+                Ok(es) => es,
+                Err(e) => {
+                    tracing::error!("[discovery] Failed to create EventSource: {}", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            let mut sse_closed = false;
+
+            loop {
+                tokio::select! {
+                    // Periodic health check for process restarts
+                    _ = monitor_interval.tick() => {
+                        self.check_and_restart().await;
+                    }
+
+                    // SSE event processing
+                    event = es.next() => {
+                        match event {
+                            Some(Ok(SseEvent::Open)) => {
+                                tracing::info!("[discovery] SSE connection opened for {}", document_path);
+                            }
+                            Some(Ok(SseEvent::Message(msg))) => {
+                                tracing::debug!("[discovery] SSE event: {} - {}", msg.event, msg.data);
+
+                                match msg.event.as_str() {
+                                    "connected" => {
+                                        tracing::info!("[discovery] SSE connected to {}", document_path);
+                                    }
+                                    "edit" => {
+                                        // Document changed - fetch new content and reconcile
+                                        tracing::info!(
+                                            "[discovery] Document {} changed, reconciling processes",
+                                            document_path
+                                        );
+
+                                        if let Err(e) = self
+                                            .fetch_and_reconcile(client, &head_url, &base_path)
+                                            .await
+                                        {
+                                            tracing::error!(
+                                                "[discovery] Failed to reconcile after edit: {}",
+                                                e
+                                            );
+                                        }
+
+                                        // Also check and restart any failed processes
+                                        self.check_and_restart().await;
+                                    }
+                                    "closed" => {
+                                        tracing::warn!("[discovery] SSE: Document {} was deleted", document_path);
+                                        // Stop all processes since the config is gone
+                                        self.shutdown().await;
+                                        sse_closed = true;
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::error!("[discovery] SSE error: {}", e);
+                                break;
+                            }
+                            None => {
+                                // Stream ended
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if sse_closed {
+                // Document was deleted, stop watching
+                break;
+            }
+
+            tracing::warn!("[discovery] SSE connection closed, reconnecting in 5s...");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+
+        Ok(())
+    }
+
+    /// Fetch document content from HEAD and reconcile processes.
+    async fn fetch_and_reconcile(
+        &mut self,
+        client: &Client,
+        head_url: &str,
+        base_path: &str,
+    ) -> Result<(), String> {
+        let resp = client
+            .get(head_url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch HEAD: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("HEAD fetch failed: {}", resp.status()));
+        }
+
+        #[derive(Deserialize)]
+        struct HeadResponse {
+            content: String,
+        }
+
+        let head: HeadResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse HEAD response: {}", e))?;
+
+        // Parse the content as ProcessesConfig
+        let config = ProcessesConfig::parse(&head.content)
+            .map_err(|e| format!("Failed to parse .processes.json: {}", e))?;
+
+        // Reconcile
+        self.reconcile_config(&config, base_path).await
+    }
+
+    /// Run the manager loop with document watching.
+    ///
+    /// This is an alternative to `run()` that watches a .processes.json document
+    /// for changes and dynamically updates processes.
+    pub async fn run_with_document_watch(
+        &mut self,
+        client: &Client,
+        document_path: &str,
+        use_paths: bool,
+    ) -> Result<(), String> {
+        // Start watching - this will do initial fetch, start processes, and watch for changes
+        self.watch_document(client, document_path, use_paths).await
     }
 
     /// Gracefully shutdown all managed processes.

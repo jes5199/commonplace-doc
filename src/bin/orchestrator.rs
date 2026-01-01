@@ -1,10 +1,11 @@
 //! commonplace-orchestrator: Process supervisor for commonplace services
 //!
 //! Starts and manages child processes (store, http) with automatic restart on failure.
+//! Supports dynamic process management via --watch-processes flag.
 
 use clap::Parser;
 use commonplace_doc::cli::OrchestratorArgs;
-use commonplace_doc::orchestrator::{OrchestratorConfig, ProcessManager};
+use commonplace_doc::orchestrator::{DiscoveredProcessManager, OrchestratorConfig, ProcessManager};
 use std::net::TcpStream;
 use std::time::Duration;
 use tokio::signal;
@@ -71,6 +72,41 @@ async fn main() {
             );
             std::process::exit(1);
         }
+    }
+
+    // Handle --watch-processes mode (dynamic process management)
+    if let Some(ref doc_path) = args.watch_processes {
+        tracing::info!("[orchestrator] Dynamic process mode: watching {}", doc_path);
+        tracing::info!("[orchestrator] Server: {}", args.server);
+
+        let mut discovered_manager =
+            DiscoveredProcessManager::new(broker_raw.to_string(), args.server.clone());
+
+        let client = reqwest::Client::new();
+
+        // Create shutdown signal
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let _ = signal::ctrl_c().await;
+            tracing::info!("[orchestrator] Received Ctrl+C");
+            let _ = shutdown_tx.send(());
+        });
+
+        // Run the document watcher with shutdown handling
+        tokio::select! {
+            result = discovered_manager.run_with_document_watch(&client, doc_path, args.use_paths) => {
+                if let Err(e) = result {
+                    tracing::error!("[orchestrator] Document watch failed: {}", e);
+                }
+            }
+            _ = shutdown_rx => {
+                tracing::info!("[orchestrator] Shutting down...");
+            }
+        }
+
+        discovered_manager.shutdown().await;
+        return;
     }
 
     let mut manager = ProcessManager::new(config, args.mqtt_broker.clone(), args.disable.clone());

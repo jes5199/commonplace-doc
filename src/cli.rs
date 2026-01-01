@@ -100,6 +100,19 @@ pub struct OrchestratorArgs {
     /// Run only a specific process (skip dependencies)
     #[clap(long, value_name = "NAME")]
     pub only: Option<String>,
+
+    /// Watch a .processes.json document for dynamic process management
+    /// When specified, processes are started/stopped based on document changes
+    #[clap(long, value_name = "DOC_PATH")]
+    pub watch_processes: Option<String>,
+
+    /// HTTP server URL for document fetching (used with --watch-processes)
+    #[clap(long, value_name = "URL", default_value = "http://localhost:3000")]
+    pub server: String,
+
+    /// Use path-based endpoints instead of document IDs (used with --watch-processes)
+    #[clap(long)]
+    pub use_paths: bool,
 }
 
 /// CLI arguments for commonplace-cmd (send commands to paths)
