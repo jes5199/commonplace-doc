@@ -34,6 +34,10 @@ pub struct FilesystemReconciler {
     known_documents: RwLock<HashSet<String>>,
     /// Last valid schemas for node-backed directories (document_id -> schema)
     last_valid_node_schemas: RwLock<std::collections::HashMap<String, FsSchema>>,
+    /// Set of document IDs that are node-backed directories
+    /// (separate from last_valid_node_schemas since those are only populated after
+    /// the directory content is parsed, but we need to track dirs immediately)
+    node_backed_dir_ids: RwLock<HashSet<String>>,
 }
 
 impl FilesystemReconciler {
@@ -45,6 +49,7 @@ impl FilesystemReconciler {
             last_valid_schema: RwLock::new(None),
             known_documents: RwLock::new(HashSet::new()),
             last_valid_node_schemas: RwLock::new(std::collections::HashMap::new()),
+            node_backed_dir_ids: RwLock::new(HashSet::new()),
         }
     }
 
@@ -134,7 +139,15 @@ impl FilesystemReconciler {
             known.insert(doc_id.clone());
         }
 
-        // 6. Update last valid schema
+        // 6. Replace the set of node-backed directory IDs with current ones
+        // (ignored_dirs contains all directories with entries: null and node_id)
+        // We replace rather than extend to avoid stale IDs from removed directories
+        {
+            let mut node_dirs = self.node_backed_dir_ids.write().await;
+            *node_dirs = ignored_dirs;
+        }
+
+        // 7. Update last valid schema
         *self.last_valid_schema.write().await = Some(schema);
 
         Ok(())
@@ -386,6 +399,23 @@ impl FilesystemReconciler {
     /// Get the fs-root document ID.
     pub fn fs_root_id(&self) -> &str {
         &self.fs_root_id
+    }
+
+    /// Check if a document ID is a known node-backed directory.
+    ///
+    /// Returns true if this document was identified as a node-backed directory
+    /// during schema parsing (has `entries: null` and a `node_id`).
+    pub async fn is_node_backed_directory(&self, doc_id: &str) -> bool {
+        let dirs = self.node_backed_dir_ids.read().await;
+        dirs.contains(doc_id)
+    }
+
+    /// Get the content of the fs-root document for re-reconciliation.
+    pub async fn get_fs_root_content(&self) -> Option<String> {
+        self.document_store
+            .get_document(&self.fs_root_id)
+            .await
+            .map(|doc| doc.content)
     }
 
     /// Migrate inline subdirectories to separate documents.

@@ -294,17 +294,38 @@ impl DocumentService {
         Ok(EditResult { cid, timestamp })
     }
 
-    /// Trigger filesystem reconciliation if the edited document is the fs-root.
+    /// Trigger filesystem reconciliation if the edited document is the fs-root
+    /// or a node-backed subdirectory.
+    ///
+    /// When a node-backed subdirectory document is updated, we re-reconcile
+    /// the fs-root to discover any new UUIDs defined in the subdirectory schema.
     async fn maybe_reconcile(&self, doc_id: &str) {
         if let (Some(reconciler), Some(fs_root_id)) = (&self.reconciler, &self.fs_root_id) {
-            if doc_id == fs_root_id {
-                // Get the updated content
-                if let Some(doc) = self.doc_store.get_document(doc_id).await {
-                    if !doc.content.is_empty() && doc.content != "{}" {
-                        if let Err(e) = reconciler.reconcile(&doc.content).await {
+            let should_reconcile = if doc_id == fs_root_id {
+                // fs-root was edited directly
+                true
+            } else {
+                // Check if this is a known node-backed directory
+                // (created by a previous reconciliation, now being populated with its schema)
+                reconciler.is_node_backed_directory(doc_id).await
+            };
+
+            if should_reconcile {
+                // Get the fs-root content for reconciliation
+                if let Some(content) = reconciler.get_fs_root_content().await {
+                    if !content.is_empty() && content != "{}" {
+                        if let Err(e) = reconciler.reconcile(&content).await {
                             tracing::warn!("Filesystem reconciliation failed: {}", e);
+                        } else if doc_id == fs_root_id {
+                            tracing::debug!(
+                                "Filesystem reconciliation completed for fs-root {}",
+                                doc_id
+                            );
                         } else {
-                            tracing::debug!("Filesystem reconciliation completed for {}", doc_id);
+                            tracing::info!(
+                                "Filesystem reconciliation triggered by subdirectory {} update",
+                                doc_id
+                            );
                         }
                     }
                 }
