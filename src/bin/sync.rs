@@ -1070,9 +1070,18 @@ async fn run_exec_mode(
         .env("COMMONPLACE_SERVER", &server)
         .env("COMMONPLACE_NODE", &fs_root_id);
 
-    // Make child a process group leader so we can kill the whole tree
+    // Make child a process group leader and set death signal on Linux
     #[cfg(unix)]
-    cmd.process_group(0);
+    unsafe {
+        cmd.pre_exec(|| {
+            // Put child in its own process group so we can kill all descendants
+            libc::setpgid(0, 0);
+            // Request SIGTERM if parent dies (Linux-only, covers SIGKILL of parent)
+            #[cfg(target_os = "linux")]
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
 
     // In sandbox mode, add commonplace binaries to PATH
     if sandbox {
