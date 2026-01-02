@@ -6,6 +6,8 @@
 use clap::Parser;
 use commonplace_doc::cli::OrchestratorArgs;
 use commonplace_doc::orchestrator::{DiscoveredProcessManager, OrchestratorConfig, ProcessManager};
+use fs2::FileExt;
+use std::fs::File;
 use std::net::TcpStream;
 use std::time::Duration;
 #[cfg(not(unix))]
@@ -54,6 +56,38 @@ async fn main() {
 
     tracing::info!("[orchestrator] Starting commonplace-orchestrator");
     tracing::info!("[orchestrator] Config file: {:?}", args.config);
+
+    // Acquire global lock to prevent multiple orchestrators from running
+    let lock_path = std::env::temp_dir().join("commonplace-orchestrator.lock");
+    let _lock_file = match File::create(&lock_path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(
+                "[orchestrator] Failed to create lock file at {:?}: {}",
+                lock_path,
+                e
+            );
+            std::process::exit(1);
+        }
+    };
+
+    match _lock_file.try_lock_exclusive() {
+        Ok(()) => {
+            tracing::info!("[orchestrator] Acquired global lock");
+        }
+        Err(e) => {
+            tracing::error!(
+                "[orchestrator] Another orchestrator is already running (lock file: {:?}): {}",
+                lock_path,
+                e
+            );
+            tracing::error!("[orchestrator] Only one orchestrator instance can run at a time");
+            std::process::exit(1);
+        }
+    }
+
+    // Keep _lock_file alive for the duration of the program
+    // The lock is released automatically when the file is dropped (on exit)
 
     let config = match OrchestratorConfig::load(&args.config) {
         Ok(c) => c,
