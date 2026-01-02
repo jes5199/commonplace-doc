@@ -329,7 +329,21 @@ pub async fn directory_watcher_task(
                             };
 
                             if let Some(evt) = dir_event {
-                                pending_events.insert(path, evt);
+                                // Don't let Modified overwrite Created - a newly created file
+                                // will typically receive Create then Modify events in rapid
+                                // succession. We need to preserve Created so the file gets
+                                // added to the schema.
+                                let should_insert = match (&evt, pending_events.get(&path)) {
+                                    (DirEvent::Modified(_), Some(DirEvent::Created(_))) => {
+                                        // Keep the existing Created event
+                                        debug!("Preserving Created event (not overwriting with Modified)");
+                                        false
+                                    }
+                                    _ => true,
+                                };
+                                if should_insert {
+                                    pending_events.insert(path, evt);
+                                }
                                 debounce_timer = Some(tokio::time::Instant::now() + debounce_duration);
                             }
                         }

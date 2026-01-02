@@ -2,15 +2,17 @@
 //!
 //! This module contains functions for syncing a single file with a server document.
 
+use crate::sync::dir_sync::{fetch_node_id_from_schema, find_owning_document};
+use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
 use crate::sync::state_file::compute_content_hash;
 use crate::sync::{
     build_edit_url, build_replace_url, create_yjs_text_update, detect_from_path, encode_node_id,
-    file_watcher_task, is_binary_content, push_json_content, refresh_from_head, sse_task,
-    EditRequest, EditResponse, FileEvent, HeadResponse, ReplaceResponse, SyncState,
-    PENDING_WRITE_TIMEOUT,
+    file_watcher_task, is_binary_content, looks_like_base64_binary, push_json_content,
+    push_schema_to_server, refresh_from_head, sse_task, EditRequest, EditResponse, FileEvent,
+    HeadResponse, ReplaceResponse, SyncState, PENDING_WRITE_TIMEOUT,
 };
 use reqwest::Client;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -439,9 +441,9 @@ pub async fn initial_sync(
                 bytes
             }
         }
-    } else {
-        // Extension says text, but try decoding as base64 in case
-        // this was a binary file detected by content sniffing
+    } else if looks_like_base64_binary(&head.content) {
+        // Extension says text, but content looks like base64-encoded binary
+        // This handles files that were detected as binary on upload
         match STANDARD.decode(&head.content) {
             Ok(decoded) if is_binary_content(&decoded) => {
                 tokio::fs::write(file_path, &decoded).await?;
@@ -453,6 +455,11 @@ pub async fn initial_sync(
                 bytes
             }
         }
+    } else {
+        // Extension says text, content doesn't look like base64 binary
+        let bytes = head.content.as_bytes().to_vec();
+        tokio::fs::write(file_path, &bytes).await?;
+        bytes
     };
 
     // Update state and persist to state file
@@ -496,6 +503,7 @@ pub async fn sync_single_file(
     client: &Client,
     server: &str,
     fs_root_id: &str,
+    root_directory: &Path,
     file: &crate::sync::directory::ScannedFile,
     file_path: &std::path::PathBuf,
     uuid_map: &std::collections::HashMap<String, String>,
@@ -514,12 +522,59 @@ pub async fn sync_single_file(
         info!("Using UUID for {}: {}", file.relative_path, uuid);
         uuid.clone()
     } else {
-        let derived = format!("{}:{}", fs_root_id, file.relative_path);
-        warn!(
-            "No UUID found for {}, using derived ID: {}",
-            file.relative_path, derived
+        // Use find_owning_document to determine correct parent document
+        // (handles files in node-backed subdirectories)
+        let owning = find_owning_document(root_directory, fs_root_id, &file.relative_path);
+        let derived = format!("{}:{}", owning.document_id, owning.relative_path);
+        info!(
+            "No UUID found for {}, using derived ID: {} (owning doc: {})",
+            file.relative_path, derived, owning.document_id
         );
-        derived
+
+        // If the owning document is different from fs_root (node-backed subdirectory),
+        // push the subdirectory's schema first so the server reconciler can create the document
+        let mut final_identifier = derived.clone();
+        if owning.document_id != fs_root_id {
+            let options = ScanOptions {
+                include_hidden: false,
+                ignore_patterns: vec![],
+            };
+            if let Ok(schema) = scan_directory(&owning.directory, &options) {
+                if let Ok(json) = schema_to_json(&schema) {
+                    info!(
+                        "Pushing subdirectory schema for {} (document {})",
+                        owning.directory.display(),
+                        owning.document_id
+                    );
+                    if let Err(e) =
+                        push_schema_to_server(client, server, &owning.document_id, &json).await
+                    {
+                        warn!("Failed to push subdirectory schema: {}", e);
+                    } else {
+                        // Wait for server to reconcile and create the document
+                        sleep(Duration::from_millis(200)).await;
+
+                        // Fetch the UUID assigned by the reconciler
+                        if let Some(uuid) = fetch_node_id_from_schema(
+                            client,
+                            server,
+                            &owning.document_id,
+                            &owning.relative_path,
+                        )
+                        .await
+                        {
+                            info!(
+                                "Resolved UUID for {}: {} -> {}",
+                                owning.relative_path, derived, uuid
+                            );
+                            final_identifier = uuid;
+                        }
+                    }
+                }
+            }
+        }
+
+        final_identifier
     };
     info!("Syncing file: {} -> {}", file.relative_path, identifier);
 

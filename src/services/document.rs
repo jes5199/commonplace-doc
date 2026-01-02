@@ -297,18 +297,32 @@ impl DocumentService {
     /// Trigger filesystem reconciliation if the edited document is the fs-root
     /// or a node-backed subdirectory.
     ///
-    /// When a node-backed subdirectory document is updated, we re-reconcile
-    /// the fs-root to discover any new UUIDs defined in the subdirectory schema.
+    /// When a node-backed subdirectory document is updated, we:
+    /// 1. Migrate the subdirectory document itself (generate UUIDs for entries)
+    /// 2. Re-reconcile the fs-root to discover any new UUIDs
     async fn maybe_reconcile(&self, doc_id: &str) {
         if let (Some(reconciler), Some(fs_root_id)) = (&self.reconciler, &self.fs_root_id) {
-            let should_reconcile = if doc_id == fs_root_id {
+            let is_subdirectory = if doc_id == fs_root_id {
                 // fs-root was edited directly
-                true
+                false
             } else {
                 // Check if this is a known node-backed directory
                 // (created by a previous reconciliation, now being populated with its schema)
                 reconciler.is_node_backed_directory(doc_id).await
             };
+
+            let should_reconcile = doc_id == fs_root_id || is_subdirectory;
+
+            if is_subdirectory {
+                // First, migrate this subdirectory document to generate UUIDs for its entries
+                if let Err(e) = reconciler.migrate_subdirectory_document(doc_id).await {
+                    tracing::warn!(
+                        "Failed to migrate subdirectory document {}: {:?}",
+                        doc_id,
+                        e
+                    );
+                }
+            }
 
             if should_reconcile {
                 // Get the fs-root content for reconciliation

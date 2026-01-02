@@ -192,6 +192,40 @@ pub fn detect_from_path(path: &Path) -> ContentTypeInfo {
     ContentTypeInfo::text("text/plain")
 }
 
+/// Check if a string looks like it might be base64-encoded binary data.
+/// Returns true only for strings that are likely base64-encoded binary,
+/// not for short text that happens to be valid base64 (like "note" or "hello").
+pub fn looks_like_base64_binary(content: &str) -> bool {
+    // Minimum length: base64 of 12+ bytes = 16+ chars
+    // This avoids treating short words like "note", "hello", "test" as base64
+    if content.len() < 16 {
+        return false;
+    }
+
+    // Must contain only valid base64 characters
+    let valid_base64_chars = content
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=');
+    if !valid_base64_chars {
+        return false;
+    }
+
+    // Padding must only appear at end
+    if let Some(eq_pos) = content.find('=') {
+        let after_eq = &content[eq_pos..];
+        if !after_eq.chars().all(|c| c == '=') {
+            return false;
+        }
+        // At most 2 padding chars
+        if after_eq.len() > 2 {
+            return false;
+        }
+    }
+
+    // Length must be multiple of 4 for valid base64
+    content.len().is_multiple_of(4)
+}
+
 /// Check if file content appears to be binary by sampling first bytes.
 /// Returns true if binary content detected.
 pub fn is_binary_content(content: &[u8]) -> bool {
@@ -302,5 +336,28 @@ mod tests {
             "application/xhtml+xml"
         );
         assert!(!detect_from_path(Path::new("foo.xhtml")).is_binary);
+    }
+
+    #[test]
+    fn test_looks_like_base64_binary() {
+        // Short strings that happen to be valid base64 should NOT be treated as binary
+        assert!(!looks_like_base64_binary("note")); // 4 chars - too short
+        assert!(!looks_like_base64_binary("hello")); // 5 chars - too short
+        assert!(!looks_like_base64_binary("test")); // 4 chars - too short
+        assert!(!looks_like_base64_binary("aGVsbG8=")); // 8 chars - too short
+
+        // Strings with non-base64 characters should NOT be treated as binary
+        assert!(!looks_like_base64_binary("Hello, world!")); // contains space and !
+        assert!(!looks_like_base64_binary("This is a test.")); // contains spaces and .
+
+        // Longer strings that look like base64 should be treated as binary
+        assert!(looks_like_base64_binary("aGVsbG8gd29ybGQh")); // 16 chars, valid base64
+        assert!(looks_like_base64_binary("YWJjZGVmZ2hpamtsbW5vcA==")); // 24 chars with padding
+
+        // Invalid base64 (wrong length) should NOT be treated as binary
+        assert!(!looks_like_base64_binary("aGVsbG8gd29ybGQ")); // 15 chars - not multiple of 4
+
+        // Invalid padding should NOT be treated as binary
+        assert!(!looks_like_base64_binary("aGVs=bG8gd29ybGQ=")); // = in middle
     }
 }

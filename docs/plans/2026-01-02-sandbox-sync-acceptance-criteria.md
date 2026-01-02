@@ -201,10 +201,6 @@ sleep 3
 
 > **Note:** Removing the database (step 4) will lose all document history. Only do this if you want a completely fresh start.
 
-## Known Issues
-
-- **CP-e3h**: Sync doesn't push local file edits to server - edits in subdirectories with node-backed schemas may not propagate correctly
-
 ## Notes
 
 - All sync propagation should complete within 5 seconds under normal conditions

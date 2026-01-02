@@ -4,8 +4,8 @@
 //! edit events and managing reconnection logic.
 
 use crate::sync::{
-    build_head_url, build_sse_url, detect_from_path, is_binary_content, EditEventData,
-    HeadResponse, PendingWrite, SyncState,
+    build_head_url, build_sse_url, detect_from_path, is_binary_content, looks_like_base64_binary,
+    EditEventData, HeadResponse, PendingWrite, SyncState,
 };
 use futures::StreamExt;
 use reqwest::Client;
@@ -214,13 +214,17 @@ pub async fn refresh_from_head(
                 tokio::fs::write(file_path, &head.content).await
             }
         }
-    } else {
+    } else if looks_like_base64_binary(&head.content) {
+        // Content looks like base64-encoded binary
         match STANDARD.decode(&head.content) {
             Ok(decoded) if is_binary_content(&decoded) => {
                 tokio::fs::write(file_path, &decoded).await
             }
             _ => tokio::fs::write(file_path, &head.content).await,
         }
+    } else {
+        // Extension says text, content doesn't look like base64 binary
+        tokio::fs::write(file_path, &head.content).await
     };
 
     if let Err(e) = write_result {
@@ -365,19 +369,22 @@ pub async fn handle_server_edit(
                 return;
             }
         }
-    } else {
-        // Extension says text, but try decoding as base64 in case
-        // this was a binary file detected by content sniffing on upload
+    } else if looks_like_base64_binary(&head.content) {
+        // Extension says text, but content looks like base64-encoded binary
+        // This handles files that were detected as binary on upload
         match STANDARD.decode(&head.content) {
             Ok(decoded) if is_binary_content(&decoded) => {
                 // Successfully decoded and content is binary - write decoded bytes
                 tokio::fs::write(file_path, &decoded).await
             }
             _ => {
-                // Not base64 or not binary - write as text
+                // Decode failed or not binary - write as text
                 tokio::fs::write(file_path, &head.content).await
             }
         }
+    } else {
+        // Extension says text, content doesn't look like base64 binary
+        tokio::fs::write(file_path, &head.content).await
     };
 
     if let Err(e) = write_result {

@@ -9,10 +9,11 @@ use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
 use commonplace_doc::sync::{
     build_replace_url, build_uuid_map_recursive, check_server_has_content, detect_from_path,
     directory_sse_task, directory_watcher_task, encode_node_id, ensure_fs_root_exists,
-    file_watcher_task, fork_node, handle_file_created, handle_file_deleted, handle_file_modified,
-    handle_schema_change, initial_sync, is_binary_content, scan_directory_with_contents,
-    spawn_file_sync_tasks, sse_task, sync_schema, sync_single_file, upload_task, DirEvent,
-    FileEvent, FileSyncState, ReplaceResponse, ScanOptions, SyncState, SCHEMA_FILENAME,
+    file_watcher_task, fork_node, get_all_node_backed_dir_ids, handle_file_created,
+    handle_file_deleted, handle_file_modified, handle_schema_change, initial_sync,
+    is_binary_content, scan_directory_with_contents, spawn_file_sync_tasks, sse_task,
+    subdir_sse_task, sync_schema, sync_single_file, upload_task, DirEvent, FileEvent,
+    FileSyncState, ReplaceResponse, ScanOptions, SyncState, SCHEMA_FILENAME,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -661,6 +662,7 @@ async fn run_directory_mode(
             &client,
             &server,
             &fs_root_id,
+            &directory,
             file,
             &file_path,
             &uuid_map,
@@ -693,6 +695,30 @@ async fn run_directory_mode(
         file_states.clone(),
         use_paths,
     ));
+
+    // Start SSE tasks for all node-backed subdirectories
+    // This allows files created in subdirectories to propagate to other sync clients
+    let node_backed_subdirs = get_all_node_backed_dir_ids(&client, &server, &fs_root_id).await;
+    info!(
+        "Found {} node-backed subdirectories to watch",
+        node_backed_subdirs.len()
+    );
+    for (subdir_path, subdir_node_id) in node_backed_subdirs {
+        info!(
+            "Spawning SSE task for node-backed subdir: {} ({})",
+            subdir_path, subdir_node_id
+        );
+        tokio::spawn(subdir_sse_task(
+            client.clone(),
+            server.clone(),
+            fs_root_id.clone(),
+            subdir_path,
+            subdir_node_id,
+            directory.clone(),
+            file_states.clone(),
+            use_paths,
+        ));
+    }
 
     // Start file sync tasks for each file and store handles in FileSyncState
     {
@@ -891,6 +917,7 @@ async fn run_exec_mode(
             &client,
             &server,
             &fs_root_id,
+            &directory,
             file,
             &file_path,
             &uuid_map,
@@ -923,6 +950,29 @@ async fn run_exec_mode(
         file_states.clone(),
         use_paths,
     ));
+
+    // Start SSE tasks for all node-backed subdirectories
+    let node_backed_subdirs = get_all_node_backed_dir_ids(&client, &server, &fs_root_id).await;
+    info!(
+        "Found {} node-backed subdirectories to watch",
+        node_backed_subdirs.len()
+    );
+    for (subdir_path, subdir_node_id) in node_backed_subdirs {
+        info!(
+            "Spawning SSE task for node-backed subdir: {} ({})",
+            subdir_path, subdir_node_id
+        );
+        tokio::spawn(subdir_sse_task(
+            client.clone(),
+            server.clone(),
+            fs_root_id.clone(),
+            subdir_path,
+            subdir_node_id,
+            directory.clone(),
+            file_states.clone(),
+            use_paths,
+        ));
+    }
 
     // Start file sync tasks for each file
     {
