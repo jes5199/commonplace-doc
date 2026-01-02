@@ -18,6 +18,39 @@ pub const FILE_DEBOUNCE_MS: u64 = 100;
 /// Default debounce duration for directory watcher (500ms)
 pub const DIR_DEBOUNCE_MS: u64 = 500;
 
+/// Check if a filename matches common temp file patterns used by atomic writes.
+///
+/// Many applications write to a temp file first, then rename to the target.
+/// These patterns help identify and ignore such intermediate files.
+fn is_temp_file(name: &str) -> bool {
+    // Python tempfile patterns (e.g., tmpXXXXXX)
+    if name.starts_with("tmp") && name.len() >= 6 {
+        let suffix = &name[3..];
+        // Check if remaining chars look like tempfile random suffix
+        if suffix.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return true;
+        }
+    }
+    // Common temp file suffixes
+    if name.ends_with(".tmp")
+        || name.ends_with(".temp")
+        || name.ends_with(".swp")
+        || name.ends_with(".swx")
+        || name.ends_with("~")
+    {
+        return true;
+    }
+    // Vim swap files
+    if name.starts_with(".") && name.ends_with(".swp") {
+        return true;
+    }
+    // Emacs backup files
+    if name.starts_with("#") && name.ends_with("#") {
+        return true;
+    }
+    false
+}
+
 /// Task that watches a single file for modifications.
 ///
 /// This task sets up a file watcher using `notify` and sends [`FileEvent::Modified`]
@@ -282,6 +315,12 @@ pub async fn directory_watcher_task(
                                 if !options.include_hidden && name_str.starts_with('.') {
                                     continue;
                                 }
+                                // Skip temp files used by atomic write patterns
+                                // These are intermediate files that will be renamed to the target
+                                if is_temp_file(&name_str) {
+                                    debug!("Skipping temp file event: {}", path.display());
+                                    continue;
+                                }
                             }
 
                             // Handle rename events specially - treat as delete+create
@@ -329,20 +368,31 @@ pub async fn directory_watcher_task(
                             };
 
                             if let Some(evt) = dir_event {
-                                // Don't let Modified overwrite Created - a newly created file
-                                // will typically receive Create then Modify events in rapid
-                                // succession. We need to preserve Created so the file gets
-                                // added to the schema.
-                                let should_insert = match (&evt, pending_events.get(&path)) {
+                                // Coalesce events to handle atomic writes and other patterns:
+                                //
+                                // 1. Modified after Created -> keep Created (new file gets modify events)
+                                // 2. Created after Deleted -> convert to Modified (atomic write pattern)
+                                //    This handles temp file + rename patterns where a file is replaced
+                                // 3. All other cases -> replace with new event
+                                let coalesced_event = match (&evt, pending_events.get(&path)) {
                                     (DirEvent::Modified(_), Some(DirEvent::Created(_))) => {
                                         // Keep the existing Created event
                                         debug!("Preserving Created event (not overwriting with Modified)");
-                                        false
+                                        None
                                     }
-                                    _ => true,
+                                    (DirEvent::Created(_), Some(DirEvent::Deleted(_))) => {
+                                        // Atomic write pattern: file was deleted then created/renamed-to
+                                        // Treat as Modified to avoid re-creating server node
+                                        debug!(
+                                            "Atomic write detected (Deleted + Created = Modified): {}",
+                                            path.display()
+                                        );
+                                        Some(DirEvent::Modified(path.clone()))
+                                    }
+                                    _ => Some(evt),
                                 };
-                                if should_insert {
-                                    pending_events.insert(path, evt);
+                                if let Some(final_event) = coalesced_event {
+                                    pending_events.insert(path, final_event);
                                 }
                                 debounce_timer = Some(tokio::time::Instant::now() + debounce_duration);
                             }
@@ -548,5 +598,145 @@ mod tests {
             Ok(None) => panic!("Channel closed without receiving event"),
             Err(_) => panic!("Timeout waiting for file modification event"),
         }
+    }
+
+    /// Test that directory_watcher_task coalesces Deleted+Created into Modified.
+    /// This is the atomic write pattern: delete target, then create/rename to target.
+    #[tokio::test]
+    async fn test_directory_watcher_coalesces_delete_create_to_modified() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let target_path = temp_dir.path().join("target.txt");
+
+        // Create the initial file
+        fs::write(&target_path, "initial content").expect("Failed to write initial file");
+
+        let (tx, mut rx) = mpsc::channel::<DirEvent>(10);
+        let options = ScanOptions {
+            include_hidden: false,
+            ignore_patterns: vec![],
+        };
+
+        // Start the watcher task
+        let dir_clone = temp_dir.path().to_path_buf();
+        let watcher_handle = tokio::spawn(async move {
+            directory_watcher_task(dir_clone, tx, options).await;
+        });
+
+        // Give the watcher time to start
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Simulate atomic write pattern: delete then create
+        fs::remove_file(&target_path).expect("Failed to delete");
+        fs::write(&target_path, "new content via delete+create").expect("Failed to create");
+
+        // Wait for the event with timeout (directory watcher has 500ms debounce)
+        let result = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+
+        // Cleanup
+        watcher_handle.abort();
+
+        match result {
+            Ok(Some(DirEvent::Modified(path))) => {
+                // Success - events were coalesced into Modified
+                assert_eq!(
+                    path.file_name().unwrap().to_str().unwrap(),
+                    "target.txt",
+                    "Modified event should be for target file"
+                );
+            }
+            Ok(Some(DirEvent::Created(path))) => {
+                panic!(
+                    "Expected Modified but got Created for {} - coalescing failed",
+                    path.display()
+                );
+            }
+            Ok(Some(DirEvent::Deleted(path))) => {
+                panic!(
+                    "Expected Modified but got Deleted for {} - events not coalesced",
+                    path.display()
+                );
+            }
+            Ok(None) => panic!("Channel closed without receiving event"),
+            Err(_) => panic!("Timeout waiting for directory event"),
+        }
+    }
+
+    /// Test that directory_watcher_task ignores temp files.
+    #[tokio::test]
+    async fn test_directory_watcher_ignores_temp_files() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+        let (tx, mut rx) = mpsc::channel::<DirEvent>(10);
+        let options = ScanOptions {
+            include_hidden: false,
+            ignore_patterns: vec![],
+        };
+
+        // Start the watcher task
+        let dir_clone = temp_dir.path().to_path_buf();
+        let watcher_handle = tokio::spawn(async move {
+            directory_watcher_task(dir_clone, tx, options).await;
+        });
+
+        // Give the watcher time to start
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Create various temp files that should be ignored
+        let temp_files = [
+            "tmpXXXabc123", // Python tempfile pattern
+            "file.tmp",     // .tmp suffix
+            "file.temp",    // .temp suffix
+            "file~",        // Backup file
+        ];
+        for name in &temp_files {
+            let path = temp_dir.path().join(name);
+            fs::write(&path, "temp content").expect("Failed to write temp file");
+        }
+
+        // Also create a normal file that should trigger an event
+        let normal_path = temp_dir.path().join("normal.txt");
+        fs::write(&normal_path, "normal content").expect("Failed to write normal file");
+
+        // Wait for events (directory watcher has 500ms debounce)
+        let result = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+
+        // Cleanup
+        watcher_handle.abort();
+
+        match result {
+            Ok(Some(event)) => {
+                // Should only receive event for normal.txt
+                let path = match &event {
+                    DirEvent::Created(p) | DirEvent::Modified(p) | DirEvent::Deleted(p) => p,
+                };
+                let name = path.file_name().unwrap().to_str().unwrap();
+                assert_eq!(
+                    name, "normal.txt",
+                    "Only normal.txt should trigger event, got: {}",
+                    name
+                );
+            }
+            Ok(None) => panic!("Channel closed without receiving event"),
+            Err(_) => panic!("Timeout waiting for directory event - maybe normal.txt was missed?"),
+        }
+    }
+
+    /// Test is_temp_file function.
+    #[test]
+    fn test_is_temp_file_detection() {
+        // Should match temp file patterns
+        assert!(is_temp_file("tmpXXXabc"), "Python tempfile pattern");
+        assert!(is_temp_file("tmp123456"), "Python tempfile numeric");
+        assert!(is_temp_file("file.tmp"), ".tmp suffix");
+        assert!(is_temp_file("file.temp"), ".temp suffix");
+        assert!(is_temp_file("file.swp"), ".swp suffix");
+        assert!(is_temp_file("file~"), "Backup suffix");
+        assert!(is_temp_file("#autosave#"), "Emacs autosave");
+
+        // Should NOT match regular files
+        assert!(!is_temp_file("file.txt"), "Regular text file");
+        assert!(!is_temp_file("tmp"), "Just 'tmp' is too short");
+        assert!(!is_temp_file("template.txt"), "Contains 'tmp' but not temp");
+        assert!(!is_temp_file("input.txt"), "Normal input file");
     }
 }
