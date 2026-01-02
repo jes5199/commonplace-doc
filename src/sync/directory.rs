@@ -187,13 +187,23 @@ fn scan_dir_recursive(
         };
 
         if file_type.is_dir() {
-            // Recursively scan subdirectory
-            let sub_entry = scan_dir_recursive(root, &entry_path, options, existing_node_ids)?;
-
-            // Note: We do NOT preserve directory node_id when we have inline entries
-            // A directory can have EITHER entries (inline) OR node_id (node-backed), not both
-            // Since we're scanning the filesystem and populating entries, it's an inline directory
-            entries.insert(name, sub_entry);
+            // Check if this subdirectory has an existing node_id (already node-backed on server)
+            if let Some(existing_node_id) = existing_node_ids.get(&relative_path) {
+                // Subdirectory is already node-backed - preserve the reference
+                // Don't scan inline, as the server has a separate document for this directory
+                entries.insert(
+                    name,
+                    Entry::Dir(DirEntry {
+                        entries: None,
+                        node_id: Some(existing_node_id.clone()),
+                        content_type: Some("application/json".to_string()),
+                    }),
+                );
+            } else {
+                // No existing node_id - scan inline as usual
+                let sub_entry = scan_dir_recursive(root, &entry_path, options, existing_node_ids)?;
+                entries.insert(name, sub_entry);
+            }
         } else if file_type.is_file() {
             // Skip files with disallowed extensions
             if !is_allowed_extension(&entry_path) {
@@ -226,9 +236,8 @@ fn scan_dir_recursive(
         // Skip other types (sockets, devices, etc.)
     }
 
-    // Note: We do NOT preserve directory node_id when we have inline entries
-    // A directory can have EITHER entries (inline) OR node_id (node-backed), not both
-    // Since we're scanning the filesystem and populating entries, it's an inline directory
+    // The root entry returned here is the content of THIS document
+    // Subdirectories with existing node_ids are preserved as node-backed references above
     Ok(Entry::Dir(DirEntry {
         entries: Some(entries),
         node_id: None,
@@ -761,6 +770,63 @@ mod tests {
                 assert_eq!(doc_b.node_id.as_deref(), Some("shared-uuid"));
             } else {
                 panic!("Expected file_b.txt to be a Doc");
+            }
+        } else {
+            panic!("Expected root to be a Dir");
+        }
+    }
+
+    #[test]
+    fn test_scan_preserves_node_backed_directory() {
+        let temp = TempDir::new().unwrap();
+
+        // Create subdirectory with files
+        fs::create_dir(temp.path().join("subdir")).unwrap();
+        File::create(temp.path().join("subdir/file.txt"))
+            .unwrap()
+            .write_all(b"content")
+            .unwrap();
+
+        // Create existing .commonplace.json where subdir is node-backed (server-side document)
+        let existing_schema = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "subdir": {
+                        "type": "dir",
+                        "node_id": "server-side-subdir-uuid",
+                        "content_type": "application/json"
+                    }
+                }
+            }
+        }"#;
+        File::create(temp.path().join(".commonplace.json"))
+            .unwrap()
+            .write_all(existing_schema.as_bytes())
+            .unwrap();
+
+        // Scan should preserve the node-backed directory reference
+        let schema = scan_directory(temp.path(), &ScanOptions::default()).unwrap();
+
+        if let Some(Entry::Dir(root)) = &schema.root {
+            let entries = root.entries.as_ref().unwrap();
+
+            // subdir should be node-backed (node_id, no entries)
+            if let Some(Entry::Dir(subdir)) = entries.get("subdir") {
+                // Should have node_id preserved
+                assert_eq!(
+                    subdir.node_id.as_deref(),
+                    Some("server-side-subdir-uuid"),
+                    "Expected subdir to preserve its node_id"
+                );
+                // Should NOT have inline entries (node-backed means entries is None)
+                assert!(
+                    subdir.entries.is_none(),
+                    "Expected subdir to be node-backed (entries should be None)"
+                );
+            } else {
+                panic!("Expected subdir to be a Dir");
             }
         } else {
             panic!("Expected root to be a Dir");

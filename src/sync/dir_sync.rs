@@ -62,6 +62,8 @@ pub async fn write_schema_file(directory: &Path, schema_json: &str) -> Result<()
 /// this function fetches each directory's content and writes it to a local
 /// .commonplace.json file inside that subdirectory. This preserves the subdirectory
 /// schemas locally so they can be restored if the server's database is cleared.
+///
+/// Uses content-based deduplication to prevent redundant writes and feedback loops.
 pub async fn write_nested_schemas(
     client: &Client,
     server: &str,
@@ -69,12 +71,25 @@ pub async fn write_nested_schemas(
     schema: &FsSchema,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref root) = schema.root {
-        write_nested_schemas_recursive(client, server, directory, root, directory).await?;
+        // Track processed node_ids with their content hashes to prevent redundant fetches
+        let mut processed_hashes: HashMap<String, String> = HashMap::new();
+        write_nested_schemas_recursive(
+            client,
+            server,
+            directory,
+            root,
+            directory,
+            &mut processed_hashes,
+        )
+        .await?;
     }
     Ok(())
 }
 
 /// Recursively traverse the schema and write nested schemas for node-backed directories.
+///
+/// Uses a hash map to track already-processed node_ids and their content hashes,
+/// preventing redundant fetches and writes within a single traversal.
 #[async_recursion::async_recursion]
 async fn write_nested_schemas_recursive(
     client: &Client,
@@ -82,15 +97,31 @@ async fn write_nested_schemas_recursive(
     _base_dir: &Path,
     entry: &Entry,
     current_dir: &Path,
+    processed_hashes: &mut HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Entry::Dir(dir) = entry {
         // Handle node-backed directory - fetch and write its schema
         if let Some(ref node_id) = dir.node_id {
+            // Skip if we've already processed this node_id in this traversal
+            if processed_hashes.contains_key(node_id) {
+                debug!(
+                    "Skipping already-processed subdirectory schema: {}",
+                    node_id
+                );
+                return Ok(());
+            }
+
             // Fetch the directory's schema from server
             let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
             if let Ok(resp) = client.get(&head_url).send().await {
                 if resp.status().is_success() {
                     if let Ok(head) = resp.json::<HeadResponse>().await {
+                        // Compute content hash and check if content has changed
+                        let content_hash = compute_content_hash(head.content.as_bytes());
+
+                        // Mark as processed with current hash
+                        processed_hashes.insert(node_id.clone(), content_hash);
+
                         // Only write if content is valid schema
                         if !head.content.is_empty() && head.content != "{}" {
                             if let Ok(sub_schema) = serde_json::from_str::<FsSchema>(&head.content)
@@ -104,7 +135,7 @@ async fn write_nested_schemas_recursive(
                                         );
                                     }
                                 }
-                                // Write the schema to the subdirectory
+                                // Write the schema to the subdirectory (write_schema_file has its own dedup)
                                 if current_dir.exists() {
                                     if let Err(e) =
                                         write_schema_file(current_dir, &head.content).await
@@ -123,6 +154,7 @@ async fn write_nested_schemas_recursive(
                                         _base_dir,
                                         sub_root,
                                         current_dir,
+                                        processed_hashes,
                                     )
                                     .await?;
                                 }
@@ -138,8 +170,15 @@ async fn write_nested_schemas_recursive(
             for (name, child) in entries {
                 if let Entry::Dir(_) = child {
                     let child_dir = current_dir.join(name);
-                    write_nested_schemas_recursive(client, server, _base_dir, child, &child_dir)
-                        .await?;
+                    write_nested_schemas_recursive(
+                        client,
+                        server,
+                        _base_dir,
+                        child,
+                        &child_dir,
+                        processed_hashes,
+                    )
+                    .await?;
                 }
             }
         }
@@ -618,6 +657,9 @@ pub async fn directory_sse_task(
     // fs-root schema subscription always uses ID-based API
     let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&fs_root_id));
 
+    // Track last processed schema to prevent redundant processing
+    let mut last_schema_hash: Option<String> = None;
+
     loop {
         info!("Connecting to fs-root SSE: {}", sse_url);
 
@@ -645,8 +687,8 @@ pub async fn directory_sse_task(
                         }
                         "edit" => {
                             // Schema changed on server, sync new files to local
-                            // Spawn tasks for new files discovered during runtime
-                            if let Err(e) = handle_schema_change(
+                            // Use content-based deduplication to prevent feedback loops
+                            match handle_schema_change_with_dedup(
                                 &client,
                                 &server,
                                 &fs_root_id,
@@ -654,10 +696,19 @@ pub async fn directory_sse_task(
                                 &file_states,
                                 true, // spawn_tasks: true for runtime schema changes
                                 use_paths,
+                                &mut last_schema_hash,
                             )
                             .await
                             {
-                                warn!("Failed to handle schema change: {}", e);
+                                Ok(true) => {
+                                    debug!("Schema change processed successfully");
+                                }
+                                Ok(false) => {
+                                    debug!("Schema unchanged, skipped processing");
+                                }
+                                Err(e) => {
+                                    warn!("Failed to handle schema change: {}", e);
+                                }
                             }
                         }
                         "closed" => {
@@ -677,6 +728,62 @@ pub async fn directory_sse_task(
         warn!("fs-root SSE connection closed, reconnecting in 5s...");
         sleep(Duration::from_secs(5)).await;
     }
+}
+
+/// Handle schema change with content-based deduplication.
+///
+/// Returns Ok(true) if schema was processed, Ok(false) if skipped due to no change.
+#[allow(clippy::too_many_arguments)]
+async fn handle_schema_change_with_dedup(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    directory: &Path,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    spawn_tasks: bool,
+    use_paths: bool,
+    last_schema_hash: &mut Option<String>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    // Fetch current schema from server
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
+    let resp = client.get(&head_url).send().await?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Failed to fetch fs-root HEAD: {}", resp.status()).into());
+    }
+
+    let head: HeadResponse = resp.json().await?;
+    if head.content.is_empty() {
+        return Ok(false);
+    }
+
+    // Compute hash of schema content for deduplication
+    let current_hash = compute_content_hash(head.content.as_bytes());
+
+    // Skip if schema hasn't changed
+    if let Some(ref last_hash) = last_schema_hash {
+        if &current_hash == last_hash {
+            return Ok(false);
+        }
+    }
+
+    // Delegate to the regular handler
+    // Note: hash is updated AFTER successful processing to ensure retries on failure
+    handle_schema_change(
+        client,
+        server,
+        fs_root_id,
+        directory,
+        file_states,
+        spawn_tasks,
+        use_paths,
+    )
+    .await?;
+
+    // Update last hash only after successful processing
+    *last_schema_hash = Some(current_hash);
+
+    Ok(true)
 }
 
 /// Handle a file creation event in directory sync mode.
