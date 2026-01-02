@@ -418,6 +418,185 @@ impl FilesystemReconciler {
             .map(|doc| doc.content)
     }
 
+    /// Migrate a single document's schema entries to have UUIDs.
+    ///
+    /// This is used when a node-backed subdirectory document is updated -
+    /// we need to generate UUIDs for any entries that don't have them
+    /// and update the document's content.
+    ///
+    /// Returns true if the document was updated.
+    pub async fn migrate_subdirectory_document(&self, doc_id: &str) -> Result<bool, FsError> {
+        // Get the document content
+        let Some(doc) = self.document_store.get_document(doc_id).await else {
+            return Ok(false);
+        };
+
+        // First, collect any existing UUIDs from the LAST VALID SCHEMA for this subdirectory
+        // This prevents race conditions where multiple schema pushes overwrite each other
+        let existing_uuids = {
+            let node_schemas = self.last_valid_node_schemas.read().await;
+            if let Some(last_schema) = node_schemas.get(doc_id) {
+                let mut uuids = HashMap::new();
+                if let Some(ref root) = last_schema.root {
+                    self.collect_uuids_from_entry(root, "", &mut uuids);
+                }
+                uuids
+            } else {
+                // Fall back to current content (may still have some UUIDs)
+                self.collect_existing_uuids(&doc.content)
+            }
+        };
+
+        // Merge existing UUIDs into the content before migration
+        let content_with_preserved_uuids =
+            self.preserve_existing_uuids(&doc.content, &existing_uuids);
+
+        // Run migration on the merged content
+        let result = self
+            .migrate_inline_subdirectories(&content_with_preserved_uuids)
+            .await?;
+
+        if result.migrated {
+            // Update this document (not fs-root!) with the migrated schema
+            if let Err(e) = self
+                .document_store
+                .set_content(doc_id, &result.schema)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to update subdirectory document {} with migrated schema: {:?}",
+                    doc_id,
+                    e
+                );
+                return Err(FsError::SchemaError(format!(
+                    "Failed to update subdirectory: {:?}",
+                    e
+                )));
+            }
+
+            // Store the migrated schema as the last valid schema for this subdirectory
+            if let Ok(schema) = serde_json::from_str::<FsSchema>(&result.schema) {
+                let mut node_schemas = self.last_valid_node_schemas.write().await;
+                node_schemas.insert(doc_id.to_string(), schema);
+            }
+
+            if result.uuids_generated > 0 {
+                tracing::info!(
+                    "Generated {} UUIDs for entries in subdirectory document {}",
+                    result.uuids_generated,
+                    doc_id
+                );
+            }
+
+            Ok(true)
+        } else {
+            // Even if no migration was needed, store the current schema
+            if let Ok(schema) = serde_json::from_str::<FsSchema>(&content_with_preserved_uuids) {
+                let mut node_schemas = self.last_valid_node_schemas.write().await;
+                node_schemas.insert(doc_id.to_string(), schema);
+            }
+            Ok(false)
+        }
+    }
+
+    /// Collect existing UUIDs from a schema content string.
+    fn collect_existing_uuids(&self, content: &str) -> HashMap<String, String> {
+        let mut uuids = HashMap::new();
+        if let Ok(schema) = serde_json::from_str::<FsSchema>(content) {
+            if let Some(root) = schema.root {
+                self.collect_uuids_from_entry(&root, "", &mut uuids);
+            }
+        }
+        uuids
+    }
+
+    /// Recursively collect UUIDs from a schema entry.
+    fn collect_uuids_from_entry(
+        &self,
+        entry: &Entry,
+        prefix: &str,
+        uuids: &mut HashMap<String, String>,
+    ) {
+        match entry {
+            Entry::Doc(doc) => {
+                if let Some(ref node_id) = doc.node_id {
+                    uuids.insert(prefix.to_string(), node_id.clone());
+                }
+            }
+            Entry::Dir(dir) => {
+                if let Some(ref entries) = dir.entries {
+                    for (name, child) in entries {
+                        let child_path = if prefix.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{}/{}", prefix, name)
+                        };
+                        self.collect_uuids_from_entry(child, &child_path, uuids);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Merge existing UUIDs into a schema content, preserving them over null values.
+    fn preserve_existing_uuids(
+        &self,
+        content: &str,
+        existing_uuids: &HashMap<String, String>,
+    ) -> String {
+        if existing_uuids.is_empty() {
+            return content.to_string();
+        }
+
+        if let Ok(mut schema) = serde_json::from_str::<FsSchema>(content) {
+            if let Some(root) = schema.root.take() {
+                let merged_root = self.merge_uuids_into_entry(root, "", existing_uuids);
+                schema.root = Some(merged_root);
+                if let Ok(json) = serde_json::to_string_pretty(&schema) {
+                    return json;
+                }
+            }
+        }
+        content.to_string()
+    }
+
+    /// Recursively merge existing UUIDs into a schema entry.
+    fn merge_uuids_into_entry(
+        &self,
+        entry: Entry,
+        prefix: &str,
+        existing_uuids: &HashMap<String, String>,
+    ) -> Entry {
+        match entry {
+            Entry::Doc(mut doc) => {
+                // If doc has null node_id but we have an existing UUID, use it
+                if doc.node_id.is_none() {
+                    if let Some(existing) = existing_uuids.get(prefix) {
+                        doc.node_id = Some(existing.clone());
+                    }
+                }
+                Entry::Doc(doc)
+            }
+            Entry::Dir(mut dir) => {
+                if let Some(entries) = dir.entries.take() {
+                    let mut merged_entries = HashMap::new();
+                    for (name, child) in entries {
+                        let child_path = if prefix.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{}/{}", prefix, name)
+                        };
+                        let merged_child =
+                            self.merge_uuids_into_entry(child, &child_path, existing_uuids);
+                        merged_entries.insert(name, merged_child);
+                    }
+                    dir.entries = Some(merged_entries);
+                }
+                Entry::Dir(dir)
+            }
+        }
+    }
+
     /// Migrate inline subdirectories to separate documents.
     ///
     /// Walks the schema tree, and for each directory with inline `entries`,
