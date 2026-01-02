@@ -115,8 +115,9 @@ pub struct OrchestratorArgs {
     pub use_paths: bool,
 
     /// Recursively discover all processes.json files in the filesystem tree
-    /// When specified, uses --server's fs-root as the starting point
-    #[clap(long)]
+    /// Uses --server's fs-root as the starting point (default: true)
+    /// Use --no-recursive to use static config file instead
+    #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub recursive: bool,
 }
 
