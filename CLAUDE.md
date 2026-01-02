@@ -151,13 +151,20 @@ cargo run --bin commonplace-sync -- --server http://localhost:3000 --node worksp
 
 ## File Linking in Workspaces
 
-**IMPORTANT**: Never use filesystem symlinks to share content between sandbox directories. Use `commonplace-link` instead.
+**CRITICAL**: NEVER create filesystem symlinks (`ln -s`) anywhere in workspace/ or synced directories.
 
-### Why commonplace-link instead of symlinks?
+### Why no symlinks?
 
 - Symlinks break sandbox isolation (processes can escape their directory)
-- Symlinks don't sync correctly through commonplace
-- commonplace-link assigns the same UUID to multiple files, enabling CRDT-based sync
+- Symlinks don't sync through commonplace - they become broken paths
+- Symlinks bypass the CRDT sync mechanism entirely
+- If you need to share content, use `commonplace-link` to assign the same UUID
+
+### Instead of symlinks
+
+- **To share file content**: Use `commonplace-link source.txt target.txt`
+- **To access another sandbox's data**: The sandbox architecture handles this automatically - bartleby's root-level checkout includes all subdirectories like `tmux/`
+- **To reference external files**: Copy the content, don't link
 
 ### Usage
 

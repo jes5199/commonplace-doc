@@ -137,11 +137,18 @@ This tests the full message round-trip using UUID-linked files.
 ### End-to-End Integration
 
 - [ ] **I1**: Send a message via Telegram to the bot (e.g., "Hello!")
-- [ ] **I2**: Verify message was received (check edit history for the content.txt/prompts.txt UUID)
-- [ ] **I3**: Wait for bartleby to respond (may take 30-60 seconds, response is non-deterministic)
-- [ ] **I4**: Verify a response was generated (check edit history for the output.txt/input.txt UUID)
-- [ ] **I5**: Verify response is sent back via Telegram (content will vary)
-- [ ] **I6**: Verify both prompt and response files are empty after consumption
+- [ ] **I2**: Verify message appears in `workspace/text-to-telegram/content.txt` (NOT `workspace/content.txt`)
+- [ ] **I3**: Verify message syncs to `workspace/bartleby/prompts.txt` via UUID link
+- [ ] **I4**: Wait for bartleby to respond (may take 30-60 seconds, response is non-deterministic)
+- [ ] **I5**: Verify response was generated in `workspace/bartleby/output.txt`
+- [ ] **I6**: Verify response syncs to `workspace/text-to-telegram/input.txt` via UUID link
+- [ ] **I7**: Verify response is sent back via Telegram (content will vary)
+- [ ] **I8**: Verify both prompt and response files are empty after consumption
+
+> **IMPORTANT:** Text-to-telegram MUST write to `text-to-telegram/content.txt` (the UUID-linked file),
+> not `content.txt` at workspace root. If messages appear in `workspace/content.txt`, the sandbox
+> configuration is wrong - text-to-telegram needs its own subdirectory processes.json so it only
+> sees its own files.
 
 ### Process Termination Cascade
 

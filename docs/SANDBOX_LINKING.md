@@ -149,6 +149,57 @@ python bartleby.py
 
 Processes only see their own subdirectory but share content via linked files.
 
+## Process Configuration with Orchestrator
+
+The orchestrator discovers `processes.json` files recursively. Where you place a process
+definition determines what gets synced to its sandbox:
+
+- **Root processes.json**: Sandbox gets the full workspace tree
+- **Subdirectory processes.json**: Sandbox gets only that subdirectory's content
+
+Choose based on what the process expects:
+
+### Pattern 1: Process expects its own subdirectory (text-to-telegram)
+
+text-to-telegram reads/writes files relative to its own directory (content.txt, input.txt).
+Define it in its subdirectory's processes.json:
+
+**workspace/text-to-telegram/processes.json:**
+```json
+{
+  "processes": {
+    "text-to-telegram": {
+      "sandbox-exec": "/path/to/python -m text_to_telegram"
+    }
+  }
+}
+```
+
+Sandbox structure: `content.txt`, `input.txt` at root (what text-to-telegram expects).
+
+### Pattern 2: Process expects workspace tree (bartleby)
+
+bartleby looks for `bartleby/prompts.txt` relative to cwd, expecting the workspace structure.
+Define it in the ROOT processes.json:
+
+**workspace/processes.json:**
+```json
+{
+  "processes": {
+    "bartleby": {
+      "sandbox-exec": "/path/to/python /path/to/bartleby.py"
+    }
+  }
+}
+```
+
+Sandbox structure: `bartleby/prompts.txt`, `bartleby/output.txt` (what bartleby expects).
+
+### Common Mistake
+
+Putting bartleby in `workspace/bartleby/processes.json` syncs only the bartleby node,
+giving a sandbox with `prompts.txt` at root instead of in `bartleby/` subdirectory.
+
 ## Related Issues
 
 - CP-2pr: Sync refactoring (completed)
