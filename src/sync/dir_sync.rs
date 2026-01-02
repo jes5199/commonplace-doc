@@ -504,10 +504,12 @@ pub async fn handle_schema_change(
     }
 
     // Collect all paths from schema (with explicit node_id if present)
-    let mut schema_paths: Vec<(String, Option<String>)> = Vec::new();
-    if let Some(ref root) = schema.root {
-        collect_paths_from_entry(root, "", &mut schema_paths);
-    }
+    // Use async version that follows node-backed directories to get complete path->UUID map
+    let uuid_map = build_uuid_map_recursive(client, server, fs_root_id).await;
+    let schema_paths: Vec<(String, Option<String>)> = uuid_map
+        .into_iter()
+        .map(|(path, node_id)| (path, Some(node_id)))
+        .collect();
 
     // Check for new paths not in our state
     let known_paths: Vec<String> = {
