@@ -452,6 +452,108 @@ pub async fn collect_paths_with_node_backed_dirs(
     }
 }
 
+/// Collect all node-backed directory IDs from a schema (recursively).
+///
+/// This returns a vec of (path_prefix, node_id) tuples for all directories
+/// that have a node_id (i.e., node-backed directories).
+#[async_recursion::async_recursion]
+pub async fn collect_node_backed_dir_ids(
+    client: &Client,
+    server: &str,
+    entry: &Entry,
+    prefix: &str,
+    result: &mut Vec<(String, String)>,
+) {
+    match entry {
+        Entry::Dir(dir) => {
+            if dir.entries.is_none() {
+                if let Some(ref node_id) = dir.node_id {
+                    // This is a node-backed directory - add to result
+                    result.push((prefix.to_string(), node_id.clone()));
+
+                    // Also recursively check if this subdirectory has nested node-backed dirs
+                    let url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
+                    if let Ok(resp) = client.get(&url).send().await {
+                        if resp.status().is_success() {
+                            if let Ok(head) = resp.json::<HeadResponse>().await {
+                                if let Ok(schema) = serde_json::from_str::<FsSchema>(&head.content)
+                                {
+                                    if let Some(ref root) = schema.root {
+                                        collect_node_backed_dir_ids(
+                                            client, server, root, prefix, result,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(ref entries) = dir.entries {
+                // Inline directory - traverse its entries
+                for (name, child) in entries {
+                    let child_path = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", prefix, name)
+                    };
+                    collect_node_backed_dir_ids(client, server, child, &child_path, result).await;
+                }
+            }
+        }
+        Entry::Doc(_) => {
+            // Documents are not directories, skip them
+        }
+    }
+}
+
+/// Collect all node-backed directory IDs from an fs-root document.
+///
+/// Fetches the schema and returns all (path, node_id) pairs for node-backed subdirectories.
+pub async fn get_all_node_backed_dir_ids(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+
+    let url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to fetch fs-root schema: {}", e);
+            return result;
+        }
+    };
+
+    if !resp.status().is_success() {
+        warn!("Failed to fetch fs-root: {}", resp.status());
+        return result;
+    }
+
+    let head: HeadResponse = match resp.json().await {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("Failed to parse fs-root response: {}", e);
+            return result;
+        }
+    };
+
+    let schema: FsSchema = match serde_json::from_str(&head.content) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to parse fs-root schema: {}", e);
+            return result;
+        }
+    };
+
+    if let Some(ref root) = schema.root {
+        collect_node_backed_dir_ids(client, server, root, "", &mut result).await;
+    }
+
+    result
+}
+
 /// Handle a schema change from the server - create new local files.
 ///
 /// When the server's fs-root schema changes (e.g., new files added by another client),
@@ -732,6 +834,102 @@ pub async fn directory_sse_task(
         }
 
         warn!("fs-root SSE connection closed, reconnecting in 5s...");
+        sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// SSE task for a node-backed subdirectory.
+///
+/// This task subscribes to a subdirectory's SSE stream and triggers full schema
+/// resync when the subdirectory's schema changes. This allows files created in
+/// node-backed subdirectories to propagate to other sync clients.
+#[allow(clippy::too_many_arguments)]
+pub async fn subdir_sse_task(
+    client: Client,
+    server: String,
+    fs_root_id: String,
+    subdir_path: String,
+    subdir_node_id: String,
+    directory: PathBuf,
+    file_states: Arc<RwLock<HashMap<String, FileSyncState>>>,
+    use_paths: bool,
+) {
+    let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&subdir_node_id));
+
+    loop {
+        info!(
+            "Connecting to subdir SSE: {} (path: {})",
+            sse_url, subdir_path
+        );
+
+        let request_builder = client.get(&sse_url);
+        let mut es = match EventSource::new(request_builder) {
+            Ok(es) => es,
+            Err(e) => {
+                error!(
+                    "Failed to create subdir EventSource for {}: {}",
+                    subdir_path, e
+                );
+                sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        while let Some(event) = es.next().await {
+            match event {
+                Ok(SseEvent::Open) => {
+                    debug!("Subdir {} SSE connection opened", subdir_path);
+                }
+                Ok(SseEvent::Message(msg)) => {
+                    debug!(
+                        "Subdir {} SSE event: {} - {}",
+                        subdir_path, msg.event, msg.data
+                    );
+
+                    match msg.event.as_str() {
+                        "connected" => {
+                            debug!("Subdir {} SSE connected", subdir_path);
+                        }
+                        "edit" => {
+                            // Subdirectory schema changed - trigger full resync
+                            info!("Subdir {} schema changed, triggering resync", subdir_path);
+                            match handle_schema_change(
+                                &client,
+                                &server,
+                                &fs_root_id,
+                                &directory,
+                                &file_states,
+                                true, // spawn_tasks: true for runtime schema changes
+                                use_paths,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    debug!("Subdir schema change processed successfully");
+                                }
+                                Err(e) => {
+                                    warn!("Failed to handle subdir schema change: {}", e);
+                                }
+                            }
+                        }
+                        "closed" => {
+                            warn!("Subdir {} SSE: Target node shut down", subdir_path);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    error!("Subdir {} SSE error: {}", subdir_path, e);
+                    break;
+                }
+            }
+        }
+
+        warn!(
+            "Subdir {} SSE connection closed, reconnecting in 5s...",
+            subdir_path
+        );
         sleep(Duration::from_secs(5)).await;
     }
 }
