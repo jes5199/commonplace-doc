@@ -270,9 +270,15 @@ pub async fn directory_watcher_task(
                 match res {
                     Ok(event) => {
                         for path in event.paths {
-                            // Skip hidden files if not configured
+                            // Skip .commonplace.json files to prevent feedback loops
+                            // These files are managed by the sync client itself
                             if let Some(name) = path.file_name() {
                                 let name_str = name.to_string_lossy();
+                                if name_str == ".commonplace.json" {
+                                    debug!("Skipping schema file event: {}", path.display());
+                                    continue;
+                                }
+                                // Skip hidden files if not configured
                                 if !options.include_hidden && name_str.starts_with('.') {
                                     continue;
                                 }
