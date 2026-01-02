@@ -644,14 +644,46 @@ pub async fn sync_single_file(
                     } else {
                         tokio::fs::write(file_path, &head.content).await?;
                     }
-                }
-                // Seed SyncState
-                let mut s = state.write().await;
-                s.last_written_cid = head.cid;
-                if initial_sync_strategy == "skip" {
+                    // Seed SyncState with server content after pull
+                    let mut s = state.write().await;
+                    s.last_written_cid = head.cid.clone();
+                    s.last_written_content = head.content.clone();
+                } else if initial_sync_strategy == "skip" && file.content != head.content {
+                    // Offline edits detected - push local changes to server
+                    // Note: push_json_content/push_file_content update state with new CID internally
+                    info!(
+                        "Detected offline edits for: {} - pushing to server",
+                        identifier
+                    );
+                    if !file.is_binary && file.content_type.starts_with("application/json") {
+                        crate::sync::push_json_content(
+                            client,
+                            server,
+                            &identifier,
+                            &file.content,
+                            &state,
+                            use_paths,
+                        )
+                        .await?;
+                    } else {
+                        crate::sync::push_file_content(
+                            client,
+                            server,
+                            &identifier,
+                            &file.content,
+                            &state,
+                            use_paths,
+                        )
+                        .await?;
+                    }
+                    // Push functions already updated state with new CID, just set content
+                    let mut s = state.write().await;
                     s.last_written_content = file.content.clone();
                 } else {
-                    s.last_written_content = head.content;
+                    // No offline edits (skip strategy, content matches) - seed SyncState
+                    let mut s = state.write().await;
+                    s.last_written_cid = head.cid;
+                    s.last_written_content = file.content.clone();
                 }
             }
         } else {
