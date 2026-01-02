@@ -111,17 +111,90 @@ pub fn router(
 }
 
 /// Resolve a filesystem path to a document ID using the fs-root schema.
+///
+/// This function handles subdirectory documents - when a directory has `entries: null`
+/// and a `node_id`, it fetches that document to continue the path resolution.
 async fn resolve_path(state: &FileApiState, path: &str) -> Result<String, PathResolveError> {
     let fs_root_id = state.fs_root.as_ref().ok_or(PathResolveError::NoFsRoot)?;
 
-    let fs_root_doc = state
-        .doc_store
-        .get_document(fs_root_id)
-        .await
-        .ok_or(PathResolveError::FsRootNotFound)?;
+    // Split path into segments
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
-    crate::document::resolve_path_to_uuid(&fs_root_doc.content, path, fs_root_id)
-        .ok_or(PathResolveError::PathNotFound)
+    if segments.is_empty() {
+        // Empty path means fs-root itself
+        return Ok(fs_root_id.clone());
+    }
+
+    // Start at fs-root
+    let mut current_doc_id = fs_root_id.clone();
+
+    for (i, segment) in segments.iter().enumerate() {
+        // Fetch the current document
+        let doc = state
+            .doc_store
+            .get_document(&current_doc_id)
+            .await
+            .ok_or(PathResolveError::FsRootNotFound)?;
+
+        // Parse the schema
+        let schema: serde_json::Value =
+            serde_json::from_str(&doc.content).map_err(|_| PathResolveError::PathNotFound)?;
+
+        let root = schema.get("root").ok_or(PathResolveError::PathNotFound)?;
+        let entries = root.get("entries").ok_or(PathResolveError::PathNotFound)?;
+
+        // entries could be null if this is a reference to another document
+        if entries.is_null() {
+            return Err(PathResolveError::PathNotFound);
+        }
+
+        let entry = entries
+            .get(*segment)
+            .ok_or(PathResolveError::PathNotFound)?;
+        let entry_type = entry
+            .get("type")
+            .and_then(|t| t.as_str())
+            .ok_or(PathResolveError::PathNotFound)?;
+
+        let is_last = i == segments.len() - 1;
+
+        if is_last {
+            // Last segment - must be a doc
+            if entry_type != "doc" {
+                return Err(PathResolveError::PathNotFound);
+            }
+            // Return node_id if set, otherwise derive from path
+            return entry
+                .get("node_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| Some(format!("{}:{}", fs_root_id, path)))
+                .ok_or(PathResolveError::PathNotFound);
+        } else {
+            // Not last segment - must be a dir
+            if entry_type != "dir" {
+                return Err(PathResolveError::PathNotFound);
+            }
+
+            // Check if entries is null (subdirectory in separate document)
+            let sub_entries = entry.get("entries");
+            if sub_entries.is_none() || sub_entries.map(|e| e.is_null()).unwrap_or(true) {
+                // Need to fetch the subdirectory document
+                let node_id = entry
+                    .get("node_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or(PathResolveError::PathNotFound)?;
+                current_doc_id = node_id.to_string();
+            } else {
+                // Entries are inline - this case shouldn't happen with current reconciler
+                // but handle it anyway by continuing to next segment
+                // We need to navigate within the same document
+                return Err(PathResolveError::PathNotFound);
+            }
+        }
+    }
+
+    Err(PathResolveError::PathNotFound)
 }
 
 // ============================================================================

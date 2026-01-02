@@ -317,22 +317,72 @@ async fn stream_file(
     State(state): State<SseState>,
     Path(path): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    // Resolve path to document ID
+    // Resolve path to document ID, following subdirectory documents
     let fs_root_id = state
         .fs_root
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let fs_root_doc = state
-        .doc_store
-        .get_document(fs_root_id)
+    let doc_id = resolve_path_to_doc_id(&state.doc_store, fs_root_id, &path)
         .await
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let doc_id = crate::document::resolve_path_to_uuid(&fs_root_doc.content, &path, fs_root_id)
         .ok_or(StatusCode::NOT_FOUND)?;
 
     stream_doc_by_id(state, doc_id).await
+}
+
+/// Resolve a filesystem path to a document ID, following subdirectory documents.
+async fn resolve_path_to_doc_id(
+    doc_store: &std::sync::Arc<crate::document::DocumentStore>,
+    fs_root_id: &str,
+    path: &str,
+) -> Option<String> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    if segments.is_empty() {
+        return Some(fs_root_id.to_string());
+    }
+
+    let mut current_doc_id = fs_root_id.to_string();
+
+    for (i, segment) in segments.iter().enumerate() {
+        let doc = doc_store.get_document(&current_doc_id).await?;
+        let schema: serde_json::Value = serde_json::from_str(&doc.content).ok()?;
+
+        let root = schema.get("root")?;
+        let entries = root.get("entries")?;
+
+        if entries.is_null() {
+            return None;
+        }
+
+        let entry = entries.get(*segment)?;
+        let entry_type = entry.get("type")?.as_str()?;
+        let is_last = i == segments.len() - 1;
+
+        if is_last {
+            if entry_type != "doc" {
+                return None;
+            }
+            return entry
+                .get("node_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| Some(format!("{}:{}", fs_root_id, path)));
+        } else {
+            if entry_type != "dir" {
+                return None;
+            }
+            let sub_entries = entry.get("entries");
+            if sub_entries.is_none() || sub_entries.map(|e| e.is_null()).unwrap_or(true) {
+                let node_id = entry.get("node_id")?.as_str()?;
+                current_doc_id = node_id.to_string();
+            } else {
+                return None;
+            }
+        }
+    }
+
+    None
 }
 
 /// Shared implementation for streaming edit events
