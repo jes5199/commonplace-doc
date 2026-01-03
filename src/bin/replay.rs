@@ -63,8 +63,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = ReplayArgs::parse();
 
     // Find workspace root and resolve UUID
+    // Start from the file's parent directory, not cwd, so we work from anywhere
     let cwd = std::env::current_dir()?;
-    let (workspace_root, _) = find_workspace_root(&cwd)?;
+    let file_path = if args.path.is_absolute() {
+        args.path.clone()
+    } else {
+        cwd.join(&args.path)
+    };
+    let file_dir = file_path.parent().ok_or("Cannot get parent directory")?;
+    let (workspace_root, _) = find_workspace_root(file_dir)?;
     let rel_path = normalize_path(&args.path, &cwd, &workspace_root)?;
     let (dirs, filename) = split_path(&rel_path)?;
     let uuid = resolve_uuid(&workspace_root, &dirs, &filename)?;
@@ -130,6 +137,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let head: HeadResponse = resp.json().await?;
 
+        // Also fetch commit count for context (unless showing historical content)
+        let commit_count = if args.at.is_none() {
+            let changes_url = format!("{}/documents/{}/changes", args.server, uuid);
+            if let Ok(resp) = client.get(&changes_url).send().await {
+                if let Ok(changes) = resp.json::<ChangesResponse>().await {
+                    Some(changes.changes.len())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         if args.json {
             let output = ContentOutput {
                 uuid: uuid.clone(),
@@ -140,7 +163,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
             if let Some(ref cid) = head.cid {
-                eprintln!("Commit: {}", cid);
+                if let Some(count) = commit_count {
+                    eprintln!("Commit: {} ({} total, use --list to see all)", cid, count);
+                } else {
+                    eprintln!("Commit: {}", cid);
+                }
             }
             if let Some(content) = head.content {
                 print!("{}", content);
