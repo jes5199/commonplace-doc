@@ -16,6 +16,10 @@ use crate::store::CommitStore;
 use crate::sync::{base64_decode, create_yjs_json_update};
 use crate::{b64, diff, replay::CommitReplayer};
 
+fn preview_text(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
 /// Errors that can occur in service operations.
 #[derive(Debug)]
 pub enum ServiceError {
@@ -620,9 +624,9 @@ impl DocumentService {
 
                 debug!(
                     "MERGE: parent content = {:?} ({} bytes), new content = {:?} ({} bytes), base_state = {} bytes",
-                    &old_content[..old_content.len().min(50)],
+                    preview_text(&old_content, 50),
                     old_content.len(),
-                    &new_content[..new_content.len().min(50)],
+                    preview_text(new_content, 50),
                     new_content.len(),
                     base_state_bytes.len()
                 );
@@ -735,7 +739,7 @@ impl DocumentService {
             .unwrap_or_default();
         debug!(
             "APPLY: doc content BEFORE update = {:?} ({} bytes)",
-            &content_before[..content_before.len().min(50)],
+            preview_text(&content_before, 50),
             content_before.len()
         );
 
@@ -751,7 +755,7 @@ impl DocumentService {
             .unwrap_or_default();
         debug!(
             "APPLY: doc content AFTER update = {:?} ({} bytes)",
-            &content_after[..content_after.len().min(50)],
+            preview_text(&content_after, 50),
             content_after.len()
         );
 
