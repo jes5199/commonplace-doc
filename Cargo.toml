@@ -63,6 +63,10 @@ path = "src/bin/log.rs"
 name = "commonplace-show"
 path = "src/bin/show.rs"
 
+[[bin]]
+name = "commonplace"
+path = "src/bin/commonplace.rs"
+
 [dependencies]
 rmcp = { version = "0.12", features = ["server", "transport-io"] }
 axum = "0.7"
