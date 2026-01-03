@@ -57,6 +57,77 @@ pub async fn write_schema_file(directory: &Path, schema_json: &str) -> Result<()
     Ok(())
 }
 
+/// Clean up directories that exist on disk but not in the schema.
+///
+/// After deleting files that were removed from the schema, this function
+/// removes any orphaned directories (directories that exist locally but
+/// have no corresponding entry in the schema).
+async fn cleanup_orphaned_directories(directory: &Path, schema: &FsSchema) {
+    // Collect all directory names from the schema
+    let schema_dirs: std::collections::HashSet<String> = collect_schema_directories(schema);
+
+    // Read local directory entries
+    let mut entries = match tokio::fs::read_dir(directory).await {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("Failed to read directory {}: {}", directory.display(), e);
+            return;
+        }
+    };
+
+    let mut dirs_to_remove = Vec::new();
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        // Skip hidden directories and special directories
+        if name.starts_with('.') {
+            continue;
+        }
+
+        // If this directory isn't in the schema, mark it for removal
+        if !schema_dirs.contains(&name) {
+            dirs_to_remove.push(path);
+        }
+    }
+
+    // Remove orphaned directories
+    for dir_path in dirs_to_remove {
+        info!(
+            "Removing orphaned directory (not in schema): {}",
+            dir_path.display()
+        );
+        if let Err(e) = tokio::fs::remove_dir_all(&dir_path).await {
+            warn!("Failed to remove directory {}: {}", dir_path.display(), e);
+        }
+    }
+}
+
+/// Collect all directory names from the schema's root entries.
+fn collect_schema_directories(schema: &FsSchema) -> std::collections::HashSet<String> {
+    let mut dirs = std::collections::HashSet::new();
+
+    if let Some(Entry::Dir(root)) = &schema.root {
+        if let Some(ref entries) = root.entries {
+            for (name, entry) in entries {
+                if matches!(entry, Entry::Dir(_)) {
+                    dirs.insert(name.clone());
+                }
+            }
+        }
+    }
+
+    dirs
+}
+
 /// Write nested .commonplace.json files for all node-backed directories.
 ///
 /// When receiving a schema from the server that contains node-backed directories,
@@ -739,6 +810,43 @@ pub async fn handle_schema_change(
             }
         }
     }
+
+    // Delete local files/directories that have been removed from server schema
+    let schema_path_set: std::collections::HashSet<&String> =
+        schema_paths.iter().map(|(p, _)| p).collect();
+
+    // Find files that exist locally but not in schema
+    let deleted_paths: Vec<String> = known_paths
+        .iter()
+        .filter(|p| !schema_path_set.contains(p))
+        .cloned()
+        .collect();
+
+    for path in &deleted_paths {
+        info!("Server removed file: {} - deleting local copy", path);
+        let file_path = directory.join(path);
+
+        // Stop sync tasks and remove from file_states
+        {
+            let mut states = file_states.write().await;
+            if let Some(file_state) = states.remove(path) {
+                for handle in file_state.task_handles {
+                    handle.abort();
+                }
+            }
+        }
+
+        // Delete the file from disk
+        if file_path.exists() && file_path.is_file() {
+            if let Err(e) = tokio::fs::remove_file(&file_path).await {
+                warn!("Failed to delete file {}: {}", file_path.display(), e);
+            }
+        }
+    }
+
+    // Check for directories that should be removed (empty after file deletions,
+    // or directories that exist on disk but have no corresponding entries in schema)
+    cleanup_orphaned_directories(directory, &schema).await;
 
     // Write nested schemas for node-backed directories to local subdirectories.
     // This persists subdirectory schemas so they survive server restarts.
