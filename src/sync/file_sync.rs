@@ -8,8 +8,8 @@ use crate::sync::state_file::compute_content_hash;
 use crate::sync::{
     build_edit_url, build_replace_url, create_yjs_text_update, detect_from_path, encode_node_id,
     file_watcher_task, is_binary_content, looks_like_base64_binary, push_json_content,
-    push_schema_to_server, refresh_from_head, sse_task, EditRequest, EditResponse, FileEvent,
-    HeadResponse, ReplaceResponse, SyncState, PENDING_WRITE_TIMEOUT,
+    push_jsonl_content, push_schema_to_server, refresh_from_head, sse_task, EditRequest,
+    EditResponse, FileEvent, HeadResponse, ReplaceResponse, SyncState, PENDING_WRITE_TIMEOUT,
 };
 use reqwest::Client;
 use std::path::{Path, PathBuf};
@@ -45,6 +45,7 @@ pub async fn upload_task(
         let content_info = detect_from_path(&file_path);
         let is_binary = content_info.is_binary || is_binary_content(&raw_content);
         let is_json = !is_binary && content_info.mime_type == "application/json";
+        let is_jsonl = !is_binary && content_info.mime_type == "application/x-ndjson";
 
         let mut content = if is_binary {
             use base64::{engine::general_purpose::STANDARD, Engine};
@@ -246,6 +247,46 @@ pub async fn upload_task(
                     }
                 } else {
                     // Upload failed - re-set the flag so we try again next time
+                    let mut s = state.write().await;
+                    s.needs_head_refresh = true;
+                }
+            }
+            continue;
+        }
+
+        if is_jsonl {
+            let jsonl_upload_succeeded = match push_jsonl_content(
+                &client,
+                &server,
+                &identifier,
+                &content,
+                &state,
+                use_paths,
+            )
+            .await
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    error!("JSONL upload failed: {}", e);
+                    false
+                }
+            };
+            if should_refresh {
+                if jsonl_upload_succeeded {
+                    let refresh_succeeded = refresh_from_head(
+                        &client,
+                        &server,
+                        &identifier,
+                        &file_path,
+                        &state,
+                        use_paths,
+                    )
+                    .await;
+                    if !refresh_succeeded {
+                        let mut s = state.write().await;
+                        s.needs_head_refresh = true;
+                    }
+                } else {
                     let mut s = state.write().await;
                     s.needs_head_refresh = true;
                 }
@@ -612,8 +653,20 @@ pub async fn sync_single_file(
                     identifier,
                     file.content.len()
                 );
-                if !file.is_binary && file.content_type.starts_with("application/json") {
+                let is_json = !file.is_binary && file.content_type.starts_with("application/json");
+                let is_jsonl = !file.is_binary && file.content_type == "application/x-ndjson";
+                if is_json {
                     crate::sync::push_json_content(
+                        client,
+                        server,
+                        &identifier,
+                        &file.content,
+                        &state,
+                        use_paths,
+                    )
+                    .await?;
+                } else if is_jsonl {
+                    crate::sync::push_jsonl_content(
                         client,
                         server,
                         &identifier,
@@ -655,8 +708,21 @@ pub async fn sync_single_file(
                         "Detected offline edits for: {} - pushing to server",
                         identifier
                     );
-                    if !file.is_binary && file.content_type.starts_with("application/json") {
+                    let is_json =
+                        !file.is_binary && file.content_type.starts_with("application/json");
+                    let is_jsonl = !file.is_binary && file.content_type == "application/x-ndjson";
+                    if is_json {
                         crate::sync::push_json_content(
+                            client,
+                            server,
+                            &identifier,
+                            &file.content,
+                            &state,
+                            use_paths,
+                        )
+                        .await?;
+                    } else if is_jsonl {
+                        crate::sync::push_jsonl_content(
                             client,
                             server,
                             &identifier,
@@ -689,8 +755,20 @@ pub async fn sync_single_file(
         } else {
             // Node doesn't exist yet - push content
             info!("Node not ready, will push with retries for: {}", identifier);
-            if !file.is_binary && file.content_type.starts_with("application/json") {
+            let is_json = !file.is_binary && file.content_type.starts_with("application/json");
+            let is_jsonl = !file.is_binary && file.content_type == "application/x-ndjson";
+            if is_json {
                 crate::sync::push_json_content(
+                    client,
+                    server,
+                    &identifier,
+                    &file.content,
+                    &state,
+                    use_paths,
+                )
+                .await?;
+            } else if is_jsonl {
+                crate::sync::push_jsonl_content(
                     client,
                     server,
                     &identifier,

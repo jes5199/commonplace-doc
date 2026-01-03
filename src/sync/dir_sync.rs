@@ -9,8 +9,8 @@ use crate::sync::state_file::compute_content_hash;
 use crate::sync::{
     build_head_url, detect_from_path, encode_node_id, fork_node, is_allowed_extension,
     is_binary_content, looks_like_base64_binary, normalize_path, push_file_content,
-    push_json_content, push_schema_to_server, spawn_file_sync_tasks, FileSyncState, HeadResponse,
-    SyncState,
+    push_json_content, push_jsonl_content, push_schema_to_server, spawn_file_sync_tasks,
+    FileSyncState, HeadResponse, SyncState,
 };
 use futures::StreamExt;
 use reqwest::Client;
@@ -1347,8 +1347,12 @@ pub async fn handle_file_created(
                 String::from_utf8_lossy(&raw_content).to_string()
             };
 
-            if let Err(e) = if !is_binary && content_info.mime_type == "application/json" {
+            let is_json = !is_binary && content_info.mime_type == "application/json";
+            let is_jsonl = !is_binary && content_info.mime_type == "application/x-ndjson";
+            if let Err(e) = if is_json {
                 push_json_content(client, server, &identifier, &content, &state, use_paths).await
+            } else if is_jsonl {
+                push_jsonl_content(client, server, &identifier, &content, &state, use_paths).await
             } else {
                 push_file_content(client, server, &identifier, &content, &state, use_paths).await
             } {

@@ -5,8 +5,8 @@
 
 use crate::sync::{
     build_edit_url, build_fork_url, build_head_url, build_replace_url, create_yjs_json_update,
-    create_yjs_text_update, encode_node_id, EditRequest, EditResponse, ForkResponse, HeadResponse,
-    ReplaceResponse, SyncState,
+    create_yjs_jsonl_update, create_yjs_text_update, encode_node_id, EditRequest, EditResponse,
+    ForkResponse, HeadResponse, ReplaceResponse, SyncState,
 };
 use reqwest::Client;
 use std::sync::Arc;
@@ -158,6 +158,70 @@ pub async fn push_json_content(
 
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("Failed to push JSON content: {}", body).into());
+    }
+}
+
+/// Push JSONL content to a node using Y.Array updates.
+pub async fn push_jsonl_content(
+    client: &Client,
+    server: &str,
+    identifier: &str,
+    content: &str,
+    state: &Arc<RwLock<SyncState>>,
+    use_paths: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let head_url = build_head_url(server, identifier, use_paths);
+    let edit_url = build_edit_url(server, identifier, use_paths);
+    let mut attempts = 0;
+    let max_attempts = 30; // 3 seconds max wait
+
+    loop {
+        let head_resp = client.get(&head_url).send().await?;
+        if head_resp.status() == reqwest::StatusCode::NOT_FOUND && attempts < max_attempts {
+            attempts += 1;
+            info!(
+                "Identifier {} not found, waiting for reconciler (attempt {}/{})",
+                identifier, attempts, max_attempts
+            );
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
+        let base_state = if head_resp.status().is_success() {
+            let head: HeadResponse = head_resp.json().await?;
+            head.state
+        } else {
+            None
+        };
+
+        let update = create_yjs_jsonl_update(content, base_state.as_deref())?;
+        let edit_req = EditRequest {
+            update,
+            author: Some("sync-client".to_string()),
+            message: Some("Sync JSONL content".to_string()),
+        };
+
+        let resp = client.post(&edit_url).json(&edit_req).send().await?;
+        if resp.status().is_success() {
+            let result: EditResponse = resp.json().await?;
+            let mut s = state.write().await;
+            s.last_written_cid = Some(result.cid);
+            s.last_written_content = content.to_string();
+            return Ok(());
+        }
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND && attempts < max_attempts {
+            attempts += 1;
+            info!(
+                "Identifier {} not found, waiting for reconciler (attempt {}/{})",
+                identifier, attempts, max_attempts
+            );
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Failed to push JSONL content: {}", body).into());
     }
 }
 

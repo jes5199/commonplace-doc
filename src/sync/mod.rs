@@ -13,7 +13,9 @@ pub mod urls;
 pub mod watcher;
 pub mod yjs;
 
-pub use client::{fork_node, push_file_content, push_json_content, push_schema_to_server};
+pub use client::{
+    fork_node, push_file_content, push_json_content, push_jsonl_content, push_schema_to_server,
+};
 pub use dir_sync::{
     build_uuid_map_from_doc, build_uuid_map_recursive, check_server_has_content,
     collect_paths_from_entry, collect_paths_with_node_backed_dirs, directory_sse_task,
