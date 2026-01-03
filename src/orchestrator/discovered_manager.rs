@@ -67,6 +67,14 @@ pub struct DiscoveredProcessManager {
     reset_after_secs: u64,
 }
 
+/// Result of recursive discovery - includes both processes.json files and all schema node_ids.
+struct DiscoveryResult {
+    /// (base_path, processes.json node_id)
+    processes_json_files: Vec<(String, String)>,
+    /// All directory schema node_ids (for watching changes)
+    schema_node_ids: Vec<String>,
+}
+
 impl DiscoveredProcessManager {
     /// Create a new discovered process manager.
     pub fn new(mqtt_broker: String, server_url: String) -> Self {
@@ -607,15 +615,20 @@ impl DiscoveredProcessManager {
     /// Recursively discover all processes.json files from a root schema.
     ///
     /// This fetches schemas for subdirectories with node_ids and finds all processes.json.
+    /// Also returns all schema node_ids encountered for recursive watching.
     async fn discover_all_processes_json(
         client: &Client,
         server_url: &str,
         root_id: &str,
-    ) -> Result<Vec<(String, String)>, String> {
-        let mut results = Vec::new();
+    ) -> Result<DiscoveryResult, String> {
+        let mut processes_json_files = Vec::new();
+        let mut schema_node_ids = Vec::new();
         let mut to_visit: Vec<(String, String)> = vec![("/".to_string(), root_id.to_string())];
 
         while let Some((path, node_id)) = to_visit.pop() {
+            // Track this schema node_id for watching
+            schema_node_ids.push(node_id.clone());
+
             // Fetch this node's schema
             let url = format!("{}/docs/{}/head", server_url, node_id);
             let resp = client
@@ -655,7 +668,7 @@ impl DiscoveredProcessManager {
                         if name == "processes.json" && entry_type == "doc" {
                             if let Some(pj_node_id) = entry.get("node_id").and_then(|n| n.as_str())
                             {
-                                results.push((path.clone(), pj_node_id.to_string()));
+                                processes_json_files.push((path.clone(), pj_node_id.to_string()));
                             }
                         } else if entry_type == "dir" {
                             // Subdirectory - check if it has a node_id to recurse into
@@ -674,7 +687,10 @@ impl DiscoveredProcessManager {
             }
         }
 
-        Ok(results)
+        Ok(DiscoveryResult {
+            processes_json_files,
+            schema_node_ids,
+        })
     }
 
     /// Watch a .processes.json document for changes and dynamically update processes.
@@ -890,6 +906,8 @@ impl DiscoveredProcessManager {
     /// This discovers all processes.json files in the filesystem tree starting from
     /// the given fs-root, and watches each one for changes. Each processes.json
     /// controls processes that sync at its containing directory.
+    ///
+    /// Watches ALL schema documents (directory node_ids) for changes, not just fs-root.
     pub async fn run_with_recursive_watch(
         &mut self,
         client: &Client,
@@ -900,26 +918,32 @@ impl DiscoveredProcessManager {
             fs_root_id
         );
 
-        // Discover all processes.json files
-        let processes_json_files =
+        // Discover all processes.json files and schema node_ids
+        let discovery =
             Self::discover_all_processes_json(client, &self.server_url, fs_root_id).await?;
 
-        if processes_json_files.is_empty() {
+        if discovery.processes_json_files.is_empty() {
             tracing::warn!("[discovery] No processes.json files found in filesystem tree");
             // Still watch the root for changes
         } else {
             tracing::info!(
                 "[discovery] Found {} processes.json file(s): {:?}",
-                processes_json_files.len(),
-                processes_json_files
+                discovery.processes_json_files.len(),
+                discovery
+                    .processes_json_files
                     .iter()
                     .map(|(p, _)| p)
                     .collect::<Vec<_>>()
             );
         }
 
+        tracing::info!(
+            "[discovery] Watching {} schema document(s) for structural changes",
+            discovery.schema_node_ids.len()
+        );
+
         // Fetch and reconcile each processes.json
-        for (base_path, pj_node_id) in &processes_json_files {
+        for (base_path, pj_node_id) in &discovery.processes_json_files {
             let url = format!("{}/docs/{}/head", self.server_url, pj_node_id);
             match self.fetch_and_reconcile(client, &url, base_path).await {
                 Ok(_) => tracing::info!(
@@ -935,13 +959,22 @@ impl DiscoveredProcessManager {
         }
 
         // Track watched documents: node_id -> base_path
-        let mut watched: HashMap<String, String> = processes_json_files
+        let mut watched: HashMap<String, String> = discovery
+            .processes_json_files
             .iter()
             .map(|(base_path, node_id)| (node_id.clone(), base_path.clone()))
             .collect();
 
-        // Also watch the fs-root for structural changes
-        let fs_root_sse_url = format!("{}/sse/docs/{}", self.server_url, fs_root_id);
+        // Track current schema node_ids for detecting new directories
+        let mut current_schema_ids: HashSet<String> =
+            discovery.schema_node_ids.iter().cloned().collect();
+
+        // Build SSE URL for watching all schema documents
+        let schema_ids_param = discovery.schema_node_ids.join(",");
+        let schemas_sse_url = format!(
+            "{}/documents/stream?doc_ids={}",
+            self.server_url, schema_ids_param
+        );
 
         // Monitor interval for checking process health
         let mut monitor_interval = tokio::time::interval(Duration::from_millis(500));
@@ -949,14 +982,33 @@ impl DiscoveredProcessManager {
         // Re-discovery interval (check for new/removed processes.json files)
         let mut discovery_interval = tokio::time::interval(Duration::from_secs(30));
 
+        // Track if we need to reconnect SSE (when new schemas are discovered)
+        let mut needs_sse_reconnect = false;
+
         loop {
-            let request_builder = client.get(&fs_root_sse_url);
+            let sse_url = if needs_sse_reconnect {
+                // Rebuild SSE URL with updated schema IDs
+                let schema_ids_param: String = current_schema_ids
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",");
+                needs_sse_reconnect = false;
+                format!(
+                    "{}/documents/stream?doc_ids={}",
+                    self.server_url, schema_ids_param
+                )
+            } else {
+                schemas_sse_url.clone()
+            };
+
+            let request_builder = client.get(&sse_url);
 
             let mut es = match EventSource::new(request_builder) {
                 Ok(es) => es,
                 Err(e) => {
                     tracing::error!(
-                        "[discovery] Failed to create EventSource for fs-root: {}",
+                        "[discovery] Failed to create EventSource for schemas: {}",
                         e
                     );
                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -976,9 +1028,9 @@ impl DiscoveredProcessManager {
                     // Periodic re-discovery of processes.json files
                     _ = discovery_interval.tick() => {
                         match Self::discover_all_processes_json(client, &self.server_url, fs_root_id).await {
-                            Ok(new_files) => {
+                            Ok(new_discovery) => {
                                 // Check for new processes.json files
-                                for (base_path, node_id) in &new_files {
+                                for (base_path, node_id) in &new_discovery.processes_json_files {
                                     if !watched.contains_key(node_id) {
                                         tracing::info!("[discovery] Found new processes.json at {}", base_path);
                                         let url = format!("{}/docs/{}/head", self.server_url, node_id);
@@ -990,7 +1042,7 @@ impl DiscoveredProcessManager {
                                 }
 
                                 // Check for removed processes.json files
-                                let new_ids: HashSet<_> = new_files.iter().map(|(_, id)| id.clone()).collect();
+                                let new_ids: HashSet<_> = new_discovery.processes_json_files.iter().map(|(_, id)| id.clone()).collect();
                                 let removed: Vec<_> = watched.keys()
                                     .filter(|id| !new_ids.contains(*id))
                                     .cloned()
@@ -1008,6 +1060,24 @@ impl DiscoveredProcessManager {
                                         }
                                     }
                                 }
+
+                                // Check for new schema node_ids (new directories added)
+                                let new_schema_ids: HashSet<String> = new_discovery.schema_node_ids.iter().cloned().collect();
+                                if new_schema_ids != current_schema_ids {
+                                    let added: Vec<_> = new_schema_ids.difference(&current_schema_ids).collect();
+                                    let removed: Vec<_> = current_schema_ids.difference(&new_schema_ids).collect();
+                                    if !added.is_empty() || !removed.is_empty() {
+                                        tracing::info!(
+                                            "[discovery] Schema set changed: +{} -{} directories",
+                                            added.len(),
+                                            removed.len()
+                                        );
+                                        current_schema_ids = new_schema_ids;
+                                        // Need to reconnect SSE with new doc_ids
+                                        needs_sse_reconnect = true;
+                                        sse_closed = true;
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!("[discovery] Re-discovery failed: {}", e);
@@ -1015,15 +1085,27 @@ impl DiscoveredProcessManager {
                         }
                     }
 
-                    // SSE event from fs-root (structural changes)
+                    // SSE event from any schema document (structural changes)
                     event = es.next() => {
                         match event {
                             Some(Ok(SseEvent::Open)) => {
-                                tracing::info!("[discovery] SSE connection opened for fs-root");
+                                tracing::info!(
+                                    "[discovery] SSE connection opened for {} schema(s)",
+                                    current_schema_ids.len()
+                                );
                             }
                             Some(Ok(SseEvent::Message(msg))) => {
-                                if msg.event == "edit" {
-                                    tracing::info!("[discovery] fs-root schema changed, re-discovering...");
+                                // /documents/stream sends "commit" events with doc_id in payload
+                                if msg.event == "commit" {
+                                    // Parse the commit event to get doc_id
+                                    if let Ok(commit) = serde_json::from_str::<serde_json::Value>(&msg.data) {
+                                        if let Some(doc_id) = commit.get("doc_id").and_then(|v| v.as_str()) {
+                                            tracing::info!(
+                                                "[discovery] Schema {} changed, re-discovering...",
+                                                doc_id
+                                            );
+                                        }
+                                    }
                                     // Trigger immediate re-discovery
                                     discovery_interval.reset();
                                 }
@@ -1046,7 +1128,7 @@ impl DiscoveredProcessManager {
             }
 
             if sse_closed {
-                tracing::info!("[discovery] Reconnecting to fs-root SSE...");
+                tracing::info!("[discovery] Reconnecting to schema stream SSE...");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
