@@ -8,6 +8,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use thiserror::Error;
+use tracing::warn;
 
 /// Schema filename for preserving node_ids
 const SCHEMA_FILENAME: &str = ".commonplace.json";
@@ -162,8 +163,77 @@ fn scan_dir_recursive(
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy().to_string();
 
-        // Skip symlinks
+        // Handle symlinks - convert to commonplace-linked files
         if file_type.is_symlink() {
+            // Apply the same hidden/ignore filters as for regular files
+            if !options.include_hidden && name.starts_with('.') {
+                continue;
+            }
+            if should_ignore(&name, &options.ignore_patterns) {
+                continue;
+            }
+
+            let entry_path = entry.path();
+
+            // Compute relative path for this entry
+            let symlink_relative = if dir_relative.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", dir_relative, name)
+            };
+
+            match resolve_symlink(root, &entry_path) {
+                SymlinkResolution::WithinWorkspace { target_relative } => {
+                    // Look up the target's node_id
+                    if let Some(target_node_id) = existing_node_ids.get(&target_relative) {
+                        // Skip files with disallowed extensions
+                        if !is_allowed_extension(&entry_path) {
+                            continue;
+                        }
+
+                        // Use the same node_id as the target (commonplace-link behavior)
+                        let content_info = detect_from_path(&entry_path);
+                        let doc_entry = Entry::Doc(DocEntry {
+                            node_id: Some(target_node_id.clone()),
+                            content_type: Some(content_info.mime_type.clone()),
+                        });
+                        entries.insert(name, doc_entry);
+                        tracing::info!(
+                            symlink = %symlink_relative,
+                            target = %target_relative,
+                            node_id = %target_node_id,
+                            "Converted symlink to commonplace-link"
+                        );
+                    } else {
+                        // Target doesn't have a node_id yet - skip for now
+                        // Next scan will pick it up once the target has been synced
+                        warn!(
+                            symlink = %symlink_relative,
+                            target = %target_relative,
+                            "Skipping symlink: target not yet synced (will retry on next scan)"
+                        );
+                    }
+                }
+                SymlinkResolution::OutsideWorkspace => {
+                    warn!(
+                        symlink = %symlink_relative,
+                        "Skipping symlink: target is outside workspace"
+                    );
+                }
+                SymlinkResolution::IsDirectory => {
+                    warn!(
+                        symlink = %symlink_relative,
+                        "Skipping symlink: directory symlinks not supported"
+                    );
+                }
+                SymlinkResolution::Failed(reason) => {
+                    warn!(
+                        symlink = %symlink_relative,
+                        reason = %reason,
+                        "Skipping symlink: resolution failed"
+                    );
+                }
+            }
             continue;
         }
 
@@ -258,6 +328,68 @@ fn should_ignore(name: &str, patterns: &[String]) -> bool {
     false
 }
 
+/// Result of resolving a symlink.
+enum SymlinkResolution {
+    /// Target is within workspace, use this relative path for node_id lookup
+    WithinWorkspace { target_relative: String },
+    /// Target is outside workspace, skip this symlink
+    OutsideWorkspace,
+    /// Target is a directory (not supported for auto-linking)
+    IsDirectory,
+    /// Failed to resolve the symlink
+    Failed(String),
+}
+
+/// Resolve a symlink and check if its target is within the workspace.
+fn resolve_symlink(root: &Path, symlink_path: &Path) -> SymlinkResolution {
+    // Read the symlink target
+    let target = match fs::read_link(symlink_path) {
+        Ok(t) => t,
+        Err(e) => return SymlinkResolution::Failed(format!("Failed to read symlink: {}", e)),
+    };
+
+    // Resolve to absolute path
+    let absolute_target = if target.is_absolute() {
+        target
+    } else {
+        // Relative symlink - resolve from symlink's parent directory
+        let parent = symlink_path.parent().unwrap_or(Path::new("."));
+        parent.join(&target)
+    };
+
+    // Canonicalize to resolve any .. or . components
+    let canonical_target = match absolute_target.canonicalize() {
+        Ok(c) => c,
+        Err(e) => {
+            return SymlinkResolution::Failed(format!("Failed to canonicalize target: {}", e))
+        }
+    };
+
+    // Canonicalize root for comparison
+    let canonical_root = match root.canonicalize() {
+        Ok(c) => c,
+        Err(e) => return SymlinkResolution::Failed(format!("Failed to canonicalize root: {}", e)),
+    };
+
+    // Check if target is within the workspace root
+    if !canonical_target.starts_with(&canonical_root) {
+        return SymlinkResolution::OutsideWorkspace;
+    }
+
+    // Check if target is a directory
+    if canonical_target.is_dir() {
+        return SymlinkResolution::IsDirectory;
+    }
+
+    // Get relative path from root
+    let target_relative = canonical_target
+        .strip_prefix(&canonical_root)
+        .map(|p| normalize_path(&p.to_string_lossy()))
+        .unwrap_or_default();
+
+    SymlinkResolution::WithinWorkspace { target_relative }
+}
+
 /// Simple glob pattern matching (supports * and ?).
 fn pattern_matches(pattern: &str, name: &str) -> bool {
     // Simple implementation: exact match or wildcard patterns
@@ -309,7 +441,8 @@ fn scan_files_recursive(
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy().to_string();
 
-        // Skip symlinks
+        // Skip symlinks - content is synced through the target file
+        // The schema scan (scan_dir_recursive) handles symlink-to-link conversion
         if file_type.is_symlink() {
             continue;
         }
@@ -836,6 +969,198 @@ mod tests {
             } else {
                 panic!("Expected subdir to be a Dir");
             }
+        } else {
+            panic!("Expected root to be a Dir");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_converts_symlink_to_commonplace_link() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+
+        // Create target file
+        File::create(temp.path().join("target.txt"))
+            .unwrap()
+            .write_all(b"target content")
+            .unwrap();
+
+        // Create symlink pointing to target
+        symlink(temp.path().join("target.txt"), temp.path().join("link.txt")).unwrap();
+
+        // Create existing .commonplace.json with node_id for target
+        let existing_schema = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "target.txt": {
+                        "type": "doc",
+                        "node_id": "target-uuid",
+                        "content_type": "text/plain"
+                    }
+                }
+            }
+        }"#;
+        File::create(temp.path().join(".commonplace.json"))
+            .unwrap()
+            .write_all(existing_schema.as_bytes())
+            .unwrap();
+
+        // Scan should convert symlink to commonplace-link (same node_id)
+        let schema = scan_directory(temp.path(), &ScanOptions::default()).unwrap();
+
+        if let Some(Entry::Dir(root)) = &schema.root {
+            let entries = root.entries.as_ref().unwrap();
+
+            // target.txt should have its node_id preserved
+            if let Some(Entry::Doc(target)) = entries.get("target.txt") {
+                assert_eq!(target.node_id.as_deref(), Some("target-uuid"));
+            } else {
+                panic!("Expected target.txt to be a Doc");
+            }
+
+            // link.txt (symlink) should use target's node_id
+            if let Some(Entry::Doc(link)) = entries.get("link.txt") {
+                assert_eq!(
+                    link.node_id.as_deref(),
+                    Some("target-uuid"),
+                    "Symlink should share node_id with target"
+                );
+            } else {
+                panic!("Expected link.txt to be converted to a Doc");
+            }
+        } else {
+            panic!("Expected root to be a Dir");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_skips_symlink_to_unsynced_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+
+        // Create target file (no existing node_id in schema)
+        File::create(temp.path().join("target.txt"))
+            .unwrap()
+            .write_all(b"target content")
+            .unwrap();
+
+        // Create symlink pointing to target
+        symlink(temp.path().join("target.txt"), temp.path().join("link.txt")).unwrap();
+
+        // No existing .commonplace.json - target has no node_id yet
+
+        // Scan should skip the symlink since target has no node_id
+        let schema = scan_directory(temp.path(), &ScanOptions::default()).unwrap();
+
+        if let Some(Entry::Dir(root)) = &schema.root {
+            let entries = root.entries.as_ref().unwrap();
+
+            // target.txt should be present with a generated UUID
+            assert!(entries.contains_key("target.txt"));
+
+            // link.txt should NOT be present (skipped because target not synced)
+            assert!(
+                !entries.contains_key("link.txt"),
+                "Symlink should be skipped until target is synced"
+            );
+        } else {
+            panic!("Expected root to be a Dir");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_skips_hidden_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+
+        // Create target file
+        File::create(temp.path().join("target.txt"))
+            .unwrap()
+            .write_all(b"target content")
+            .unwrap();
+
+        // Create hidden symlink pointing to target
+        symlink(
+            temp.path().join("target.txt"),
+            temp.path().join(".hidden-link.txt"),
+        )
+        .unwrap();
+
+        // Create existing .commonplace.json with node_id for target
+        let existing_schema = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "target.txt": {
+                        "type": "doc",
+                        "node_id": "target-uuid",
+                        "content_type": "text/plain"
+                    }
+                }
+            }
+        }"#;
+        File::create(temp.path().join(".commonplace.json"))
+            .unwrap()
+            .write_all(existing_schema.as_bytes())
+            .unwrap();
+
+        // Scan with include_hidden=false (default) should skip hidden symlink
+        let schema = scan_directory(temp.path(), &ScanOptions::default()).unwrap();
+
+        if let Some(Entry::Dir(root)) = &schema.root {
+            let entries = root.entries.as_ref().unwrap();
+
+            // Hidden symlink should NOT be present
+            assert!(
+                !entries.contains_key(".hidden-link.txt"),
+                "Hidden symlink should be skipped by default"
+            );
+        } else {
+            panic!("Expected root to be a Dir");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_skips_symlink_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+
+        // Create file outside workspace
+        File::create(external.path().join("external.txt"))
+            .unwrap()
+            .write_all(b"external content")
+            .unwrap();
+
+        // Create symlink pointing outside workspace
+        symlink(
+            external.path().join("external.txt"),
+            temp.path().join("link.txt"),
+        )
+        .unwrap();
+
+        // Scan should skip the symlink since target is outside workspace
+        let schema = scan_directory(temp.path(), &ScanOptions::default()).unwrap();
+
+        if let Some(Entry::Dir(root)) = &schema.root {
+            let entries = root.entries.as_ref().unwrap();
+
+            // link.txt should NOT be present
+            assert!(
+                !entries.contains_key("link.txt"),
+                "Symlink to external file should be skipped"
+            );
         } else {
             panic!("Expected root to be a Dir");
         }
