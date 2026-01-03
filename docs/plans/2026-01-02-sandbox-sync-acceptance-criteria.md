@@ -84,6 +84,19 @@ The orchestrator uses recursive discovery mode by default. It reads `processes.j
 - [ ] **E5**: Edit `workspace/bartleby/test-note.txt` to change content to "updated note"
 - [ ] **E6**: Within 5 seconds, verify bartleby sandbox `bartleby/test-note.txt` shows "updated note"
 
+### JSONL File Handling
+
+JSONL (JSON Lines) files use append-style updates where each line is a valid JSON object.
+
+- [ ] **J1**: Create a new JSONL file: `echo '{"event": "start"}' > workspace/bartleby/test.jsonl`
+- [ ] **J2**: Within 5 seconds, verify file appears in bartleby sandbox at `bartleby/test.jsonl`
+- [ ] **J3**: Verify the content matches: `{"event": "start"}`
+- [ ] **J4**: Append a line: `echo '{"event": "middle"}' >> workspace/bartleby/test.jsonl`
+- [ ] **J5**: Within 5 seconds, verify bartleby sandbox file has both lines
+- [ ] **J6**: Append from the sandbox: `echo '{"event": "end"}' >> /tmp/commonplace-sandbox-*/bartleby/test.jsonl`
+- [ ] **J7**: Within 5 seconds, verify `workspace/bartleby/test.jsonl` has all three lines
+- [ ] **J8**: Delete the test file: `rm workspace/bartleby/test.jsonl`
+
 ### File Deletion Propagation
 
 - [ ] **D1**: Delete `workspace/text-to-telegram/test-file.txt`
