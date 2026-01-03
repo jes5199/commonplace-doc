@@ -98,6 +98,18 @@ struct Args {
     /// Implies --exec and conflicts with --directory (uses temp dir instead).
     #[arg(long, conflicts_with = "directory", requires = "exec")]
     sandbox: bool,
+
+    /// Push-only mode: watch local files and push changes to server.
+    /// Ignores server-side updates (no SSE subscription).
+    /// Use case: source-of-truth files like .beads/issues.jsonl
+    #[arg(long, conflicts_with = "pull_only")]
+    push_only: bool,
+
+    /// Pull-only mode: subscribe to server updates and write to local files.
+    /// Ignores local file changes (no file watcher).
+    /// Use case: read-only mirrors, generated content
+    #[arg(long, conflicts_with = "push_only")]
+    pull_only: bool,
 }
 
 /// Discover the fs-root document ID from the server.
@@ -359,6 +371,8 @@ async fn main() -> ExitCode {
             exec_cmd,
             args.exec_args,
             true, // sandbox mode
+            args.push_only,
+            args.pull_only,
         )
         .await;
 
@@ -403,6 +417,8 @@ async fn main() -> ExitCode {
                 exec_cmd,
                 args.exec_args,
                 false, // not sandbox mode
+                args.push_only,
+                args.pull_only,
             )
             .await
         } else {
@@ -415,14 +431,23 @@ async fn main() -> ExitCode {
                 scan_options,
                 args.initial_sync,
                 args.use_paths,
+                args.push_only,
+                args.pull_only,
             )
             .await
             .map(|_| 0u8)
         }
     } else if let Some(file) = args.file {
-        run_file_mode(client, args.server, node_id, file)
-            .await
-            .map(|_| 0u8)
+        run_file_mode(
+            client,
+            args.server,
+            node_id,
+            file,
+            args.push_only,
+            args.pull_only,
+        )
+        .await
+        .map(|_| 0u8)
     } else {
         unreachable!("Validated above")
     };
@@ -442,9 +467,19 @@ async fn run_file_mode(
     server: String,
     node_id: String,
     file: PathBuf,
+    push_only: bool,
+    pull_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mode = if push_only {
+        "push-only"
+    } else if pull_only {
+        "pull-only"
+    } else {
+        "bidirectional"
+    };
     info!(
-        "Starting commonplace-sync (file mode): server={}, node={}, file={}",
+        "Starting commonplace-sync (file mode, {}): server={}, node={}, file={}",
+        mode,
         server,
         node_id,
         file.display()
@@ -541,45 +576,66 @@ async fn run_file_mode(
     // Create channel for file events
     let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
 
-    // Start file watcher task
-    let watcher_handle = tokio::spawn(file_watcher_task(file.clone(), file_tx));
+    // Start file watcher task (skip if pull-only)
+    let watcher_handle = if !pull_only {
+        Some(tokio::spawn(file_watcher_task(file.clone(), file_tx)))
+    } else {
+        info!("Pull-only mode: skipping file watcher");
+        None
+    };
 
-    // Start file change handler task
+    // Start file change handler task (skip if pull-only)
     // File mode always uses ID-based API (use_paths=false)
-    let upload_handle = tokio::spawn(upload_task(
-        client.clone(),
-        server.clone(),
-        node_id.clone(),
-        file.clone(),
-        state.clone(),
-        file_rx,
-        false, // use_paths: file mode uses ID-based API
-    ));
+    let upload_handle = if !pull_only {
+        Some(tokio::spawn(upload_task(
+            client.clone(),
+            server.clone(),
+            node_id.clone(),
+            file.clone(),
+            state.clone(),
+            file_rx,
+            false, // use_paths: file mode uses ID-based API
+        )))
+    } else {
+        None
+    };
 
-    // Start SSE subscription task
-    let sse_handle = tokio::spawn(sse_task(
-        client.clone(),
-        server.clone(),
-        node_id.clone(),
-        file.clone(),
-        state.clone(),
-        false, // use_paths: file mode uses ID-based API
-    ));
+    // Start SSE subscription task (skip if push-only)
+    let sse_handle = if !push_only {
+        Some(tokio::spawn(sse_task(
+            client.clone(),
+            server.clone(),
+            node_id.clone(),
+            file.clone(),
+            state.clone(),
+            false, // use_paths: file mode uses ID-based API
+        )))
+    } else {
+        info!("Push-only mode: skipping SSE subscription");
+        None
+    };
 
     // Wait for Ctrl+C
     tokio::signal::ctrl_c().await?;
     info!("Shutting down...");
 
     // Cancel tasks
-    watcher_handle.abort();
-    upload_handle.abort();
-    sse_handle.abort();
+    if let Some(handle) = watcher_handle {
+        handle.abort();
+    }
+    if let Some(handle) = upload_handle {
+        handle.abort();
+    }
+    if let Some(handle) = sse_handle {
+        handle.abort();
+    }
 
     info!("Goodbye!");
     Ok(())
 }
 
 /// Run directory sync mode
+#[allow(clippy::too_many_arguments)]
 async fn run_directory_mode(
     client: Client,
     server: String,
@@ -588,9 +644,19 @@ async fn run_directory_mode(
     options: ScanOptions,
     initial_sync_strategy: String,
     use_paths: bool,
+    push_only: bool,
+    pull_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mode = if push_only {
+        "push-only"
+    } else if pull_only {
+        "pull-only"
+    } else {
+        "bidirectional"
+    };
     info!(
-        "Starting commonplace-sync (directory mode): server={}, fs-root={}, directory={}, use_paths={}",
+        "Starting commonplace-sync (directory mode, {}): server={}, fs-root={}, directory={}, use_paths={}",
+        mode,
         server,
         fs_root_id,
         directory.display(),
@@ -625,6 +691,8 @@ async fn run_directory_mode(
             &file_states,
             false,
             use_paths,
+            push_only,
+            pull_only,
         )
         .await?;
         info!("Server files pulled to local directory");
@@ -690,46 +758,62 @@ async fn run_directory_mode(
 
     info!("Initial sync complete: {} files synced", files.len());
 
-    // Start directory watcher
+    // Start directory watcher (skip if pull-only)
     let (dir_tx, mut dir_rx) = mpsc::channel::<DirEvent>(100);
-    let watcher_handle = tokio::spawn(directory_watcher_task(
-        directory.clone(),
-        dir_tx,
-        options.clone(),
-    ));
+    let watcher_handle = if !pull_only {
+        Some(tokio::spawn(directory_watcher_task(
+            directory.clone(),
+            dir_tx,
+            options.clone(),
+        )))
+    } else {
+        info!("Pull-only mode: skipping directory watcher");
+        None
+    };
 
-    // Start SSE task for fs-root (to watch for schema changes)
-    let sse_handle = tokio::spawn(directory_sse_task(
-        client.clone(),
-        server.clone(),
-        fs_root_id.clone(),
-        directory.clone(),
-        file_states.clone(),
-        use_paths,
-    ));
-
-    // Start SSE tasks for all node-backed subdirectories
-    // This allows files created in subdirectories to propagate to other sync clients
-    let node_backed_subdirs = get_all_node_backed_dir_ids(&client, &server, &fs_root_id).await;
-    info!(
-        "Found {} node-backed subdirectories to watch",
-        node_backed_subdirs.len()
-    );
-    for (subdir_path, subdir_node_id) in node_backed_subdirs {
-        info!(
-            "Spawning SSE task for node-backed subdir: {} ({})",
-            subdir_path, subdir_node_id
-        );
-        tokio::spawn(subdir_sse_task(
+    // Start SSE task for fs-root (skip if push-only)
+    let sse_handle = if !push_only {
+        Some(tokio::spawn(directory_sse_task(
             client.clone(),
             server.clone(),
             fs_root_id.clone(),
-            subdir_path,
-            subdir_node_id,
             directory.clone(),
             file_states.clone(),
             use_paths,
-        ));
+            push_only,
+            pull_only,
+        )))
+    } else {
+        info!("Push-only mode: skipping SSE subscription");
+        None
+    };
+
+    // Start SSE tasks for all node-backed subdirectories (skip if push-only)
+    // This allows files created in subdirectories to propagate to other sync clients
+    if !push_only {
+        let node_backed_subdirs = get_all_node_backed_dir_ids(&client, &server, &fs_root_id).await;
+        info!(
+            "Found {} node-backed subdirectories to watch",
+            node_backed_subdirs.len()
+        );
+        for (subdir_path, subdir_node_id) in node_backed_subdirs {
+            info!(
+                "Spawning SSE task for node-backed subdir: {} ({})",
+                subdir_path, subdir_node_id
+            );
+            tokio::spawn(subdir_sse_task(
+                client.clone(),
+                server.clone(),
+                fs_root_id.clone(),
+                subdir_path,
+                subdir_node_id,
+                directory.clone(),
+                file_states.clone(),
+                use_paths,
+                push_only,
+                pull_only,
+            ));
+        }
     }
 
     // Start file sync tasks for each file and store handles in FileSyncState
@@ -746,6 +830,8 @@ async fn run_directory_mode(
                 file_path,
                 file_state.state.clone(),
                 file_state.use_paths,
+                push_only,
+                pull_only,
             );
         }
     }
@@ -771,6 +857,8 @@ async fn run_directory_mode(
                             &options,
                             &file_states,
                             use_paths,
+                            push_only,
+                            pull_only,
                         )
                         .await;
                     }
@@ -807,8 +895,12 @@ async fn run_directory_mode(
     info!("Shutting down...");
 
     // Cancel all tasks
-    watcher_handle.abort();
-    sse_handle.abort();
+    if let Some(handle) = watcher_handle {
+        handle.abort();
+    }
+    if let Some(handle) = sse_handle {
+        handle.abort();
+    }
     dir_event_handle.abort();
 
     // Abort all per-file sync tasks
@@ -841,9 +933,19 @@ async fn run_exec_mode(
     exec_cmd: String,
     exec_args: Vec<String>,
     sandbox: bool,
+    push_only: bool,
+    pull_only: bool,
 ) -> Result<u8, Box<dyn std::error::Error>> {
+    let mode = if push_only {
+        "push-only"
+    } else if pull_only {
+        "pull-only"
+    } else {
+        "bidirectional"
+    };
     info!(
-        "Starting commonplace-sync (exec mode): server={}, fs-root={}, directory={}, exec={}",
+        "Starting commonplace-sync (exec mode, {}): server={}, fs-root={}, directory={}, exec={}",
+        mode,
         server,
         fs_root_id,
         directory.display(),
@@ -880,6 +982,8 @@ async fn run_exec_mode(
             &file_states,
             false,
             use_paths,
+            push_only,
+            pull_only,
         )
         .await?;
         info!("Server files pulled to local directory");
@@ -945,45 +1049,61 @@ async fn run_exec_mode(
 
     info!("Initial sync complete: {} files synced", files.len());
 
-    // Start directory watcher
+    // Start directory watcher (skip if pull-only)
     let (dir_tx, mut dir_rx) = mpsc::channel::<DirEvent>(100);
-    let watcher_handle = tokio::spawn(directory_watcher_task(
-        directory.clone(),
-        dir_tx,
-        options.clone(),
-    ));
+    let watcher_handle = if !pull_only {
+        Some(tokio::spawn(directory_watcher_task(
+            directory.clone(),
+            dir_tx,
+            options.clone(),
+        )))
+    } else {
+        info!("Pull-only mode: skipping directory watcher");
+        None
+    };
 
-    // Start SSE task for fs-root
-    let sse_handle = tokio::spawn(directory_sse_task(
-        client.clone(),
-        server.clone(),
-        fs_root_id.clone(),
-        directory.clone(),
-        file_states.clone(),
-        use_paths,
-    ));
-
-    // Start SSE tasks for all node-backed subdirectories
-    let node_backed_subdirs = get_all_node_backed_dir_ids(&client, &server, &fs_root_id).await;
-    info!(
-        "Found {} node-backed subdirectories to watch",
-        node_backed_subdirs.len()
-    );
-    for (subdir_path, subdir_node_id) in node_backed_subdirs {
-        info!(
-            "Spawning SSE task for node-backed subdir: {} ({})",
-            subdir_path, subdir_node_id
-        );
-        tokio::spawn(subdir_sse_task(
+    // Start SSE task for fs-root (skip if push-only)
+    let sse_handle = if !push_only {
+        Some(tokio::spawn(directory_sse_task(
             client.clone(),
             server.clone(),
             fs_root_id.clone(),
-            subdir_path,
-            subdir_node_id,
             directory.clone(),
             file_states.clone(),
             use_paths,
-        ));
+            push_only,
+            pull_only,
+        )))
+    } else {
+        info!("Push-only mode: skipping SSE subscription");
+        None
+    };
+
+    // Start SSE tasks for all node-backed subdirectories (skip if push-only)
+    if !push_only {
+        let node_backed_subdirs = get_all_node_backed_dir_ids(&client, &server, &fs_root_id).await;
+        info!(
+            "Found {} node-backed subdirectories to watch",
+            node_backed_subdirs.len()
+        );
+        for (subdir_path, subdir_node_id) in node_backed_subdirs {
+            info!(
+                "Spawning SSE task for node-backed subdir: {} ({})",
+                subdir_path, subdir_node_id
+            );
+            tokio::spawn(subdir_sse_task(
+                client.clone(),
+                server.clone(),
+                fs_root_id.clone(),
+                subdir_path,
+                subdir_node_id,
+                directory.clone(),
+                file_states.clone(),
+                use_paths,
+                push_only,
+                pull_only,
+            ));
+        }
     }
 
     // Start file sync tasks for each file
@@ -998,6 +1118,8 @@ async fn run_exec_mode(
                 file_path,
                 file_state.state.clone(),
                 file_state.use_paths,
+                push_only,
+                pull_only,
             );
         }
     }
@@ -1023,6 +1145,8 @@ async fn run_exec_mode(
                             &options,
                             &file_states,
                             use_paths,
+                            push_only,
+                            pull_only,
                         )
                         .await;
                     }
@@ -1188,8 +1312,12 @@ async fn run_exec_mode(
     info!("Shutting down sync...");
 
     // Cancel all tasks
-    watcher_handle.abort();
-    sse_handle.abort();
+    if let Some(handle) = watcher_handle {
+        handle.abort();
+    }
+    if let Some(handle) = sse_handle {
+        handle.abort();
+    }
     dir_event_handle.abort();
 
     // Abort all per-file sync tasks

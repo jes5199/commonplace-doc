@@ -415,6 +415,7 @@ async fn push_nested_schemas_recursive(
 /// When the server's fs-root schema changes (e.g., new files added by another client),
 /// this function fetches the new schema, creates any missing local files, and optionally
 /// spawns sync tasks for them.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_schema_change(
     client: &Client,
     server: &str,
@@ -423,6 +424,8 @@ pub async fn handle_schema_change(
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
     spawn_tasks: bool,
     use_paths: bool,
+    push_only: bool,
+    pull_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Fetch current schema from server (fs-root schema always uses ID-based API)
     let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
@@ -607,6 +610,8 @@ pub async fn handle_schema_change(
                                 file_path.clone(),
                                 state.clone(),
                                 use_paths,
+                                push_only,
+                                pull_only,
                             )
                         } else {
                             Vec::new()
@@ -687,6 +692,7 @@ pub async fn handle_schema_change(
 ///
 /// This task subscribes to the fs-root document's SSE stream and handles
 /// schema change events, triggering handle_schema_change to sync new files.
+#[allow(clippy::too_many_arguments)]
 pub async fn directory_sse_task(
     client: Client,
     server: String,
@@ -694,6 +700,8 @@ pub async fn directory_sse_task(
     directory: PathBuf,
     file_states: Arc<RwLock<HashMap<String, FileSyncState>>>,
     use_paths: bool,
+    push_only: bool,
+    pull_only: bool,
 ) {
     // fs-root schema subscription always uses ID-based API
     let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&fs_root_id));
@@ -738,6 +746,8 @@ pub async fn directory_sse_task(
                                 true, // spawn_tasks: true for runtime schema changes
                                 use_paths,
                                 &mut last_schema_hash,
+                                push_only,
+                                pull_only,
                             )
                             .await
                             {
@@ -786,6 +796,8 @@ pub async fn subdir_sse_task(
     directory: PathBuf,
     file_states: Arc<RwLock<HashMap<String, FileSyncState>>>,
     use_paths: bool,
+    push_only: bool,
+    pull_only: bool,
 ) {
     let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&subdir_node_id));
 
@@ -834,6 +846,8 @@ pub async fn subdir_sse_task(
                                 &file_states,
                                 true, // spawn_tasks: true for runtime schema changes
                                 use_paths,
+                                push_only,
+                                pull_only,
                             )
                             .await
                             {
@@ -880,6 +894,8 @@ async fn handle_schema_change_with_dedup(
     spawn_tasks: bool,
     use_paths: bool,
     last_schema_hash: &mut Option<String>,
+    push_only: bool,
+    pull_only: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     // Fetch current schema from server
     let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
@@ -914,6 +930,8 @@ async fn handle_schema_change_with_dedup(
         file_states,
         spawn_tasks,
         use_paths,
+        push_only,
+        pull_only,
     )
     .await?;
 
@@ -1060,6 +1078,8 @@ pub async fn handle_file_created(
     options: &ScanOptions,
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
     use_paths: bool,
+    push_only: bool,
+    pull_only: bool,
 ) {
     debug!("Directory event: file created: {}", path.display());
 
@@ -1301,6 +1321,8 @@ pub async fn handle_file_created(
             path.to_path_buf(),
             state.clone(),
             use_paths,
+            push_only,
+            pull_only,
         );
 
         // Add to file_states with task handles

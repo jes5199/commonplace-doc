@@ -837,6 +837,10 @@ pub async fn sync_single_file(
 
 /// Spawn sync tasks (watcher, upload, SSE) for a single file.
 /// Returns the task handles so they can be aborted on file deletion.
+///
+/// - push_only: Skip SSE subscription (only push local changes)
+/// - pull_only: Skip file watcher (only pull server changes)
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_file_sync_tasks(
     client: Client,
     server: String,
@@ -844,14 +848,16 @@ pub fn spawn_file_sync_tasks(
     file_path: PathBuf,
     state: Arc<RwLock<SyncState>>,
     use_paths: bool,
+    push_only: bool,
+    pull_only: bool,
 ) -> Vec<JoinHandle<()>> {
     let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
+    let mut handles = Vec::new();
 
-    vec![
-        // File watcher task
-        tokio::spawn(file_watcher_task(file_path.clone(), file_tx)),
-        // Upload task
-        tokio::spawn(upload_task(
+    // File watcher and upload tasks (skip if pull-only)
+    if !pull_only {
+        handles.push(tokio::spawn(file_watcher_task(file_path.clone(), file_tx)));
+        handles.push(tokio::spawn(upload_task(
             client.clone(),
             server.clone(),
             identifier.clone(),
@@ -859,10 +865,15 @@ pub fn spawn_file_sync_tasks(
             state.clone(),
             file_rx,
             use_paths,
-        )),
-        // SSE task
-        tokio::spawn(sse_task(
+        )));
+    }
+
+    // SSE task (skip if push-only)
+    if !push_only {
+        handles.push(tokio::spawn(sse_task(
             client, server, identifier, file_path, state, use_paths,
-        )),
-    ]
+        )));
+    }
+
+    handles
 }
