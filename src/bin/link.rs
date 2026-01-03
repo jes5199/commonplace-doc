@@ -13,7 +13,9 @@ use clap::Parser;
 use commonplace_doc::{
     cli::LinkArgs,
     fs::{DocEntry, Entry, FsSchema},
+    sync::client::push_schema_to_server,
 };
+use reqwest::Client;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,9 +31,12 @@ struct ResolvedPath {
     dirs_within_schema: Vec<String>,
     /// The filename
     filename: String,
+    /// The document ID for this schema (node_id of the containing directory)
+    doc_id: Option<String>,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = LinkArgs::parse();
 
     // Find the workspace root by searching up for .commonplace.json
@@ -75,21 +80,102 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
-    // Write all modified schemas atomically
+    // Write all modified schemas atomically and collect for server push
+    let mut schemas_to_push: Vec<(String, String)> = Vec::new(); // (doc_id, json_content)
+
     for (schema_path, schema) in &schemas_to_save {
         let temp_path = schema_path.with_extension("json.tmp");
         let new_schema_content = serde_json::to_string_pretty(schema)?;
         fs::write(&temp_path, &new_schema_content)?;
         fs::rename(&temp_path, schema_path)?;
+
+        // Determine the doc_id for this schema
+        let doc_id = get_doc_id_for_schema(&workspace_root, schema_path)?;
+        schemas_to_push.push((doc_id, new_schema_content));
     }
 
     println!(
         "Created link: {} -> {} (node_id: {})",
         target_path, source_path, node_id
     );
-    println!("Run sync to materialize the file on disk.");
+
+    // Push schemas to server
+    let client = Client::new();
+    for (doc_id, schema_json) in &schemas_to_push {
+        match push_schema_to_server(&client, &args.server, doc_id, schema_json).await {
+            Ok(()) => println!("Pushed schema to server ({})", doc_id),
+            Err(e) => eprintln!("Warning: Failed to push schema to server: {}", e),
+        }
+    }
 
     Ok(())
+}
+
+/// Determine the document ID for a schema file
+fn get_doc_id_for_schema(
+    workspace_root: &Path,
+    schema_path: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let schema_dir = schema_path
+        .parent()
+        .ok_or("Schema has no parent directory")?;
+
+    if schema_dir == workspace_root {
+        // This is the root schema - use the workspace directory name as fs_root_id
+        let dir_name = workspace_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace");
+        return Ok(dir_name.to_string());
+    }
+
+    // This is a subdirectory schema - find its node_id from the parent schema
+    let parent_schema_path = find_parent_schema(workspace_root, schema_dir)?;
+    let parent_schema_content = fs::read_to_string(&parent_schema_path)?;
+    let parent_schema: FsSchema = serde_json::from_str(&parent_schema_content)?;
+
+    let subdir_name = schema_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Cannot get subdirectory name")?;
+
+    // Look up the node_id for this subdirectory in the parent schema
+    if let Some(Entry::Dir(root)) = &parent_schema.root {
+        if let Some(entries) = &root.entries {
+            if let Some(Entry::Dir(dir)) = entries.get(subdir_name) {
+                if let Some(node_id) = &dir.node_id {
+                    return Ok(node_id.clone());
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "Could not find node_id for subdirectory {} in parent schema",
+        subdir_name
+    )
+    .into())
+}
+
+/// Find the parent schema file for a given directory
+fn find_parent_schema(
+    workspace_root: &Path,
+    dir: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut current = dir.parent().ok_or("Directory has no parent")?;
+
+    loop {
+        let schema_path = current.join(SCHEMA_FILENAME);
+        if schema_path.exists() {
+            return Ok(schema_path);
+        }
+        if current == workspace_root {
+            return Err("Could not find parent schema".into());
+        }
+        current = current
+            .parent()
+            .ok_or("Reached filesystem root without finding schema")?;
+    }
 }
 
 /// Find the workspace root by searching up the directory tree for .commonplace.json
@@ -163,6 +249,7 @@ fn resolve_schema_path(
             schema_path: root_schema_path,
             dirs_within_schema: vec![],
             filename: filename.to_string(),
+            doc_id: None, // Computed later via get_doc_id_for_schema
         });
     }
 
@@ -250,6 +337,7 @@ fn resolve_schema_path(
         schema_path,
         dirs_within_schema: remaining_dirs,
         filename: filename.to_string(),
+        doc_id: None, // Computed later via get_doc_id_for_schema
     })
 }
 

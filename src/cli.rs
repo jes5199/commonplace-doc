@@ -155,4 +155,8 @@ pub struct LinkArgs {
 
     /// Target link path (must not exist)
     pub target: PathBuf,
+
+    /// Server URL to push schema changes to (optional, defaults to http://localhost:3000)
+    #[clap(short, long, default_value = "http://localhost:3000")]
+    pub server: String,
 }
