@@ -1236,9 +1236,9 @@ pub async fn handle_file_created(
         };
 
         // Initial identifier - may be updated after schema push if not using paths
-        // Use the owning document's relative path, not the full relative path
+        // When using paths, always use the full fs-root relative path.
         let mut identifier = if use_paths {
-            owning_doc.relative_path.clone()
+            relative_path.clone()
         } else {
             format!("{}:{}", owning_doc.document_id, owning_doc.relative_path)
         };
