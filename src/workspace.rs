@@ -237,7 +237,7 @@ pub fn format_timestamp_short(ts: u64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
     let time = UNIX_EPOCH + Duration::from_millis(ts);
     let datetime: chrono::DateTime<chrono::Local> = time.into();
-    datetime.format("%Y-%m-%d").to_string()
+    datetime.format("%Y-%m-%d %H:%M").to_string()
 }
 
 /// Parse a date string into a timestamp (milliseconds since epoch).
