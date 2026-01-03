@@ -19,28 +19,6 @@
         "max_backoff_ms": 10000
       },
       "depends_on": ["server"]
-    },
-    "bartleby": {
-      "command": "/home/jes/.local/bin/uv",
-      "args": ["run", "--project", "/home/jes/bartleby", "python", "/home/jes/bartleby/bartleby.py"],
-      "cwd": "/home/jes/sandbox-workspace",
-      "restart": {
-        "policy": "always",
-        "backoff_ms": 1000,
-        "max_backoff_ms": 30000
-      },
-      "depends_on": ["sync"]
-    },
-    "text-to-telegram": {
-      "command": "/home/jes/.local/bin/uv",
-      "args": ["run", "--project", "/home/jes/text-to-telegram", "python", "-m", "text_to_telegram", "--config", "/home/jes/text-to-telegram/config.json"],
-      "cwd": "/home/jes/sandbox-workspace/text-to-telegram",
-      "restart": {
-        "policy": "always",
-        "backoff_ms": 1000,
-        "max_backoff_ms": 30000
-      },
-      "depends_on": ["sync"]
     }
   }
 }
