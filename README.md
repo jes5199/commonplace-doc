@@ -56,6 +56,41 @@ cargo fmt
 cargo clippy
 ```
 
+## CLI Tools
+
+### commonplace-ps
+
+List all processes managed by the orchestrator:
+
+```bash
+# Human-readable table
+commonplace-ps
+
+# JSON output
+commonplace-ps --json
+```
+
+Shows process name, PID, state, and working directory.
+
+### commonplace-uuid
+
+Resolve a synced file path to its UUID:
+
+```bash
+commonplace-uuid path/to/file.txt
+commonplace-uuid --json path/to/file.txt  # JSON output
+```
+
+### commonplace-link
+
+Link two files to share the same UUID:
+
+```bash
+commonplace-link source.txt target.txt
+```
+
+After linking, changes to either file sync to the other through commonplace.
+
 ## API Endpoints
 
 See `docs/API.md` for detailed request/response examples.

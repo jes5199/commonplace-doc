@@ -136,6 +136,38 @@ cargo run --bin commonplace-server -- --database ./data.redb --fs-root workspace
 cargo run --bin commonplace-sync -- --server http://localhost:3000 --node workspace --directory ./workspace
 ```
 
+### CLI Tools
+
+#### commonplace-ps
+
+List all processes managed by the orchestrator:
+
+```bash
+# Human-readable table
+commonplace-ps
+
+# JSON output
+commonplace-ps --json
+```
+
+Shows process name, PID, state, and working directory for each managed process.
+
+#### commonplace-uuid
+
+Resolve a synced file path to its UUID:
+
+```bash
+# Get UUID for a file
+commonplace-uuid path/to/file.txt
+
+# JSON output
+commonplace-uuid --json path/to/file.txt
+```
+
+#### commonplace-link
+
+Link two files to share the same UUID (see "File Linking" section below).
+
 ## Development Commands
 
 - `cargo build` - Build all binaries
