@@ -120,8 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let graph = args.graph && !args.no_graph && !args.oneline;
     let decorate = (args.decorate || graph) && !args.no_decorate;
 
-    // Fetch diffs (default on, unless --no-patch or --oneline/--graph)
-    let show_patch = !args.no_patch && !args.oneline && !graph;
+    // Fetch diffs (default on, unless --no-patch or --oneline)
+    let show_patch = !args.no_patch && !args.oneline;
     let diffs: Option<Vec<Option<String>>> = if show_patch {
         Some(compute_diffs(&client, &args.server, &uuid, &changes.changes).await?)
     } else {

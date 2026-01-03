@@ -227,7 +227,7 @@ pub struct LogArgs {
     pub stat: bool,
 
     /// Show diff/patch for each commit (default: on)
-    #[clap(short = 'p', short = 'u', long, default_value = "true", action = clap::ArgAction::SetTrue)]
+    #[clap(short = 'u', visible_short_alias = 'p', long, default_value = "true", action = clap::ArgAction::SetTrue)]
     pub patch: bool,
 
     /// Suppress diff output (summary only)
