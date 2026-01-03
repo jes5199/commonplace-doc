@@ -21,6 +21,23 @@ Each sandbox syncs a portion of the server's fs-root:
 
 The workspace directory on the host contains the authoritative structure that the sandboxes derive from.
 
+## Process Configuration Topology
+
+Each sandbox's sync scope is determined by where its `processes.json` is located. A process syncs at the directory containing its `processes.json`:
+
+```
+workspace/
+├── processes.json          ← bartleby defined here (syncs entire workspace/)
+├── bartleby/
+│   └── (no processes.json - bartleby is defined at root level)
+├── text-to-telegram/
+│   └── processes.json      ← text-to-telegram defined here (syncs only this subdirectory)
+└── tmux/
+    └── processes.json      ← file-tmux-file defined here (syncs only this subdirectory)
+```
+
+**Key principle:** If a process needs access to the entire workspace tree, define it in `workspace/processes.json`. If a process only needs its own subdirectory, define it in `workspace/<subdirectory>/processes.json`.
+
 ## UUID Link Topology
 
 Files can share the same commonplace UUID, causing them to automatically share content via CRDT sync:

@@ -1,1 +1,1 @@
-{"processes":{"bartleby":{"sandbox-exec":"/home/jes/.local/bin/uv run --project /home/jes/bartleby python /home/jes/bartleby/bartleby.py"}},"_test":"sync-test-123"}
+{"processes":{}}
