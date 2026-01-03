@@ -250,6 +250,14 @@ pub struct LogArgs {
     #[clap(long)]
     pub until: Option<String>,
 
+    /// Show commits oldest-first instead of newest-first
+    #[clap(long)]
+    pub reverse: bool,
+
+    /// Watch for new commits and output them as they arrive (implies --reverse)
+    #[clap(short = 'f', long)]
+    pub follow: bool,
+
     /// Server URL
     #[clap(long, default_value = "http://localhost:3000")]
     pub server: String,

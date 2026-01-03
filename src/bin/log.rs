@@ -13,7 +13,9 @@ use commonplace_doc::cli::LogArgs;
 use commonplace_doc::workspace::{
     format_timestamp, format_timestamp_short, parse_date, resolve_path_to_uuid,
 };
+use futures::StreamExt;
 use reqwest::Client;
+use reqwest_eventsource::{Event as SseEvent, EventSource};
 use serde::{Deserialize, Serialize};
 use std::io::{self, IsTerminal, Write};
 use std::process::{Command, Stdio};
@@ -57,6 +59,15 @@ struct ChangeStats {
     chars_removed: usize,
 }
 
+/// SSE edit event from server
+#[derive(Deserialize)]
+struct SseEditEvent {
+    #[serde(default)]
+    cid: Option<String>,
+    #[serde(default)]
+    timestamp: Option<u64>,
+}
+
 #[derive(Serialize)]
 struct LogOutput {
     uuid: String,
@@ -84,8 +95,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut changes: ChangesResponse = resp.json().await?;
 
+    // --follow implies --reverse (oldest first for watching)
+    let reverse = args.reverse || args.follow;
+
     // Reverse to show newest first (git log order) - API returns oldest first
-    changes.changes.reverse();
+    // Unless --reverse is set, then keep oldest first
+    if !reverse {
+        changes.changes.reverse();
+    }
 
     // Apply date filters
     if let Some(ref since) = args.since {
@@ -140,14 +157,95 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         decorate,
     )?;
 
-    // Use pager if interactive terminal and not disabled
-    if !args.no_pager && !args.json && io::stdout().is_terminal() {
+    // Use pager if interactive terminal and not disabled (never for --follow)
+    if !args.follow && !args.no_pager && !args.json && io::stdout().is_terminal() {
         output_with_pager(&output);
     } else {
         print!("{}", output);
+        io::stdout().flush()?;
+    }
+
+    // If --follow, subscribe to SSE and watch for new commits
+    if args.follow {
+        follow_commits(&client, &args, &uuid, graph, decorate).await?;
     }
 
     Ok(())
+}
+
+/// Watch for new commits via SSE and print them as they arrive
+async fn follow_commits(
+    client: &Client,
+    args: &LogArgs,
+    uuid: &str,
+    graph: bool,
+    decorate: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sse_url = format!("{}/sse/docs/{}", args.server, uuid);
+
+    eprintln!("Watching for new commits... (Ctrl+C to stop)");
+
+    let request_builder = client.get(&sse_url);
+    let mut es = EventSource::new(request_builder)?;
+
+    while let Some(event) = es.next().await {
+        match event {
+            Ok(SseEvent::Open) => {
+                // Connection opened
+            }
+            Ok(SseEvent::Message(msg)) => {
+                if msg.event == "edit" {
+                    // Parse the edit event to get commit info
+                    if let Ok(edit) = serde_json::from_str::<SseEditEvent>(&msg.data) {
+                        if let (Some(cid), Some(ts)) = (edit.cid, edit.timestamp) {
+                            // Create a minimal commit change for display
+                            let change = CommitChange {
+                                doc_id: uuid.to_string(),
+                                commit_id: cid,
+                                timestamp: ts,
+                                url: String::new(),
+                            };
+
+                            // Format and print the new commit
+                            let line = format_single_commit(args, &change, graph, decorate);
+                            print!("{}", line);
+                            io::stdout().flush()?;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("SSE error: {}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Format a single commit for --follow output
+fn format_single_commit(
+    args: &LogArgs,
+    change: &CommitChange,
+    graph: bool,
+    _decorate: bool,
+) -> String {
+    if args.oneline {
+        let cid_short = &change.commit_id[..12.min(change.commit_id.len())];
+        let date = format_timestamp_short(change.timestamp);
+        format!("\x1b[33m{}\x1b[0m {}\n", cid_short, date)
+    } else if graph {
+        let cid_short = &change.commit_id[..8.min(change.commit_id.len())];
+        let date = format_timestamp_short(change.timestamp);
+        format!("* \x1b[33m{}\x1b[0m {}\n| \n", cid_short, date)
+    } else {
+        format!(
+            "\x1b[33mcommit {}\x1b[0m\nDate:   {}\n\n",
+            change.commit_id,
+            format_timestamp(change.timestamp)
+        )
+    }
 }
 
 fn build_output(
