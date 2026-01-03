@@ -155,6 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &diffs,
         graph,
         decorate,
+        reverse,
     )?;
 
     // Use pager if interactive terminal and not disabled (never for --follow)
@@ -257,7 +258,14 @@ fn build_output(
     diffs: &Option<Vec<Option<String>>>,
     graph: bool,
     decorate: bool,
+    reverse: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    // HEAD is at index 0 normally, but at last index in reverse mode
+    let head_idx = if reverse {
+        changes.len().saturating_sub(1)
+    } else {
+        0
+    };
     let mut out = String::new();
 
     if args.json {
@@ -283,7 +291,7 @@ fn build_output(
         for (i, change) in changes.iter().enumerate() {
             let cid_short = &change.commit_id[..12.min(change.commit_id.len())];
             let date = format_timestamp_short(change.timestamp);
-            let decoration = if decorate && i == 0 {
+            let decoration = if decorate && i == head_idx {
                 " \x1b[36m(HEAD)\x1b[0m"
             } else {
                 ""
@@ -311,6 +319,7 @@ fn build_output(
             stats_map.as_ref(),
             diffs.as_ref(),
             decorate,
+            head_idx,
         ));
     } else {
         // Full output (like git log)
@@ -319,7 +328,7 @@ fn build_output(
         out.push('\n');
 
         for (i, change) in changes.iter().enumerate() {
-            let decoration = if decorate && i == 0 {
+            let decoration = if decorate && i == head_idx {
                 " \x1b[36m(HEAD)\x1b[0m"
             } else {
                 ""
@@ -415,6 +424,7 @@ fn build_graph_view(
     stats_map: Option<&Vec<Option<ChangeStats>>>,
     diffs: Option<&Vec<Option<String>>>,
     decorate: bool,
+    head_idx: usize,
 ) -> String {
     let mut out = String::new();
     // Simple linear graph - for now we don't have parent info
@@ -423,7 +433,7 @@ fn build_graph_view(
         let cid_short = &change.commit_id[..8.min(change.commit_id.len())];
         let date = format_timestamp_short(change.timestamp);
         let is_last = i == changes.len() - 1;
-        let decoration = if decorate && i == 0 {
+        let decoration = if decorate && i == head_idx {
             " \x1b[36m(HEAD)\x1b[0m"
         } else {
             ""
