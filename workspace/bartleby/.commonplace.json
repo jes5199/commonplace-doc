@@ -1,30 +1,35 @@
 {
-    "version": 1,
-    "root": {
-        "type": "dir",
-        "entries": {
-            "system_prompt.txt": {
-                "type": "doc",
-                "node_id": "9b4d7f6c-b227-4059-b195-d390a74f2514",
-                "content_type": "text/plain"
-            },
-            "output.txt": {
-                "type": "doc",
-                "node_id": "12504d60-2b58-43c8-b461-a42215a3954d",
-                "content_type": "text/plain"
-            },
-            "prompts.txt": {
-                "type": "doc",
-                "node_id": "702bacdf-3577-4e0f-9550-d2589d3333fa",
-                "content_type": "text/plain"
-            },
-            "processes.json": {
-                "type": "doc",
-                "node_id": "b8e2f3a1-4567-4890-abcd-ef1234567890",
-                "content_type": "application/json"
-            }
-        },
-        "node_id": null,
-        "content_type": null
-    }
+  "version": 1,
+  "root": {
+    "type": "dir",
+    "entries": {
+      "output.txt": {
+        "type": "doc",
+        "node_id": "839ba100-b599-43c5-b96b-209e0f427a14",
+        "content_type": "text/plain"
+      },
+      "processes.json": {
+        "type": "doc",
+        "node_id": "c6be6b93-6413-4a07-b089-86da5ed3c025",
+        "content_type": "application/json"
+      },
+      "system_prompt.txt": {
+        "type": "doc",
+        "node_id": "974718c4-739f-4bc6-8e9e-631730ac5bba",
+        "content_type": "text/plain"
+      },
+      "prompts.txt": {
+        "type": "doc",
+        "node_id": "b25c9b85-4981-41fe-a0b4-0e7b1abbf97b",
+        "content_type": "text/plain"
+      },
+      "history.jsonl": {
+        "type": "doc",
+        "node_id": "1f7b01d3-aafe-4dd3-9c97-6a36cec936c3",
+        "content_type": "application/x-ndjson"
+      }
+    },
+    "node_id": null,
+    "content_type": null
+  }
 }
