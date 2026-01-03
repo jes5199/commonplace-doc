@@ -1,0 +1,267 @@
+//! UUID map building and path resolution for directory sync.
+//!
+//! This module handles building maps of relative paths to UUIDs by
+//! fetching schemas from the server and traversing node-backed directories.
+
+use crate::fs::{Entry, FsSchema};
+use crate::sync::{encode_node_id, HeadResponse};
+use reqwest::Client;
+use std::collections::HashMap;
+use tracing::{debug, warn};
+
+/// Collect all file paths and their node_ids from a schema entry.
+///
+/// This is a synchronous traversal that does not follow node-backed directories.
+/// For async traversal that follows node-backed dirs, use `collect_paths_with_node_backed_dirs`.
+pub fn collect_paths_from_entry(
+    entry: &Entry,
+    prefix: &str,
+    paths: &mut Vec<(String, Option<String>)>,
+) {
+    match entry {
+        Entry::Dir(dir) => {
+            if let Some(ref entries) = dir.entries {
+                for (name, child) in entries {
+                    let child_path = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", prefix, name)
+                    };
+                    collect_paths_from_entry(child, &child_path, paths);
+                }
+            }
+        }
+        Entry::Doc(doc) => {
+            paths.push((prefix.to_string(), doc.node_id.clone()));
+        }
+    }
+}
+
+/// Fetch the node_id (UUID) for a file path from the server's schema.
+///
+/// After pushing a schema update, the server's reconciler creates documents with UUIDs.
+/// This function fetches the updated schema and looks up the UUID for the given path.
+/// Returns None if the path is not found or if the node_id is not set.
+pub async fn fetch_node_id_from_schema(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    relative_path: &str,
+) -> Option<String> {
+    // Build the full UUID map recursively (follows node-backed directories)
+    let uuid_map = build_uuid_map_recursive(client, server, fs_root_id).await;
+    uuid_map.get(relative_path).cloned()
+}
+
+/// Recursively build a map of relative paths to UUIDs by fetching all schemas.
+///
+/// This function follows node-backed directories and fetches their schemas
+/// to build a complete map of all file paths to their UUIDs.
+pub async fn build_uuid_map_recursive(
+    client: &Client,
+    server: &str,
+    doc_id: &str,
+) -> HashMap<String, String> {
+    let mut uuid_map = HashMap::new();
+    build_uuid_map_from_doc(client, server, doc_id, "", &mut uuid_map).await;
+    uuid_map
+}
+
+/// Helper function to recursively build the UUID map from a document and its children.
+#[async_recursion::async_recursion]
+pub async fn build_uuid_map_from_doc(
+    client: &Client,
+    server: &str,
+    doc_id: &str,
+    path_prefix: &str,
+    uuid_map: &mut HashMap<String, String>,
+) {
+    // Fetch the schema from this document
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(doc_id));
+    let resp = match client.get(&head_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to fetch schema for {}: {}", doc_id, e);
+            return;
+        }
+    };
+
+    if !resp.status().is_success() {
+        warn!(
+            "Failed to fetch schema: {} (status {})",
+            doc_id,
+            resp.status()
+        );
+        return;
+    }
+
+    let head: HeadResponse = match resp.json().await {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("Failed to parse schema response for {}: {}", doc_id, e);
+            return;
+        }
+    };
+
+    let schema: FsSchema = match serde_json::from_str(&head.content) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("Document {} is not a schema ({}), skipping", doc_id, e);
+            return;
+        }
+    };
+
+    // Traverse the schema and collect UUIDs
+    if let Some(ref root) = schema.root {
+        collect_paths_with_node_backed_dirs(client, server, root, path_prefix, uuid_map).await;
+    }
+}
+
+/// Recursively collect paths from an entry, following node-backed directories.
+#[async_recursion::async_recursion]
+pub async fn collect_paths_with_node_backed_dirs(
+    client: &Client,
+    server: &str,
+    entry: &Entry,
+    prefix: &str,
+    uuid_map: &mut HashMap<String, String>,
+) {
+    match entry {
+        Entry::Dir(dir) => {
+            // If this is a node-backed directory (entries: null, node_id: Some),
+            // fetch its schema and continue recursively
+            if dir.entries.is_none() {
+                if let Some(ref node_id) = dir.node_id {
+                    // This is a node-backed directory - fetch its schema
+                    build_uuid_map_from_doc(client, server, node_id, prefix, uuid_map).await;
+                }
+            } else if let Some(ref entries) = dir.entries {
+                // Inline directory - traverse its entries
+                for (name, child) in entries {
+                    let child_path = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", prefix, name)
+                    };
+                    collect_paths_with_node_backed_dirs(
+                        client,
+                        server,
+                        child,
+                        &child_path,
+                        uuid_map,
+                    )
+                    .await;
+                }
+            }
+        }
+        Entry::Doc(doc) => {
+            // This is a file - add it to the map if it has a node_id
+            if let Some(ref node_id) = doc.node_id {
+                debug!("Found UUID: {} -> {}", prefix, node_id);
+                uuid_map.insert(prefix.to_string(), node_id.clone());
+            }
+        }
+    }
+}
+
+/// Collect all node-backed directory IDs from a schema (recursively).
+///
+/// This returns a vec of (path_prefix, node_id) tuples for all directories
+/// that have a node_id (i.e., node-backed directories).
+#[async_recursion::async_recursion]
+pub async fn collect_node_backed_dir_ids(
+    client: &Client,
+    server: &str,
+    entry: &Entry,
+    prefix: &str,
+    result: &mut Vec<(String, String)>,
+) {
+    match entry {
+        Entry::Dir(dir) => {
+            if dir.entries.is_none() {
+                if let Some(ref node_id) = dir.node_id {
+                    // This is a node-backed directory - add to result
+                    result.push((prefix.to_string(), node_id.clone()));
+
+                    // Also recursively check if this subdirectory has nested node-backed dirs
+                    let url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
+                    if let Ok(resp) = client.get(&url).send().await {
+                        if resp.status().is_success() {
+                            if let Ok(head) = resp.json::<HeadResponse>().await {
+                                if let Ok(schema) = serde_json::from_str::<FsSchema>(&head.content)
+                                {
+                                    if let Some(ref root) = schema.root {
+                                        collect_node_backed_dir_ids(
+                                            client, server, root, prefix, result,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(ref entries) = dir.entries {
+                // Inline directory - traverse its entries
+                for (name, child) in entries {
+                    let child_path = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", prefix, name)
+                    };
+                    collect_node_backed_dir_ids(client, server, child, &child_path, result).await;
+                }
+            }
+        }
+        Entry::Doc(_) => {
+            // Documents are not directories, skip them
+        }
+    }
+}
+
+/// Collect all node-backed directory IDs from an fs-root document.
+///
+/// Fetches the schema and returns all (path, node_id) pairs for node-backed subdirectories.
+pub async fn get_all_node_backed_dir_ids(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+
+    let url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to fetch fs-root schema: {}", e);
+            return result;
+        }
+    };
+
+    if !resp.status().is_success() {
+        warn!("Failed to fetch fs-root: {}", resp.status());
+        return result;
+    }
+
+    let head: HeadResponse = match resp.json().await {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("Failed to parse fs-root response: {}", e);
+            return result;
+        }
+    };
+
+    let schema: FsSchema = match serde_json::from_str(&head.content) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to parse fs-root schema: {}", e);
+            return result;
+        }
+    };
+
+    if let Some(ref root) = schema.root {
+        collect_node_backed_dir_ids(client, server, root, "", &mut result).await;
+    }
+
+    result
+}

@@ -16,6 +16,7 @@ pub mod state;
 pub mod state_file;
 pub mod types;
 pub mod urls;
+pub mod uuid_map;
 pub mod watcher;
 pub mod yjs;
 
@@ -56,16 +57,18 @@ pub use client::{
     fork_node, push_file_content, push_json_content, push_jsonl_content, push_schema_to_server,
 };
 pub use dir_sync::{
-    build_uuid_map_from_doc, build_uuid_map_recursive, check_server_has_content,
-    collect_paths_from_entry, collect_paths_with_node_backed_dirs, directory_sse_task,
-    ensure_fs_root_exists, fetch_node_id_from_schema, get_all_node_backed_dir_ids,
-    handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
-    push_nested_schemas, subdir_sse_task, sync_schema, write_nested_schemas, write_schema_file,
-    SCHEMA_FILENAME,
+    check_server_has_content, directory_sse_task, ensure_fs_root_exists, handle_file_created,
+    handle_file_deleted, handle_file_modified, handle_schema_change, push_nested_schemas,
+    subdir_sse_task, sync_schema, write_nested_schemas, write_schema_file, SCHEMA_FILENAME,
 };
 pub use file_sync::{
     initial_sync, spawn_file_sync_tasks, sync_single_file, upload_task, BARRIER_RETRY_COUNT,
     BARRIER_RETRY_DELAY,
+};
+pub use uuid_map::{
+    build_uuid_map_from_doc, build_uuid_map_recursive, collect_node_backed_dir_ids,
+    collect_paths_from_entry, collect_paths_with_node_backed_dirs, fetch_node_id_from_schema,
+    get_all_node_backed_dir_ids,
 };
 
 pub use content_type::{
