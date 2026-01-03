@@ -177,22 +177,34 @@ fn build_output(
         for (i, change) in changes.iter().enumerate() {
             let cid_short = &change.commit_id[..12.min(change.commit_id.len())];
             let date = format_timestamp_short(change.timestamp);
+            let decoration = if args.decorate && i == 0 {
+                " \x1b[36m(HEAD)\x1b[0m"
+            } else {
+                ""
+            };
 
             if args.stat {
                 if let Some(ref stats_vec) = stats_map {
                     if let Some(Some(stats)) = stats_vec.get(i) {
                         out.push_str(&format!(
-                            "{} {} (+{} -{} chars)\n",
-                            cid_short, date, stats.chars_added, stats.chars_removed
+                            "\x1b[33m{}\x1b[0m{} {} (+{} -{} chars)\n",
+                            cid_short, decoration, date, stats.chars_added, stats.chars_removed
                         ));
                         continue;
                     }
                 }
             }
-            out.push_str(&format!("{} {}\n", cid_short, date));
+            out.push_str(&format!(
+                "\x1b[33m{}\x1b[0m{} {}\n",
+                cid_short, decoration, date
+            ));
         }
     } else if args.graph {
-        out.push_str(&build_graph_view(changes, stats_map.as_ref()));
+        out.push_str(&build_graph_view(
+            changes,
+            stats_map.as_ref(),
+            args.decorate,
+        ));
     } else {
         // Full output (like git log)
         out.push_str(&format!("File: {}\n", rel_path));
@@ -200,7 +212,15 @@ fn build_output(
         out.push('\n');
 
         for (i, change) in changes.iter().enumerate() {
-            out.push_str(&format!("\x1b[33mcommit {}\x1b[0m\n", change.commit_id));
+            let decoration = if args.decorate && i == 0 {
+                " \x1b[36m(HEAD)\x1b[0m"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "\x1b[33mcommit {}\x1b[0m{}\n",
+                change.commit_id, decoration
+            ));
             out.push_str(&format!("Date:   {}\n", format_timestamp(change.timestamp)));
 
             if args.stat {
@@ -286,6 +306,7 @@ fn output_with_pager(output: &str) {
 fn build_graph_view(
     changes: &[CommitChange],
     stats_map: Option<&Vec<Option<ChangeStats>>>,
+    decorate: bool,
 ) -> String {
     let mut out = String::new();
     // Simple linear graph - for now we don't have parent info
@@ -294,10 +315,18 @@ fn build_graph_view(
         let cid_short = &change.commit_id[..8.min(change.commit_id.len())];
         let date = format_timestamp_short(change.timestamp);
         let is_last = i == changes.len() - 1;
+        let decoration = if decorate && i == 0 {
+            " \x1b[36m(HEAD)\x1b[0m"
+        } else {
+            ""
+        };
 
         let connector = if is_last { "  " } else { "| " };
 
-        out.push_str(&format!("* {} {}", cid_short, date));
+        out.push_str(&format!(
+            "* \x1b[33m{}\x1b[0m{} {}",
+            cid_short, decoration, date
+        ));
 
         if let Some(stats_vec) = stats_map {
             if let Some(Some(stats)) = stats_vec.get(i) {

@@ -210,6 +210,10 @@ pub struct LogArgs {
     #[clap(long)]
     pub graph: bool,
 
+    /// Show ref-like decorations (HEAD marker) next to commits
+    #[clap(long)]
+    pub decorate: bool,
+
     /// Show change statistics (lines added/removed)
     #[clap(long)]
     pub stat: bool,
