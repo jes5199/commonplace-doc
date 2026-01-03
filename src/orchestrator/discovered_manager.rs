@@ -981,38 +981,24 @@ impl DiscoveredProcessManager {
         let mut current_schema_ids: HashSet<String> =
             discovery.schema_node_ids.iter().cloned().collect();
 
-        // Build SSE URL for watching all schema documents
-        let schema_ids_param = discovery.schema_node_ids.join(",");
-        let schemas_sse_url = format!(
-            "{}/documents/stream?doc_ids={}",
-            self.server_url, schema_ids_param
-        );
-
         // Monitor interval for checking process health
         let mut monitor_interval = tokio::time::interval(Duration::from_millis(500));
 
         // Re-discovery interval (check for new/removed processes.json files)
         let mut discovery_interval = tokio::time::interval(Duration::from_secs(30));
 
-        // Track if we need to reconnect SSE (when new schemas are discovered)
-        let mut needs_sse_reconnect = false;
-
         loop {
-            let sse_url = if needs_sse_reconnect {
-                // Rebuild SSE URL with updated schema IDs
-                let schema_ids_param: String = current_schema_ids
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(",");
-                needs_sse_reconnect = false;
-                format!(
-                    "{}/documents/stream?doc_ids={}",
-                    self.server_url, schema_ids_param
-                )
-            } else {
-                schemas_sse_url.clone()
-            };
+            // Build SSE URL from current watched state (schemas + processes.json files)
+            // Rebuilt on every reconnect to ensure we don't miss newly discovered docs
+            let mut all_ids: Vec<String> = current_schema_ids.iter().cloned().collect();
+            for node_id in watched.keys() {
+                all_ids.push(node_id.clone());
+            }
+            let all_ids_param = all_ids.join(",");
+            let sse_url = format!(
+                "{}/documents/stream?doc_ids={}",
+                self.server_url, all_ids_param
+            );
 
             let request_builder = client.get(&sse_url);
 
@@ -1042,6 +1028,7 @@ impl DiscoveredProcessManager {
                         match Self::discover_all_processes_json(client, &self.server_url, fs_root_id).await {
                             Ok(new_discovery) => {
                                 // Check for new or previously-failed processes.json files
+                                let mut added_new_pj = false;
                                 for (base_path, node_id) in &new_discovery.processes_json_files {
                                     if !watched.contains_key(node_id) {
                                         tracing::info!("[discovery] Trying processes.json at {}", base_path);
@@ -1051,6 +1038,7 @@ impl DiscoveredProcessManager {
                                                 tracing::info!("[discovery] Loaded processes from {}/processes.json", base_path);
                                                 // Only add to watched if successfully loaded
                                                 watched.insert(node_id.clone(), base_path.clone());
+                                                added_new_pj = true;
                                             }
                                             Err(e) => {
                                                 tracing::warn!("[discovery] Failed to load {}: {} (will retry)", base_path, e);
@@ -1081,20 +1069,22 @@ impl DiscoveredProcessManager {
 
                                 // Check for new schema node_ids (new directories added)
                                 let new_schema_ids: HashSet<String> = new_discovery.schema_node_ids.iter().cloned().collect();
-                                if new_schema_ids != current_schema_ids {
+                                let schema_changed = new_schema_ids != current_schema_ids;
+                                if schema_changed {
                                     let added: Vec<_> = new_schema_ids.difference(&current_schema_ids).collect();
                                     let removed: Vec<_> = current_schema_ids.difference(&new_schema_ids).collect();
-                                    if !added.is_empty() || !removed.is_empty() {
-                                        tracing::info!(
-                                            "[discovery] Schema set changed: +{} -{} directories",
-                                            added.len(),
-                                            removed.len()
-                                        );
-                                        current_schema_ids = new_schema_ids;
-                                        // Need to reconnect SSE with new doc_ids
-                                        needs_sse_reconnect = true;
-                                        sse_closed = true;
-                                    }
+                                    tracing::info!(
+                                        "[discovery] Schema set changed: +{} -{} directories",
+                                        added.len(),
+                                        removed.len()
+                                    );
+                                    current_schema_ids = new_schema_ids;
+                                }
+
+                                // Reconnect SSE if schemas changed or new processes.json added
+                                // (URL is rebuilt on each loop iteration with current watch set)
+                                if schema_changed || added_new_pj {
+                                    sse_closed = true;
                                 }
                             }
                             Err(e) => {
@@ -1118,14 +1108,31 @@ impl DiscoveredProcessManager {
                                     // Parse the commit event to get doc_id
                                     if let Ok(commit) = serde_json::from_str::<serde_json::Value>(&msg.data) {
                                         if let Some(doc_id) = commit.get("doc_id").and_then(|v| v.as_str()) {
-                                            tracing::info!(
-                                                "[discovery] Schema {} changed, re-discovering...",
-                                                doc_id
-                                            );
+                                            // Check if this is a processes.json file we're watching
+                                            if let Some(base_path) = watched.get(doc_id) {
+                                                tracing::info!(
+                                                    "[discovery] processes.json changed at {}, reconciling...",
+                                                    base_path
+                                                );
+                                                // Fetch and reconcile this specific processes.json
+                                                let url = format!("{}/docs/{}/head", self.server_url, doc_id);
+                                                let base_path = base_path.clone();
+                                                if let Err(e) = self.fetch_and_reconcile(client, &url, &base_path).await {
+                                                    tracing::error!(
+                                                        "[discovery] Failed to reconcile {}/processes.json: {}",
+                                                        base_path, e
+                                                    );
+                                                }
+                                            } else {
+                                                // It's a schema change - trigger re-discovery
+                                                tracing::info!(
+                                                    "[discovery] Schema {} changed, re-discovering...",
+                                                    doc_id
+                                                );
+                                                discovery_interval.reset();
+                                            }
                                         }
                                     }
-                                    // Trigger immediate re-discovery
-                                    discovery_interval.reset();
                                 }
                             }
                             Some(Err(e)) => {
