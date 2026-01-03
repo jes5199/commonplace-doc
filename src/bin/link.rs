@@ -32,6 +32,7 @@ struct ResolvedPath {
     /// The filename
     filename: String,
     /// The document ID for this schema (node_id of the containing directory)
+    #[allow(dead_code)]
     doc_id: Option<String>,
 }
 

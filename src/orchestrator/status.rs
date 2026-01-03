@@ -56,8 +56,7 @@ impl OrchestratorStatus {
 
     /// Write status to the status file
     pub fn write(&self) -> io::Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
         fs::write(STATUS_FILE_PATH, json)
     }
 
