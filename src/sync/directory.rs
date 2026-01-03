@@ -224,8 +224,11 @@ fn scan_dir_recursive(
                 content_info.mime_type.clone()
             };
 
-            // Look up existing node_id for this file
-            let node_id = existing_node_ids.get(&relative_path).cloned();
+            // Look up existing node_id for this file, or generate a new one
+            let node_id = existing_node_ids
+                .get(&relative_path)
+                .cloned()
+                .or_else(|| Some(uuid::Uuid::new_v4().to_string()));
 
             let doc_entry = Entry::Doc(DocEntry {
                 node_id,
@@ -693,9 +696,14 @@ mod tests {
                 panic!("Expected file1.txt to be a Doc");
             }
 
-            // file2.txt should have None (not in existing schema)
+            // file2.txt should have a generated UUID (not in existing schema, so one is created)
             if let Some(Entry::Doc(doc)) = entries.get("file2.txt") {
-                assert_eq!(doc.node_id, None);
+                assert!(
+                    doc.node_id.is_some(),
+                    "New files should get a generated UUID"
+                );
+                // Verify it's a valid UUID format
+                assert!(uuid::Uuid::parse_str(doc.node_id.as_ref().unwrap()).is_ok());
             } else {
                 panic!("Expected file2.txt to be a Doc");
             }
