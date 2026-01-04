@@ -1,524 +1,524 @@
 Session: 0
 Window: 0 (claude)
 Pane: 0
-Title: ✳ Restart Orchestrator
+Title: ✳ Pager and Reverse Flags
 ---
-     Priority: P2
-     … +24 lines (ctrl+o to expand)
-
-● Let me look at the current implementation:
+      302 -    } else {
+      303 -        // Full output (like git log)
+      304 -        out.push_str(&format!("File: {}\n", rel_path));
+      305 -        out.push_str(&format!("UUID: {}\n", uuid));
+      306 -        out.push('\n');
+      307 -
+      308 -        for (i, change) in changes.iter().enumerate() {
+      309 -            let decoration = if decorate && i == head_idx {
+      310 -                " \x1b[36m(HEAD)\x1b[0m"
+      311 -            } else {
+      312 -                ""
+      313 -            };
+      314 -            out.push_str(&format!(
+      315 -                "\x1b[33mcommit {}\x1b[0m{}\n",
+      316 -                change.commit_id, decoration
+      317 -            ));
+      318 -            out.push_str(&format!("Date:   {}\n", format_timestamp(change.timestamp)));
+      319 -
+      320 -            if args.stat {
+      321 -                if let Some(ref stats_vec) = stats_map {
+      322 -                    if let Some(Some(stats)) = stats_vec.get(i) {
+      323 -                        out.push('\n');
+      324 -                        out.push_str(&format!(
+      325 -                            " {} chars (+{}/-{}), {} lines (+{}/-{})\n",
+      326 -                            stats.chars_added + stats.chars_removed,
+      327 -                            stats.chars_added,
+      328 -                            stats.chars_removed,
+      329 -                            stats.lines_added + stats.lines_removed,
+      330 -                            stats.lines_added,
+      331 -                            stats.lines_removed
+      332 -                        ));
+      333 -                    }
+      334 -                }
+      335 -            }
+      336 -
+      337 -            // Show diff if available (default on, suppressed by --no-patch)
+      338 -            if let Some(ref diff_vec) = diffs {
+      339 -                if let Some(Some(diff)) = diff_vec.get(i) {
+      340 -                    if !diff.is_empty() {
+      341 -                        out.push('\n');
+      342 -                        out.push_str(&colorize_diff(diff));
+      343 -                    }
+      344 -                }
+      345 -            }
+      346 -
+      347 -            out.push('\n');
+      348 -        }
+      349 -
+      350 -        out.push_str(&format!("{} commits\n", changes.len()));
+      351 -    }
+      352 -
+      353 -    Ok(out)
+      354 -}
+      355 -
+      229  /// Stream output, computing diffs sequentially as we print each commit
+      230  /// Since we process in chronological order, we just track prev_content
+      231  #[allow(clippy::too_many_arguments)]
 
 ● Read(src/bin/log.rs)
-  ⎿  Read 667 lines
-
-● I see the issue. The problem is on lines 142-146 where compute_diffs fetches content for EVERY commit before any output is displayed. For a file w
-ith many commits, this causes long delays.
-
-  The fix is to:
-  1. Stream output instead of buffering everything
-  2. Compute diffs lazily as we print each commit
-  3. Show progress when computation is expensive
+  ⎿  Read 400 lines
 
 ● Update(src/bin/log.rs)
-  ⎿  Added 1 line
-      17  use reqwest::Client;
-      18  use reqwest_eventsource::{Event as SseEvent, EventSource};
-      19  use serde::{Deserialize, Serialize};
-      20 +use std::collections::HashMap;
-      21  use std::io::{self, IsTerminal, Write};
-      22  use std::process::{Command, Stdio};
-      23
+  ⎿  Removed 97 lines
+      434      Ok(None)
+      435  }
+      436
+      437 -/// Fetch content at a specific commit, using cache
+      438 -async fn fetch_content(
+      439 -    client: &Client,
+      440 -    server: &str,
+      441 -    uuid: &str,
+      442 -    commit_id: &str,
+      443 -    cache: &mut HashMap<String, String>,
+      444 -) -> Result<Option<String>, Box<dyn std::error::Error>> {
+      445 -    if let Some(content) = cache.get(commit_id) {
+      446 -        return Ok(Some(content.clone()));
+      447 -    }
+      448 -
+      449 -    let url = format!("{}/docs/{}/head?at_commit={}", server, uuid, commit_id);
+      450 -    match client.get(&url).send().await {
+      451 -        Ok(resp) if resp.status().is_success() => {
+      452 -            if let Ok(head) = resp.json::<HeadResponse>().await {
+      453 -                if let Some(content) = head.content {
+      454 -                    cache.insert(commit_id.to_string(), content.clone());
+      455 -                    return Ok(Some(content));
+      456 -                }
+      457 -            }
+      458 -        }
+      459 -        _ => {}
+      460 -    }
+      461 -    Ok(None)
+      462 -}
+      463 -
+      464 -/// Compute diff for a single commit
+      465 -async fn compute_single_diff(
+      466 -    client: &Client,
+      467 -    server: &str,
+      468 -    uuid: &str,
+      469 -    change: &CommitChange,
+      470 -    parent_map: &HashMap<String, Option<String>>,
+      471 -    cache: &mut HashMap<String, String>,
+      472 -) -> Result<Option<String>, Box<dyn std::error::Error>> {
+      473 -    // Fetch current commit content
+      474 -    let current = fetch_content(client, server, uuid, &change.commit_id, cache).await?;
+      475 -
+      476 -    // Get parent commit ID and fetch its content
+      477 -    let parent_id = parent_map.get(&change.commit_id).and_then(|p| p.clone());
+      478 -    let parent_content = if let Some(ref pid) = parent_id {
+      479 -        fetch_content(client, server, uuid, pid, cache).await?
+      480 -    } else {
+      481 -        None
+      482 -    };
+      483 -
+      484 -    match (current, parent_content) {
+      485 -        (Some(curr), Some(prev)) => Ok(Some(compute_unified_diff(&prev, &curr))),
+      486 -        (Some(curr), None) => {
+      487 -            // First commit - show all as additions
+      488 -            Ok(Some(
+      489 -                curr.lines()
+      490 -                    .map(|l| format!("+{}", l))
+      491 -                    .collect::<Vec<_>>()
+      492 -                    .join("\n"),
+      493 -            ))
+      494 -        }
+      495 -        _ => Ok(None),
+      496 -    }
+      497 -}
+      498 -
+      499 -/// Compute stats for a single commit
+      500 -async fn compute_single_stats(
+      501 -    client: &Client,
+      502 -    server: &str,
+      503 -    uuid: &str,
+      504 -    change: &CommitChange,
+      505 -    parent_map: &HashMap<String, Option<String>>,
+      506 -    cache: &mut HashMap<String, String>,
+      507 -) -> Result<Option<ChangeStats>, Box<dyn std::error::Error>> {
+      508 -    // Fetch current commit content
+      509 -    let current = fetch_content(client, server, uuid, &change.commit_id, cache).await?;
+      510 -
+      511 -    // Get parent commit ID and fetch its content
+      512 -    let parent_id = parent_map.get(&change.commit_id).and_then(|p| p.clone());
+      513 -    let parent_content = if let Some(ref pid) = parent_id {
+      514 -        fetch_content(client, server, uuid, pid, cache).await?
+      515 -    } else {
+      516 -        None
+      517 -    };
+      518 -
+      519 -    match (current, parent_content) {
+      520 -        (Some(curr), Some(prev)) => Ok(Some(compute_diff_stats(&prev, &curr))),
+      521 -        (Some(curr), None) => {
+      522 -            // First commit - all additions
+      523 -            Ok(Some(ChangeStats {
+      524 -                lines_added: curr.lines().count(),
+      525 -                lines_removed: 0,
+      526 -                chars_added: curr.len(),
+      527 -                chars_removed: 0,
+      528 -            }))
+      529 -        }
+      530 -        _ => Ok(None),
+      531 -    }
+      532 -}
+      533 -
+      437  fn colorize_diff(diff: &str) -> String {
+      438      let mut out = String::new();
+      439      for line in diff.lines() {
 
-● Now let me refactor the main function to stream output:
-
-● Update(src/bin/log.rs)
-  ⎿  Added 61 lines, removed 27 lines
-      127          changes.changes.truncate(max);
-      128      }
-      129
-      130 -    // Compute stats if requested
-      131 -    let stats_map: Option<Vec<Option<ChangeStats>>> = if args.stat {
-      132 -        Some(compute_stats(&client, &args.server, &uuid, &changes.changes).await?)
-      133 -    } else {
-      134 -        None
-      135 -    };
-      136 -
-      130      // Apply opt-out flags
-      131      let graph = args.graph && !args.no_graph && !args.oneline;
-      132      let decorate = (args.decorate || graph) && !args.no_decorate;
-      133
-      134 -    // Fetch diffs (default on, unless --no-patch or --oneline)
-      134 +    // Determine if we need diffs (default on, unless --no-patch or --oneline)
-      135      let show_patch = !args.no_patch && !args.oneline;
-      136 -    let diffs: Option<Vec<Option<String>>> = if show_patch {
-      137 -        Some(compute_diffs(&client, &args.server, &uuid, &changes.changes).await?)
-      136 +
-      137 +    // Determine if we should use pager (interactive terminal, not disabled, not --follow)
-      138 +    let use_pager = !args.follow && !args.no_pager && !args.json && io::stdout().is_terminal();
-      139 +
-      140 +    // HEAD is at index 0 normally, but at last index in reverse mode
-      141 +    let head_idx = if reverse {
-      142 +        changes.changes.len().saturating_sub(1)
-      143      } else {
-      144 -        None
-      144 +        0
-      145      };
-      146
-      147 -    // Build output string
-      148 -    let output = build_output(
-      149 -        &args,
-      150 -        &rel_path,
-      151 -        &uuid,
-      152 -        &changes.changes,
-      153 -        &stats_map,
-      154 -        &diffs,
-      155 -        graph,
-      156 -        decorate,
-      157 -        reverse,
-      158 -    )?;
-      147 +    if use_pager {
-      148 +        // For pager mode, we need to buffer all output
-      149 +        // Compute stats and diffs eagerly (with progress for large histories)
-      150 +        let stats_map: Option<Vec<Option<ChangeStats>>> = if args.stat {
-      151 +            if changes.changes.len() > 20 {
-      152 +                eprint!("Computing stats for {} commits...", changes.changes.len());
-      153 +            }
-      154 +            let result = compute_stats(&client, &args.server, &uuid, &changes.changes).await?;
-      155 +            if changes.changes.len() > 20 {
-      156 +                eprintln!(" done");
-      157 +            }
-      158 +            Some(result)
-      159 +        } else {
-      160 +            None
-      161 +        };
-      162
-      163 -    // Use pager if interactive terminal and not disabled (never for --follow)
-      164 -    if !args.follow && !args.no_pager && !args.json && io::stdout().is_terminal() {
-      163 +        let diffs: Option<Vec<Option<String>>> = if show_patch {
-      164 +            if changes.changes.len() > 20 {
-      165 +                eprint!("Computing diffs for {} commits...", changes.changes.len());
-      166 +            }
-      167 +            let result = compute_diffs(&client, &args.server, &uuid, &changes.changes).await?;
-      168 +            if changes.changes.len() > 20 {
-      169 +                eprintln!(" done");
-      170 +            }
-      171 +            Some(result)
-      172 +        } else {
-      173 +            None
-      174 +        };
-      175 +
-      176 +        let output = build_output(
-      177 +            &args,
-      178 +            &rel_path,
-      179 +            &uuid,
-      180 +            &changes.changes,
-      181 +            &stats_map,
-      182 +            &diffs,
-      183 +            graph,
-      184 +            decorate,
-      185 +            reverse,
-      186 +        )?;
-      187          output_with_pager(&output);
-      188      } else {
-      189 -        print!("{}", output);
-      190 -        io::stdout().flush()?;
-      189 +        // Streaming mode: output each commit as we compute its diff
-      190 +        stream_output(
-      191 +            &client,
-      192 +            &args,
-      193 +            &rel_path,
-      194 +            &uuid,
-      195 +            &changes.changes,
-      196 +            show_patch,
-      197 +            graph,
-      198 +            decorate,
-      199 +            head_idx,
-      200 +        )
-      201 +        .await?;
-      202      }
-      203
-      204      // If --follow, subscribe to SSE and watch for new commits
-
-● Now I need to add the stream_output function and a helper to fetch content. Let me add them:
+● Read(src/bin/log.rs)
+  ⎿  Read 250 lines
 
 ● Update(src/bin/log.rs)
-  ⎿  Added 276 lines
-      411      Ok(out)
-      412  }
-      413
-      414 +/// Stream output, computing diffs lazily as we print each commit
-      415 +#[allow(clippy::too_many_arguments)]
-      416 +async fn stream_output(
-      417 +    client: &Client,
-      418 +    args: &LogArgs,
-      419 +    rel_path: &str,
-      420 +    uuid: &str,
-      421 +    changes: &[CommitChange],
-      422 +    show_patch: bool,
-      423 +    graph: bool,
-      424 +    decorate: bool,
-      425 +    head_idx: usize,
-      426 +) -> Result<(), Box<dyn std::error::Error>> {
-      427 +    let stdout = io::stdout();
-      428 +    let mut out = stdout.lock();
-      429 +
-      430 +    // JSON mode: still need to buffer for valid JSON
-      431 +    if args.json {
-      432 +        // For JSON, we need all data upfront - fall back to buffered mode
-      433 +        let stats_map: Option<Vec<Option<ChangeStats>>> = if args.stat {
-      434 +            Some(compute_stats(client, &args.server, uuid, changes).await?)
-      435 +        } else {
-      436 +            None
-      437 +        };
-      438 +
-      439 +        let commits: Vec<CommitInfo> = changes
-      440 +            .iter()
-      441 +            .enumerate()
-      442 +            .map(|(i, c)| CommitInfo {
-      443 +                cid: c.commit_id.clone(),
-      444 +                timestamp: c.timestamp,
-      445 +                datetime: format_timestamp(c.timestamp),
-      446 +                stats: stats_map.as_ref().and_then(|m| m.get(i).cloned().flatten()),
-      447 +            })
-      448 +            .collect();
-      449 +
-      450 +        let output = LogOutput {
-      451 +            uuid: uuid.to_string(),
-      452 +            path: rel_path.to_string(),
-      453 +            commits,
-      454 +        };
-      455 +        writeln!(out, "{}", serde_json::to_string_pretty(&output)?)?;
-      456 +        return Ok(());
-      457 +    }
-      458 +
-      459 +    // Build parent map for diff computation (previous commit by timestamp)
-      460 +    let mut sorted_by_time: Vec<(usize, &CommitChange)> = changes.iter().enumerate().collect();
-      461 +    sorted_by_time.sort_by_key(|(_, c)| c.timestamp);
-      462 +
-      463 +    let mut parent_map: HashMap<String, Option<String>> = HashMap::new();
-      464 +    for i in 0..sorted_by_time.len() {
-      465 +        let (_, change) = sorted_by_time[i];
-      466 +        let parent = if i > 0 {
-      467 +            Some(sorted_by_time[i - 1].1.commit_id.clone())
-      468 +        } else {
-      469 +            None
-      470 +        };
-      471 +        parent_map.insert(change.commit_id.clone(), parent);
-      472 +    }
-      473 +
-      474 +    // Content cache to avoid re-fetching
-      475 +    let mut content_cache: HashMap<String, String> = HashMap::new();
-      476 +
-      477 +    // Print header for full output mode
-      478 +    if !args.oneline && !graph {
-      479 +        writeln!(out, "File: {}", rel_path)?;
-      480 +        writeln!(out, "UUID: {}", uuid)?;
-      481 +        writeln!(out)?;
-      482 +    }
-      483 +
-      484 +    for (i, change) in changes.iter().enumerate() {
-      485 +        let decoration = if decorate && i == head_idx {
-      486 +            " \x1b[36m(HEAD)\x1b[0m"
-      487 +        } else {
-      488 +            ""
-      489 +        };
-      490 +
-      491 +        // Compute stats if needed
-      492 +        let stats = if args.stat {
-      493 +            compute_single_stats(client, &args.server, uuid, change, &parent_map, &mut content_cache)
-      494 +                .await
-      495 +                .ok()
-      496 +                .flatten()
-      497 +        } else {
-      498 +            None
-      499 +        };
-      500 +
-      501 +        // Compute diff if needed
-      502 +        let diff = if show_patch {
-      503 +            compute_single_diff(client, &args.server, uuid, change, &parent_map, &mut content_cache)
-      504 +                .await
-      505 +                .ok()
-      506 +                .flatten()
-      507 +        } else {
-      508 +            None
-      509 +        };
-      510 +
-      511 +        // Format and output this commit
-      512 +        if args.oneline {
-      513 +            let cid_short = &change.commit_id[..12.min(change.commit_id.len())];
-      514 +            let date = format_timestamp_short(change.timestamp);
-      515 +            if let Some(ref s) = stats {
-      516 +                writeln!(
-      517 +                    out,
-      518 +                    "\x1b[33m{}\x1b[0m{} {} (+{} -{} chars)",
-      519 +                    cid_short, decoration, date, s.chars_added, s.chars_removed
-      520 +                )?;
-      521 +            } else {
-      522 +                writeln!(out, "\x1b[33m{}\x1b[0m{} {}", cid_short, decoration, date)?;
-      523 +            }
-      524 +        } else if graph {
-      525 +            let cid_short = &change.commit_id[..8.min(change.commit_id.len())];
-      526 +            let date = format_timestamp_short(change.timestamp);
-      527 +            let is_last = i == changes.len() - 1;
-      528 +            let connector = if is_last { "  " } else { "| " };
-      529 +
-      530 +            write!(
-      531 +                out,
-      532 +                "* \x1b[33m{}\x1b[0m{} {}",
-      533 +                cid_short, decoration, date
-      534 +            )?;
-      535 +            if let Some(ref s) = stats {
-      536 +                write!(out, " (+{} -{} chars)", s.chars_added, s.chars_removed)?;
-      537 +            }
-      538 +            writeln!(out)?;
-      539 +
-      540 +            if let Some(ref d) = diff {
-      541 +                if !d.is_empty() {
-      542 +                    for line in colorize_diff(d).lines() {
-      543 +                        writeln!(out, "{} {}", connector, line)?;
-      544 +                    }
-      545 +                }
-      546 +            }
-      547 +            if !is_last {
-      548 +                writeln!(out, "{}", connector)?;
-      549 +            }
-      550 +        } else {
-      551 +            // Full output
-      552 +            writeln!(
-      553 +                out,
-      554 +                "\x1b[33mcommit {}\x1b[0m{}",
-      555 +                change.commit_id, decoration
-      556 +            )?;
-      557 +            writeln!(out, "Date:   {}", format_timestamp(change.timestamp))?;
-      558 +
-      559 +            if let Some(ref s) = stats {
-      560 +                writeln!(out)?;
-      561 +                writeln!(
-      562 +                    out,
-      563 +                    " {} chars (+{}/-{}), {} lines (+{}/-{})",
-      564 +                    s.chars_added + s.chars_removed,
-      565 +                    s.chars_added,
-      566 +                    s.chars_removed,
-      567 +                    s.lines_added + s.lines_removed,
-      568 +                    s.lines_added,
-      569 +                    s.lines_removed
-      570 +                )?;
-      571 +            }
-      572 +
-      573 +            if let Some(ref d) = diff {
-      574 +                if !d.is_empty() {
-      575 +                    writeln!(out)?;
-      576 +                    write!(out, "{}", colorize_diff(d))?;
-      577 +                }
-      578 +            }
-      579 +
-      580 +            writeln!(out)?;
-      581 +        }
-      582 +
-      583 +        out.flush()?;
-      584 +    }
-      585 +
-      586 +    if !args.oneline && !graph {
-      587 +        writeln!(out, "{} commits", changes.len())?;
-      588 +    }
-      589 +
-      590 +    Ok(())
-      591 +}
-      592 +
-      593 +/// Fetch content at a specific commit, using cache
-      594 +async fn fetch_content(
-      595 +    client: &Client,
-      596 +    server: &str,
-      597 +    uuid: &str,
-      598 +    commit_id: &str,
-      599 +    cache: &mut HashMap<String, String>,
-      600 +) -> Result<Option<String>, Box<dyn std::error::Error>> {
-      601 +    if let Some(content) = cache.get(commit_id) {
-      602 +        return Ok(Some(content.clone()));
-      603 +    }
-      604 +
-      605 +    let url = format!("{}/docs/{}/head?at_commit={}", server, uuid, commit_id);
-      606 +    match client.get(&url).send().await {
-      607 +        Ok(resp) if resp.status().is_success() => {
-      608 +            if let Ok(head) = resp.json::<HeadResponse>().await {
-      609 +                if let Some(content) = head.content {
-      610 +                    cache.insert(commit_id.to_string(), content.clone());
-      611 +                    return Ok(Some(content));
-      612 +                }
-      613 +            }
-      614 +        }
-      615 +        _ => {}
-      616 +    }
-      617 +    Ok(None)
-      618 +}
-      619 +
-      620 +/// Compute diff for a single commit
-      621 +async fn compute_single_diff(
-      622 +    client: &Client,
-      623 +    server: &str,
-      624 +    uuid: &str,
-      625 +    change: &CommitChange,
-      626 +    parent_map: &HashMap<String, Option<String>>,
-      627 +    cache: &mut HashMap<String, String>,
-      628 +) -> Result<Option<String>, Box<dyn std::error::Error>> {
-      629 +    // Fetch current commit content
-      630 +    let current = fetch_content(client, server, uuid, &change.commit_id, cache).await?;
-      631 +
-      632 +    // Get parent commit ID and fetch its content
-      633 +    let parent_id = parent_map.get(&change.commit_id).and_then(|p| p.clone());
-      634 +    let parent_content = if let Some(ref pid) = parent_id {
-      635 +        fetch_content(client, server, uuid, pid, cache).await?
-      636 +    } else {
-      637 +        None
-      638 +    };
-      639 +
-      640 +    match (current, parent_content) {
-      641 +        (Some(curr), Some(prev)) => Ok(Some(compute_unified_diff(&prev, &curr))),
-      642 +        (Some(curr), None) => {
-      643 +            // First commit - show all as additions
-      644 +            Ok(Some(
-      645 +                curr.lines()
-      646 +                    .map(|l| format!("+{}", l))
-      647 +                    .collect::<Vec<_>>()
-      648 +                    .join("\n"),
-      649 +            ))
-      650 +        }
-      651 +        _ => Ok(None),
-      652 +    }
-      653 +}
-      654 +
-      655 +/// Compute stats for a single commit
-      656 +async fn compute_single_stats(
-      657 +    client: &Client,
-      658 +    server: &str,
-      659 +    uuid: &str,
-      660 +    change: &CommitChange,
-      661 +    parent_map: &HashMap<String, Option<String>>,
-      662 +    cache: &mut HashMap<String, String>,
-      663 +) -> Result<Option<ChangeStats>, Box<dyn std::error::Error>> {
-      664 +    // Fetch current commit content
-      665 +    let current = fetch_content(client, server, uuid, &change.commit_id, cache).await?;
-      666 +
-      667 +    // Get parent commit ID and fetch its content
-      668 +    let parent_id = parent_map.get(&change.commit_id).and_then(|p| p.clone());
-      669 +    let parent_content = if let Some(ref pid) = parent_id {
-      670 +        fetch_content(client, server, uuid, pid, cache).await?
-      671 +    } else {
-      672 +        None
-      673 +    };
-      674 +
-      675 +    match (current, parent_content) {
-      676 +        (Some(curr), Some(prev)) => Ok(Some(compute_diff_stats(&prev, &curr))),
-      677 +        (Some(curr), None) => {
-      678 +            // First commit - all additions
-      679 +            Ok(Some(ChangeStats {
-      680 +                lines_added: curr.lines().count(),
-      681 +                lines_removed: 0,
-      682 +                chars_added: curr.len(),
-      683 +                chars_removed: 0,
-      684 +            }))
-      685 +        }
-      686 +        _ => Ok(None),
-      687 +    }
-      688 +}
-      689 +
-      690  fn colorize_diff(diff: &str) -> String {
-      691      let mut out = String::new();
-      692      for line in diff.lines() {
+  ⎿  Removed 143 lines
+      451      out
+      452  }
+      453
+      454 -fn output_with_pager(output: &str) {
+      455 -    // Try PAGER env var, then less, then more
+      456 -    let pager = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
+      457 -
+      458 -    // Build pager command with -R for color support
+      459 -    let mut cmd = if pager.contains("less") {
+      460 -        let mut c = Command::new(&pager);
+      461 -        c.arg("-R"); // Enable raw control codes for colors
+      462 -        c
+      463 -    } else {
+      464 -        Command::new(&pager)
+      465 -    };
+      466 -
+      467 -    match cmd.stdin(Stdio::piped()).spawn() {
+      468 -        Ok(mut child) => {
+      469 -            if let Some(mut stdin) = child.stdin.take() {
+      470 -                let _ = stdin.write_all(output.as_bytes());
+      471 -            }
+      472 -            let _ = child.wait();
+      473 -        }
+      474 -        Err(_) => {
+      475 -            // Fall back to direct output
+      476 -            print!("{}", output);
+      477 -        }
+      478 -    }
+      479 -}
+      480 -
+      481 -fn build_graph_view(
+      482 -    changes: &[CommitChange],
+      483 -    stats_map: Option<&Vec<Option<ChangeStats>>>,
+      484 -    diffs: Option<&Vec<Option<String>>>,
+      485 -    decorate: bool,
+      486 -    head_idx: usize,
+      487 -) -> String {
+      488 -    let mut out = String::new();
+      489 -    // Simple linear graph - for now we don't have parent info
+      490 -    // Full graph would need to fetch commit parents from server
+      491 -    for (i, change) in changes.iter().enumerate() {
+      492 -        let cid_short = &change.commit_id[..8.min(change.commit_id.len())];
+      493 -        let date = format_timestamp_short(change.timestamp);
+      494 -        let is_last = i == changes.len() - 1;
+      495 -        let decoration = if decorate && i == head_idx {
+      496 -            " \x1b[36m(HEAD)\x1b[0m"
+      497 -        } else {
+      498 -            ""
+      499 -        };
+      500 -
+      501 -        let connector = if is_last { "  " } else { "| " };
+      502 -
+      503 -        out.push_str(&format!(
+      504 -            "* \x1b[33m{}\x1b[0m{} {}",
+      505 -            cid_short, decoration, date
+      506 -        ));
+      507 -
+      508 -        if let Some(stats_vec) = stats_map {
+      509 -            if let Some(Some(stats)) = stats_vec.get(i) {
+      510 -                out.push_str(&format!(
+      511 -                    " (+{} -{} chars)",
+      512 -                    stats.chars_added, stats.chars_removed
+      513 -                ));
+      514 -            }
+      515 -        }
+      516 -        out.push('\n');
+      517 -
+      518 -        // Show diff if available
+      519 -        if let Some(diff_vec) = diffs {
+      520 -            if let Some(Some(diff)) = diff_vec.get(i) {
+      521 -                if !diff.is_empty() {
+      522 -                    for line in colorize_diff(diff).lines() {
+      523 -                        out.push_str(&format!("{} {}\n", connector, line));
+      524 -                    }
+      525 -                }
+      526 -            }
+      527 -        }
+      528 -
+      529 -        if !is_last {
+      530 -            out.push_str(&format!("{}\n", connector));
+      531 -        }
+      532 -    }
+      533 -    out
+      534 -}
+      535 -
+      536 -async fn compute_stats(
+      537 -    client: &Client,
+      538 -    server: &str,
+      539 -    uuid: &str,
+      540 -    changes: &[CommitChange],
+      541 -) -> Result<Vec<Option<ChangeStats>>, Box<dyn std::error::Error>> {
+      542 -    let mut result = Vec::with_capacity(changes.len());
+      543 -
+      544 -    // We need content at each commit and the previous one to compute diffs
+      545 -    // For efficiency, we'll fetch content sequentially and diff with previous
+      546 -    let mut prev_content: Option<String> = None;
+      547 -
+      548 -    // Sort by timestamp to process chronologically
+      549 -    let mut sorted_indices: Vec<usize> = (0..changes.len()).collect();
+      550 -    sorted_indices.sort_by_key(|&i| changes[i].timestamp);
+      551 -
+      552 -    // Map from original index to stats
+      553 -    let mut stats_by_index: std::collections::HashMap<usize, ChangeStats> =
+      554 -        std::collections::HashMap::new();
+      555 -
+      556 -    for &orig_idx in &sorted_indices {
+      557 -        let change = &changes[orig_idx];
+      558 -        let url = format!(
+      559 -            "{}/docs/{}/head?at_commit={}",
+      560 -            server, uuid, change.commit_id
+      561 -        );
+      562 -
+      563 -        match client.get(&url).send().await {
+      564 -            Ok(resp) if resp.status().is_success() => {
+      565 -                if let Ok(head) = resp.json::<HeadResponse>().await {
+      566 -                    if let Some(content) = head.content {
+      567 -                        let stats = if let Some(ref prev) = prev_content {
+      568 -                            compute_diff_stats(prev, &content)
+      569 -                        } else {
+      570 -                            // First commit - all additions
+      571 -                            ChangeStats {
+      572 -                                lines_added: content.lines().count(),
+      573 -                                lines_removed: 0,
+      574 -                                chars_added: content.len(),
+      575 -                                chars_removed: 0,
+      576 -                            }
+      577 -                        };
+      578 -                        stats_by_index.insert(orig_idx, stats);
+      579 -                        prev_content = Some(content);
+      580 -                    }
+      581 -                }
+      582 -            }
+      583 -            _ => {
+      584 -                // Skip commits we can't fetch
+      585 -            }
+      586 -        }
+      587 -    }
+      588 -
+      589 -    // Build result in original order
+      590 -    for i in 0..changes.len() {
+      591 -        result.push(stats_by_index.remove(&i));
+      592 -    }
+      593 -
+      594 -    Ok(result)
+      595 -}
+      596 -
+      454  fn compute_diff_stats(old: &str, new: &str) -> ChangeStats {
+      455      // Simple line-based diff stats
+      456      let old_lines: std::collections::HashSet<&str> = old.lines().collect();
 
-● Let me build and run clippy to check for issues:
+● Read(src/bin/log.rs)
+  ⎿  Read 100 lines
 
-● Bash(cargo clippy --bin commonplace-log 2>&1)
+● Update(src/bin/log.rs)
+  ⎿  Removed 59 lines
+      479      }
+      480  }
+      481
+      482 -async fn compute_diffs(
+      483 -    client: &Client,
+      484 -    server: &str,
+      485 -    uuid: &str,
+      486 -    changes: &[CommitChange],
+      487 -) -> Result<Vec<Option<String>>, Box<dyn std::error::Error>> {
+      488 -    let mut result = Vec::with_capacity(changes.len());
+      489 -
+      490 -    // We need content at each commit and the previous one to compute diffs
+      491 -    let mut prev_content: Option<String> = None;
+      492 -
+      493 -    // Sort by timestamp to process chronologically (oldest first)
+      494 -    let mut sorted_indices: Vec<usize> = (0..changes.len()).collect();
+      495 -    sorted_indices.sort_by_key(|&i| changes[i].timestamp);
+      496 -
+      497 -    // Map from original index to diff
+      498 -    let mut diffs_by_index: std::collections::HashMap<usize, String> =
+      499 -        std::collections::HashMap::new();
+      500 -
+      501 -    for &orig_idx in &sorted_indices {
+      502 -        let change = &changes[orig_idx];
+      503 -        let url = format!(
+      504 -            "{}/docs/{}/head?at_commit={}",
+      505 -            server, uuid, change.commit_id
+      506 -        );
+      507 -
+      508 -        match client.get(&url).send().await {
+      509 -            Ok(resp) if resp.status().is_success() => {
+      510 -                if let Ok(head) = resp.json::<HeadResponse>().await {
+      511 -                    if let Some(content) = head.content {
+      512 -                        let diff = if let Some(ref prev) = prev_content {
+      513 -                            compute_unified_diff(prev, &content)
+      514 -                        } else {
+      515 -                            // First commit - show all as additions
+      516 -                            content
+      517 -                                .lines()
+      518 -                                .map(|l| format!("+{}", l))
+      519 -                                .collect::<Vec<_>>()
+      520 -                                .join("\n")
+      521 -                        };
+      522 -                        diffs_by_index.insert(orig_idx, diff);
+      523 -                        prev_content = Some(content);
+      524 -                    }
+      525 -                }
+      526 -            }
+      527 -            _ => {
+      528 -                // Skip commits we can't fetch
+      529 -            }
+      530 -        }
+      531 -    }
+      532 -
+      533 -    // Build result in original order (newest first)
+      534 -    for i in 0..changes.len() {
+      535 -        result.push(diffs_by_index.remove(&i));
+      536 -    }
+      537 -
+      538 -    Ok(result)
+      539 -}
+      540 -
+      482  fn compute_unified_diff(old: &str, new: &str) -> String {
+      483      // Simple unified diff format
+      484      let old_lines: Vec<&str> = old.lines().collect();
+
+● Now let me check for remaining issues and update the CLI to remove the --reverse flag:
+
+● Bash(cargo clippy --bin commonplace-log 2>&1) timeout: 1m 0s
+  ⎿  Error: Exit code 101
+         Checking commonplace-doc v0.1.0 (/home/jes/commonplace)
+     error[E0425]: cannot find function `compute_stats` in this scope
+        --> src/bin/log.rs:250:18
+         |
+     250 |             Some(compute_stats(client, &args.server, uuid, changes).await?)
+         |                  ^^^^^^^^^^^^^ not found in this scope
+
+     For more information about this error, try `rustc --explain E0425`.
+     error: could not compile `commonplace-doc` (bin "commonplace-log") due to 1 previous error
+
+● Read(src/bin/log.rs)
+  ⎿  Read 80 lines
+
+● I need to fix the JSON mode to compute stats inline:
+
+● Update(src/bin/log.rs)
+  ⎿  Added 34 lines, removed 17 lines
+      243      let stdout = io::stdout();
+      244      let mut out = stdout.lock();
+      245
+      246 -    // JSON mode: still need to buffer for valid JSON
+      246 +    // JSON mode: compute stats inline and buffer for valid JSON
+      247      if args.json {
+      248 -        // For JSON, we need all data upfront - fall back to buffered mode
+      249 -        let stats_map: Option<Vec<Option<ChangeStats>>> = if args.stat {
+      250 -            Some(compute_stats(client, &args.server, uuid, changes).await?)
+      251 -        } else {
+      252 -            None
+      253 -        };
+      248 +        let mut commits = Vec::with_capacity(changes.len());
+      249 +        let mut prev_content: Option<String> = None;
+      250
+      251 -        let commits: Vec<CommitInfo> = changes
+      252 -            .iter()
+      253 -            .enumerate()
+      254 -            .map(|(i, c)| CommitInfo {
+      255 -                cid: c.commit_id.clone(),
+      256 -                timestamp: c.timestamp,
+      257 -                datetime: format_timestamp(c.timestamp),
+      258 -                stats: stats_map.as_ref().and_then(|m| m.get(i).cloned().flatten()),
+      259 -            })
+      260 -            .collect();
+      251 +        for change in changes {
+      252 +            let stats = if args.stat {
+      253 +                if let Some(content) =
+      254 +                    fetch_commit_content(client, &args.server, uuid, &change.commit_id).await?
+      255 +                {
+      256 +                    let s = if let Some(ref prev) = prev_content {
+      257 +                        compute_diff_stats(prev, &content)
+      258 +                    } else {
+      259 +                        ChangeStats {
+      260 +                            lines_added: content.lines().count(),
+      261 +                            lines_removed: 0,
+      262 +                            chars_added: content.len(),
+      263 +                            chars_removed: 0,
+      264 +                        }
+      265 +                    };
+      266 +                    prev_content = Some(content);
+      267 +                    Some(s)
+      268 +                } else {
+      269 +                    None
+      270 +                }
+      271 +            } else {
+      272 +                None
+      273 +            };
+      274
+      275 +            commits.push(CommitInfo {
+      276 +                cid: change.commit_id.clone(),
+      277 +                timestamp: change.timestamp,
+      278 +                datetime: format_timestamp(change.timestamp),
+      279 +                stats,
+      280 +            });
+      281 +        }
+      282 +
+      283          let output = LogOutput {
+      284              uuid: uuid.to_string(),
+      285              path: rel_path.to_string(),
+
+● Bash(cargo clippy --bin commonplace-log 2>&1) timeout: 1m 0s
   ⎿      Checking commonplace-doc v0.1.0 (/home/jes/commonplace)
-         Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.32s
+         Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.14s
 
-● Bash(cargo build --release --bin commonplace-log 2>&1 && echo "Build successful")
-  ⎿     Compiling commonplace-doc v0.1.0 (/home/jes/commonplace)
-         Finished `release` profile [optimized] target(s) in 1m 33s
-     Build successful
+● Now let me remove the --reverse and --no-pager flags from the CLI:
 
-● Bash(# First check how many commits output.txt has with --oneline --no-patch (should be fast) timeout: 30s
-      time ./target/release/commonplace-log --oneline --no-patch workspace/ba…)
-  ⎿  real       0m0.024s
-     user       0m0.001s
-     sys        0m0.008s
+● Search(pattern: "reverse|no_pager", path: "src/cli.rs", output_mode: "content")
+  ⎿  Found 3 lines (ctrl+o to expand)
 
-● Bash(# Count commits                                                                                  timeout: 30s
-      ./target/release/commonplace-log --oneline --no-patch workspace/bartleby/output.txt 2>&1 | wc -l)
-  ⎿  0
+● Read(src/cli.rs)
+  ⎿  Read 50 lines
 
-● Bash(# Try different files                                                                             timeout: 30s
-      ./target/release/commonplace-log --oneline --no-patch workspace/bartleby/prompts.txt 2>&1 | wc -l)
-  ⎿  0
+● Update(src/cli.rs)
+  ⎿  Added 1 line, removed 9 lines
+      239      #[clap(long)]
+      240      pub no_patch: bool,
+      241
+      242 -    /// Disable pager (output directly to terminal)
+      243 -    #[clap(long)]
+      244 -    pub no_pager: bool,
+      245 -
+      242      /// Limit number of commits shown
+      243      #[clap(short = 'n', long = "max-count")]
+      244      pub max_count: Option<usize>,
+     ...
+      255      #[clap(long)]
+      256      pub until: Option<String>,
+      257
+      258 -    /// Show commits oldest-first instead of newest-first
+      259 -    #[clap(long)]
+      260 -    pub reverse: bool,
+      261 -
+      262 -    /// Watch for new commits and output them as they arrive (implies --reverse)
+      258 +    /// Watch for new commits and output them as they arrive
+      259      #[clap(short = 'f', long)]
+      260      pub follow: bool,
+      261
 
-● Bash(# Try to find files with commits                                                                          timeout: 30s
-      ./target/release/commonplace-log --oneline --no-patch workspace/text-to-telegram/content.txt 2>&1 | wc -l)
-  ⎿  0
-
-● Bash(# Check if server is running and has any docs with changes timeout: 10s
-      curl -s http://localhost:3000/health && echo ""…)
-  ⎿  OK
-
-● Bash(# Check the .commonplace.json to find UUID               timeout: 10s
-      cat workspace/bartleby/.commonplace.json 2>&1 | head -30)
-  ⎿  (No content)
-
-● Bash(# Check for database file                                                 timeout: 10s
-      ls -la *.redb 2>&1 || ls -la data.redb 2>&1 || echo "No redb file found"…)
-  ⎿  -rw-rw-r-- 1 jes jes 1589248 Jan  1 04:15 bartleby-test.redb
-     -rw-rw-r-- 1 jes jes 1589248 Jan  4 00:00 data.redb
-     -rw-rw-r-- 1 jes jes 1589248 Jan  1 11:53 sandbox.redb
-     … +2 lines (ctrl+o to expand)
-
-● Bash(# Get a UUID and check changes                                                                                      timeout: 10s
-      UUID=$(./target/release/commonplace-uuid workspace/bartleby/output.txt 2>&1 | grep -oE '[0-9a-f-]{36}' || echo "")…)
-  ⎿  UUID:
-
-● Bash(# Look at the JSON files timeout: 10s
-      python3 -c "…)
-  ⎿  (No content)
-
-● Read(workspace/.commonplace.json)
-  ⎿  Read 44 lines
-
-● Bash(# Check changes for a known UUID             timeout: 10s
-      UUID="50c74659-c0fc-44c9-b06c-0b5193e9d0b6"…)
-  ⎿  Checking changes for UUID 50c74659-c0fc-44c9-b06c-0b5193e9d0b6...
-     {
-       "changes": [
-     … +100 lines (ctrl+o to expand)
-
-● The file has 14 commits. Let me test the streaming behavior:
-
-● Bash(# Test streaming mode (--no-pager triggers streaming)         timeout: 1m 0s
-      echo "=== Testing streaming (--no-pager) with 5 commits ==="…)
-  ⎿  === Testing streaming (--no-pager) with 5 commits ===
-     * 955b28c0 (HEAD) 2026-01-04 09:39
-     |
-     … +37 lines (ctrl+o to expand)
-
-● Bash(# Find which file has the most commits                                                                                     timeout: 30s
-      for uuid in $(curl -s "http://localhost:3000/documents" 2>/dev/null | python3 -c "import json,sys; [print(d) for d in jso…)
-  ⎿  (No content)
-
-● The streaming is working correctly. Let me verify the default full output mode also streams properly:
-
-● Bash(# Test full output streaming (not oneline, not graph, but with --no-pager for streaming) timeout: 30s
-      echo "=== Testing full output streaming ==="…)
-  ⎿  === Testing full output streaming ===
-     File: first_conversation_haiku.txt
-     UUID: 50c74659-c0fc-44c9-b06c-0b5193e9d0b6
-     … +18 lines (ctrl+o to expand)
-
-● Bash(# Check if commits have the same content (no diffs) timeout: 10s
-      UUID="50c74659-c0fc-44c9-b06c-0b5193e9d0b6"…)
-  ⎿  === Content at 955b28c0fea1f5637c4ad4f895480624e34d372a86d27836cff91baf4653065e ===
-     Voices bridge the void—
-     Telegram sparks connection,
-     … +15 lines (ctrl+o to expand)
-
-● The content is the same between those commits (no actual changes), which is why no diffs are shown. The fix is working correctly. Let me run the t
-ests and commit:
+● Bash(cargo clippy --bin commonplace-log 2>&1) timeout: 1m 0s
+  ⎿      Checking commonplace-doc v0.1.0 (/home/jes/commonplace)
+         Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.14s
 
 ● Bash(cargo test 2>&1 | tail -20) timeout: 3m 0s
   ⎿  running 8 tests
@@ -526,28 +526,28 @@ ests and commit:
      test test_ws_connect_and_initial_sync ... ok
      … +16 lines (ctrl+o to expand)
 
-● Bash(git add -A && git commit -m "CP-oxqa: Stream log output with lazy diff computation…)
-  ⎿  Error: Exit code 1
-     warning: adding embedded git repository: commonplaced-2025
-     hint: You've added another git repository inside your current repository.
-     hint: Clones of the outer repository will not contain the contents of
-     hint: the embedded repository and will not know how to obtain it.
-     hint: If you meant to add a submodule, use:
-     hint:
-     hint:      git submodule add <url> commonplaced-2025
-     hint:
-     hint: If you added this path by mistake, you can remove it from the
-     … +65 lines (ctrl+o to see all)
+● Bash(cargo build --release --bin commonplace-log 2>&1 && echo "Build successful")
+  ⎿     Compiling commonplace-doc v0.1.0 (/home/jes/commonplace)
+         Finished `release` profile [optimized] target(s) in 1m 31s
+     Build successful
 
-● Bash(# Remove the embedded repo and format code
-      git rm --cached commonplaced-2025 2>/dev/null || true…)
+● Bash(# Test the new log output (oldest first, streaming)                                    timeout: 30s
+      ./target/release/commonplace-log --oneline workspace/first_conversation_haiku.txt 2>&1)
+  ⎿  de883437bd8b 2026-01-03 12:37
+     3e4135a67a9a 2026-01-03 13:22
+     7617e425ed79 2026-01-03 17:53
+     … +11 lines (ctrl+o to expand)
+
+● Output is now oldest-first (chronological), with HEAD at the end. Let me commit:
+
+  Bash(git add -A && git commit -m "Simplify commonplace-log: always chronological, no pager…)
   ⎿  Running…
 
-✽ Combobulating… (esc to interrupt · 8m 54s · ↓ 18.4k tokens)
+· Manifesting… (esc to interrupt · 8m 38s · ↓ 13.5k tokens · thinking)
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 > 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  [Opus 4.5] 📁 commonplace | 🌿 main | 📊 37%
+  [Opus 4.5] 📁 commonplace | 🌿 main | 📊 57%
   ⏵⏵ bypass permissions on · 2 background tasks
 

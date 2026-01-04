@@ -3,39 +3,6 @@ Window: 1 (codex)
 Pane: 0
 Title: commonplace.astrolab.ist
 ---
-     49 +
-     50 +If a client can’t set password, allow an alternate format:
-     51 +- `username`: `macaroon`
-     52 +- `password`: token
-     53 +
-     54 +The broker must reject connections without a valid macaroon unless explicitly configured to allow anonymous access for development.
-     55 +
-     56 +## Caveat Schema (Commonplace v1)
-     57 +
-     58 +Macaroons carry first-party caveats. This spec defines a small set of caveat types with stable string encodings.
-     59 +
-     60 +### Version
-     61 +
-     62 +- `cp.v=1`
-     63 +
-     64 +### Expiration (recommended)
-     65 +
-     66 +- `cp.exp=<unix_seconds>`
-     67 +
-     68 +Verifier rule: deny if current time is greater than `cp.exp`.
-     69 +
-     70 +### Audience (recommended)
-     71 +
-     72 +- `cp.aud=<broker_id>`
-     73 +
-     74 +Use to prevent replay of a token against a different broker. `broker_id` can be a configured string (e.g., `dev`, `prod`, or a hostname).
-     75 +
-     76 +### Bind to MQTT client id (optional)
-     77 +
-     78 +- `cp.cid=<mqtt_client_id>`
-     79 +
-     80 +Use to reduce token replay risk if stolen. This weakens delegatability (one token per client id).
-     81 +
      82 +### ACL (required)
      83 +
      84 +ACL caveats define allowed publish/subscribe topic filters. Because macaroons can only be attenuated, ACL caveats must be interpreted as an
@@ -546,8 +513,41 @@ Title: commonplace.astrolab.ist
 • Filed CP-oxqa for lazy diff computation in commonplace-log.
 
 
-› Improve documentation in @filename
+› symptom: a process in a sandbox reads the first line from a text file and deletes it. then it reads the file again, and that line is back. what
+  went wrong?
 
-  25% context left · ? for shortcuts
+
+• I'm unpacking why a sandbox deleting a file's first line sees it return upon reread. The likely culprit is the sync client overwriting the local
+  deletion with the server's HEAD copy—often from a server refresh, merge with stale parents, or another writer appending full content including the
+  deleted line. I'll suggest diagnosing with sync logs searching "Refreshed local file from HEAD," server merge logs, commit history checks, and
+  inspecting for concurrent sync processes. I’ll also mention Yjs semantics where deletions don't remove newly inserted duplicate items, so full-
+  replace writes can reintroduce lines. Commands like commonplace log --no-patch -n, commonplace show --at <cid>, and grepping sync logs help
+  diagnose this. Additionally, files linked across sandboxes or multiple writers might cause these conflicts. This approach should clarify what went
+  wrong and how to troubleshoot.
+
+─ Worked for 24s ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• Most likely the deletion was overwritten by sync, not “undone” by the deleting process. In Commonplace that can happen a few ways:
+
+  - Server HEAD got re‑applied locally. The sync client sometimes does a refresh_from_head after uploads/SSE. If the server still had the old line
+    (delete never applied or was merged out), the refresh writes it back and the next read sees it “return.”
+  - Merge against a stale parent re‑introduced the line. If another writer (even append‑only) sends a full‑content replace based on an old snapshot,
+    Yjs treats those old lines as new inserts. Your delete only tombstones the old items, so the line reappears as new items.
+  - Delete commit didn’t apply on the server. If the server panicked while applying (e.g., the UTF‑8 slice bug we fixed), the commit may exist but
+    the document state never updated. Subsequent refreshes pull the old content.
+  - Two sync processes for the same checkout. Competing syncs can race and overwrite with stale content.
+
+  How to confirm which one happened:
+
+  - Check /tmp/sync.log around the time of the delete for Refreshed local file from HEAD or rapid upload/refresh cycles.
+  - Check server logs for MERGE PATH: parent ... differs from HEAD for that doc UUID right after the delete.
+  - Inspect commit history: commonplace log --no-patch -n 20 <file> and commonplace show --at <cid> <file> to see if the delete commit is present
+    and whether a later commit reintroduces the line.
+  - Verify the “append-only” process isn’t rewriting the entire file (read‑modify‑write) instead of appending or sending a proper diff.
+
+  If you want, give me the file path + approximate time and I’ll pinpoint it in the logs/commits.
 
 
+› another process is appending to the same file, server-side. is there a strategy to prevent
+
+  24% context left

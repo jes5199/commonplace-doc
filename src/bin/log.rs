@@ -17,9 +17,7 @@ use futures::StreamExt;
 use reqwest::Client;
 use reqwest_eventsource::{Event as SseEvent, EventSource};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::io::{self, IsTerminal, Write};
-use std::process::{Command, Stdio};
+use std::io::{self, Write};
 
 #[derive(Deserialize)]
 struct CommitChange {
@@ -96,14 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut changes: ChangesResponse = resp.json().await?;
 
-    // --follow implies --reverse (oldest first for watching)
-    let reverse = args.reverse || args.follow;
-
-    // Reverse to show newest first (git log order) - API returns oldest first
-    // Unless --reverse is set, then keep oldest first
-    if !reverse {
-        changes.changes.reverse();
-    }
+    // Always show oldest first (chronological order)
+    // API returns oldest first, so no reversal needed
 
     // Apply date filters
     if let Some(ref since) = args.since {
@@ -134,72 +126,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Determine if we need diffs (default on, unless --no-patch or --oneline)
     let show_patch = !args.no_patch && !args.oneline;
 
-    // Determine if we should use pager (interactive terminal, not disabled, not --follow)
-    let use_pager = !args.follow && !args.no_pager && !args.json && io::stdout().is_terminal();
+    // HEAD is always at the end (newest commit, chronological order)
+    let head_idx = changes.changes.len().saturating_sub(1);
 
-    // HEAD is at index 0 normally, but at last index in reverse mode
-    let head_idx = if reverse {
-        changes.changes.len().saturating_sub(1)
-    } else {
-        0
-    };
-
-    if use_pager {
-        // For pager mode, we need to buffer all output
-        // Compute stats and diffs eagerly (with progress for large histories)
-        let stats_map: Option<Vec<Option<ChangeStats>>> = if args.stat {
-            if changes.changes.len() > 20 {
-                eprint!("Computing stats for {} commits...", changes.changes.len());
-            }
-            let result = compute_stats(&client, &args.server, &uuid, &changes.changes).await?;
-            if changes.changes.len() > 20 {
-                eprintln!(" done");
-            }
-            Some(result)
-        } else {
-            None
-        };
-
-        let diffs: Option<Vec<Option<String>>> = if show_patch {
-            if changes.changes.len() > 20 {
-                eprint!("Computing diffs for {} commits...", changes.changes.len());
-            }
-            let result = compute_diffs(&client, &args.server, &uuid, &changes.changes).await?;
-            if changes.changes.len() > 20 {
-                eprintln!(" done");
-            }
-            Some(result)
-        } else {
-            None
-        };
-
-        let output = build_output(
-            &args,
-            &rel_path,
-            &uuid,
-            &changes.changes,
-            &stats_map,
-            &diffs,
-            graph,
-            decorate,
-            reverse,
-        )?;
-        output_with_pager(&output);
-    } else {
-        // Streaming mode: output each commit as we compute its diff
-        stream_output(
-            &client,
-            &args,
-            &rel_path,
-            &uuid,
-            &changes.changes,
-            show_patch,
-            graph,
-            decorate,
-            head_idx,
-        )
-        .await?;
-    }
+    // Stream output, computing diffs as we go (chronological order is efficient)
+    stream_output(
+        &client,
+        &args,
+        &rel_path,
+        &uuid,
+        &changes.changes,
+        show_patch,
+        graph,
+        decorate,
+        head_idx,
+    )
+    .await?;
 
     // If --follow, subscribe to SSE and watch for new commits
     if args.follow {
@@ -284,134 +226,8 @@ fn format_single_commit(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_output(
-    args: &LogArgs,
-    rel_path: &str,
-    uuid: &str,
-    changes: &[CommitChange],
-    stats_map: &Option<Vec<Option<ChangeStats>>>,
-    diffs: &Option<Vec<Option<String>>>,
-    graph: bool,
-    decorate: bool,
-    reverse: bool,
-) -> Result<String, Box<dyn std::error::Error>> {
-    // HEAD is at index 0 normally, but at last index in reverse mode
-    let head_idx = if reverse {
-        changes.len().saturating_sub(1)
-    } else {
-        0
-    };
-    let mut out = String::new();
-
-    if args.json {
-        let commits: Vec<CommitInfo> = changes
-            .iter()
-            .enumerate()
-            .map(|(i, c)| CommitInfo {
-                cid: c.commit_id.clone(),
-                timestamp: c.timestamp,
-                datetime: format_timestamp(c.timestamp),
-                stats: stats_map.as_ref().and_then(|m| m.get(i).cloned().flatten()),
-            })
-            .collect();
-
-        let output = LogOutput {
-            uuid: uuid.to_string(),
-            path: rel_path.to_string(),
-            commits,
-        };
-        out.push_str(&serde_json::to_string_pretty(&output)?);
-        out.push('\n');
-    } else if args.oneline {
-        for (i, change) in changes.iter().enumerate() {
-            let cid_short = &change.commit_id[..12.min(change.commit_id.len())];
-            let date = format_timestamp_short(change.timestamp);
-            let decoration = if decorate && i == head_idx {
-                " \x1b[36m(HEAD)\x1b[0m"
-            } else {
-                ""
-            };
-
-            if args.stat {
-                if let Some(ref stats_vec) = stats_map {
-                    if let Some(Some(stats)) = stats_vec.get(i) {
-                        out.push_str(&format!(
-                            "\x1b[33m{}\x1b[0m{} {} (+{} -{} chars)\n",
-                            cid_short, decoration, date, stats.chars_added, stats.chars_removed
-                        ));
-                        continue;
-                    }
-                }
-            }
-            out.push_str(&format!(
-                "\x1b[33m{}\x1b[0m{} {}\n",
-                cid_short, decoration, date
-            ));
-        }
-    } else if graph {
-        out.push_str(&build_graph_view(
-            changes,
-            stats_map.as_ref(),
-            diffs.as_ref(),
-            decorate,
-            head_idx,
-        ));
-    } else {
-        // Full output (like git log)
-        out.push_str(&format!("File: {}\n", rel_path));
-        out.push_str(&format!("UUID: {}\n", uuid));
-        out.push('\n');
-
-        for (i, change) in changes.iter().enumerate() {
-            let decoration = if decorate && i == head_idx {
-                " \x1b[36m(HEAD)\x1b[0m"
-            } else {
-                ""
-            };
-            out.push_str(&format!(
-                "\x1b[33mcommit {}\x1b[0m{}\n",
-                change.commit_id, decoration
-            ));
-            out.push_str(&format!("Date:   {}\n", format_timestamp(change.timestamp)));
-
-            if args.stat {
-                if let Some(ref stats_vec) = stats_map {
-                    if let Some(Some(stats)) = stats_vec.get(i) {
-                        out.push('\n');
-                        out.push_str(&format!(
-                            " {} chars (+{}/-{}), {} lines (+{}/-{})\n",
-                            stats.chars_added + stats.chars_removed,
-                            stats.chars_added,
-                            stats.chars_removed,
-                            stats.lines_added + stats.lines_removed,
-                            stats.lines_added,
-                            stats.lines_removed
-                        ));
-                    }
-                }
-            }
-
-            // Show diff if available (default on, suppressed by --no-patch)
-            if let Some(ref diff_vec) = diffs {
-                if let Some(Some(diff)) = diff_vec.get(i) {
-                    if !diff.is_empty() {
-                        out.push('\n');
-                        out.push_str(&colorize_diff(diff));
-                    }
-                }
-            }
-
-            out.push('\n');
-        }
-
-        out.push_str(&format!("{} commits\n", changes.len()));
-    }
-
-    Ok(out)
-}
-
-/// Stream output, computing diffs lazily as we print each commit
+/// Stream output, computing diffs sequentially as we print each commit
+/// Since we process in chronological order, we just track prev_content
 #[allow(clippy::too_many_arguments)]
 async fn stream_output(
     client: &Client,
@@ -427,25 +243,42 @@ async fn stream_output(
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    // JSON mode: still need to buffer for valid JSON
+    // JSON mode: compute stats inline and buffer for valid JSON
     if args.json {
-        // For JSON, we need all data upfront - fall back to buffered mode
-        let stats_map: Option<Vec<Option<ChangeStats>>> = if args.stat {
-            Some(compute_stats(client, &args.server, uuid, changes).await?)
-        } else {
-            None
-        };
+        let mut commits = Vec::with_capacity(changes.len());
+        let mut prev_content: Option<String> = None;
 
-        let commits: Vec<CommitInfo> = changes
-            .iter()
-            .enumerate()
-            .map(|(i, c)| CommitInfo {
-                cid: c.commit_id.clone(),
-                timestamp: c.timestamp,
-                datetime: format_timestamp(c.timestamp),
-                stats: stats_map.as_ref().and_then(|m| m.get(i).cloned().flatten()),
-            })
-            .collect();
+        for change in changes {
+            let stats = if args.stat {
+                if let Some(content) =
+                    fetch_commit_content(client, &args.server, uuid, &change.commit_id).await?
+                {
+                    let s = if let Some(ref prev) = prev_content {
+                        compute_diff_stats(prev, &content)
+                    } else {
+                        ChangeStats {
+                            lines_added: content.lines().count(),
+                            lines_removed: 0,
+                            chars_added: content.len(),
+                            chars_removed: 0,
+                        }
+                    };
+                    prev_content = Some(content);
+                    Some(s)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            commits.push(CommitInfo {
+                cid: change.commit_id.clone(),
+                timestamp: change.timestamp,
+                datetime: format_timestamp(change.timestamp),
+                stats,
+            });
+        }
 
         let output = LogOutput {
             uuid: uuid.to_string(),
@@ -456,30 +289,15 @@ async fn stream_output(
         return Ok(());
     }
 
-    // Build parent map for diff computation (previous commit by timestamp)
-    let mut sorted_by_time: Vec<(usize, &CommitChange)> = changes.iter().enumerate().collect();
-    sorted_by_time.sort_by_key(|(_, c)| c.timestamp);
-
-    let mut parent_map: HashMap<String, Option<String>> = HashMap::new();
-    for i in 0..sorted_by_time.len() {
-        let (_, change) = sorted_by_time[i];
-        let parent = if i > 0 {
-            Some(sorted_by_time[i - 1].1.commit_id.clone())
-        } else {
-            None
-        };
-        parent_map.insert(change.commit_id.clone(), parent);
-    }
-
-    // Content cache to avoid re-fetching
-    let mut content_cache: HashMap<String, String> = HashMap::new();
-
     // Print header for full output mode
     if !args.oneline && !graph {
         writeln!(out, "File: {}", rel_path)?;
         writeln!(out, "UUID: {}", uuid)?;
         writeln!(out)?;
     }
+
+    // Track previous content for sequential diff computation
+    let mut prev_content: Option<String> = None;
 
     for (i, change) in changes.iter().enumerate() {
         let decoration = if decorate && i == head_idx {
@@ -488,39 +306,53 @@ async fn stream_output(
             ""
         };
 
+        // Fetch current content if we need stats or diffs
+        let current_content = if args.stat || show_patch {
+            fetch_commit_content(client, &args.server, uuid, &change.commit_id).await?
+        } else {
+            None
+        };
+
         // Compute stats if needed
         let stats = if args.stat {
-            compute_single_stats(
-                client,
-                &args.server,
-                uuid,
-                change,
-                &parent_map,
-                &mut content_cache,
-            )
-            .await
-            .ok()
-            .flatten()
+            current_content.as_ref().map(|curr| {
+                if let Some(ref prev) = prev_content {
+                    compute_diff_stats(prev, curr)
+                } else {
+                    // First commit - all additions
+                    ChangeStats {
+                        lines_added: curr.lines().count(),
+                        lines_removed: 0,
+                        chars_added: curr.len(),
+                        chars_removed: 0,
+                    }
+                }
+            })
         } else {
             None
         };
 
         // Compute diff if needed
         let diff = if show_patch {
-            compute_single_diff(
-                client,
-                &args.server,
-                uuid,
-                change,
-                &parent_map,
-                &mut content_cache,
-            )
-            .await
-            .ok()
-            .flatten()
+            current_content.as_ref().map(|curr| {
+                if let Some(ref prev) = prev_content {
+                    compute_unified_diff(prev, curr)
+                } else {
+                    // First commit - show all as additions
+                    curr.lines()
+                        .map(|l| format!("+{}", l))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            })
         } else {
             None
         };
+
+        // Update prev_content for next iteration
+        if current_content.is_some() {
+            prev_content = current_content;
+        }
 
         // Format and output this commit
         if args.oneline {
@@ -600,101 +432,23 @@ async fn stream_output(
     Ok(())
 }
 
-/// Fetch content at a specific commit, using cache
-async fn fetch_content(
+/// Fetch content at a specific commit
+async fn fetch_commit_content(
     client: &Client,
     server: &str,
     uuid: &str,
     commit_id: &str,
-    cache: &mut HashMap<String, String>,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    if let Some(content) = cache.get(commit_id) {
-        return Ok(Some(content.clone()));
-    }
-
     let url = format!("{}/docs/{}/head?at_commit={}", server, uuid, commit_id);
     match client.get(&url).send().await {
         Ok(resp) if resp.status().is_success() => {
             if let Ok(head) = resp.json::<HeadResponse>().await {
-                if let Some(content) = head.content {
-                    cache.insert(commit_id.to_string(), content.clone());
-                    return Ok(Some(content));
-                }
+                return Ok(head.content);
             }
         }
         _ => {}
     }
     Ok(None)
-}
-
-/// Compute diff for a single commit
-async fn compute_single_diff(
-    client: &Client,
-    server: &str,
-    uuid: &str,
-    change: &CommitChange,
-    parent_map: &HashMap<String, Option<String>>,
-    cache: &mut HashMap<String, String>,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    // Fetch current commit content
-    let current = fetch_content(client, server, uuid, &change.commit_id, cache).await?;
-
-    // Get parent commit ID and fetch its content
-    let parent_id = parent_map.get(&change.commit_id).and_then(|p| p.clone());
-    let parent_content = if let Some(ref pid) = parent_id {
-        fetch_content(client, server, uuid, pid, cache).await?
-    } else {
-        None
-    };
-
-    match (current, parent_content) {
-        (Some(curr), Some(prev)) => Ok(Some(compute_unified_diff(&prev, &curr))),
-        (Some(curr), None) => {
-            // First commit - show all as additions
-            Ok(Some(
-                curr.lines()
-                    .map(|l| format!("+{}", l))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ))
-        }
-        _ => Ok(None),
-    }
-}
-
-/// Compute stats for a single commit
-async fn compute_single_stats(
-    client: &Client,
-    server: &str,
-    uuid: &str,
-    change: &CommitChange,
-    parent_map: &HashMap<String, Option<String>>,
-    cache: &mut HashMap<String, String>,
-) -> Result<Option<ChangeStats>, Box<dyn std::error::Error>> {
-    // Fetch current commit content
-    let current = fetch_content(client, server, uuid, &change.commit_id, cache).await?;
-
-    // Get parent commit ID and fetch its content
-    let parent_id = parent_map.get(&change.commit_id).and_then(|p| p.clone());
-    let parent_content = if let Some(ref pid) = parent_id {
-        fetch_content(client, server, uuid, pid, cache).await?
-    } else {
-        None
-    };
-
-    match (current, parent_content) {
-        (Some(curr), Some(prev)) => Ok(Some(compute_diff_stats(&prev, &curr))),
-        (Some(curr), None) => {
-            // First commit - all additions
-            Ok(Some(ChangeStats {
-                lines_added: curr.lines().count(),
-                lines_removed: 0,
-                chars_added: curr.len(),
-                chars_removed: 0,
-            }))
-        }
-        _ => Ok(None),
-    }
 }
 
 fn colorize_diff(diff: &str) -> String {
@@ -712,149 +466,6 @@ fn colorize_diff(diff: &str) -> String {
         }
     }
     out
-}
-
-fn output_with_pager(output: &str) {
-    // Try PAGER env var, then less, then more
-    let pager = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
-
-    // Build pager command with -R for color support
-    let mut cmd = if pager.contains("less") {
-        let mut c = Command::new(&pager);
-        c.arg("-R"); // Enable raw control codes for colors
-        c
-    } else {
-        Command::new(&pager)
-    };
-
-    match cmd.stdin(Stdio::piped()).spawn() {
-        Ok(mut child) => {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(output.as_bytes());
-            }
-            let _ = child.wait();
-        }
-        Err(_) => {
-            // Fall back to direct output
-            print!("{}", output);
-        }
-    }
-}
-
-fn build_graph_view(
-    changes: &[CommitChange],
-    stats_map: Option<&Vec<Option<ChangeStats>>>,
-    diffs: Option<&Vec<Option<String>>>,
-    decorate: bool,
-    head_idx: usize,
-) -> String {
-    let mut out = String::new();
-    // Simple linear graph - for now we don't have parent info
-    // Full graph would need to fetch commit parents from server
-    for (i, change) in changes.iter().enumerate() {
-        let cid_short = &change.commit_id[..8.min(change.commit_id.len())];
-        let date = format_timestamp_short(change.timestamp);
-        let is_last = i == changes.len() - 1;
-        let decoration = if decorate && i == head_idx {
-            " \x1b[36m(HEAD)\x1b[0m"
-        } else {
-            ""
-        };
-
-        let connector = if is_last { "  " } else { "| " };
-
-        out.push_str(&format!(
-            "* \x1b[33m{}\x1b[0m{} {}",
-            cid_short, decoration, date
-        ));
-
-        if let Some(stats_vec) = stats_map {
-            if let Some(Some(stats)) = stats_vec.get(i) {
-                out.push_str(&format!(
-                    " (+{} -{} chars)",
-                    stats.chars_added, stats.chars_removed
-                ));
-            }
-        }
-        out.push('\n');
-
-        // Show diff if available
-        if let Some(diff_vec) = diffs {
-            if let Some(Some(diff)) = diff_vec.get(i) {
-                if !diff.is_empty() {
-                    for line in colorize_diff(diff).lines() {
-                        out.push_str(&format!("{} {}\n", connector, line));
-                    }
-                }
-            }
-        }
-
-        if !is_last {
-            out.push_str(&format!("{}\n", connector));
-        }
-    }
-    out
-}
-
-async fn compute_stats(
-    client: &Client,
-    server: &str,
-    uuid: &str,
-    changes: &[CommitChange],
-) -> Result<Vec<Option<ChangeStats>>, Box<dyn std::error::Error>> {
-    let mut result = Vec::with_capacity(changes.len());
-
-    // We need content at each commit and the previous one to compute diffs
-    // For efficiency, we'll fetch content sequentially and diff with previous
-    let mut prev_content: Option<String> = None;
-
-    // Sort by timestamp to process chronologically
-    let mut sorted_indices: Vec<usize> = (0..changes.len()).collect();
-    sorted_indices.sort_by_key(|&i| changes[i].timestamp);
-
-    // Map from original index to stats
-    let mut stats_by_index: std::collections::HashMap<usize, ChangeStats> =
-        std::collections::HashMap::new();
-
-    for &orig_idx in &sorted_indices {
-        let change = &changes[orig_idx];
-        let url = format!(
-            "{}/docs/{}/head?at_commit={}",
-            server, uuid, change.commit_id
-        );
-
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(head) = resp.json::<HeadResponse>().await {
-                    if let Some(content) = head.content {
-                        let stats = if let Some(ref prev) = prev_content {
-                            compute_diff_stats(prev, &content)
-                        } else {
-                            // First commit - all additions
-                            ChangeStats {
-                                lines_added: content.lines().count(),
-                                lines_removed: 0,
-                                chars_added: content.len(),
-                                chars_removed: 0,
-                            }
-                        };
-                        stats_by_index.insert(orig_idx, stats);
-                        prev_content = Some(content);
-                    }
-                }
-            }
-            _ => {
-                // Skip commits we can't fetch
-            }
-        }
-    }
-
-    // Build result in original order
-    for i in 0..changes.len() {
-        result.push(stats_by_index.remove(&i));
-    }
-
-    Ok(result)
 }
 
 fn compute_diff_stats(old: &str, new: &str) -> ChangeStats {
@@ -883,65 +494,6 @@ fn compute_diff_stats(old: &str, new: &str) -> ChangeStats {
         chars_added,
         chars_removed,
     }
-}
-
-async fn compute_diffs(
-    client: &Client,
-    server: &str,
-    uuid: &str,
-    changes: &[CommitChange],
-) -> Result<Vec<Option<String>>, Box<dyn std::error::Error>> {
-    let mut result = Vec::with_capacity(changes.len());
-
-    // We need content at each commit and the previous one to compute diffs
-    let mut prev_content: Option<String> = None;
-
-    // Sort by timestamp to process chronologically (oldest first)
-    let mut sorted_indices: Vec<usize> = (0..changes.len()).collect();
-    sorted_indices.sort_by_key(|&i| changes[i].timestamp);
-
-    // Map from original index to diff
-    let mut diffs_by_index: std::collections::HashMap<usize, String> =
-        std::collections::HashMap::new();
-
-    for &orig_idx in &sorted_indices {
-        let change = &changes[orig_idx];
-        let url = format!(
-            "{}/docs/{}/head?at_commit={}",
-            server, uuid, change.commit_id
-        );
-
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(head) = resp.json::<HeadResponse>().await {
-                    if let Some(content) = head.content {
-                        let diff = if let Some(ref prev) = prev_content {
-                            compute_unified_diff(prev, &content)
-                        } else {
-                            // First commit - show all as additions
-                            content
-                                .lines()
-                                .map(|l| format!("+{}", l))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        };
-                        diffs_by_index.insert(orig_idx, diff);
-                        prev_content = Some(content);
-                    }
-                }
-            }
-            _ => {
-                // Skip commits we can't fetch
-            }
-        }
-    }
-
-    // Build result in original order (newest first)
-    for i in 0..changes.len() {
-        result.push(diffs_by_index.remove(&i));
-    }
-
-    Ok(result)
 }
 
 fn compute_unified_diff(old: &str, new: &str) -> String {

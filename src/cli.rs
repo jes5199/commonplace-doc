@@ -239,10 +239,6 @@ pub struct LogArgs {
     #[clap(long)]
     pub no_patch: bool,
 
-    /// Disable pager (output directly to terminal)
-    #[clap(long)]
-    pub no_pager: bool,
-
     /// Limit number of commits shown
     #[clap(short = 'n', long = "max-count")]
     pub max_count: Option<usize>,
@@ -255,11 +251,7 @@ pub struct LogArgs {
     #[clap(long)]
     pub until: Option<String>,
 
-    /// Show commits oldest-first instead of newest-first
-    #[clap(long)]
-    pub reverse: bool,
-
-    /// Watch for new commits and output them as they arrive (implies --reverse)
+    /// Watch for new commits and output them as they arrive
     #[clap(short = 'f', long)]
     pub follow: bool,
 
