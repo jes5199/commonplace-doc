@@ -20,6 +20,16 @@
         "max_backoff_ms": 10000
       },
       "depends_on": ["server"]
+    },
+    "beads-sync": {
+      "command": "/home/jes/commonplace/target/release/commonplace-sync",
+      "args": ["--server", "http://localhost:3000", "--node", "workspace/beads/commonplace-issues.jsonl", "--file", ".beads/issues.jsonl", "--push-only", "--force-push"],
+      "restart": {
+        "policy": "always",
+        "backoff_ms": 500,
+        "max_backoff_ms": 10000
+      },
+      "depends_on": ["sync"]
     }
   }
 }
