@@ -43,6 +43,112 @@ async fn wait_for_shutdown_signal() {
     tracing::info!("[orchestrator] Received Ctrl+C");
 }
 
+/// Schema structure for parsing fs-root content
+#[derive(serde::Deserialize)]
+struct FsSchema {
+    #[allow(dead_code)]
+    version: Option<u32>,
+    root: Option<SchemaRoot>,
+}
+
+#[derive(serde::Deserialize)]
+struct SchemaRoot {
+    entries: Option<serde_json::Value>,
+    node_id: Option<String>,
+}
+
+/// Wait for sync to push initial content by polling the fs-root schema.
+/// Returns when schema has valid entries, or times out after max_wait.
+async fn wait_for_sync_initial_push(
+    client: &reqwest::Client,
+    server_url: &str,
+    fs_root_id: &str,
+    max_wait: Duration,
+) -> bool {
+    let poll_interval = Duration::from_millis(500);
+    let start = std::time::Instant::now();
+    let mut last_log = std::time::Instant::now();
+    let log_interval = Duration::from_secs(5);
+
+    tracing::info!(
+        "[orchestrator] Waiting for sync to push initial content (timeout: {:?})...",
+        max_wait
+    );
+
+    loop {
+        // Check if we've exceeded max wait time
+        if start.elapsed() >= max_wait {
+            tracing::warn!(
+                "[orchestrator] Timed out waiting for sync initial push after {:?}",
+                max_wait
+            );
+            return false;
+        }
+
+        // Fetch fs-root HEAD
+        let head_url = format!("{}/docs/{}/head", server_url, fs_root_id);
+        match client.get(&head_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(body) = resp.text().await {
+                    // Parse the response to check for schema entries
+                    #[derive(serde::Deserialize)]
+                    struct HeadResponse {
+                        content: String,
+                    }
+
+                    if let Ok(head) = serde_json::from_str::<HeadResponse>(&body) {
+                        if !head.content.is_empty() {
+                            // Try to parse schema and check for entries
+                            if let Ok(schema) = serde_json::from_str::<FsSchema>(&head.content) {
+                                if let Some(root) = &schema.root {
+                                    // Schema is valid if it has entries or a node_id
+                                    let has_entries = root
+                                        .entries
+                                        .as_ref()
+                                        .map(|e| e.as_object().is_some_and(|o| !o.is_empty()))
+                                        .unwrap_or(false);
+                                    let has_node_id = root.node_id.is_some();
+
+                                    if has_entries || has_node_id {
+                                        tracing::info!(
+                                            "[orchestrator] Sync initial push complete (schema has entries), waited {:?}",
+                                            start.elapsed()
+                                        );
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(resp) => {
+                tracing::debug!(
+                    "[orchestrator] fs-root HEAD returned {}, waiting...",
+                    resp.status()
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "[orchestrator] Failed to fetch fs-root HEAD: {}, waiting...",
+                    e
+                );
+            }
+        }
+
+        // Log progress periodically
+        if last_log.elapsed() >= log_interval {
+            tracing::info!(
+                "[orchestrator] Still waiting for sync initial push ({:.1}s elapsed)...",
+                start.elapsed().as_secs_f64()
+            );
+            last_log = std::time::Instant::now();
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = OrchestratorArgs::parse();
@@ -208,26 +314,7 @@ async fn main() {
         }
     }
 
-    // Start sync if configured (to push initial content to server)
-    if config.processes.contains_key("sync") {
-        tracing::info!("[orchestrator] Starting sync from config...");
-        if let Err(e) = base_manager.spawn_process("sync").await {
-            tracing::error!("[orchestrator] Failed to start sync: {}", e);
-            base_manager.shutdown().await;
-            std::process::exit(1);
-        }
-
-        // Give sync time to push initial content
-        // TODO: CP-bxv - sync should signal when initial push is complete
-        tracing::info!("[orchestrator] Waiting for sync to push initial content...");
-        tokio::time::sleep(Duration::from_secs(10)).await;
-    }
-
-    // Now we can start recursive discovery
-    let mut discovered_manager =
-        DiscoveredProcessManager::new(broker_raw.to_string(), args.server.clone());
-
-    // Get fs-root ID from server
+    // Get fs-root ID from server (needed for sync wait polling)
     let fs_root_url = format!("{}/fs-root", args.server);
     let fs_root_id = match client.get(&fs_root_url).send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -254,13 +341,65 @@ async fn main() {
             std::process::exit(1);
         }
         Err(e) => {
-            tracing::error!("[orchestrator] Failed to connect to server: {}", e);
+            tracing::error!(
+                "[orchestrator] Failed to connect to server for fs-root: {}",
+                e
+            );
             base_manager.shutdown().await;
             std::process::exit(1);
         }
     };
+    tracing::info!(
+        "[orchestrator] Got fs-root ID: {}",
+        &fs_root_id[..8.min(fs_root_id.len())]
+    );
 
-    tracing::info!("[orchestrator] Using fs-root: {}", fs_root_id);
+    // Start sync if configured (to push initial content to server)
+    if config.processes.contains_key("sync") {
+        tracing::info!("[orchestrator] Starting sync from config...");
+        if let Err(e) = base_manager.spawn_process("sync").await {
+            tracing::error!("[orchestrator] Failed to start sync: {}", e);
+            base_manager.shutdown().await;
+            std::process::exit(1);
+        }
+
+        // Wait for sync to push initial content by polling fs-root schema
+        // Timeout after 2 minutes to avoid hanging indefinitely
+        let sync_ready = wait_for_sync_initial_push(
+            &client,
+            &args.server,
+            &fs_root_id,
+            Duration::from_secs(120),
+        )
+        .await;
+
+        if !sync_ready {
+            tracing::warn!(
+                "[orchestrator] Sync initial push timed out, continuing anyway. \
+                Discovery may find empty processes.json files."
+            );
+        }
+    }
+
+    // Start remaining processes from commonplace.json (e.g., additional syncs)
+    for name in config.processes.keys() {
+        if name != "server" && name != "sync" {
+            tracing::info!("[orchestrator] Starting {} from config...", name);
+            if let Err(e) = base_manager.spawn_process(name).await {
+                tracing::warn!("[orchestrator] Failed to start '{}': {}", name, e);
+                // Continue with other processes, don't exit
+            }
+        }
+    }
+
+    // Now we can start recursive discovery
+    let mut discovered_manager =
+        DiscoveredProcessManager::new(broker_raw.to_string(), args.server.clone());
+
+    tracing::info!(
+        "[orchestrator] Starting recursive discovery with fs-root: {}",
+        &fs_root_id[..8.min(fs_root_id.len())]
+    );
 
     // Run the recursive watcher with shutdown handling
     // Also monitor base processes (server, sync) for restarts
