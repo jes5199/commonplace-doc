@@ -41,6 +41,7 @@ pub fn router(
         // Document change history endpoints
         .route("/documents/:id/changes", get(get_document_changes))
         .route("/documents/changes", get(get_documents_changes))
+        .route("/documents/:id/commits", get(get_document_commits))
         .route("/documents/:id/stream", get(stream_document_changes))
         .route("/documents/stream", get(stream_documents_changes))
         // Document SSE endpoints (for sync client)
@@ -78,6 +79,55 @@ struct CommitChange {
 #[derive(Serialize)]
 struct CommitChangesResponse {
     changes: Vec<CommitChange>,
+}
+
+/// Full commit data including Yjs update bytes
+#[derive(Serialize, Clone)]
+struct CommitWithUpdate {
+    commit_id: String,
+    timestamp: u64,
+    update: String, // base64-encoded Yjs update
+    parents: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct CommitsResponse {
+    doc_id: String,
+    commits: Vec<CommitWithUpdate>,
+}
+
+/// Get all commits for a document with their Yjs updates (for incremental replay)
+async fn get_document_commits(
+    State(state): State<SseState>,
+    Path(doc_id): Path<String>,
+    Query(query): Query<SinceQuery>,
+) -> Result<Json<CommitsResponse>, StatusCode> {
+    let commit_store = state
+        .commit_store
+        .as_ref()
+        .ok_or(StatusCode::NOT_IMPLEMENTED)?;
+
+    if state.doc_store.get_document(&doc_id).await.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let since = query.since.unwrap_or(0);
+    let commits = commit_store
+        .get_commits_since(&doc_id, since)
+        .await
+        .map_err(map_store_error)?;
+
+    let commits: Vec<CommitWithUpdate> = commits
+        .into_iter()
+        .map(|(cid, commit)| CommitWithUpdate {
+            commit_id: cid,
+            timestamp: commit.timestamp,
+            update: commit.update,
+            parents: commit.parents,
+        })
+        .collect();
+
+    Ok(Json(CommitsResponse { doc_id, commits }))
 }
 
 async fn get_document_changes(

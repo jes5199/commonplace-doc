@@ -8,6 +8,7 @@
 //!   commonplace-log -n 5 path/to/file.txt          # Limit to 5 commits
 //!   commonplace-log --since 2024-01-01 path.txt    # Commits after date
 
+use base64::prelude::*;
 use clap::Parser;
 use commonplace_doc::cli::LogArgs;
 use commonplace_doc::workspace::{
@@ -18,7 +19,27 @@ use reqwest::Client;
 use reqwest_eventsource::{Event as SseEvent, EventSource};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
+use yrs::updates::decoder::Decode;
+use yrs::{Doc, GetString, Transact, Update};
 
+/// Commit with Yjs update from /documents/:id/commits endpoint
+#[derive(Deserialize)]
+struct CommitWithUpdate {
+    commit_id: String,
+    timestamp: u64,
+    update: String, // base64-encoded Yjs update
+    #[allow(dead_code)]
+    parents: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct CommitsResponse {
+    #[allow(dead_code)]
+    doc_id: String,
+    commits: Vec<CommitWithUpdate>,
+}
+
+/// Legacy commit change (for --follow mode which uses SSE)
 #[derive(Deserialize)]
 struct CommitChange {
     #[allow(dead_code)]
@@ -27,18 +48,6 @@ struct CommitChange {
     timestamp: u64,
     #[allow(dead_code)]
     url: String,
-}
-
-#[derive(Deserialize)]
-struct ChangesResponse {
-    changes: Vec<CommitChange>,
-}
-
-#[derive(Deserialize)]
-struct HeadResponse {
-    #[allow(dead_code)]
-    cid: Option<String>,
-    content: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -83,24 +92,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = Client::new();
 
-    // Fetch commit history
-    let url = format!("{}/documents/{}/changes", args.server, uuid);
+    // Fetch commits with Yjs updates (single HTTP request)
+    let url = format!("{}/documents/{}/commits", args.server, uuid);
     let resp = client.get(&url).send().await?;
 
     if !resp.status().is_success() {
-        eprintln!("Failed to fetch changes: HTTP {}", resp.status());
+        eprintln!("Failed to fetch commits: HTTP {}", resp.status());
         std::process::exit(1);
     }
 
-    let mut changes: ChangesResponse = resp.json().await?;
+    let mut commits_resp: CommitsResponse = resp.json().await?;
 
-    // Always show oldest first (chronological order)
-    // API returns oldest first, so no reversal needed
+    // API returns commits in chronological order (oldest first)
 
     // Apply date filters
     if let Some(ref since) = args.since {
         if let Some(since_ts) = parse_date(since) {
-            changes.changes.retain(|c| c.timestamp >= since_ts);
+            commits_resp.commits.retain(|c| c.timestamp >= since_ts);
         } else {
             eprintln!("Warning: could not parse --since date: {}", since);
         }
@@ -108,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(ref until) = args.until {
         if let Some(until_ts) = parse_date(until) {
-            changes.changes.retain(|c| c.timestamp <= until_ts);
+            commits_resp.commits.retain(|c| c.timestamp <= until_ts);
         } else {
             eprintln!("Warning: could not parse --until date: {}", until);
         }
@@ -116,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Apply max count limit
     if let Some(max) = args.max_count {
-        changes.changes.truncate(max);
+        commits_resp.commits.truncate(max);
     }
 
     // Apply opt-out flags
@@ -127,21 +135,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let show_patch = !args.no_patch && !args.oneline;
 
     // HEAD is always at the end (newest commit, chronological order)
-    let head_idx = changes.changes.len().saturating_sub(1);
+    let head_idx = commits_resp.commits.len().saturating_sub(1);
 
-    // Stream output, computing diffs as we go (chronological order is efficient)
-    stream_output(
-        &client,
+    // Stream output using incremental Yjs replay (O(n) not O(n²))
+    stream_output_yjs(
         &args,
         &rel_path,
         &uuid,
-        &changes.changes,
+        &commits_resp.commits,
         show_patch,
         graph,
         decorate,
         head_idx,
-    )
-    .await?;
+    )?;
 
     // If --follow, subscribe to SSE and watch for new commits
     if args.follow {
@@ -226,15 +232,14 @@ fn format_single_commit(
     }
 }
 
-/// Stream output, computing diffs sequentially as we print each commit
-/// Since we process in chronological order, we just track prev_content
+/// Stream output using incremental Yjs replay - O(n) not O(n²)
+/// Applies Yjs updates incrementally instead of fetching content per-commit
 #[allow(clippy::too_many_arguments)]
-async fn stream_output(
-    client: &Client,
+fn stream_output_yjs(
     args: &LogArgs,
     rel_path: &str,
     uuid: &str,
-    changes: &[CommitChange],
+    commits: &[CommitWithUpdate],
     show_patch: bool,
     graph: bool,
     decorate: bool,
@@ -243,39 +248,50 @@ async fn stream_output(
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    // JSON mode: compute stats inline and buffer for valid JSON
-    if args.json {
-        let mut commits = Vec::with_capacity(changes.len());
-        let mut prev_content: Option<String> = None;
+    // Create Yjs doc for incremental replay
+    let doc = Doc::new();
+    let text = doc.get_or_insert_text("content");
 
-        for change in changes {
-            let stats = if args.stat {
-                if let Some(content) =
-                    fetch_commit_content(client, &args.server, uuid, &change.commit_id).await?
-                {
-                    let s = if let Some(ref prev) = prev_content {
-                        compute_diff_stats(prev, &content)
-                    } else {
-                        ChangeStats {
-                            lines_added: content.lines().count(),
-                            lines_removed: 0,
-                            chars_added: content.len(),
-                            chars_removed: 0,
-                        }
-                    };
-                    prev_content = Some(content);
-                    Some(s)
-                } else {
-                    None
+    // Track previous content for diff computation
+    let mut prev_content = String::new();
+
+    // JSON mode: buffer all data
+    if args.json {
+        let mut commit_infos = Vec::with_capacity(commits.len());
+
+        for commit in commits {
+            // Apply update
+            if let Ok(update_bytes) = BASE64_STANDARD.decode(&commit.update) {
+                if let Ok(update) = Update::decode_v1(&update_bytes) {
+                    let mut txn = doc.transact_mut();
+                    txn.apply_update(update);
                 }
+            }
+
+            let current_content = text.get_string(&doc.transact());
+
+            let stats = if args.stat {
+                let s = if prev_content.is_empty() && !current_content.is_empty() {
+                    ChangeStats {
+                        lines_added: current_content.lines().count(),
+                        lines_removed: 0,
+                        chars_added: current_content.len(),
+                        chars_removed: 0,
+                    }
+                } else {
+                    compute_diff_stats(&prev_content, &current_content)
+                };
+                prev_content = current_content;
+                Some(s)
             } else {
+                prev_content = current_content;
                 None
             };
 
-            commits.push(CommitInfo {
-                cid: change.commit_id.clone(),
-                timestamp: change.timestamp,
-                datetime: format_timestamp(change.timestamp),
+            commit_infos.push(CommitInfo {
+                cid: commit.commit_id.clone(),
+                timestamp: commit.timestamp,
+                datetime: format_timestamp(commit.timestamp),
                 stats,
             });
         }
@@ -283,7 +299,7 @@ async fn stream_output(
         let output = LogOutput {
             uuid: uuid.to_string(),
             path: rel_path.to_string(),
-            commits,
+            commits: commit_infos,
         };
         writeln!(out, "{}", serde_json::to_string_pretty(&output)?)?;
         return Ok(());
@@ -296,68 +312,63 @@ async fn stream_output(
         writeln!(out)?;
     }
 
-    // Track previous content for sequential diff computation
-    let mut prev_content: Option<String> = None;
+    for (i, commit) in commits.iter().enumerate() {
+        // Apply update to doc
+        if let Ok(update_bytes) = BASE64_STANDARD.decode(&commit.update) {
+            if let Ok(update) = Update::decode_v1(&update_bytes) {
+                let mut txn = doc.transact_mut();
+                txn.apply_update(update);
+            }
+        }
 
-    for (i, change) in changes.iter().enumerate() {
+        let current_content = text.get_string(&doc.transact());
+
         let decoration = if decorate && i == head_idx {
             " \x1b[36m(HEAD)\x1b[0m"
         } else {
             ""
         };
 
-        // Fetch current content if we need stats or diffs
-        let current_content = if args.stat || show_patch {
-            fetch_commit_content(client, &args.server, uuid, &change.commit_id).await?
-        } else {
-            None
-        };
-
         // Compute stats if needed
         let stats = if args.stat {
-            current_content.as_ref().map(|curr| {
-                if let Some(ref prev) = prev_content {
-                    compute_diff_stats(prev, curr)
-                } else {
-                    // First commit - all additions
-                    ChangeStats {
-                        lines_added: curr.lines().count(),
-                        lines_removed: 0,
-                        chars_added: curr.len(),
-                        chars_removed: 0,
-                    }
-                }
-            })
+            if prev_content.is_empty() && !current_content.is_empty() {
+                Some(ChangeStats {
+                    lines_added: current_content.lines().count(),
+                    lines_removed: 0,
+                    chars_added: current_content.len(),
+                    chars_removed: 0,
+                })
+            } else {
+                Some(compute_diff_stats(&prev_content, &current_content))
+            }
         } else {
             None
         };
 
         // Compute diff if needed
         let diff = if show_patch {
-            current_content.as_ref().map(|curr| {
-                if let Some(ref prev) = prev_content {
-                    compute_unified_diff(prev, curr)
-                } else {
-                    // First commit - show all as additions
-                    curr.lines()
+            if prev_content.is_empty() && !current_content.is_empty() {
+                Some(
+                    current_content
+                        .lines()
                         .map(|l| format!("+{}", l))
                         .collect::<Vec<_>>()
-                        .join("\n")
-                }
-            })
+                        .join("\n"),
+                )
+            } else {
+                Some(compute_unified_diff(&prev_content, &current_content))
+            }
         } else {
             None
         };
 
-        // Update prev_content for next iteration
-        if current_content.is_some() {
-            prev_content = current_content;
-        }
+        // Update prev_content
+        prev_content = current_content;
 
         // Format and output this commit
         if args.oneline {
-            let cid_short = &change.commit_id[..12.min(change.commit_id.len())];
-            let date = format_timestamp_short(change.timestamp);
+            let cid_short = &commit.commit_id[..12.min(commit.commit_id.len())];
+            let date = format_timestamp_short(commit.timestamp);
             if let Some(ref s) = stats {
                 writeln!(
                     out,
@@ -368,9 +379,9 @@ async fn stream_output(
                 writeln!(out, "\x1b[33m{}\x1b[0m{} {}", cid_short, decoration, date)?;
             }
         } else if graph {
-            let cid_short = &change.commit_id[..8.min(change.commit_id.len())];
-            let date = format_timestamp_short(change.timestamp);
-            let is_last = i == changes.len() - 1;
+            let cid_short = &commit.commit_id[..8.min(commit.commit_id.len())];
+            let date = format_timestamp_short(commit.timestamp);
+            let is_last = i == commits.len() - 1;
             let connector = if is_last { "  " } else { "| " };
 
             write!(out, "* \x1b[33m{}\x1b[0m{} {}", cid_short, decoration, date)?;
@@ -394,9 +405,9 @@ async fn stream_output(
             writeln!(
                 out,
                 "\x1b[33mcommit {}\x1b[0m{}",
-                change.commit_id, decoration
+                commit.commit_id, decoration
             )?;
-            writeln!(out, "Date:   {}", format_timestamp(change.timestamp))?;
+            writeln!(out, "Date:   {}", format_timestamp(commit.timestamp))?;
 
             if let Some(ref s) = stats {
                 writeln!(out)?;
@@ -426,29 +437,10 @@ async fn stream_output(
     }
 
     if !args.oneline && !graph {
-        writeln!(out, "{} commits", changes.len())?;
+        writeln!(out, "{} commits", commits.len())?;
     }
 
     Ok(())
-}
-
-/// Fetch content at a specific commit
-async fn fetch_commit_content(
-    client: &Client,
-    server: &str,
-    uuid: &str,
-    commit_id: &str,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let url = format!("{}/docs/{}/head?at_commit={}", server, uuid, commit_id);
-    match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            if let Ok(head) = resp.json::<HeadResponse>().await {
-                return Ok(head.content);
-            }
-        }
-        _ => {}
-    }
-    Ok(None)
 }
 
 fn colorize_diff(diff: &str) -> String {
