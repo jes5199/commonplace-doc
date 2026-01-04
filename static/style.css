@@ -1,0 +1,133 @@
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+    background: #1a1a2e;
+    color: #eee;
+    min-height: 100vh;
+}
+
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.5rem 1rem;
+    background: #16213e;
+    border-bottom: 1px solid #0f3460;
+}
+
+header h1 {
+    margin: 0;
+    font-size: 1rem;
+    font-weight: 500;
+    color: #e94560;
+    font-family: 'Monaco', 'Menlo', monospace;
+}
+
+.status {
+    font-size: 0.75rem;
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    font-weight: 500;
+}
+
+.status.connected {
+    background: #0f5132;
+    color: #75b798;
+}
+
+.status.disconnected {
+    background: #842029;
+    color: #ea868f;
+}
+
+.status.reconnecting {
+    background: #664d03;
+    color: #ffda6a;
+}
+
+main {
+    padding: 1rem;
+    max-width: 100%;
+    overflow: auto;
+}
+
+#loading {
+    color: #888;
+    font-style: italic;
+}
+
+/* Content rendering */
+#content pre {
+    margin: 0;
+    padding: 1rem;
+    background: #0d1117;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
+    font-size: 0.875rem;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+/* JSON syntax highlighting */
+.json-key {
+    color: #7ee787;
+}
+
+.json-string {
+    color: #a5d6ff;
+}
+
+.json-number {
+    color: #79c0ff;
+}
+
+.json-boolean {
+    color: #ff7b72;
+}
+
+.json-null {
+    color: #8b949e;
+}
+
+/* XML syntax highlighting */
+.xml-tag {
+    color: #7ee787;
+}
+
+.xml-attr {
+    color: #79c0ff;
+}
+
+.xml-value {
+    color: #a5d6ff;
+}
+
+.xml-comment {
+    color: #8b949e;
+    font-style: italic;
+}
+
+/* HTML iframe container */
+.html-frame {
+    width: 100%;
+    min-height: calc(100vh - 100px);
+    background: white;
+    border: none;
+    border-radius: 6px;
+}
+
+/* Error display */
+.error {
+    background: #3d1f24;
+    border: 1px solid #842029;
+    color: #ea868f;
+    padding: 1rem;
+    border-radius: 6px;
+}

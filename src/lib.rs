@@ -17,6 +17,7 @@ pub mod services;
 pub mod sse;
 pub mod store;
 pub mod sync;
+pub mod viewer;
 pub mod workspace;
 pub mod ws;
 
@@ -45,6 +46,8 @@ pub struct RouterConfig {
     pub mqtt: Option<mqtt::MqttConfig>,
     /// Document paths to subscribe via MQTT (requires mqtt to be set)
     pub mqtt_subscribe: Vec<String>,
+    /// Directory containing static files for the document viewer
+    pub static_dir: Option<String>,
 }
 
 /// Create a router with the given configuration.
@@ -163,7 +166,7 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
         },
     );
 
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(health_check))
         .merge(api::router(
             doc_store.clone(),
@@ -190,8 +193,14 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
             commit_store,
             commit_broadcaster,
             config.fs_root,
-        ))
-        .layer(CorsLayer::permissive())
+        ));
+
+    // Add viewer routes if static_dir is configured
+    if let Some(viewer_router) = viewer::router(config.static_dir) {
+        router = router.merge(viewer_router);
+    }
+
+    router.layer(CorsLayer::permissive())
 }
 
 /// Create a router with a commit store (no filesystem).

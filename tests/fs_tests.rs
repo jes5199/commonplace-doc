@@ -401,6 +401,7 @@ async fn test_router_with_fs_root() {
         fs_root: Some("my-filesystem".to_string()),
         mqtt: None,
         mqtt_subscribe: vec![],
+        static_dir: None,
     })
     .await;
 

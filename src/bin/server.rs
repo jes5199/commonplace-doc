@@ -54,12 +54,18 @@ async fn main() {
         tracing::info!("MQTT subscribe: {}", path);
     }
 
+    // Log static directory if configured
+    if let Some(ref static_dir) = args.static_dir {
+        tracing::info!("Static directory: {}", static_dir.display());
+    }
+
     // Build our application with routes
     let app = create_router_with_config(RouterConfig {
         commit_store,
         fs_root: args.fs_root,
         mqtt: mqtt_config,
         mqtt_subscribe: args.mqtt_subscribe,
+        static_dir: args.static_dir.map(|p| p.to_string_lossy().to_string()),
     })
     .await;
 

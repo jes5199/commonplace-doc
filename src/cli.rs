@@ -34,6 +34,11 @@ pub struct Args {
     /// Paths must include file extensions (e.g., notes/todo.txt, config.json)
     #[clap(long = "mqtt-subscribe", value_name = "PATH")]
     pub mqtt_subscribe: Vec<String>,
+
+    /// Directory containing static HTML/JS/CSS for the document viewer
+    /// Enables /view/docs/:id and /view/files/*path routes
+    #[clap(long, value_name = "DIR")]
+    pub static_dir: Option<PathBuf>,
 }
 
 /// CLI arguments for commonplace-store (document storage, no HTTP)
