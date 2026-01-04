@@ -1,6 +1,10 @@
 //! WebSocket module for real-time Yjs sync.
 //!
-//! Provides WebSocket endpoint at `/ws/docs/{id}` with subprotocol negotiation:
+//! Provides WebSocket endpoints with subprotocol negotiation:
+//! - `/ws/docs/:id` - Connect by document ID
+//! - `/ws/files/*path` - Connect by filesystem path (requires --fs-root)
+//!
+//! Subprotocols:
 //! - `y-websocket`: Standard Yjs sync protocol for browser tools (Tiptap, Monaco)
 //! - `commonplace`: Extended protocol with commit metadata and blue/red ports
 
@@ -23,10 +27,10 @@ pub fn router(
     doc_store: Arc<DocumentStore>,
     commit_store: Option<Arc<CommitStore>>,
     broadcaster: Option<CommitBroadcaster>,
-    _fs_root: Option<String>,
+    fs_root: Option<String>,
 ) -> Router {
     let room_manager = Arc::new(RoomManager::new(
-        doc_store,
+        doc_store.clone(),
         commit_store,
         broadcaster.clone(),
     ));
@@ -39,10 +43,15 @@ pub fn router(
         });
     }
 
-    let state = WsState { room_manager };
+    let state = WsState {
+        room_manager,
+        doc_store,
+        fs_root,
+    };
 
     Router::new()
         .route("/ws/docs/:id", get(handler::ws_handler))
+        .route("/ws/files/*path", get(handler::ws_path_handler))
         .with_state(state)
 }
 

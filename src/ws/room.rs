@@ -217,24 +217,44 @@ impl Room {
     }
 
     /// Broadcast a message to all connections except one.
-    pub async fn broadcast_except(&self, except_conn_id: &str, message: Vec<u8>) {
+    /// Returns the number of connections that failed to receive (slow clients).
+    pub async fn broadcast_except(&self, except_conn_id: &str, message: Vec<u8>) -> usize {
         let connections = self.connections.read().await;
+        let mut dropped = 0;
         for (conn_id, conn) in connections.iter() {
             if conn_id != except_conn_id {
                 let conn = conn.read().await;
                 // Non-blocking send, drop if buffer full
-                let _ = conn.try_send_binary(message.clone());
+                if !conn.try_send_binary(message.clone()) {
+                    dropped += 1;
+                    tracing::warn!(
+                        conn_id = %conn_id,
+                        doc_id = %self.doc_id,
+                        "Dropped message to slow client (backpressure)"
+                    );
+                }
             }
         }
+        dropped
     }
 
     /// Broadcast a message to all connections.
-    pub async fn broadcast_all(&self, message: Vec<u8>) {
+    /// Returns the number of connections that failed to receive (slow clients).
+    pub async fn broadcast_all(&self, message: Vec<u8>) -> usize {
         let connections = self.connections.read().await;
-        for conn in connections.values() {
+        let mut dropped = 0;
+        for (conn_id, conn) in connections.iter() {
             let conn = conn.read().await;
-            let _ = conn.try_send_binary(message.clone());
+            if !conn.try_send_binary(message.clone()) {
+                dropped += 1;
+                tracing::warn!(
+                    conn_id = %conn_id,
+                    doc_id = %self.doc_id,
+                    "Dropped message to slow client (backpressure)"
+                );
+            }
         }
+        dropped
     }
 
     /// Handle a commit notification from the broadcaster.
@@ -261,6 +281,17 @@ impl Room {
     /// Get document ID.
     pub fn doc_id(&self) -> &str {
         &self.doc_id
+    }
+
+    /// Close all connections in this room (for graceful shutdown).
+    pub async fn close_all_connections(&self) {
+        let connections = self.connections.read().await;
+        for (conn_id, conn) in connections.iter() {
+            let conn = conn.read().await;
+            if conn.try_send(super::connection::OutgoingMessage::Close) {
+                tracing::info!(conn_id = %conn_id, doc_id = %self.doc_id, "Sent close to connection");
+            }
+        }
     }
 }
 
@@ -340,5 +371,14 @@ impl RoomManager {
     /// Get all rooms (for broadcasting commit notifications).
     pub async fn get_all_rooms(&self) -> Vec<Arc<Room>> {
         self.rooms.read().await.values().cloned().collect()
+    }
+
+    /// Close all connections in all rooms (for graceful shutdown).
+    pub async fn shutdown(&self) {
+        let rooms = self.rooms.read().await;
+        tracing::info!("Shutting down {} WebSocket rooms", rooms.len());
+        for room in rooms.values() {
+            room.close_all_connections().await;
+        }
     }
 }
