@@ -6,7 +6,7 @@
 
 use clap::Parser;
 use commonplace_doc::cli::PsArgs;
-use commonplace_doc::orchestrator::OrchestratorStatus;
+use commonplace_doc::orchestrator::{get_process_cwd, OrchestratorStatus};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = PsArgs::parse();
@@ -67,7 +67,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ("-".to_string(), proc.state.clone())
                 };
 
-                let cwd = proc.cwd.as_deref().unwrap_or("-");
+                // Look up CWD dynamically to find sandbox directories
+                // This finds the deepest child's CWD for sandbox processes
+                let cwd = proc
+                    .pid
+                    .and_then(get_process_cwd)
+                    .or_else(|| proc.cwd.clone())
+                    .unwrap_or_else(|| "-".to_string());
+                let cwd = cwd.as_str();
 
                 // Truncate cwd if too long
                 let cwd_display = if cwd.len() > 40 {
