@@ -12,6 +12,7 @@ use axum::response::IntoResponse;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
+use yrs::updates::encoder::Encode;
 
 /// WebSocket state shared across handlers.
 #[derive(Clone)]
@@ -170,8 +171,9 @@ async fn send_initial_sync(
     let _ = socket.send(Message::Binary(sync_step1)).await;
 
     // Send SyncStep2 with full state (so client gets everything)
-    // Use empty state vector to get full document
-    let full_state = room.handle_sync_step1(&[]).await?;
+    // Use properly encoded empty state vector to get full document
+    let empty_sv = yrs::StateVector::default().encode_v1();
+    let full_state = room.handle_sync_step1(&empty_sv).await?;
     let _ = socket.send(Message::Binary(full_state)).await;
 
     Ok(())

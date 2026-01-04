@@ -42,7 +42,7 @@ pub fn router(
     let state = WsState { room_manager };
 
     Router::new()
-        .route("/ws/docs/{id}", get(handler::ws_handler))
+        .route("/ws/docs/:id", get(handler::ws_handler))
         .with_state(state)
 }
 

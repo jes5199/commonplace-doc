@@ -102,3 +102,6 @@ chrono = { version = "0.4", features = ["serde"] }
 http-body-util = "0.1"
 tempfile = "3.0"
 tower = { version = "0.4", features = ["util"] }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
