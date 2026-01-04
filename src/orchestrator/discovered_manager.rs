@@ -112,35 +112,13 @@ impl DiscoveredProcessManager {
             let pid = process.handle.as_ref().and_then(|h| h.id());
 
             // Try to get CWD from config first, otherwise read from /proc/<pid>/cwd
+            // For sandbox processes, this finds the deepest child's CWD
             let cwd = process
                 .config
                 .cwd
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string())
-                .or_else(|| {
-                    // For sandbox-exec processes, we need the child's CWD, not the wrapper's
-                    #[cfg(target_os = "linux")]
-                    if let Some(p) = pid {
-                        // First try to find a child process (for sandbox-exec)
-                        if let Ok(children) =
-                            std::fs::read_to_string(format!("/proc/{}/task/{}/children", p, p))
-                        {
-                            // Get the first child PID
-                            if let Some(child_pid) = children.split_whitespace().next() {
-                                if let Ok(link) =
-                                    std::fs::read_link(format!("/proc/{}/cwd", child_pid))
-                                {
-                                    return Some(link.to_string_lossy().to_string());
-                                }
-                            }
-                        }
-                        // Fall back to the process's own CWD
-                        if let Ok(link) = std::fs::read_link(format!("/proc/{}/cwd", p)) {
-                            return Some(link.to_string_lossy().to_string());
-                        }
-                    }
-                    None
-                });
+                .or_else(|| pid.and_then(super::status::get_process_cwd));
 
             let state = match process.state {
                 DiscoveredProcessState::Stopped => "Stopped",

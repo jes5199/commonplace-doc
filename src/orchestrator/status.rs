@@ -125,3 +125,55 @@ impl Default for OrchestratorStatus {
         Self::new()
     }
 }
+
+/// Get the working directory for a process, following the process tree to find
+/// the deepest child's CWD. This is needed for sandbox processes where the
+/// actual sandboxed process runs in a temp directory.
+///
+/// On Linux, this walks the process tree looking for children and returns
+/// the CWD of the deepest descendant (the actual sandboxed process).
+#[cfg(target_os = "linux")]
+pub fn get_process_cwd(pid: u32) -> Option<String> {
+    // First, try to find the deepest child process
+    if let Some(deepest_pid) = find_deepest_child(pid) {
+        if let Ok(link) = std::fs::read_link(format!("/proc/{}/cwd", deepest_pid)) {
+            return Some(link.to_string_lossy().to_string());
+        }
+    }
+
+    // Fall back to the process's own CWD
+    if let Ok(link) = std::fs::read_link(format!("/proc/{}/cwd", pid)) {
+        return Some(link.to_string_lossy().to_string());
+    }
+
+    None
+}
+
+/// Find the deepest child process in the process tree.
+/// Returns the PID of the deepest descendant, or None if no children.
+#[cfg(target_os = "linux")]
+fn find_deepest_child(pid: u32) -> Option<u32> {
+    let children_path = format!("/proc/{}/task/{}/children", pid, pid);
+
+    if let Ok(children) = std::fs::read_to_string(&children_path) {
+        // Get the first child PID
+        if let Some(child_str) = children.split_whitespace().next() {
+            if let Ok(child_pid) = child_str.parse::<u32>() {
+                // Recursively look for deeper children
+                if let Some(deeper) = find_deepest_child(child_pid) {
+                    return Some(deeper);
+                }
+                // No deeper children, this is the deepest
+                return Some(child_pid);
+            }
+        }
+    }
+
+    None
+}
+
+/// Get the working directory for a process (non-Linux fallback).
+#[cfg(not(target_os = "linux"))]
+pub fn get_process_cwd(_pid: u32) -> Option<String> {
+    None
+}

@@ -78,21 +78,13 @@ impl ProcessManager {
             let pid = process.handle.as_ref().and_then(|h| h.id());
 
             // Try to get CWD from config first, otherwise read from /proc/<pid>/cwd
+            // For sandbox processes, this finds the deepest child's CWD
             let cwd = process
                 .config
                 .cwd
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string())
-                .or_else(|| {
-                    // For processes without explicit cwd, read actual cwd from /proc
-                    #[cfg(target_os = "linux")]
-                    if let Some(p) = pid {
-                        if let Ok(link) = std::fs::read_link(format!("/proc/{}/cwd", p)) {
-                            return Some(link.to_string_lossy().to_string());
-                        }
-                    }
-                    None
-                });
+                .or_else(|| pid.and_then(super::status::get_process_cwd));
 
             let state = match process.state {
                 ProcessState::Stopped => "Stopped",
