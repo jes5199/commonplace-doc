@@ -612,6 +612,7 @@ pub async fn handle_schema_change(
                                 use_paths,
                                 push_only,
                                 pull_only,
+                                false, // force_push: directory mode doesn't support force-push
                             )
                         } else {
                             Vec::new()
@@ -1323,6 +1324,7 @@ pub async fn handle_file_created(
             use_paths,
             push_only,
             pull_only,
+            false, // force_push: directory mode doesn't support force-push
         );
 
         // Add to file_states with task handles

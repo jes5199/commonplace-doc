@@ -110,6 +110,13 @@ struct Args {
     /// Use case: read-only mirrors, generated content
     #[arg(long, conflicts_with = "push_only")]
     pull_only: bool,
+
+    /// Force-push mode: local file content replaces server entirely.
+    /// On each local change, fetches current HEAD and replaces content.
+    /// No CRDT merge - local always wins unconditionally.
+    /// Use case: source-of-truth files, recovery scenarios
+    #[arg(long)]
+    force_push: bool,
 }
 
 /// Discover the fs-root document ID from the server.
@@ -627,6 +634,7 @@ async fn main() -> ExitCode {
             file,
             args.push_only,
             args.pull_only,
+            args.force_push,
         )
         .await
         .map(|_| 0u8)
@@ -651,8 +659,11 @@ async fn run_file_mode(
     file: PathBuf,
     push_only: bool,
     pull_only: bool,
+    force_push: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mode = if push_only {
+    let mode = if force_push {
+        "force-push"
+    } else if push_only {
         "push-only"
     } else if pull_only {
         "pull-only"
@@ -777,6 +788,7 @@ async fn run_file_mode(
             state.clone(),
             file_rx,
             false, // use_paths: file mode uses ID-based API
+            force_push,
         )))
     } else {
         None
@@ -1014,6 +1026,7 @@ async fn run_directory_mode(
                 file_state.use_paths,
                 push_only,
                 pull_only,
+                false, // force_push: directory mode doesn't support force-push
             );
         }
     }
@@ -1302,6 +1315,7 @@ async fn run_exec_mode(
                 file_state.use_paths,
                 push_only,
                 pull_only,
+                false, // force_push: sandbox mode doesn't support force-push
             );
         }
     }

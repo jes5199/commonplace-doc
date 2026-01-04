@@ -7,10 +7,11 @@ use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
 use crate::sync::state_file::compute_content_hash;
 use crate::sync::uuid_map::fetch_node_id_from_schema;
 use crate::sync::{
-    build_edit_url, build_replace_url, create_yjs_text_update, detect_from_path, encode_node_id,
-    file_watcher_task, is_binary_content, looks_like_base64_binary, push_json_content,
-    push_jsonl_content, push_schema_to_server, refresh_from_head, sse_task, EditRequest,
-    EditResponse, FileEvent, HeadResponse, ReplaceResponse, SyncState, PENDING_WRITE_TIMEOUT,
+    build_edit_url, build_head_url, build_replace_url, create_yjs_text_update, detect_from_path,
+    encode_node_id, file_watcher_task, is_binary_content, looks_like_base64_binary,
+    push_json_content, push_jsonl_content, push_schema_to_server, refresh_from_head, sse_task,
+    EditRequest, EditResponse, FileEvent, HeadResponse, ReplaceResponse, SyncState,
+    PENDING_WRITE_TIMEOUT,
 };
 use reqwest::Client;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,7 @@ fn ensure_trailing_newline(content: &str) -> String {
 }
 
 /// Task that handles file changes and uploads to server
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_task(
     client: Client,
     server: String,
@@ -45,6 +47,7 @@ pub async fn upload_task(
     state: Arc<RwLock<SyncState>>,
     mut rx: mpsc::Receiver<FileEvent>,
     use_paths: bool,
+    force_push: bool,
 ) {
     while let Some(event) = rx.recv().await {
         // Extract captured content from the event
@@ -306,7 +309,28 @@ pub async fn upload_task(
         }
 
         // Get parent CID to decide which endpoint to use
-        let parent_cid = {
+        // In force-push mode, always fetch HEAD to ensure we replace current content
+        let parent_cid = if force_push {
+            // Force-push: fetch HEAD's cid to ensure we replace current content
+            let head_url = build_head_url(&server, &identifier, use_paths);
+            match client.get(&head_url).send().await {
+                Ok(resp) if resp.status().is_success() => match resp.json::<HeadResponse>().await {
+                    Ok(head) => head.cid,
+                    Err(e) => {
+                        error!("Force-push: failed to parse HEAD response: {}", e);
+                        continue;
+                    }
+                },
+                Ok(resp) => {
+                    error!("Force-push: HEAD request failed with {}", resp.status());
+                    continue;
+                }
+                Err(e) => {
+                    error!("Force-push: HEAD request failed: {}", e);
+                    continue;
+                }
+            }
+        } else {
             let s = state.read().await;
             s.last_written_cid.clone()
         };
@@ -317,6 +341,7 @@ pub async fn upload_task(
         match parent_cid {
             Some(parent) => {
                 // Normal case: use replace endpoint
+                // For force-push, parent is HEAD's cid so this is a simple replace
                 let replace_url = build_replace_url(&server, &identifier, &parent, use_paths);
 
                 match client
@@ -840,6 +865,7 @@ pub async fn sync_single_file(
 ///
 /// - push_only: Skip SSE subscription (only push local changes)
 /// - pull_only: Skip file watcher (only pull server changes)
+/// - force_push: Always fetch HEAD before upload to ensure local replaces server
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_file_sync_tasks(
     client: Client,
@@ -850,6 +876,7 @@ pub fn spawn_file_sync_tasks(
     use_paths: bool,
     push_only: bool,
     pull_only: bool,
+    force_push: bool,
 ) -> Vec<JoinHandle<()>> {
     let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
     let mut handles = Vec::new();
@@ -865,6 +892,7 @@ pub fn spawn_file_sync_tasks(
             state.clone(),
             file_rx,
             use_paths,
+            force_push,
         )));
     }
 
