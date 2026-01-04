@@ -1,0 +1,13 @@
+{
+  "server": "http://localhost:3000",
+  "node_id": "4e966429-b8fd-4461-9034-8a656510f1e3",
+  "last_synced_cid": "9e57f9d4a535071180e53a253889799e4fd932eaa691c043dbde7adb04c59ec2",
+  "last_synced_at": "2026-01-03T19:50:50.865885963+00:00",
+  "files": {
+    "issues.jsonl": {
+      "hash": "105890bce2b2266716fb8e5b7b2bfa52af74d27e101eef2c4b7b231a7821794e",
+      "last_modified": "2026-01-03T19:50:50.865898189+00:00"
+    }
+  },
+  "directories": []
+}

@@ -1,434 +1,553 @@
 Session: 0
 Window: 0 (claude)
 Pane: 0
-Title: ✳ Git commit push
+Title: ✳ Restart Orchestrator
 ---
-
- * ▐▛███▜▌ *   Claude Code v2.0.76
-* ▝▜█████▛▘ *  Opus 4.5 · Claude Max
- *  ▘▘ ▝▝  *   ~/commonplace
-══════════════════════════════════════════════════ Conversation compacted · ctrl+o for history ═════════════════════════════════════════════════
-  ⎿  Read ../../../tmp/commonplace-sandbox-3b736b22-64a7-4e14-8d6d-ed7473a1c612/.pid (1 lines)
-  ⎿  Read src/sync/mod.rs (94 lines)
-  ⎿  Referenced file src/bin/sync.rs
-  ⎿  Read ../../../tmp/claude/-home-jes-commonplace/tasks/bad2b04.output (15 lines)
-  ⎿  Read src/bin/uuid.rs (198 lines)
-  ⎿  Slash commands restored (chief-wiggum:wiggum-loop, beads:list, local-codex-review)
-
-● Let me check the current state of open beads and see what else can be knocked out quickly:
-
-● Bash(bd list --status open 2>/dev/null | head -40)
-  ⎿  CP-byr [P2] [feature] open - Add CLI to view/replay edits for a file
-     CP-8sf [P2] [feature] open - Add CLI to signal orchestrator-managed process by path/name
-     CP-bt0 [P2] [feature] open - Add CLI to list orchestrator-managed processes (pid/cwd)
-     … +20 lines (ctrl+o to expand)
-
-● Let me check the details on the remaining non-future-work beads to find quick wins:
-
-● Bash(bd show CP-bt0 2>/dev/null)
-  ⎿  CP-bt0: Add CLI to list orchestrator-managed processes (pid/cwd)
-     Status: open
      Priority: P2
-     … +26 lines (ctrl+o to expand)
+     … +24 lines (ctrl+o to expand)
 
-● Bash(bd show CP-8sf 2>/dev/null)
-  ⎿  CP-8sf: Add CLI to signal orchestrator-managed process by path/name
-     Status: open
-     Priority: P2
-     … +22 lines (ctrl+o to expand)
+● Let me look at the current implementation:
 
-● Bash(bd show CP-byr 2>/dev/null)
-  ⎿  CP-byr: Add CLI to view/replay edits for a file
-     Status: open
-     Priority: P2
-     … +22 lines (ctrl+o to expand)
+● Read(src/bin/log.rs)
+  ⎿  Read 667 lines
 
-● The IPC-based CLIs (CP-bt0, CP-8sf, CP-byr) require orchestrator query APIs that don't exist yet - they need design work. Let me check the sim
-pler ones:
+● I see the issue. The problem is on lines 142-146 where compute_diffs fetches content for EVERY commit before any output is displayed. For a file w
+ith many commits, this causes long delays.
 
-● Bash(bd show CP-8p9 2>/dev/null)
-  ⎿  CP-8p9: Sync should delete directories removed from schema
-     Status: open
-     Priority: P2
-     … +11 lines (ctrl+o to expand)
+  The fix is to:
+  1. Stream output instead of buffering everything
+  2. Compute diffs lazily as we print each commit
+  3. Show progress when computation is expensive
 
-● Bash(bd show CP-jgn 2>/dev/null)
-  ⎿  CP-jgn: Deleting directory on disk should remove it from parent .commonplace.json
-     Status: open
-     Priority: P2
-     … +14 lines (ctrl+o to expand)
-
-● Bash(bd show CP-tmo 2>/dev/null)
-  ⎿  CP-tmo: Orchestrator should watch for fs-root schema changes
-     Status: open
-     Priority: P2
-     … +8 lines (ctrl+o to expand)
-
-● Bash(bd show CP-buj 2>/dev/null)
-  ⎿  CP-buj: Sync should auto-convert symlinks to commonplace-linked files
-     Status: open
-     Priority: P3
-     … +19 lines (ctrl+o to expand)
-
-● Let me check the orchestrator to see if there's existing process tracking we can expose:
-
-● Search(pattern: "ProcessInfo|running_processes|child_processes", path: "src")
-  ⎿  Found 0 files
-
-● Search(pattern: "HashMap.*Child|processes.*pid", path: "src/bin")
-  ⎿  Found 0 files
-
-● Bash(grep -n "Child\|pid\|spawn" /home/jes/commonplace/src/bin/orchestrator.rs | head -50)
-  ⎿  229:        if let Err(e) = manager.spawn_process(only).await {
-
-● Search(pattern: "struct.*Manager|struct.*Process", path: "src", output_mode: "content")
-  ⎿  Found 7 lines (ctrl+o to expand)
-
-● Read(src/orchestrator/manager.rs)
-  ⎿  Read 80 lines
-
-● Search(pattern: "status.*file|write.*json|pid.*file", path: "src/orchestrator")
-  ⎿  Found 0 files
-
-● Search(pattern: "lock|LOCK", path: "src/orchestrator", output_mode: "content")
-  ⎿  Found 0 lines
-
-● Search(pattern: "lock|pid", path: "src/bin/orchestrator.rs", output_mode: "content")
-  ⎿  Found 11 lines (ctrl+o to expand)
-
-● The remaining non-future-work beads all require either:
-  - IPC design (CP-bt0, CP-8sf, CP-byr) - need status file or socket mechanism
-  - State tracking (CP-8p9, CP-jgn) - distinguish "deleted locally" vs "not yet synced"
-  - Complex orchestrator changes (CP-tmo) - watching fs-root schema
-
-  Let me implement CP-bt0 with a simple status file approach - the orchestrator writes process info to a file, CLI reads it:
-
-● Read(src/bin/orchestrator.rs)
-  ⎿  Read 273 lines
-
-● Read(src/orchestrator/discovered_manager.rs)
-  ⎿  Read 100 lines
-
-● Search(pattern: "src/orchestrator/*.rs")
-  ⎿  Found 5 files (ctrl+o to expand)
-
-● Write(src/orchestrator/status.rs)
-  ⎿  Wrote 90 lines to src/orchestrator/status.rs
-     //! Status file for orchestrator process information.
-     //!
-     //! Writes a JSON file to /tmp that can be read by commonplace-ps.
-     use serde::{Deserialize, Serialize};
-     use std::fs;
-     use std::io;
-     use std::path::PathBuf;
-     use std::time::SystemTime;
-     … +80 lines (ctrl+o to expand)
-
-● Read(src/orchestrator/mod.rs)
-  ⎿  Read 12 lines
-
-● Update(src/orchestrator/mod.rs)
-  ⎿  Added 2 lines
-      2  mod discovered_manager;
-      3  mod discovery;
-      4  mod manager;
-      5 +mod status;
-      6
-      7  pub use config::{OrchestratorConfig, ProcessConfig, RestartMode, RestartPolicy};
-      8  pub use discovered_manager::{
-     ...
-       9  };
-      10  pub use discovery::{CommandSpec, DiscoveredProcess, ProcessesConfig};
-      11  pub use manager::{ManagedProcess, ProcessManager, ProcessState};
-      12 +pub use status::{OrchestratorStatus, ProcessStatus, STATUS_FILE_PATH};
-
-● Read(src/orchestrator/discovered_manager.rs)
-  ⎿  Read 150 lines
-
-● Read(src/orchestrator/discovered_manager.rs)
-  ⎿  Read 150 lines
-
-● Search(pattern: "fn shutdown", path: "src/orchestrator/discovered_manager.rs", output_mode: "content")
-  ⎿  Found 1 line (ctrl+o to expand)
-
-● Read(src/orchestrator/discovered_manager.rs)
-  ⎿  Read 25 lines
-
-● Update(src/orchestrator/discovered_manager.rs)
+● Update(src/bin/log.rs)
   ⎿  Added 1 line
-       5  //! see the `discovery` module.
-       6
-       7  use super::discovery::{DiscoveredProcess, ProcessesConfig};
-       8 +use super::status::{OrchestratorStatus, ProcessStatus};
-       9  use futures::StreamExt;
-      10  use reqwest::Client;
-      11  use reqwest_eventsource::{Event as SseEvent, EventSource};
+      17  use reqwest::Client;
+      18  use reqwest_eventsource::{Event as SseEvent, EventSource};
+      19  use serde::{Deserialize, Serialize};
+      20 +use std::collections::HashMap;
+      21  use std::io::{self, IsTerminal, Write};
+      22  use std::process::{Command, Stdio};
+      23
 
-● Read(src/orchestrator/discovered_manager.rs)
-  ⎿  Read 30 lines
+● Now let me refactor the main function to stream output:
 
-● Update(src/orchestrator/discovered_manager.rs)
-  ⎿  Added 38 lines
-       95          &self.processes
-       96      }
-       97
-       98 +    /// Write current process status to the status file.
-       99 +    /// Called when processes start, stop, or change state.
-      100 +    pub fn write_status(&self) {
-      101 +        let mut status = OrchestratorStatus::new();
-      102 +
-      103 +        for (name, process) in &self.processes {
-      104 +            let pid = process
-      105 +                .handle
-      106 +                .as_ref()
-      107 +                .and_then(|h| h.id());
-      108 +
-      109 +            let cwd = process.config.cwd.clone();
-      110 +
-      111 +            let state = match process.state {
-      112 +                DiscoveredProcessState::Stopped => "Stopped",
-      113 +                DiscoveredProcessState::Starting => "Starting",
-      114 +                DiscoveredProcessState::Running => "Running",
-      115 +                DiscoveredProcessState::Failed => "Failed",
-      116 +            };
-      117 +
-      118 +            status.processes.push(ProcessStatus {
-      119 +                name: name.clone(),
-      120 +                pid,
-      121 +                cwd,
-      122 +                state: state.to_string(),
-      123 +                document_path: Some(process.document_path.clone()),
-      124 +                source_path: Some(process.source_path.clone()),
-      125 +            });
-      126 +        }
-      127 +
-      128 +        // Sort by name for consistent output
-      129 +        status.processes.sort_by(|a, b| a.name.cmp(&b.name));
-      130 +
-      131 +        if let Err(e) = status.write() {
-      132 +            tracing::warn!("[discovery] Failed to write status file: {}", e);
-      133 +        }
-      134 +    }
-      135 +
-      136      /// Add a process to be managed.
-      137      ///
-      138      /// # Arguments
+● Update(src/bin/log.rs)
+  ⎿  Added 61 lines, removed 27 lines
+      127          changes.changes.truncate(max);
+      128      }
+      129
+      130 -    // Compute stats if requested
+      131 -    let stats_map: Option<Vec<Option<ChangeStats>>> = if args.stat {
+      132 -        Some(compute_stats(&client, &args.server, &uuid, &changes.changes).await?)
+      133 -    } else {
+      134 -        None
+      135 -    };
+      136 -
+      130      // Apply opt-out flags
+      131      let graph = args.graph && !args.no_graph && !args.oneline;
+      132      let decorate = (args.decorate || graph) && !args.no_decorate;
+      133
+      134 -    // Fetch diffs (default on, unless --no-patch or --oneline)
+      134 +    // Determine if we need diffs (default on, unless --no-patch or --oneline)
+      135      let show_patch = !args.no_patch && !args.oneline;
+      136 -    let diffs: Option<Vec<Option<String>>> = if show_patch {
+      137 -        Some(compute_diffs(&client, &args.server, &uuid, &changes.changes).await?)
+      136 +
+      137 +    // Determine if we should use pager (interactive terminal, not disabled, not --follow)
+      138 +    let use_pager = !args.follow && !args.no_pager && !args.json && io::stdout().is_terminal();
+      139 +
+      140 +    // HEAD is at index 0 normally, but at last index in reverse mode
+      141 +    let head_idx = if reverse {
+      142 +        changes.changes.len().saturating_sub(1)
+      143      } else {
+      144 -        None
+      144 +        0
+      145      };
+      146
+      147 -    // Build output string
+      148 -    let output = build_output(
+      149 -        &args,
+      150 -        &rel_path,
+      151 -        &uuid,
+      152 -        &changes.changes,
+      153 -        &stats_map,
+      154 -        &diffs,
+      155 -        graph,
+      156 -        decorate,
+      157 -        reverse,
+      158 -    )?;
+      147 +    if use_pager {
+      148 +        // For pager mode, we need to buffer all output
+      149 +        // Compute stats and diffs eagerly (with progress for large histories)
+      150 +        let stats_map: Option<Vec<Option<ChangeStats>>> = if args.stat {
+      151 +            if changes.changes.len() > 20 {
+      152 +                eprint!("Computing stats for {} commits...", changes.changes.len());
+      153 +            }
+      154 +            let result = compute_stats(&client, &args.server, &uuid, &changes.changes).await?;
+      155 +            if changes.changes.len() > 20 {
+      156 +                eprintln!(" done");
+      157 +            }
+      158 +            Some(result)
+      159 +        } else {
+      160 +            None
+      161 +        };
+      162
+      163 -    // Use pager if interactive terminal and not disabled (never for --follow)
+      164 -    if !args.follow && !args.no_pager && !args.json && io::stdout().is_terminal() {
+      163 +        let diffs: Option<Vec<Option<String>>> = if show_patch {
+      164 +            if changes.changes.len() > 20 {
+      165 +                eprint!("Computing diffs for {} commits...", changes.changes.len());
+      166 +            }
+      167 +            let result = compute_diffs(&client, &args.server, &uuid, &changes.changes).await?;
+      168 +            if changes.changes.len() > 20 {
+      169 +                eprintln!(" done");
+      170 +            }
+      171 +            Some(result)
+      172 +        } else {
+      173 +            None
+      174 +        };
+      175 +
+      176 +        let output = build_output(
+      177 +            &args,
+      178 +            &rel_path,
+      179 +            &uuid,
+      180 +            &changes.changes,
+      181 +            &stats_map,
+      182 +            &diffs,
+      183 +            graph,
+      184 +            decorate,
+      185 +            reverse,
+      186 +        )?;
+      187          output_with_pager(&output);
+      188      } else {
+      189 -        print!("{}", output);
+      190 -        io::stdout().flush()?;
+      189 +        // Streaming mode: output each commit as we compute its diff
+      190 +        stream_output(
+      191 +            &client,
+      192 +            &args,
+      193 +            &rel_path,
+      194 +            &uuid,
+      195 +            &changes.changes,
+      196 +            show_patch,
+      197 +            graph,
+      198 +            decorate,
+      199 +            head_idx,
+      200 +        )
+      201 +        .await?;
+      202      }
+      203
+      204      // If --follow, subscribe to SSE and watch for new commits
 
-● Read(src/orchestrator/discovered_manager.rs)
-  ⎿  Read 35 lines
+● Now I need to add the stream_output function and a helper to fetch content. Let me add them:
 
-● Update(src/orchestrator/discovered_manager.rs)
-  ⎿  Added 5 lines
-      321          process.state = DiscoveredProcessState::Running;
-      322          process.last_start = Some(Instant::now());
-      323
-      324 +        // Update status file
-      325 +        self.write_status();
-      326 +
-      327          Ok(())
-      328      }
-      329
-     ...
-      332              // Small delay between starts
-      333              tokio::time::sleep(Duration::from_millis(100)).await;
-      334          }
-      335 +        // Write final status after all started
-      336 +        self.write_status();
-      337          Ok(())
-      338      }
-      339
+● Update(src/bin/log.rs)
+  ⎿  Added 276 lines
+      411      Ok(out)
+      412  }
+      413
+      414 +/// Stream output, computing diffs lazily as we print each commit
+      415 +#[allow(clippy::too_many_arguments)]
+      416 +async fn stream_output(
+      417 +    client: &Client,
+      418 +    args: &LogArgs,
+      419 +    rel_path: &str,
+      420 +    uuid: &str,
+      421 +    changes: &[CommitChange],
+      422 +    show_patch: bool,
+      423 +    graph: bool,
+      424 +    decorate: bool,
+      425 +    head_idx: usize,
+      426 +) -> Result<(), Box<dyn std::error::Error>> {
+      427 +    let stdout = io::stdout();
+      428 +    let mut out = stdout.lock();
+      429 +
+      430 +    // JSON mode: still need to buffer for valid JSON
+      431 +    if args.json {
+      432 +        // For JSON, we need all data upfront - fall back to buffered mode
+      433 +        let stats_map: Option<Vec<Option<ChangeStats>>> = if args.stat {
+      434 +            Some(compute_stats(client, &args.server, uuid, changes).await?)
+      435 +        } else {
+      436 +            None
+      437 +        };
+      438 +
+      439 +        let commits: Vec<CommitInfo> = changes
+      440 +            .iter()
+      441 +            .enumerate()
+      442 +            .map(|(i, c)| CommitInfo {
+      443 +                cid: c.commit_id.clone(),
+      444 +                timestamp: c.timestamp,
+      445 +                datetime: format_timestamp(c.timestamp),
+      446 +                stats: stats_map.as_ref().and_then(|m| m.get(i).cloned().flatten()),
+      447 +            })
+      448 +            .collect();
+      449 +
+      450 +        let output = LogOutput {
+      451 +            uuid: uuid.to_string(),
+      452 +            path: rel_path.to_string(),
+      453 +            commits,
+      454 +        };
+      455 +        writeln!(out, "{}", serde_json::to_string_pretty(&output)?)?;
+      456 +        return Ok(());
+      457 +    }
+      458 +
+      459 +    // Build parent map for diff computation (previous commit by timestamp)
+      460 +    let mut sorted_by_time: Vec<(usize, &CommitChange)> = changes.iter().enumerate().collect();
+      461 +    sorted_by_time.sort_by_key(|(_, c)| c.timestamp);
+      462 +
+      463 +    let mut parent_map: HashMap<String, Option<String>> = HashMap::new();
+      464 +    for i in 0..sorted_by_time.len() {
+      465 +        let (_, change) = sorted_by_time[i];
+      466 +        let parent = if i > 0 {
+      467 +            Some(sorted_by_time[i - 1].1.commit_id.clone())
+      468 +        } else {
+      469 +            None
+      470 +        };
+      471 +        parent_map.insert(change.commit_id.clone(), parent);
+      472 +    }
+      473 +
+      474 +    // Content cache to avoid re-fetching
+      475 +    let mut content_cache: HashMap<String, String> = HashMap::new();
+      476 +
+      477 +    // Print header for full output mode
+      478 +    if !args.oneline && !graph {
+      479 +        writeln!(out, "File: {}", rel_path)?;
+      480 +        writeln!(out, "UUID: {}", uuid)?;
+      481 +        writeln!(out)?;
+      482 +    }
+      483 +
+      484 +    for (i, change) in changes.iter().enumerate() {
+      485 +        let decoration = if decorate && i == head_idx {
+      486 +            " \x1b[36m(HEAD)\x1b[0m"
+      487 +        } else {
+      488 +            ""
+      489 +        };
+      490 +
+      491 +        // Compute stats if needed
+      492 +        let stats = if args.stat {
+      493 +            compute_single_stats(client, &args.server, uuid, change, &parent_map, &mut content_cache)
+      494 +                .await
+      495 +                .ok()
+      496 +                .flatten()
+      497 +        } else {
+      498 +            None
+      499 +        };
+      500 +
+      501 +        // Compute diff if needed
+      502 +        let diff = if show_patch {
+      503 +            compute_single_diff(client, &args.server, uuid, change, &parent_map, &mut content_cache)
+      504 +                .await
+      505 +                .ok()
+      506 +                .flatten()
+      507 +        } else {
+      508 +            None
+      509 +        };
+      510 +
+      511 +        // Format and output this commit
+      512 +        if args.oneline {
+      513 +            let cid_short = &change.commit_id[..12.min(change.commit_id.len())];
+      514 +            let date = format_timestamp_short(change.timestamp);
+      515 +            if let Some(ref s) = stats {
+      516 +                writeln!(
+      517 +                    out,
+      518 +                    "\x1b[33m{}\x1b[0m{} {} (+{} -{} chars)",
+      519 +                    cid_short, decoration, date, s.chars_added, s.chars_removed
+      520 +                )?;
+      521 +            } else {
+      522 +                writeln!(out, "\x1b[33m{}\x1b[0m{} {}", cid_short, decoration, date)?;
+      523 +            }
+      524 +        } else if graph {
+      525 +            let cid_short = &change.commit_id[..8.min(change.commit_id.len())];
+      526 +            let date = format_timestamp_short(change.timestamp);
+      527 +            let is_last = i == changes.len() - 1;
+      528 +            let connector = if is_last { "  " } else { "| " };
+      529 +
+      530 +            write!(
+      531 +                out,
+      532 +                "* \x1b[33m{}\x1b[0m{} {}",
+      533 +                cid_short, decoration, date
+      534 +            )?;
+      535 +            if let Some(ref s) = stats {
+      536 +                write!(out, " (+{} -{} chars)", s.chars_added, s.chars_removed)?;
+      537 +            }
+      538 +            writeln!(out)?;
+      539 +
+      540 +            if let Some(ref d) = diff {
+      541 +                if !d.is_empty() {
+      542 +                    for line in colorize_diff(d).lines() {
+      543 +                        writeln!(out, "{} {}", connector, line)?;
+      544 +                    }
+      545 +                }
+      546 +            }
+      547 +            if !is_last {
+      548 +                writeln!(out, "{}", connector)?;
+      549 +            }
+      550 +        } else {
+      551 +            // Full output
+      552 +            writeln!(
+      553 +                out,
+      554 +                "\x1b[33mcommit {}\x1b[0m{}",
+      555 +                change.commit_id, decoration
+      556 +            )?;
+      557 +            writeln!(out, "Date:   {}", format_timestamp(change.timestamp))?;
+      558 +
+      559 +            if let Some(ref s) = stats {
+      560 +                writeln!(out)?;
+      561 +                writeln!(
+      562 +                    out,
+      563 +                    " {} chars (+{}/-{}), {} lines (+{}/-{})",
+      564 +                    s.chars_added + s.chars_removed,
+      565 +                    s.chars_added,
+      566 +                    s.chars_removed,
+      567 +                    s.lines_added + s.lines_removed,
+      568 +                    s.lines_added,
+      569 +                    s.lines_removed
+      570 +                )?;
+      571 +            }
+      572 +
+      573 +            if let Some(ref d) = diff {
+      574 +                if !d.is_empty() {
+      575 +                    writeln!(out)?;
+      576 +                    write!(out, "{}", colorize_diff(d))?;
+      577 +                }
+      578 +            }
+      579 +
+      580 +            writeln!(out)?;
+      581 +        }
+      582 +
+      583 +        out.flush()?;
+      584 +    }
+      585 +
+      586 +    if !args.oneline && !graph {
+      587 +        writeln!(out, "{} commits", changes.len())?;
+      588 +    }
+      589 +
+      590 +    Ok(())
+      591 +}
+      592 +
+      593 +/// Fetch content at a specific commit, using cache
+      594 +async fn fetch_content(
+      595 +    client: &Client,
+      596 +    server: &str,
+      597 +    uuid: &str,
+      598 +    commit_id: &str,
+      599 +    cache: &mut HashMap<String, String>,
+      600 +) -> Result<Option<String>, Box<dyn std::error::Error>> {
+      601 +    if let Some(content) = cache.get(commit_id) {
+      602 +        return Ok(Some(content.clone()));
+      603 +    }
+      604 +
+      605 +    let url = format!("{}/docs/{}/head?at_commit={}", server, uuid, commit_id);
+      606 +    match client.get(&url).send().await {
+      607 +        Ok(resp) if resp.status().is_success() => {
+      608 +            if let Ok(head) = resp.json::<HeadResponse>().await {
+      609 +                if let Some(content) = head.content {
+      610 +                    cache.insert(commit_id.to_string(), content.clone());
+      611 +                    return Ok(Some(content));
+      612 +                }
+      613 +            }
+      614 +        }
+      615 +        _ => {}
+      616 +    }
+      617 +    Ok(None)
+      618 +}
+      619 +
+      620 +/// Compute diff for a single commit
+      621 +async fn compute_single_diff(
+      622 +    client: &Client,
+      623 +    server: &str,
+      624 +    uuid: &str,
+      625 +    change: &CommitChange,
+      626 +    parent_map: &HashMap<String, Option<String>>,
+      627 +    cache: &mut HashMap<String, String>,
+      628 +) -> Result<Option<String>, Box<dyn std::error::Error>> {
+      629 +    // Fetch current commit content
+      630 +    let current = fetch_content(client, server, uuid, &change.commit_id, cache).await?;
+      631 +
+      632 +    // Get parent commit ID and fetch its content
+      633 +    let parent_id = parent_map.get(&change.commit_id).and_then(|p| p.clone());
+      634 +    let parent_content = if let Some(ref pid) = parent_id {
+      635 +        fetch_content(client, server, uuid, pid, cache).await?
+      636 +    } else {
+      637 +        None
+      638 +    };
+      639 +
+      640 +    match (current, parent_content) {
+      641 +        (Some(curr), Some(prev)) => Ok(Some(compute_unified_diff(&prev, &curr))),
+      642 +        (Some(curr), None) => {
+      643 +            // First commit - show all as additions
+      644 +            Ok(Some(
+      645 +                curr.lines()
+      646 +                    .map(|l| format!("+{}", l))
+      647 +                    .collect::<Vec<_>>()
+      648 +                    .join("\n"),
+      649 +            ))
+      650 +        }
+      651 +        _ => Ok(None),
+      652 +    }
+      653 +}
+      654 +
+      655 +/// Compute stats for a single commit
+      656 +async fn compute_single_stats(
+      657 +    client: &Client,
+      658 +    server: &str,
+      659 +    uuid: &str,
+      660 +    change: &CommitChange,
+      661 +    parent_map: &HashMap<String, Option<String>>,
+      662 +    cache: &mut HashMap<String, String>,
+      663 +) -> Result<Option<ChangeStats>, Box<dyn std::error::Error>> {
+      664 +    // Fetch current commit content
+      665 +    let current = fetch_content(client, server, uuid, &change.commit_id, cache).await?;
+      666 +
+      667 +    // Get parent commit ID and fetch its content
+      668 +    let parent_id = parent_map.get(&change.commit_id).and_then(|p| p.clone());
+      669 +    let parent_content = if let Some(ref pid) = parent_id {
+      670 +        fetch_content(client, server, uuid, pid, cache).await?
+      671 +    } else {
+      672 +        None
+      673 +    };
+      674 +
+      675 +    match (current, parent_content) {
+      676 +        (Some(curr), Some(prev)) => Ok(Some(compute_diff_stats(&prev, &curr))),
+      677 +        (Some(curr), None) => {
+      678 +            // First commit - all additions
+      679 +            Ok(Some(ChangeStats {
+      680 +                lines_added: curr.lines().count(),
+      681 +                lines_removed: 0,
+      682 +                chars_added: curr.len(),
+      683 +                chars_removed: 0,
+      684 +            }))
+      685 +        }
+      686 +        _ => Ok(None),
+      687 +    }
+      688 +}
+      689 +
+      690  fn colorize_diff(diff: &str) -> String {
+      691      let mut out = String::new();
+      692      for line in diff.lines() {
 
-● Read(src/orchestrator/discovered_manager.rs)
-  ⎿  Read 50 lines
+● Let me build and run clippy to check for issues:
 
-● Update(src/orchestrator/discovered_manager.rs)
-  ⎿  Added 1 line
-      360                                  status
-      361                              );
-      362                              process.handle = None;
-      363 +                            process.state = DiscoveredProcessState::Failed;
-      364                              true // Always restart discovered processes
-      365                          }
-      366                          Ok(None) => {
+● Bash(cargo clippy --bin commonplace-log 2>&1)
+  ⎿      Checking commonplace-doc v0.1.0 (/home/jes/commonplace)
+         Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.32s
 
-● Read(src/orchestrator/discovered_manager.rs)
-  ⎿  Read 40 lines
-
-● Update(src/orchestrator/discovered_manager.rs)
-  ⎿  Added 3 lines
-      402                      )
-      403                  };
-      404
-      405 +                // Update status to reflect the failed state
-      406 +                self.write_status();
-      407 +
-      408                  let failures = self.processes.get(&name).unwrap().consecutive_failures;
-      409                  tracing::info!(
-      410                      "[discovery] Restarting '{}' in {}ms (attempt {})",
-
-● Read(src/orchestrator/discovered_manager.rs)
-  ⎿  Read 60 lines
-
-● Read(src/orchestrator/discovered_manager.rs)
-  ⎿  Read 40 lines
-
-> let's put this in the readme and in CLAUDE.md when it's ready
-
-● Understood - I'll add documentation to README and CLAUDE.md once the CLI is working. Let me continue with the implementation.
-
-● Update(src/orchestrator/discovered_manager.rs)
-  ⎿  Added 5 lines
-      1106              }
-      1107          }
-      1108
-      1109 +        // Remove status file on shutdown
-      1110 +        if let Err(e) = OrchestratorStatus::remove() {
-      1111 +            tracing::warn!("[discovery] Failed to remove status file: {}", e);
-      1112 +        }
-      1113 +
-      1114          tracing::info!("[discovery] Shutdown complete");
-      1115      }
-      1116  }
-
-● Read(src/orchestrator/discovered_manager.rs)
-  ⎿  Read 35 lines
-
-● Update(src/orchestrator/discovered_manager.rs)
-  ⎿  Added 2 lines
-      189                      let _ = child.kill().await;
-      190                  }
-      191              }
-      192 +            // Update status after removing process
-      193 +            self.write_status();
-      194              Some(process)
-      195          } else {
-      196              None
-
-● Read(src/cli.rs)
-  ⎿  Read 60 lines
-
-● Search(pattern: "pub struct.*Args", path: "src/cli.rs", output_mode: "content")
-  ⎿  Found 7 lines (ctrl+o to expand)
-
-● Read(src/cli.rs)
-  ⎿  Read 9 lines
-
-● Update(src/cli.rs)
-  ⎿  Added 10 lines
-      173      #[clap(long)]
-      174      pub json: bool,
-      175  }
-      176 +
-      177 +/// CLI arguments for commonplace-ps (list orchestrator processes)
-      178 +#[derive(Parser, Debug)]
-      179 +#[clap(name = "commonplace-ps")]
-      180 +#[clap(about = "List processes managed by the commonplace orchestrator", long_about = None)]
-      181 +pub struct PsArgs {
-      182 +    /// Output in JSON format
-      183 +    #[clap(long)]
-      184 +    pub json: bool,
-      185 +}
-
-● Write(src/bin/ps.rs)
-  ⎿  Wrote 105 lines to src/bin/ps.rs
-     //! commonplace-ps: List processes managed by the commonplace orchestrator
-     //!
-     //! Usage:
-     //!   commonplace-ps           # Human-readable table
-     //!   commonplace-ps --json    # JSON output
-     use clap::Parser;
-     use commonplace_doc::cli::PsArgs;
-     use commonplace_doc::orchestrator::OrchestratorStatus;
-     … +95 lines (ctrl+o to expand)
-
-● Search(pattern: "^chrono", path: "Cargo.toml")
-  ⎿  Found 1 file (ctrl+o to expand)
-
-● Search(pattern: "name = \"commonplace-uuid\"", path: "Cargo.toml", output_mode: "content")
-  ⎿  Found 7 lines (ctrl+o to expand)
-
-● Update(Cargo.toml)
-  ⎿  File must be read first
-
-● Read(Cargo.toml)
-  ⎿  Read 60 lines
-
-● Update(Cargo.toml)
-  ⎿  Added 4 lines
-      43  name = "commonplace-uuid"
-      44  path = "src/bin/uuid.rs"
-      45
-      46 +[[bin]]
-      47 +name = "commonplace-ps"
-      48 +path = "src/bin/ps.rs"
-      49 +
-      50  [dependencies]
-      51  rmcp = { version = "0.12", features = ["server", "transport-io"] }
-      52  axum = "0.7"
-
-● Bash(cargo build --release --bin commonplace-ps 2>&1) timeout: 5m 0s
-  ⎿  Error: Exit code 101
-        Compiling commonplace-doc v0.1.0 (/home/jes/commonplace)
-     error[E0308]: mismatched types
-        --> src/orchestrator/discovered_manager.rs:121:17
-         |
-     121 |                 cwd,
-         |                 ^^^ expected `Option<String>`, found `Option<PathBuf>`
-         |
-         = note: expected enum `std::option::Option<std::string::String>`
-                    found enum `std::option::Option<PathBuf>`
-     … +3 lines (ctrl+o to see all)
-
-● Update(src/orchestrator/discovered_manager.rs)
-  ⎿  Added 1 line, removed 1 line
-      106                  .as_ref()
-      107                  .and_then(|h| h.id());
-      108
-      109 -            let cwd = process.config.cwd.clone();
-      109 +            let cwd = process.config.cwd.as_ref().map(|p| p.to_string_lossy().to_string());
-      110
-      111              let state = match process.state {
-      112                  DiscoveredProcessState::Stopped => "Stopped",
-
-● Bash(cargo build --release --bin commonplace-ps 2>&1) timeout: 5m 0s
+● Bash(cargo build --release --bin commonplace-log 2>&1 && echo "Build successful")
   ⎿     Compiling commonplace-doc v0.1.0 (/home/jes/commonplace)
-     warning: unused import: `SystemTime`
-       --> src/bin/ps.rs:99:31
-     … +9 lines (ctrl+o to expand)
+         Finished `release` profile [optimized] target(s) in 1m 33s
+     Build successful
 
-● Update(src/bin/ps.rs)
-  ⎿  Added 1 line, removed 1 line
-       96
-       97  /// Format Unix timestamp as human-readable
-       98  fn format_timestamp(ts: u64) -> String {
-       99 -    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-       99 +    use std::time::{Duration, UNIX_EPOCH};
-      100
-      101      let time = UNIX_EPOCH + Duration::from_secs(ts);
-      102      let datetime: chrono::DateTime<chrono::Local> = time.into();
+● Bash(# First check how many commits output.txt has with --oneline --no-patch (should be fast) timeout: 30s
+      time ./target/release/commonplace-log --oneline --no-patch workspace/ba…)
+  ⎿  real       0m0.024s
+     user       0m0.001s
+     sys        0m0.008s
 
-● Bash(cargo build --release --bin commonplace-ps && ./target/release/commonplace-ps 2>&1) timeout: 5m 0s
+● Bash(# Count commits                                                                                  timeout: 30s
+      ./target/release/commonplace-log --oneline --no-patch workspace/bartleby/output.txt 2>&1 | wc -l)
+  ⎿  0
+
+● Bash(# Try different files                                                                             timeout: 30s
+      ./target/release/commonplace-log --oneline --no-patch workspace/bartleby/prompts.txt 2>&1 | wc -l)
+  ⎿  0
+
+● Bash(# Try to find files with commits                                                                          timeout: 30s
+      ./target/release/commonplace-log --oneline --no-patch workspace/text-to-telegram/content.txt 2>&1 | wc -l)
+  ⎿  0
+
+● Bash(# Check if server is running and has any docs with changes timeout: 10s
+      curl -s http://localhost:3000/health && echo ""…)
+  ⎿  OK
+
+● Bash(# Check the .commonplace.json to find UUID               timeout: 10s
+      cat workspace/bartleby/.commonplace.json 2>&1 | head -30)
+  ⎿  (No content)
+
+● Bash(# Check for database file                                                 timeout: 10s
+      ls -la *.redb 2>&1 || ls -la data.redb 2>&1 || echo "No redb file found"…)
+  ⎿  -rw-rw-r-- 1 jes jes 1589248 Jan  1 04:15 bartleby-test.redb
+     -rw-rw-r-- 1 jes jes 1589248 Jan  4 00:00 data.redb
+     -rw-rw-r-- 1 jes jes 1589248 Jan  1 11:53 sandbox.redb
+     … +2 lines (ctrl+o to expand)
+
+● Bash(# Get a UUID and check changes                                                                                      timeout: 10s
+      UUID=$(./target/release/commonplace-uuid workspace/bartleby/output.txt 2>&1 | grep -oE '[0-9a-f-]{36}' || echo "")…)
+  ⎿  UUID:
+
+● Bash(# Look at the JSON files timeout: 10s
+      python3 -c "…)
+  ⎿  (No content)
+
+● Read(workspace/.commonplace.json)
+  ⎿  Read 44 lines
+
+● Bash(# Check changes for a known UUID             timeout: 10s
+      UUID="50c74659-c0fc-44c9-b06c-0b5193e9d0b6"…)
+  ⎿  Checking changes for UUID 50c74659-c0fc-44c9-b06c-0b5193e9d0b6...
+     {
+       "changes": [
+     … +100 lines (ctrl+o to expand)
+
+● The file has 14 commits. Let me test the streaming behavior:
+
+● Bash(# Test streaming mode (--no-pager triggers streaming)         timeout: 1m 0s
+      echo "=== Testing streaming (--no-pager) with 5 commits ==="…)
+  ⎿  === Testing streaming (--no-pager) with 5 commits ===
+     * 955b28c0 (HEAD) 2026-01-04 09:39
+     |
+     … +37 lines (ctrl+o to expand)
+
+● Bash(# Find which file has the most commits                                                                                     timeout: 30s
+      for uuid in $(curl -s "http://localhost:3000/documents" 2>/dev/null | python3 -c "import json,sys; [print(d) for d in jso…)
+  ⎿  (No content)
+
+● The streaming is working correctly. Let me verify the default full output mode also streams properly:
+
+● Bash(# Test full output streaming (not oneline, not graph, but with --no-pager for streaming) timeout: 30s
+      echo "=== Testing full output streaming ==="…)
+  ⎿  === Testing full output streaming ===
+     File: first_conversation_haiku.txt
+     UUID: 50c74659-c0fc-44c9-b06c-0b5193e9d0b6
+     … +18 lines (ctrl+o to expand)
+
+● Bash(# Check if commits have the same content (no diffs) timeout: 10s
+      UUID="50c74659-c0fc-44c9-b06c-0b5193e9d0b6"…)
+  ⎿  === Content at 955b28c0fea1f5637c4ad4f895480624e34d372a86d27836cff91baf4653065e ===
+     Voices bridge the void—
+     Telegram sparks connection,
+     … +15 lines (ctrl+o to expand)
+
+● The content is the same between those commits (no actual changes), which is why no diffs are shown. The fix is working correctly. Let me run the t
+ests and commit:
+
+● Bash(cargo test 2>&1 | tail -20) timeout: 3m 0s
+  ⎿  running 8 tests
+     test test_document_http_roundtrip ... ok
+     test test_ws_connect_and_initial_sync ... ok
+     … +16 lines (ctrl+o to expand)
+
+● Bash(git add -A && git commit -m "CP-oxqa: Stream log output with lazy diff computation…)
   ⎿  Error: Exit code 1
-        Compiling commonplace-doc v0.1.0 (/home/jes/commonplace)
-         Finished `release` profile [optimized] target(s) in 1.59s
+     warning: adding embedded git repository: commonplaced-2025
+     hint: You've added another git repository inside your current repository.
+     hint: Clones of the outer repository will not contain the contents of
+     hint: the embedded repository and will not know how to obtain it.
+     hint: If you meant to add a submodule, use:
+     hint:
+     hint:      git submodule add <url> commonplaced-2025
+     hint:
+     hint: If you added this path by mistake, you can remove it from the
+     … +65 lines (ctrl+o to see all)
 
-     Orchestrator is not running (no status file found)
+● Bash(# Remove the embedded repo and format code
+      git rm --cached commonplaced-2025 2>/dev/null || true…)
+  ⎿  Running…
 
-● Bash(cargo build --release --bin commonplace-orchestrator 2>&1 | tail -5) timeout: 5m 0s
-  ⎿     Compiling commonplace-doc v0.1.0 (/home/jes/commonplace)
-         Finished `release` profile [optimized] target(s) in 11.72s
+✽ Combobulating… (esc to interrupt · 8m 54s · ↓ 18.4k tokens)
 
-● Bash(pkill -f commonplace-orchestrator; sleep 2; ./target/release/commonplace-orchestrator &)
-  ⎿  Waiting…
-
-✻ Implementing CP-bt0: commonplace-ps CLI… (esc to interrupt · ctrl+t to hide todos · 11m 6s · ↓ 15.2k tokens · thinking)
-  ⎿  ☐ Implement CP-bt0: Add commonplace-ps CLI to list orchestrator processes
-     ☒ Add status file writing to orchestrator when processes start/stop
-     ☐ Create commonplace-ps binary to read and display status
-
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 > 
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  [Opus 4.5] 📁 commonplace | 🌿 main | 📊 38%
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [Opus 4.5] 📁 commonplace | 🌿 main | 📊 37%
   ⏵⏵ bypass permissions on · 2 background tasks
 

@@ -8,15 +8,15 @@
 # 4. Pushes the linked schema to the server
 #
 # Prerequisites:
-# - Server must be running with: commonplace-server --fs-root sandbox-workspace --database /path/to/data.redb
+# - Server must be running with: commonplace-server --fs-root workspace --database /path/to/data.redb
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-SANDBOX_DIR="${SANDBOX_DIR:-$HOME/sandbox-workspace}"
+SANDBOX_DIR="${SANDBOX_DIR:-$HOME/workspace}"
 SERVER_URL="${SERVER_URL:-http://localhost:3000}"
-FS_ROOT="${FS_ROOT:-sandbox-workspace}"
+FS_ROOT="${FS_ROOT:-workspace}"
 
 echo "=== Sandbox Setup ==="
 echo "Sandbox directory: $SANDBOX_DIR"

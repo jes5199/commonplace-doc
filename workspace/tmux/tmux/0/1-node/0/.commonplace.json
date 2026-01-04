@@ -1,1 +1,9 @@
-{"root":{"entries":{"content.txt":{"content_type":"text/plain","type":"doc","node_id":"7d60bc0c-a531-45b1-a141-7857fdf10059"},"input.txt":{"node_id":"05787d30-99b9-44d2-9519-b4cfedee7810","type":"doc","content_type":"text/plain"}},"node_id":null,"type":"dir","content_type":null},"version":1}
+{
+  "version": 1,
+  "root": {
+    "type": "dir",
+    "entries": {},
+    "node_id": null,
+    "content_type": null
+  }
+}

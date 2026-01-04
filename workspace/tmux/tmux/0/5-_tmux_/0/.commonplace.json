@@ -2,18 +2,7 @@
   "version": 1,
   "root": {
     "type": "dir",
-    "entries": {
-      "content.txt": {
-        "type": "doc",
-        "node_id": "939d9504-b46d-4bc3-86ce-02098b8b8b4f",
-        "content_type": "text/plain"
-      },
-      "input.txt": {
-        "type": "doc",
-        "node_id": "75abd385-96f4-4deb-92f8-c4c78d91f45d",
-        "content_type": "text/plain"
-      }
-    },
+    "entries": {},
     "node_id": null,
     "content_type": null
   }

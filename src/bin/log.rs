@@ -17,6 +17,7 @@ use futures::StreamExt;
 use reqwest::Client;
 use reqwest_eventsource::{Event as SseEvent, EventSource};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::process::{Command, Stdio};
 
@@ -126,44 +127,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         changes.changes.truncate(max);
     }
 
-    // Compute stats if requested
-    let stats_map: Option<Vec<Option<ChangeStats>>> = if args.stat {
-        Some(compute_stats(&client, &args.server, &uuid, &changes.changes).await?)
-    } else {
-        None
-    };
-
     // Apply opt-out flags
     let graph = args.graph && !args.no_graph && !args.oneline;
     let decorate = (args.decorate || graph) && !args.no_decorate;
 
-    // Fetch diffs (default on, unless --no-patch or --oneline)
+    // Determine if we need diffs (default on, unless --no-patch or --oneline)
     let show_patch = !args.no_patch && !args.oneline;
-    let diffs: Option<Vec<Option<String>>> = if show_patch {
-        Some(compute_diffs(&client, &args.server, &uuid, &changes.changes).await?)
+
+    // Determine if we should use pager (interactive terminal, not disabled, not --follow)
+    let use_pager = !args.follow && !args.no_pager && !args.json && io::stdout().is_terminal();
+
+    // HEAD is at index 0 normally, but at last index in reverse mode
+    let head_idx = if reverse {
+        changes.changes.len().saturating_sub(1)
     } else {
-        None
+        0
     };
 
-    // Build output string
-    let output = build_output(
-        &args,
-        &rel_path,
-        &uuid,
-        &changes.changes,
-        &stats_map,
-        &diffs,
-        graph,
-        decorate,
-        reverse,
-    )?;
+    if use_pager {
+        // For pager mode, we need to buffer all output
+        // Compute stats and diffs eagerly (with progress for large histories)
+        let stats_map: Option<Vec<Option<ChangeStats>>> = if args.stat {
+            if changes.changes.len() > 20 {
+                eprint!("Computing stats for {} commits...", changes.changes.len());
+            }
+            let result = compute_stats(&client, &args.server, &uuid, &changes.changes).await?;
+            if changes.changes.len() > 20 {
+                eprintln!(" done");
+            }
+            Some(result)
+        } else {
+            None
+        };
 
-    // Use pager if interactive terminal and not disabled (never for --follow)
-    if !args.follow && !args.no_pager && !args.json && io::stdout().is_terminal() {
+        let diffs: Option<Vec<Option<String>>> = if show_patch {
+            if changes.changes.len() > 20 {
+                eprint!("Computing diffs for {} commits...", changes.changes.len());
+            }
+            let result = compute_diffs(&client, &args.server, &uuid, &changes.changes).await?;
+            if changes.changes.len() > 20 {
+                eprintln!(" done");
+            }
+            Some(result)
+        } else {
+            None
+        };
+
+        let output = build_output(
+            &args,
+            &rel_path,
+            &uuid,
+            &changes.changes,
+            &stats_map,
+            &diffs,
+            graph,
+            decorate,
+            reverse,
+        )?;
         output_with_pager(&output);
     } else {
-        print!("{}", output);
-        io::stdout().flush()?;
+        // Streaming mode: output each commit as we compute its diff
+        stream_output(
+            &client,
+            &args,
+            &rel_path,
+            &uuid,
+            &changes.changes,
+            show_patch,
+            graph,
+            decorate,
+            head_idx,
+        )
+        .await?;
     }
 
     // If --follow, subscribe to SSE and watch for new commits
@@ -374,6 +409,292 @@ fn build_output(
     }
 
     Ok(out)
+}
+
+/// Stream output, computing diffs lazily as we print each commit
+#[allow(clippy::too_many_arguments)]
+async fn stream_output(
+    client: &Client,
+    args: &LogArgs,
+    rel_path: &str,
+    uuid: &str,
+    changes: &[CommitChange],
+    show_patch: bool,
+    graph: bool,
+    decorate: bool,
+    head_idx: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    // JSON mode: still need to buffer for valid JSON
+    if args.json {
+        // For JSON, we need all data upfront - fall back to buffered mode
+        let stats_map: Option<Vec<Option<ChangeStats>>> = if args.stat {
+            Some(compute_stats(client, &args.server, uuid, changes).await?)
+        } else {
+            None
+        };
+
+        let commits: Vec<CommitInfo> = changes
+            .iter()
+            .enumerate()
+            .map(|(i, c)| CommitInfo {
+                cid: c.commit_id.clone(),
+                timestamp: c.timestamp,
+                datetime: format_timestamp(c.timestamp),
+                stats: stats_map.as_ref().and_then(|m| m.get(i).cloned().flatten()),
+            })
+            .collect();
+
+        let output = LogOutput {
+            uuid: uuid.to_string(),
+            path: rel_path.to_string(),
+            commits,
+        };
+        writeln!(out, "{}", serde_json::to_string_pretty(&output)?)?;
+        return Ok(());
+    }
+
+    // Build parent map for diff computation (previous commit by timestamp)
+    let mut sorted_by_time: Vec<(usize, &CommitChange)> = changes.iter().enumerate().collect();
+    sorted_by_time.sort_by_key(|(_, c)| c.timestamp);
+
+    let mut parent_map: HashMap<String, Option<String>> = HashMap::new();
+    for i in 0..sorted_by_time.len() {
+        let (_, change) = sorted_by_time[i];
+        let parent = if i > 0 {
+            Some(sorted_by_time[i - 1].1.commit_id.clone())
+        } else {
+            None
+        };
+        parent_map.insert(change.commit_id.clone(), parent);
+    }
+
+    // Content cache to avoid re-fetching
+    let mut content_cache: HashMap<String, String> = HashMap::new();
+
+    // Print header for full output mode
+    if !args.oneline && !graph {
+        writeln!(out, "File: {}", rel_path)?;
+        writeln!(out, "UUID: {}", uuid)?;
+        writeln!(out)?;
+    }
+
+    for (i, change) in changes.iter().enumerate() {
+        let decoration = if decorate && i == head_idx {
+            " \x1b[36m(HEAD)\x1b[0m"
+        } else {
+            ""
+        };
+
+        // Compute stats if needed
+        let stats = if args.stat {
+            compute_single_stats(
+                client,
+                &args.server,
+                uuid,
+                change,
+                &parent_map,
+                &mut content_cache,
+            )
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+
+        // Compute diff if needed
+        let diff = if show_patch {
+            compute_single_diff(
+                client,
+                &args.server,
+                uuid,
+                change,
+                &parent_map,
+                &mut content_cache,
+            )
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+
+        // Format and output this commit
+        if args.oneline {
+            let cid_short = &change.commit_id[..12.min(change.commit_id.len())];
+            let date = format_timestamp_short(change.timestamp);
+            if let Some(ref s) = stats {
+                writeln!(
+                    out,
+                    "\x1b[33m{}\x1b[0m{} {} (+{} -{} chars)",
+                    cid_short, decoration, date, s.chars_added, s.chars_removed
+                )?;
+            } else {
+                writeln!(out, "\x1b[33m{}\x1b[0m{} {}", cid_short, decoration, date)?;
+            }
+        } else if graph {
+            let cid_short = &change.commit_id[..8.min(change.commit_id.len())];
+            let date = format_timestamp_short(change.timestamp);
+            let is_last = i == changes.len() - 1;
+            let connector = if is_last { "  " } else { "| " };
+
+            write!(out, "* \x1b[33m{}\x1b[0m{} {}", cid_short, decoration, date)?;
+            if let Some(ref s) = stats {
+                write!(out, " (+{} -{} chars)", s.chars_added, s.chars_removed)?;
+            }
+            writeln!(out)?;
+
+            if let Some(ref d) = diff {
+                if !d.is_empty() {
+                    for line in colorize_diff(d).lines() {
+                        writeln!(out, "{} {}", connector, line)?;
+                    }
+                }
+            }
+            if !is_last {
+                writeln!(out, "{}", connector)?;
+            }
+        } else {
+            // Full output
+            writeln!(
+                out,
+                "\x1b[33mcommit {}\x1b[0m{}",
+                change.commit_id, decoration
+            )?;
+            writeln!(out, "Date:   {}", format_timestamp(change.timestamp))?;
+
+            if let Some(ref s) = stats {
+                writeln!(out)?;
+                writeln!(
+                    out,
+                    " {} chars (+{}/-{}), {} lines (+{}/-{})",
+                    s.chars_added + s.chars_removed,
+                    s.chars_added,
+                    s.chars_removed,
+                    s.lines_added + s.lines_removed,
+                    s.lines_added,
+                    s.lines_removed
+                )?;
+            }
+
+            if let Some(ref d) = diff {
+                if !d.is_empty() {
+                    writeln!(out)?;
+                    write!(out, "{}", colorize_diff(d))?;
+                }
+            }
+
+            writeln!(out)?;
+        }
+
+        out.flush()?;
+    }
+
+    if !args.oneline && !graph {
+        writeln!(out, "{} commits", changes.len())?;
+    }
+
+    Ok(())
+}
+
+/// Fetch content at a specific commit, using cache
+async fn fetch_content(
+    client: &Client,
+    server: &str,
+    uuid: &str,
+    commit_id: &str,
+    cache: &mut HashMap<String, String>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if let Some(content) = cache.get(commit_id) {
+        return Ok(Some(content.clone()));
+    }
+
+    let url = format!("{}/docs/{}/head?at_commit={}", server, uuid, commit_id);
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(head) = resp.json::<HeadResponse>().await {
+                if let Some(content) = head.content {
+                    cache.insert(commit_id.to_string(), content.clone());
+                    return Ok(Some(content));
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(None)
+}
+
+/// Compute diff for a single commit
+async fn compute_single_diff(
+    client: &Client,
+    server: &str,
+    uuid: &str,
+    change: &CommitChange,
+    parent_map: &HashMap<String, Option<String>>,
+    cache: &mut HashMap<String, String>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    // Fetch current commit content
+    let current = fetch_content(client, server, uuid, &change.commit_id, cache).await?;
+
+    // Get parent commit ID and fetch its content
+    let parent_id = parent_map.get(&change.commit_id).and_then(|p| p.clone());
+    let parent_content = if let Some(ref pid) = parent_id {
+        fetch_content(client, server, uuid, pid, cache).await?
+    } else {
+        None
+    };
+
+    match (current, parent_content) {
+        (Some(curr), Some(prev)) => Ok(Some(compute_unified_diff(&prev, &curr))),
+        (Some(curr), None) => {
+            // First commit - show all as additions
+            Ok(Some(
+                curr.lines()
+                    .map(|l| format!("+{}", l))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Compute stats for a single commit
+async fn compute_single_stats(
+    client: &Client,
+    server: &str,
+    uuid: &str,
+    change: &CommitChange,
+    parent_map: &HashMap<String, Option<String>>,
+    cache: &mut HashMap<String, String>,
+) -> Result<Option<ChangeStats>, Box<dyn std::error::Error>> {
+    // Fetch current commit content
+    let current = fetch_content(client, server, uuid, &change.commit_id, cache).await?;
+
+    // Get parent commit ID and fetch its content
+    let parent_id = parent_map.get(&change.commit_id).and_then(|p| p.clone());
+    let parent_content = if let Some(ref pid) = parent_id {
+        fetch_content(client, server, uuid, pid, cache).await?
+    } else {
+        None
+    };
+
+    match (current, parent_content) {
+        (Some(curr), Some(prev)) => Ok(Some(compute_diff_stats(&prev, &curr))),
+        (Some(curr), None) => {
+            // First commit - all additions
+            Ok(Some(ChangeStats {
+                lines_added: curr.lines().count(),
+                lines_removed: 0,
+                chars_added: curr.len(),
+                chars_removed: 0,
+            }))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn colorize_diff(diff: &str) -> String {

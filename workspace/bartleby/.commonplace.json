@@ -3,6 +3,17 @@
   "root": {
     "type": "dir",
     "entries": {
+      "prompts.txt": {
+        "type": "doc",
+        "node_id": "b25c9b85-4981-41fe-a0b4-0e7b1abbf97b",
+        "content_type": "text/plain"
+      },
+      "bartleby": {
+        "type": "dir",
+        "entries": null,
+        "node_id": "f2b23768-8457-4abe-ad6d-7c3e9c36862d",
+        "content_type": "application/json"
+      },
       "output.txt": {
         "type": "doc",
         "node_id": "839ba100-b599-43c5-b96b-209e0f427a14",
@@ -16,11 +27,6 @@
       "system_prompt.txt": {
         "type": "doc",
         "node_id": "974718c4-739f-4bc6-8e9e-631730ac5bba",
-        "content_type": "text/plain"
-      },
-      "prompts.txt": {
-        "type": "doc",
-        "node_id": "b25c9b85-4981-41fe-a0b4-0e7b1abbf97b",
         "content_type": "text/plain"
       },
       "history.jsonl": {

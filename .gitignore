@@ -2,6 +2,7 @@
 *.skill
 .claude/wiggum-loop.local.md
 .worktrees/
+.commonplaced-2025
 
 # Python
 __pycache__/

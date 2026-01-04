@@ -5,15 +5,15 @@
 # When bartleby exits, sync also stops.
 #
 # Prerequisites:
-# - Server running: commonplace-server --fs-root sandbox-workspace --database /path/to/data.redb
+# - Server running: commonplace-server --fs-root workspace --database /path/to/data.redb
 # - Sandbox set up: scripts/setup-sandbox.sh
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SANDBOX_DIR="${SANDBOX_DIR:-$HOME/sandbox-workspace}"
+SANDBOX_DIR="${SANDBOX_DIR:-$HOME/workspace}"
 SERVER_URL="${SERVER_URL:-http://localhost:3000}"
-FS_ROOT="${FS_ROOT:-sandbox-workspace}"
+FS_ROOT="${FS_ROOT:-workspace}"
 
 # Check server is running
 if ! curl -s "$SERVER_URL/health" > /dev/null 2>&1; then

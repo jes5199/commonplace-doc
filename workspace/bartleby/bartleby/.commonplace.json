@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "root": {
+    "type": "dir",
+    "entries": {
+      "prompts.txt": {
+        "type": "doc",
+        "node_id": "10fd0642-7c58-44f0-b78d-5c0b79f8802d",
+        "content_type": "text/plain"
+      },
+      "output.txt": {
+        "type": "doc",
+        "node_id": "838d87c3-4fd3-470c-97f6-c0e32c664a3f",
+        "content_type": "text/plain"
+      }
+    },
+    "node_id": null,
+    "content_type": null
+  }
+}

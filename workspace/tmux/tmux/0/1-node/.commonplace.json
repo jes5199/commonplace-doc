@@ -1,1 +1,16 @@
-{"root":{"type":"dir","content_type":null,"entries":{"0":{"entries":null,"content_type":"application/json","type":"dir","node_id":"21b539ff-0dbe-4b94-b466-0ca6aa3b040c"}},"node_id":null},"version":1}
+{
+  "version": 1,
+  "root": {
+    "type": "dir",
+    "entries": {
+      "0": {
+        "type": "dir",
+        "entries": null,
+        "node_id": "567a24fe-3d24-4fc3-a090-e4d7530482e2",
+        "content_type": "application/json"
+      }
+    },
+    "node_id": null,
+    "content_type": null
+  }
+}
