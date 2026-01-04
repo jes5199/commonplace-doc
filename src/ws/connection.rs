@@ -7,6 +7,14 @@ use tokio::sync::mpsc;
 /// Unique connection ID.
 pub type ConnectionId = String;
 
+/// Pending commit metadata from a commonplace-mode client.
+#[derive(Debug, Clone, Default)]
+pub struct PendingCommitMeta {
+    pub parent_cid: Option<String>,
+    pub author: Option<String>,
+    pub message: Option<String>,
+}
+
 /// Per-connection state.
 #[derive(Debug)]
 pub struct WsConnection {
@@ -27,6 +35,9 @@ pub struct WsConnection {
 
     /// Sender for outgoing messages to this connection
     pub sender: mpsc::Sender<OutgoingMessage>,
+
+    /// Pending commit metadata (commonplace mode only)
+    pub pending_commit_meta: PendingCommitMeta,
 }
 
 /// Outgoing message to send to a WebSocket client.
@@ -66,7 +77,27 @@ impl WsConnection {
             client_id,
             last_activity: Instant::now(),
             sender,
+            pending_commit_meta: PendingCommitMeta::default(),
         }
+    }
+
+    /// Set pending commit metadata (for next update).
+    pub fn set_commit_meta(&mut self, parent_cid: String, author: String, message: Option<String>) {
+        self.pending_commit_meta = PendingCommitMeta {
+            parent_cid: Some(parent_cid),
+            author: Some(author),
+            message,
+        };
+    }
+
+    /// Take and clear pending commit metadata.
+    pub fn take_commit_meta(&mut self) -> PendingCommitMeta {
+        std::mem::take(&mut self.pending_commit_meta)
+    }
+
+    /// Check if this connection is in commonplace mode.
+    pub fn is_commonplace_mode(&self) -> bool {
+        self.protocol == ProtocolMode::Commonplace
     }
 
     /// Update last activity timestamp.

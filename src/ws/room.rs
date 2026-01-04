@@ -1,7 +1,7 @@
 //! Document room for coordinating multiple WebSocket connections.
 
-use super::connection::{ConnectionId, WsConnection};
-use super::protocol;
+use super::connection::{ConnectionId, PendingCommitMeta, WsConnection};
+use super::protocol::{self, ProtocolMode};
 use crate::document::DocumentStore;
 use crate::events::{CommitBroadcaster, CommitNotification};
 use crate::store::CommitStore;
@@ -40,7 +40,7 @@ pub struct Room {
     /// Commit store for persistence (optional)
     commit_store: Option<Arc<CommitStore>>,
 
-    /// Broadcaster for commit notifications (for Phase 2: commonplace extensions)
+    /// Broadcaster for commit notifications (used to receive HTTP API edits)
     #[allow(dead_code)]
     broadcaster: Option<CommitBroadcaster>,
 }
@@ -120,17 +120,100 @@ impl Room {
     /// Handle an update from a client.
     /// Applies to document store and broadcasts to other connections.
     pub async fn handle_update(&self, from_conn_id: &str, update: &[u8]) -> Result<(), RoomError> {
+        self.handle_update_with_meta(from_conn_id, update, PendingCommitMeta::default())
+            .await
+    }
+
+    /// Handle an update from a client with optional commit metadata.
+    /// If commit metadata is provided, creates a proper commit in the store.
+    pub async fn handle_update_with_meta(
+        &self,
+        from_conn_id: &str,
+        update: &[u8],
+        commit_meta: PendingCommitMeta,
+    ) -> Result<(), RoomError> {
         // Apply to document store
         self.doc_store
             .apply_yjs_update(&self.doc_id, update)
             .await
             .map_err(|e| RoomError::ApplyError(format!("{:?}", e)))?;
 
-        // Broadcast to other connections
+        // If we have commit metadata and a commit store, persist the commit
+        let commit_id = if let Some(store) = &self.commit_store {
+            if commit_meta.author.is_some() {
+                // Create a commit with the provided metadata
+                let update_b64 = crate::b64::encode(update);
+                let commit = crate::commit::Commit {
+                    parents: commit_meta.parent_cid.map(|p| vec![p]).unwrap_or_default(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                    update: update_b64,
+                    author: commit_meta
+                        .author
+                        .unwrap_or_else(|| "ws-client".to_string()),
+                    message: commit_meta.message,
+                    extensions: std::collections::HashMap::new(),
+                };
+
+                match store.store_commit(&commit).await {
+                    Ok(cid) => {
+                        // Update document head
+                        let _ = store.set_document_head(&self.doc_id, &cid).await;
+                        Some(cid)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to store commit: {:?}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Broadcast update to other connections
         let encoded = protocol::encode_update(update);
         self.broadcast_except(from_conn_id, encoded).await;
 
+        // If we created a commit, broadcast BlueEvent to commonplace-mode clients
+        if let Some(cid) = commit_id {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            self.broadcast_blue_event(&self.doc_id, &cid, timestamp)
+                .await;
+        }
+
         Ok(())
+    }
+
+    /// Broadcast a BlueEvent to all commonplace-mode connections.
+    pub async fn broadcast_blue_event(&self, doc_id: &str, commit_id: &str, timestamp: u64) {
+        let message = protocol::encode_blue_event(doc_id, commit_id, timestamp);
+        let connections = self.connections.read().await;
+        for conn in connections.values() {
+            let conn = conn.read().await;
+            if conn.protocol == ProtocolMode::Commonplace {
+                let _ = conn.try_send_binary(message.clone());
+            }
+        }
+    }
+
+    /// Broadcast a RedEvent to all other connections (any mode).
+    pub async fn broadcast_red_event(&self, from_conn_id: &str, event_type: &str, payload: &str) {
+        let message = protocol::encode_red_event(event_type, payload);
+        let connections = self.connections.read().await;
+        for (conn_id, conn) in connections.iter() {
+            if conn_id != from_conn_id {
+                let conn = conn.read().await;
+                let _ = conn.try_send_binary(message.clone());
+            }
+        }
     }
 
     /// Broadcast a message to all connections except one.

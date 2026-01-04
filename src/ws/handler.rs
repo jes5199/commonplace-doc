@@ -113,7 +113,7 @@ async fn handle_socket(
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
                         conn.write().await.touch();
-                        if let Err(e) = handle_binary_message(&conn_id, &data, &room).await {
+                        if let Err(e) = handle_binary_message(&conn, &data, &room).await {
                             warn!(conn_id = %conn_id, "Error handling message: {}", e);
                         }
                     }
@@ -131,7 +131,7 @@ async fn handle_socket(
                     Some(Ok(Message::Text(text))) => {
                         // y-websocket uses binary, but some clients might send text
                         conn.write().await.touch();
-                        if let Err(e) = handle_binary_message(&conn_id, text.as_bytes(), &room).await {
+                        if let Err(e) = handle_binary_message(&conn, text.as_bytes(), &room).await {
                             warn!(conn_id = %conn_id, "Error handling text message: {}", e);
                         }
                     }
@@ -179,11 +179,12 @@ async fn send_initial_sync(
 
 /// Handle a binary WebSocket message.
 async fn handle_binary_message(
-    conn_id: &str,
+    conn: &Arc<RwLock<WsConnection>>,
     data: &[u8],
     room: &Arc<super::room::Room>,
 ) -> Result<(), String> {
     let msg = protocol::decode_message(data).map_err(|e| e.to_string())?;
+    let conn_id = conn.read().await.id.clone();
 
     match msg {
         WsMessage::SyncStep1 { state_vector } => {
@@ -194,19 +195,19 @@ async fn handle_binary_message(
                 .map_err(|e| e.to_string())?;
 
             // Send response to the specific connection
-            // Note: We need access to the connection here
-            // For now, broadcast to all (the sender will receive it too, which is fine)
-            room.broadcast_all(response).await;
+            conn.read().await.try_send_binary(response);
         }
         WsMessage::SyncStep2 { update } => {
             // Client is sending us updates we're missing
-            room.handle_update(conn_id, &update)
+            let commit_meta = conn.write().await.take_commit_meta();
+            room.handle_update_with_meta(&conn_id, &update, commit_meta)
                 .await
                 .map_err(|e| e.to_string())?;
         }
         WsMessage::Update { update } => {
             // Incremental update from client
-            room.handle_update(conn_id, &update)
+            let commit_meta = conn.write().await.take_commit_meta();
+            room.handle_update_with_meta(&conn_id, &update, commit_meta)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -214,17 +215,32 @@ async fn handle_binary_message(
             // Awareness is deferred - just ignore for now
             debug!("Ignoring awareness message (not implemented)");
         }
-        WsMessage::CommitMeta { .. } => {
-            // Commonplace extension - TODO in Phase 2
-            debug!("CommitMeta message (commonplace mode) - not yet implemented");
+        WsMessage::CommitMeta {
+            parent_cid,
+            timestamp: _,
+            author,
+            message,
+        } => {
+            // Store commit metadata for the next update
+            let mut conn = conn.write().await;
+            if conn.is_commonplace_mode() {
+                conn.set_commit_meta(parent_cid, author, message);
+                debug!(conn_id = %conn_id, "Stored pending commit metadata");
+            } else {
+                debug!(conn_id = %conn_id, "Ignoring CommitMeta in y-websocket mode");
+            }
         }
         WsMessage::BlueEvent { .. } => {
-            // Commonplace extension - TODO in Phase 2
-            debug!("BlueEvent message (commonplace mode) - not yet implemented");
+            // BlueEvents are server-to-client only
+            debug!("Ignoring BlueEvent from client (server-to-client only)");
         }
-        WsMessage::RedEvent { .. } => {
-            // Commonplace extension - TODO in Phase 2
-            debug!("RedEvent message (commonplace mode) - not yet implemented");
+        WsMessage::RedEvent {
+            event_type,
+            payload,
+        } => {
+            // Broadcast RedEvent to all other clients
+            room.broadcast_red_event(&conn_id, &event_type, &payload)
+                .await;
         }
     }
 
