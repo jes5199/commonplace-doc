@@ -640,8 +640,12 @@ fn append_issue(
     let (current_content, parent_cid) = if resp.status().is_success() {
         let head: HeadResponse = resp.json()?;
         (head.content, head.cid)
-    } else {
+    } else if resp.status().as_u16() == 404 {
+        // Document doesn't exist yet - start fresh
         (String::new(), String::new())
+    } else {
+        // Any other error should fail, not silently truncate
+        return Err(format!("Failed to fetch current content: {}", resp.status()).into());
     };
 
     // Append new issue
