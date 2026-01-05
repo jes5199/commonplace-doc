@@ -1,7 +1,7 @@
 //! Process lifecycle management for discovered processes.
 //!
 //! This module handles the state machine and lifecycle management for processes
-//! discovered from `.processes.json` files. For config parsing and discovery logic,
+//! discovered from `__processes.json` files. For config parsing and discovery logic,
 //! see the `discovery` module.
 
 use super::discovery::{DiscoveredProcess, ProcessesConfig};
@@ -37,7 +37,7 @@ pub struct ManagedDiscoveredProcess {
     /// The document path this process owns
     pub document_path: String,
     /// The base_path (source) this process was loaded from
-    /// Used to track which processes.json file defined this process
+    /// Used to track which __processes.json file defined this process
     pub source_path: String,
     /// Configuration for this process
     pub config: DiscoveredProcess,
@@ -51,7 +51,7 @@ pub struct ManagedDiscoveredProcess {
     pub last_start: Option<Instant>,
 }
 
-/// Manager for processes discovered from `.processes.json` files.
+/// Manager for processes discovered from `__processes.json` files.
 pub struct DiscoveredProcessManager {
     /// MQTT broker address
     mqtt_broker: String,
@@ -67,9 +67,9 @@ pub struct DiscoveredProcessManager {
     reset_after_secs: u64,
 }
 
-/// Result of recursive discovery - includes both processes.json files and all schema node_ids.
+/// Result of recursive discovery - includes both __processes.json files and all schema node_ids.
 struct DiscoveryResult {
-    /// (base_path, processes.json node_id)
+    /// (base_path, __processes.json node_id)
     processes_json_files: Vec<(String, String)>,
     /// All directory schema node_ids (for watching changes)
     schema_node_ids: Vec<String>,
@@ -148,7 +148,7 @@ impl DiscoveredProcessManager {
     /// # Arguments
     /// * `name` - Unique name for this process
     /// * `document_path` - Full document path (e.g., "examples/counter.json")
-    /// * `config` - Process configuration from `.processes.json`
+    /// * `config` - Process configuration from `__processes.json`
     pub fn add_process(
         &mut self,
         name: String,
@@ -514,8 +514,8 @@ impl DiscoveredProcessManager {
                 self.remove_process(name).await;
 
                 // Add with new config
-                // Priority: explicit path > owns > base_path (processes.json location)
-                // sandbox-exec processes sync at the directory containing their processes.json
+                // Priority: explicit path > owns > base_path (__processes.json location)
+                // sandbox-exec processes sync at the directory containing their __processes.json
                 let document_path = if let Some(ref explicit_path) = new_config.path {
                     if explicit_path == "/" || explicit_path.is_empty() {
                         base_path.to_string()
@@ -613,9 +613,9 @@ impl DiscoveredProcessManager {
     // Note: find_processes_json_recursive was replaced by discover_all_processes_json
     // which handles async fetching of subdirectory schemas.
 
-    /// Recursively discover all processes.json files from a root schema.
+    /// Recursively discover all __processes.json files from a root schema.
     ///
-    /// This fetches schemas for subdirectories with node_ids and finds all processes.json.
+    /// This fetches schemas for subdirectories with node_ids and finds all __processes.json.
     /// Also returns all schema node_ids encountered for recursive watching.
     async fn discover_all_processes_json(
         client: &Client,
@@ -660,13 +660,13 @@ impl DiscoveredProcessManager {
             let schema: serde_json::Value = serde_json::from_str(&head.content)
                 .map_err(|e| format!("Failed to parse schema: {}", e))?;
 
-            // Check for processes.json at this level
+            // Check for __processes.json at this level
             if let Some(root) = schema.get("root") {
                 if let Some(entries) = root.get("entries").and_then(|e| e.as_object()) {
                     for (name, entry) in entries {
                         let entry_type = entry.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-                        if name == "processes.json" && entry_type == "doc" {
+                        if name == "__processes.json" && entry_type == "doc" {
                             if let Some(pj_node_id) = entry.get("node_id").and_then(|n| n.as_str())
                             {
                                 processes_json_files.push((path.clone(), pj_node_id.to_string()));
@@ -694,14 +694,14 @@ impl DiscoveredProcessManager {
         })
     }
 
-    /// Watch a .processes.json document for changes and dynamically update processes.
+    /// Watch a __processes.json document for changes and dynamically update processes.
     ///
     /// This method subscribes to the SSE stream for a document and calls
     /// `reconcile_config` whenever the document changes.
     ///
     /// # Arguments
     /// * `client` - HTTP client for making requests
-    /// * `document_path` - The document path to watch (e.g., "examples/.processes.json")
+    /// * `document_path` - The document path to watch (e.g., "examples/__processes.json")
     /// * `use_paths` - Whether to use path-based endpoints
     pub async fn watch_document(
         &mut self,
@@ -882,7 +882,7 @@ impl DiscoveredProcessManager {
 
         // Parse the content as ProcessesConfig
         let config = ProcessesConfig::parse(&head.content)
-            .map_err(|e| format!("Failed to parse .processes.json: {}", e))?;
+            .map_err(|e| format!("Failed to parse __processes.json: {}", e))?;
 
         // Reconcile
         self.reconcile_config(&config, base_path).await
@@ -890,7 +890,7 @@ impl DiscoveredProcessManager {
 
     /// Run the manager loop with document watching.
     ///
-    /// This is an alternative to `run()` that watches a .processes.json document
+    /// This is an alternative to `run()` that watches a __processes.json document
     /// for changes and dynamically updates processes.
     pub async fn run_with_document_watch(
         &mut self,
@@ -902,10 +902,10 @@ impl DiscoveredProcessManager {
         self.watch_document(client, document_path, use_paths).await
     }
 
-    /// Run with recursive discovery of all processes.json files.
+    /// Run with recursive discovery of all __processes.json files.
     ///
-    /// This discovers all processes.json files in the filesystem tree starting from
-    /// the given fs-root, and watches each one for changes. Each processes.json
+    /// This discovers all __processes.json files in the filesystem tree starting from
+    /// the given fs-root, and watches each one for changes. Each __processes.json
     /// controls processes that sync at its containing directory.
     ///
     /// Watches ALL schema documents (directory node_ids) for changes, not just fs-root.
@@ -919,16 +919,16 @@ impl DiscoveredProcessManager {
             fs_root_id
         );
 
-        // Discover all processes.json files and schema node_ids
+        // Discover all __processes.json files and schema node_ids
         let discovery =
             Self::discover_all_processes_json(client, &self.server_url, fs_root_id).await?;
 
         if discovery.processes_json_files.is_empty() {
-            tracing::warn!("[discovery] No processes.json files found in filesystem tree");
+            tracing::warn!("[discovery] No __processes.json files found in filesystem tree");
             // Still watch the root for changes
         } else {
             tracing::info!(
-                "[discovery] Found {} processes.json file(s): {:?}",
+                "[discovery] Found {} __processes.json file(s): {:?}",
                 discovery.processes_json_files.len(),
                 discovery
                     .processes_json_files
@@ -944,23 +944,23 @@ impl DiscoveredProcessManager {
         );
 
         // Track watched documents: node_id -> base_path
-        // Only successfully loaded processes.json files are added to this map
+        // Only successfully loaded __processes.json files are added to this map
         let mut watched: HashMap<String, String> = HashMap::new();
 
-        // Fetch and reconcile each processes.json
+        // Fetch and reconcile each __processes.json
         for (base_path, pj_node_id) in &discovery.processes_json_files {
             let url = format!("{}/docs/{}/head", self.server_url, pj_node_id);
             match self.fetch_and_reconcile(client, &url, base_path).await {
                 Ok(_) => {
                     tracing::info!(
-                        "[discovery] Loaded processes from {}/processes.json",
+                        "[discovery] Loaded processes from {}/__processes.json",
                         base_path
                     );
                     // Only add to watched if successfully loaded
                     watched.insert(pj_node_id.clone(), base_path.clone());
                 }
                 Err(e) => tracing::warn!(
-                    "[discovery] Failed to load {}/processes.json: {} (will retry)",
+                    "[discovery] Failed to load {}/__processes.json: {} (will retry)",
                     base_path,
                     e
                 ),
@@ -974,11 +974,11 @@ impl DiscoveredProcessManager {
         // Monitor interval for checking process health
         let mut monitor_interval = tokio::time::interval(Duration::from_millis(500));
 
-        // Re-discovery interval (check for new/removed processes.json files)
+        // Re-discovery interval (check for new/removed __processes.json files)
         let mut discovery_interval = tokio::time::interval(Duration::from_secs(30));
 
         loop {
-            // Build SSE URL from current watched state (schemas + processes.json files)
+            // Build SSE URL from current watched state (schemas + __processes.json files)
             // Rebuilt on every reconnect to ensure we don't miss newly discovered docs
             let mut all_ids: Vec<String> = current_schema_ids.iter().cloned().collect();
             for node_id in watched.keys() {
@@ -1013,19 +1013,19 @@ impl DiscoveredProcessManager {
                         self.check_and_restart().await;
                     }
 
-                    // Periodic re-discovery of processes.json files
+                    // Periodic re-discovery of __processes.json files
                     _ = discovery_interval.tick() => {
                         match Self::discover_all_processes_json(client, &self.server_url, fs_root_id).await {
                             Ok(new_discovery) => {
-                                // Check for new or previously-failed processes.json files
+                                // Check for new or previously-failed __processes.json files
                                 let mut added_new_pj = false;
                                 for (base_path, node_id) in &new_discovery.processes_json_files {
                                     if !watched.contains_key(node_id) {
-                                        tracing::info!("[discovery] Trying processes.json at {}", base_path);
+                                        tracing::info!("[discovery] Trying __processes.json at {}", base_path);
                                         let url = format!("{}/docs/{}/head", self.server_url, node_id);
                                         match self.fetch_and_reconcile(client, &url, base_path).await {
                                             Ok(_) => {
-                                                tracing::info!("[discovery] Loaded processes from {}/processes.json", base_path);
+                                                tracing::info!("[discovery] Loaded processes from {}/__processes.json", base_path);
                                                 // Only add to watched if successfully loaded
                                                 watched.insert(node_id.clone(), base_path.clone());
                                                 added_new_pj = true;
@@ -1037,7 +1037,7 @@ impl DiscoveredProcessManager {
                                     }
                                 }
 
-                                // Check for removed processes.json files
+                                // Check for removed __processes.json files
                                 let new_ids: HashSet<_> = new_discovery.processes_json_files.iter().map(|(_, id)| id.clone()).collect();
                                 let removed: Vec<_> = watched.keys()
                                     .filter(|id| !new_ids.contains(*id))
@@ -1045,7 +1045,7 @@ impl DiscoveredProcessManager {
                                     .collect();
                                 for node_id in removed {
                                     if let Some(base_path) = watched.remove(&node_id) {
-                                        tracing::info!("[discovery] processes.json removed at {}", base_path);
+                                        tracing::info!("[discovery] __processes.json removed at {}", base_path);
                                         // Remove processes that were from this base_path
                                         let to_remove: Vec<_> = self.processes.iter()
                                             .filter(|(_, p)| p.document_path.starts_with(&base_path))
@@ -1071,7 +1071,7 @@ impl DiscoveredProcessManager {
                                     current_schema_ids = new_schema_ids;
                                 }
 
-                                // Reconnect SSE if schemas changed or new processes.json added
+                                // Reconnect SSE if schemas changed or new __processes.json added
                                 // (URL is rebuilt on each loop iteration with current watch set)
                                 if schema_changed || added_new_pj {
                                     sse_closed = true;
@@ -1098,18 +1098,18 @@ impl DiscoveredProcessManager {
                                     // Parse the commit event to get doc_id
                                     if let Ok(commit) = serde_json::from_str::<serde_json::Value>(&msg.data) {
                                         if let Some(doc_id) = commit.get("doc_id").and_then(|v| v.as_str()) {
-                                            // Check if this is a processes.json file we're watching
+                                            // Check if this is a __processes.json file we're watching
                                             if let Some(base_path) = watched.get(doc_id) {
                                                 tracing::info!(
-                                                    "[discovery] processes.json changed at {}, reconciling...",
+                                                    "[discovery] __processes.json changed at {}, reconciling...",
                                                     base_path
                                                 );
-                                                // Fetch and reconcile this specific processes.json
+                                                // Fetch and reconcile this specific __processes.json
                                                 let url = format!("{}/docs/{}/head", self.server_url, doc_id);
                                                 let base_path = base_path.clone();
                                                 if let Err(e) = self.fetch_and_reconcile(client, &url, &base_path).await {
                                                     tracing::error!(
-                                                        "[discovery] Failed to reconcile {}/processes.json: {}",
+                                                        "[discovery] Failed to reconcile {}/__processes.json: {}",
                                                         base_path, e
                                                     );
                                                 }

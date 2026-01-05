@@ -22,6 +22,49 @@ const DEFAULT_SERVER: &str = "http://localhost:3000";
 /// Default path to issues JSONL in commonplace
 const DEFAULT_PATH: &str = "beads/commonplace-issues.jsonl";
 
+/// Config file structure for .cbd.json
+#[derive(Debug, Deserialize)]
+struct CbdConfig {
+    /// Path to issues JSONL in commonplace workspace
+    path: String,
+    /// Optional server URL override
+    server: Option<String>,
+}
+
+/// Discover .cbd.json by walking up directories from cwd
+fn discover_config() -> Option<CbdConfig> {
+    let mut dir = std::env::current_dir().ok()?;
+
+    loop {
+        // Check .cbd.json in current dir
+        let config_path = dir.join(".cbd.json");
+        if config_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&config_path) {
+                if let Ok(config) = serde_json::from_str::<CbdConfig>(&content) {
+                    return Some(config);
+                }
+            }
+        }
+
+        // Check .beads/.cbd.json
+        let beads_config = dir.join(".beads").join(".cbd.json");
+        if beads_config.exists() {
+            if let Ok(content) = std::fs::read_to_string(&beads_config) {
+                if let Ok(config) = serde_json::from_str::<CbdConfig>(&content) {
+                    return Some(config);
+                }
+            }
+        }
+
+        // Move to parent
+        if !dir.pop() {
+            break;
+        }
+    }
+
+    None
+}
+
 #[derive(Parser)]
 #[command(name = "cbd", about = "Commonplace Bug Database CLI")]
 struct Cli {
@@ -133,8 +176,21 @@ struct HeadResponse {
 }
 
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     let client = Client::new();
+
+    // Apply discovered config if CLI args are defaults
+    if let Some(config) = discover_config() {
+        // Only override if user didn't explicitly set via CLI/env
+        if cli.path == DEFAULT_PATH {
+            cli.path = config.path;
+        }
+        if cli.server == DEFAULT_SERVER {
+            if let Some(server) = config.server {
+                cli.server = server;
+            }
+        }
+    }
 
     match &cli.command {
         Commands::List { status } => cmd_list(&client, &cli, status),

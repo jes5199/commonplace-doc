@@ -1,7 +1,7 @@
 //! commonplace-orchestrator: Process supervisor for commonplace services
 //!
 //! Starts server and sync from commonplace.json, then recursively discovers all
-//! processes.json files and manages discovered processes with automatic restart.
+//! __processes.json files and manages discovered processes with automatic restart.
 
 use clap::Parser;
 use commonplace_doc::cli::OrchestratorArgs;
@@ -376,7 +376,7 @@ async fn main() {
         if !sync_ready {
             tracing::warn!(
                 "[orchestrator] Sync initial push timed out, continuing anyway. \
-                Discovery may find empty processes.json files."
+                Discovery may find empty __processes.json files."
             );
         }
     }

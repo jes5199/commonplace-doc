@@ -1,7 +1,7 @@
-//! Discovery module for `.processes.json` files.
+//! Discovery module for `__processes.json` files.
 //!
 //! This module provides the configuration format and parsing for
-//! processes discovered from `.processes.json` files in the filesystem.
+//! processes discovered from `__processes.json` files in the filesystem.
 //!
 //! For process lifecycle management, see the `discovered_manager` module.
 
@@ -9,13 +9,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Configuration parsed from `.processes.json` files.
+/// Configuration parsed from `__processes.json` files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessesConfig {
     pub processes: HashMap<String, DiscoveredProcess>,
 }
 
-/// A process discovered from a `.processes.json` file.
+/// A process discovered from a `__processes.json` file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredProcess {
     /// Command to run (either a string or array of strings)
@@ -80,7 +80,7 @@ impl CommandSpec {
 }
 
 impl ProcessesConfig {
-    /// Load a `.processes.json` file from the given path.
+    /// Load a `__processes.json` file from the given path.
     pub fn load(path: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
         let config: Self = serde_json::from_str(&content)?;

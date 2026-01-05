@@ -24,7 +24,7 @@ pub struct ProcessStatus {
     pub state: String,
     /// Document path (for discovered processes)
     pub document_path: Option<String>,
-    /// Source path (for discovered processes, which processes.json defined this)
+    /// Source path (for discovered processes, which __processes.json defined this)
     pub source_path: Option<String>,
 }
 

@@ -75,6 +75,10 @@ path = "src/bin/cbd.rs"
 name = "commonplace-bd"
 path = "src/bin/commonplace_bd.rs"
 
+[[bin]]
+name = "commonplace-beads-bridge"
+path = "src/bin/beads_bridge.rs"
+
 [dependencies]
 rmcp = { version = "0.12", features = ["server", "transport-io"] }
 axum = { version = "0.7", features = ["ws"] }
