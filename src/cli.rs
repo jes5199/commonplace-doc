@@ -262,6 +262,10 @@ pub struct LogArgs {
     /// Output in JSON format
     #[clap(long)]
     pub json: bool,
+
+    /// Show raw Yjs update bytes (ASCII-ish representation)
+    #[clap(long)]
+    pub show_yjs: bool,
 }
 
 /// CLI arguments for commonplace-show (git-show style content display)

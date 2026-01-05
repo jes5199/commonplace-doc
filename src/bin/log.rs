@@ -313,12 +313,11 @@ fn stream_output_yjs(
     }
 
     for (i, commit) in commits.iter().enumerate() {
-        // Apply update to doc
-        if let Ok(update_bytes) = BASE64_STANDARD.decode(&commit.update) {
-            if let Ok(update) = Update::decode_v1(&update_bytes) {
-                let mut txn = doc.transact_mut();
-                txn.apply_update(update);
-            }
+        // Apply update to doc and keep raw bytes for --show-yjs
+        let raw_update = BASE64_STANDARD.decode(&commit.update).unwrap_or_default();
+        if let Ok(update) = Update::decode_v1(&raw_update) {
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update);
         }
 
         let current_content = text.get_string(&doc.transact());
@@ -370,14 +369,23 @@ fn stream_output_yjs(
             let cid_short = &commit.commit_id[..12.min(commit.commit_id.len())];
             let date = format_timestamp_short(commit.timestamp);
             if let Some(ref s) = stats {
-                writeln!(
+                write!(
                     out,
                     "\x1b[33m{}\x1b[0m{} {} (+{} -{} chars)",
                     cid_short, decoration, date, s.chars_added, s.chars_removed
                 )?;
             } else {
-                writeln!(out, "\x1b[33m{}\x1b[0m{} {}", cid_short, decoration, date)?;
+                write!(out, "\x1b[33m{}\x1b[0m{} {}", cid_short, decoration, date)?;
             }
+            if args.show_yjs {
+                write!(
+                    out,
+                    " \x1b[90m[{}b] {}\x1b[0m",
+                    raw_update.len(),
+                    bytes_to_ascii_ish(&raw_update)
+                )?;
+            }
+            writeln!(out)?;
         } else if graph {
             let cid_short = &commit.commit_id[..8.min(commit.commit_id.len())];
             let date = format_timestamp_short(commit.timestamp);
@@ -396,6 +404,15 @@ fn stream_output_yjs(
                         writeln!(out, "{} {}", connector, line)?;
                     }
                 }
+            }
+            if args.show_yjs {
+                writeln!(
+                    out,
+                    "{} \x1b[90m[{} bytes] {}\x1b[0m",
+                    connector,
+                    raw_update.len(),
+                    bytes_to_ascii_ish(&raw_update)
+                )?;
             }
             if !is_last {
                 writeln!(out, "{}", connector)?;
@@ -430,6 +447,16 @@ fn stream_output_yjs(
                 }
             }
 
+            if args.show_yjs {
+                writeln!(out)?;
+                writeln!(
+                    out,
+                    "\x1b[90mYjs: [{} bytes] {}\x1b[0m",
+                    raw_update.len(),
+                    bytes_to_ascii_ish(&raw_update)
+                )?;
+            }
+
             writeln!(out)?;
         }
 
@@ -441,6 +468,20 @@ fn stream_output_yjs(
     }
 
     Ok(())
+}
+
+/// Render bytes as ASCII-ish: printable chars shown, non-printable as dots
+fn bytes_to_ascii_ish(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| {
+            if (0x20..0x7f).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect()
 }
 
 fn colorize_diff(diff: &str) -> String {
