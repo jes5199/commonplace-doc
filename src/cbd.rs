@@ -125,6 +125,45 @@ enum Commands {
         /// Description
         #[arg(long, short = 'd')]
         description: Option<String>,
+        /// Read description from file (use - for stdin)
+        #[arg(long)]
+        body_file: Option<String>,
+        /// Explicit issue ID (e.g., 'CP-42')
+        #[arg(long)]
+        id: Option<String>,
+        /// Assignee
+        #[arg(long, short = 'a')]
+        assignee: Option<String>,
+        /// Labels (comma-separated)
+        #[arg(long, short = 'l', value_delimiter = ',')]
+        labels: Option<Vec<String>>,
+        /// Parent issue ID
+        #[arg(long)]
+        parent: Option<String>,
+        /// Dependencies in format 'type:id' or 'id' (blocks by default)
+        #[arg(long, value_delimiter = ',')]
+        deps: Option<Vec<String>>,
+        /// Due date
+        #[arg(long)]
+        due: Option<String>,
+        /// Defer until date
+        #[arg(long)]
+        defer: Option<String>,
+        /// Time estimate in minutes
+        #[arg(long, short = 'e')]
+        estimate: Option<i64>,
+        /// Acceptance criteria
+        #[arg(long)]
+        acceptance: Option<String>,
+        /// Design notes
+        #[arg(long)]
+        design: Option<String>,
+        /// Additional notes
+        #[arg(long)]
+        notes: Option<String>,
+        /// External reference (e.g., 'gh-9', 'jira-ABC')
+        #[arg(long)]
+        external_ref: Option<String>,
     },
     /// Close an issue
     Close {
@@ -147,6 +186,45 @@ enum Commands {
         /// New title
         #[arg(long)]
         title: Option<String>,
+        /// New issue type
+        #[arg(long, short = 't')]
+        issue_type: Option<String>,
+        /// New description
+        #[arg(long, short = 'd')]
+        description: Option<String>,
+        /// Read description from file (use - for stdin)
+        #[arg(long)]
+        body_file: Option<String>,
+        /// New assignee
+        #[arg(long, short = 'a')]
+        assignee: Option<String>,
+        /// New labels (comma-separated, replaces existing)
+        #[arg(long, short = 'l', value_delimiter = ',')]
+        labels: Option<Vec<String>>,
+        /// New parent issue ID
+        #[arg(long)]
+        parent: Option<String>,
+        /// New due date
+        #[arg(long)]
+        due: Option<String>,
+        /// New defer date
+        #[arg(long)]
+        defer: Option<String>,
+        /// New time estimate in minutes
+        #[arg(long, short = 'e')]
+        estimate: Option<i64>,
+        /// New acceptance criteria
+        #[arg(long)]
+        acceptance: Option<String>,
+        /// New design notes
+        #[arg(long)]
+        design: Option<String>,
+        /// New additional notes
+        #[arg(long)]
+        notes: Option<String>,
+        /// New external reference
+        #[arg(long)]
+        external_ref: Option<String>,
     },
     /// Manage dependencies
     Dep {
@@ -180,6 +258,49 @@ enum DepAction {
     },
 }
 
+/// Options for creating a new issue
+#[derive(Debug)]
+struct CreateOptions {
+    title: String,
+    issue_type: String,
+    priority: u8,
+    description: Option<String>,
+    body_file: Option<String>,
+    id: Option<String>,
+    assignee: Option<String>,
+    labels: Option<Vec<String>>,
+    parent: Option<String>,
+    deps: Option<Vec<String>>,
+    due: Option<String>,
+    defer: Option<String>,
+    estimate: Option<i64>,
+    acceptance: Option<String>,
+    design: Option<String>,
+    notes: Option<String>,
+    external_ref: Option<String>,
+}
+
+/// Options for updating an issue
+#[derive(Debug)]
+struct UpdateOptions {
+    status: Option<String>,
+    priority: Option<u8>,
+    title: Option<String>,
+    issue_type: Option<String>,
+    description: Option<String>,
+    body_file: Option<String>,
+    assignee: Option<String>,
+    labels: Option<Vec<String>>,
+    parent: Option<String>,
+    due: Option<String>,
+    defer: Option<String>,
+    estimate: Option<i64>,
+    acceptance: Option<String>,
+    design: Option<String>,
+    notes: Option<String>,
+    external_ref: Option<String>,
+}
+
 /// Issue structure matching beads format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Issue {
@@ -204,9 +325,23 @@ struct Issue {
     dependencies: Option<Vec<Dependency>>,
     // Additional beads fields
     #[serde(skip_serializing_if = "Option::is_none")]
+    assignee: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    due: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    defer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    estimate: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acceptance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     design: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     comments: Option<Vec<serde_json::Value>>,
     // Preserve any unknown fields for round-trip fidelity
@@ -273,13 +408,41 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             issue_type,
             priority,
             description,
+            body_file,
+            id,
+            assignee,
+            labels,
+            parent,
+            deps,
+            due,
+            defer,
+            estimate,
+            acceptance,
+            design,
+            notes,
+            external_ref,
         } => cmd_create(
             &client,
             &cli,
-            title,
-            issue_type,
-            *priority,
-            description.clone(),
+            CreateOptions {
+                title: title.clone(),
+                issue_type: issue_type.clone(),
+                priority: *priority,
+                description: description.clone(),
+                body_file: body_file.clone(),
+                id: id.clone(),
+                assignee: assignee.clone(),
+                labels: labels.clone(),
+                parent: parent.clone(),
+                deps: deps.clone(),
+                due: due.clone(),
+                defer: defer.clone(),
+                estimate: *estimate,
+                acceptance: acceptance.clone(),
+                design: design.clone(),
+                notes: notes.clone(),
+                external_ref: external_ref.clone(),
+            },
         ),
         Commands::Close { id, reason } => cmd_close(&client, &cli, id, reason.clone()),
         Commands::Update {
@@ -287,7 +450,42 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             status,
             priority,
             title,
-        } => cmd_update(&client, &cli, id, status.clone(), *priority, title.clone()),
+            issue_type,
+            description,
+            body_file,
+            assignee,
+            labels,
+            parent,
+            due,
+            defer,
+            estimate,
+            acceptance,
+            design,
+            notes,
+            external_ref,
+        } => cmd_update(
+            &client,
+            &cli,
+            id,
+            UpdateOptions {
+                status: status.clone(),
+                priority: *priority,
+                title: title.clone(),
+                issue_type: issue_type.clone(),
+                description: description.clone(),
+                body_file: body_file.clone(),
+                assignee: assignee.clone(),
+                labels: labels.clone(),
+                parent: parent.clone(),
+                due: due.clone(),
+                defer: defer.clone(),
+                estimate: *estimate,
+                acceptance: acceptance.clone(),
+                design: design.clone(),
+                notes: notes.clone(),
+                external_ref: external_ref.clone(),
+            },
+        ),
         Commands::Dep { action } => match action {
             DepAction::Add {
                 issue_id,
@@ -657,33 +855,83 @@ fn cmd_show(client: &Client, cli: &Cli, id: &str) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// Read description from file or stdin (if path is "-")
+fn read_body_file(path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Read;
+    if path == "-" {
+        let mut content = String::new();
+        std::io::stdin().read_to_string(&mut content)?;
+        Ok(content.trim().to_string())
+    } else {
+        Ok(std::fs::read_to_string(path)?.trim().to_string())
+    }
+}
+
+/// Parse dependency string in format "type:id" or "id" (defaults to blocks)
+fn parse_dep_string(s: &str, issue_id: &str, created_by: &str, created_at: &str) -> Dependency {
+    let (dep_type, depends_on_id) = if let Some((t, id)) = s.split_once(':') {
+        (t.to_string(), id.to_string())
+    } else {
+        ("blocks".to_string(), s.to_string())
+    };
+    Dependency {
+        issue_id: issue_id.to_string(),
+        depends_on_id,
+        dep_type,
+        created_at: created_at.to_string(),
+        created_by: created_by.to_string(),
+    }
+}
+
 fn cmd_create(
     client: &Client,
     cli: &Cli,
-    title: &str,
-    issue_type: &str,
-    priority: u8,
-    description: Option<String>,
+    opts: CreateOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let now: DateTime<Utc> = Utc::now();
     let now_str = now.to_rfc3339();
+    let created_by = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+
+    // Resolve description: body_file takes precedence over description flag
+    let description = if let Some(path) = &opts.body_file {
+        read_body_file(path)?
+    } else {
+        opts.description.unwrap_or_default()
+    };
+
+    // Generate or use provided ID
+    let id = opts.id.unwrap_or_else(generate_id);
+
+    // Parse dependencies
+    let dependencies = opts.deps.map(|deps| {
+        deps.iter()
+            .map(|d| parse_dep_string(d, &id, &created_by, &now_str))
+            .collect()
+    });
 
     let issue = Issue {
-        id: generate_id(),
-        title: title.to_string(),
-        description: description.unwrap_or_default(),
+        id,
+        title: opts.title,
+        description,
         status: "open".to_string(),
-        priority,
-        issue_type: issue_type.to_string(),
+        priority: opts.priority,
+        issue_type: opts.issue_type,
         created_at: now_str.clone(),
-        created_by: std::env::var("USER").unwrap_or_else(|_| "unknown".to_string()),
+        created_by,
         updated_at: now_str,
         closed_at: None,
         close_reason: None,
-        labels: None,
-        dependencies: None,
-        design: None,
-        notes: None,
+        labels: opts.labels,
+        dependencies,
+        assignee: opts.assignee,
+        parent: opts.parent,
+        due: opts.due,
+        defer: opts.defer,
+        estimate: opts.estimate,
+        acceptance: opts.acceptance,
+        design: opts.design,
+        notes: opts.notes,
+        external_ref: opts.external_ref,
         comments: None,
         extra: HashMap::new(),
     };
@@ -740,9 +988,7 @@ fn cmd_update(
     client: &Client,
     cli: &Cli,
     id: &str,
-    status: Option<String>,
-    priority: Option<u8>,
-    title: Option<String>,
+    opts: UpdateOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let issues = fetch_issues(client, cli)?;
     let mut map = build_issue_map(issues);
@@ -754,14 +1000,54 @@ fn cmd_update(
     let now: DateTime<Utc> = Utc::now();
     issue.updated_at = now.to_rfc3339();
 
-    if let Some(s) = status {
+    // Update only fields that are explicitly set
+    if let Some(s) = opts.status {
         issue.status = s;
     }
-    if let Some(p) = priority {
+    if let Some(p) = opts.priority {
         issue.priority = p;
     }
-    if let Some(t) = title {
+    if let Some(t) = opts.title {
         issue.title = t;
+    }
+    if let Some(t) = opts.issue_type {
+        issue.issue_type = t;
+    }
+    // body_file takes precedence over description
+    if let Some(path) = opts.body_file {
+        issue.description = read_body_file(&path)?;
+    } else if let Some(d) = opts.description {
+        issue.description = d;
+    }
+    if let Some(a) = opts.assignee {
+        issue.assignee = Some(a);
+    }
+    if let Some(l) = opts.labels {
+        issue.labels = Some(l);
+    }
+    if let Some(p) = opts.parent {
+        issue.parent = Some(p);
+    }
+    if let Some(d) = opts.due {
+        issue.due = Some(d);
+    }
+    if let Some(d) = opts.defer {
+        issue.defer = Some(d);
+    }
+    if let Some(e) = opts.estimate {
+        issue.estimate = Some(e);
+    }
+    if let Some(a) = opts.acceptance {
+        issue.acceptance = Some(a);
+    }
+    if let Some(d) = opts.design {
+        issue.design = Some(d);
+    }
+    if let Some(n) = opts.notes {
+        issue.notes = Some(n);
+    }
+    if let Some(e) = opts.external_ref {
+        issue.external_ref = Some(e);
     }
 
     append_issue(client, cli, issue)?;
