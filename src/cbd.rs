@@ -1,5 +1,6 @@
-//! commonplace-bd (cbd): Bug database CLI backed by JSONL in commonplace
+//! cbd: Commonplace Bug Database
 //!
+//! A CLI for viewing and managing beads issues stored in commonplace.
 //! Works directly with the commonplace server API - no disk sync needed.
 //!
 //! Usage:
