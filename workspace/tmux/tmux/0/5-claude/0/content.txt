@@ -3,259 +3,6 @@ Window: 5 (claude)
 Pane: 0
 Title: ✳ Git Commit
 ---
-  -q, --quiet                   Suppress non-essential output (errors only)
-      --readonly                Read-only mode: block write operations (for worker sandboxes)
-      --sandbox                 Sandbox mode: disables daemon and auto-sync
-  -v, --verbose                 Enable verbose/debug output
-
-jes@commonplace:~/commonplace$ bd show CP-egb
-
-CP-egb: Sandboxed JS evaluator with document subscriptions and output
-Status: open
-Priority: P2
-Type: feature
-Created: 2025-12-28 22:49
-Updated: 2026-01-04 02:10
-
-Description:
-Run a JS file in a sandbox with the ability to:
-- Declare dependencies on other commonplace documents
-- Subscribe to commits on those dependencies
-- Create a read-only output document
-- Listen for commands on the output document's path
-- Emit events as that document
-
-The JS file acts as a reactive transform: inputs → computation → output document.
-
-Design:
-Plan (v1)
-
-Goal
-- Run a JS file as a reactive transform: subscribe to dependency documents (read-only), own output document(s) (write), receive commands on the outp
-ut path, and emit events.
-
-Context / Existing Docs
-- MQTT topic model and ports: docs/MQTT.md
-- External-process participation via MQTT: examples/python-client/README.md
-- MQTT auth direction (future): docs/MACAROONS.md (CP-adm)
-
-Architecture
-- The evaluator is an external process that connects to the MQTT broker with a stable client_id.
-- For each dependency path:
-  - Subscribe to `{path}/edits`.
-  - Use `{path}/sync/{client_id}` to catch up (head + ancestors/pull) and reconstruct state.
-  - Maintain a local Yjs doc for the dependency so the script sees converged content.
-- For each owned output path:
-  - Subscribe to `{path}/commands/#`.
-  - Publish edits to `{path}/edits` (with parent commit context) and publish events to `{path}/events/<name>`.
-
-Runtime Choice
-- Preferred v1: Deno-based runner (permissions + TS path later).
-- Fallback v1: Node-based runner.
-- Future v2: embed a JS runtime in Rust (deno_core or quickjs) to avoid external runtime dependency.
-
-Script API (initial)
-- `cp.doc(path, { type })` returns a handle with:
-  - `get()` → current content (string for text, object/array for JSON)
-  - `set(value, { message })` → publish update
-  - `onChange(cb)` → callback on new converged content
-- `cp.onCommand(verb, handler)` registers a handler for `{output}/commands/{verb}`.
-- `cp.emit(event, payload)` publishes to `{output}/events/{event}`.
-
-Configuration
-- Sidecar manifest next to script (v1): `<script>.commonplace.json` describing:
-  - `deps`: list of doc paths + content types
-  - `outputs`: list of owned doc paths + content types
-  - `commands`: allowed verbs
-  - broker/server settings + client_id
-- Future: allow the manifest to live in a commonplace doc.
-
-Orchestrator Integration
-- Run via `processes.json` using `sandbox-exec`, so orchestrator launches:
-  - `commonplace-sync --sandbox --exec "<runner> <script>"`
-- This gives a temp working directory with synced files and reduces accidental access to the host checkout.
-
-Sandbox / Resource Limits
-- Deno runner flags (target shape): `--no-prompt`, narrow `--allow-net` to broker, allow only required env vars, deny subprocess.
-- Future: Podman-based isolation (CP-c7h) for stronger untrusted-code boundaries.
-
-Milestones
-1. Minimal runner: 1 dependency (text), 1 output (text), subscribe + publish edits.
-2. Add commands and events plumbing (magenta/red ports).
-3. Add JSON support using Y.Map/Y.Array semantics.
-4. Add manifest parsing and multi-dep/multi-output wiring.
-5. Observability: log per-doc head/last-applied CID and last command/event.
-6. Add an example transform + regression test harness.
-
-Open Questions
-- Choose v1 runtime (Deno vs Node) based on deploy constraints.
-- Decide whether output ownership is enforced (deny non-owner publishes) or convention-only.
-
-Labels: [future-work]
-
-Depends on (1):
-  → CP-nno: External process MQTT client as first-class citizen [P2]
-
-Blocks (1):
-  ← CP-qyj: TypeScript support for sandboxed evaluator [P2 - open]
-
-jes@commonplace:~/commonplace$ vi .gitignore
-jes@commonplace:~/commonplace$ git clone git@github.com:jes5199/commonplaced-2025.git
-Cloning into 'commonplaced-2025'...
-remote: Enumerating objects: 4286, done.
-remote: Counting objects: 100% (557/557), done.
-remote: Compressing objects: 100% (239/239), done.
-remote: Total 4286 (delta 381), reused 455 (delta 316), pack-reused 3729 (from 1)
-Receiving objects: 100% (4286/4286), 2.48 MiB | 6.13 MiB/s, done.
-Resolving deltas: 100% (2875/2875), done.
-jes@commonplace:~/commonplace$ git status
-On branch main
-Your branch is ahead of 'origin/main' by 4 commits.
-  (use "git push" to publish your local commits)
-
-You are in a sparse checkout with 100% of tracked files present.
-
-Changes not staged for commit:
-  (use "git add/rm <file>..." to update what will be committed)
-  (use "git restore <file>..." to discard changes in working directory)
-        modified:   .beads/issues.jsonl
-        modified:   .gitignore
-        modified:   Cargo.lock
-        modified:   run-bartleby.sh
-        modified:   scripts/setup-sandbox.sh
-        modified:   workspace/.commonplace.json
-        modified:   workspace/bartleby/.commonplace.json
-        modified:   workspace/bartleby/history.jsonl
-        modified:   workspace/bartleby/processes.json
-        modified:   workspace/tmux/tmux/0/.commonplace.json
-        modified:   workspace/tmux/tmux/0/0-_tmux_/.commonplace.json
-        modified:   workspace/tmux/tmux/0/0-_tmux_/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/0-_tmux_/0/content.txt
-        deleted:    workspace/tmux/tmux/0/0-_tmux_/0/input.txt
-        modified:   workspace/tmux/tmux/0/0-bash/.commonplace.json
-        modified:   workspace/tmux/tmux/0/0-claude/.commonplace.json
-        modified:   workspace/tmux/tmux/0/0-claude/0/.commonplace.json
-        modified:   workspace/tmux/tmux/0/0-claude/0/content.txt
-        modified:   workspace/tmux/tmux/0/1-_tmux_/.commonplace.json
-        modified:   workspace/tmux/tmux/0/1-node/.commonplace.json
-        modified:   workspace/tmux/tmux/0/1-node/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/1-node/0/content.txt
-        deleted:    workspace/tmux/tmux/0/1-node/0/input.txt
-        modified:   workspace/tmux/tmux/0/2-_tmux_/.commonplace.json
-        modified:   workspace/tmux/tmux/0/2-_tmux_/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/2-_tmux_/0/content.txt
-        deleted:    workspace/tmux/tmux/0/2-_tmux_/0/input.txt
-        modified:   workspace/tmux/tmux/0/2-bash/.commonplace.json
-        modified:   workspace/tmux/tmux/0/2-bash/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/2-bash/0/content.txt
-        deleted:    workspace/tmux/tmux/0/2-bash/0/input.txt
-        modified:   workspace/tmux/tmux/0/2-bd/.commonplace.json
-        modified:   workspace/tmux/tmux/0/2-bd/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/2-bd/0/content.txt
-        deleted:    workspace/tmux/tmux/0/2-bd/0/input.txt
-        modified:   workspace/tmux/tmux/0/2-cat/.commonplace.json
-        modified:   workspace/tmux/tmux/0/2-git/.commonplace.json
-        modified:   workspace/tmux/tmux/0/2-git/0/.commonplace.json
-        modified:   workspace/tmux/tmux/0/2-less/.commonplace.json
-        modified:   workspace/tmux/tmux/0/2-less/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/2-less/0/content.txt
-        deleted:    workspace/tmux/tmux/0/2-less/0/input.txt
-        modified:   workspace/tmux/tmux/0/2-sleep/.commonplace.json
-        modified:   workspace/tmux/tmux/0/2-sleep/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/2-sleep/0/content.txt
-        deleted:    workspace/tmux/tmux/0/2-sleep/0/input.txt
-        modified:   workspace/tmux/tmux/0/2-tail/.commonplace.json
-        modified:   workspace/tmux/tmux/0/2-tail/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/2-tail/0/content.txt
-        deleted:    workspace/tmux/tmux/0/2-tail/0/input.txt
-        modified:   workspace/tmux/tmux/0/2-vi/.commonplace.json
-        modified:   workspace/tmux/tmux/0/2-vi/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/2-vi/0/content.txt
-        deleted:    workspace/tmux/tmux/0/2-vi/0/input.txt
-        modified:   workspace/tmux/tmux/0/3-_tmux_/.commonplace.json
-        modified:   workspace/tmux/tmux/0/3-_tmux_/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/3-_tmux_/0/content.txt
-        deleted:    workspace/tmux/tmux/0/3-_tmux_/0/input.txt
-        modified:   workspace/tmux/tmux/0/3-bash/.commonplace.json
-        modified:   workspace/tmux/tmux/0/3-bash/0/.commonplace.json
-        modified:   workspace/tmux/tmux/0/3-bash/0/content.txt
-        modified:   workspace/tmux/tmux/0/3-claude/.commonplace.json
-        modified:   workspace/tmux/tmux/0/3-claude/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/3-claude/0/content.txt
-        deleted:    workspace/tmux/tmux/0/3-claude/0/input.txt
-        modified:   workspace/tmux/tmux/0/3-node/.commonplace.json
-        modified:   workspace/tmux/tmux/0/3-node/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/3-node/0/content.txt
-        deleted:    workspace/tmux/tmux/0/3-node/0/input.txt
-        modified:   workspace/tmux/tmux/0/3-vi/.commonplace.json
-        modified:   workspace/tmux/tmux/0/3-vi/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/3-vi/0/content.txt
-        deleted:    workspace/tmux/tmux/0/3-vi/0/input.txt
-        modified:   workspace/tmux/tmux/0/4-claude/.commonplace.json
-        modified:   workspace/tmux/tmux/0/4-claude/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/4-claude/0/content.txt
-        deleted:    workspace/tmux/tmux/0/4-claude/0/input.txt
-        modified:   workspace/tmux/tmux/0/5-_tmux_/.commonplace.json
-        modified:   workspace/tmux/tmux/0/5-_tmux_/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/5-_tmux_/0/content.txt
-        deleted:    workspace/tmux/tmux/0/5-_tmux_/0/input.txt
-        modified:   workspace/tmux/tmux/0/5-bash/.commonplace.json
-        modified:   workspace/tmux/tmux/0/5-bash/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/5-bash/0/content.txt
-        deleted:    workspace/tmux/tmux/0/5-bash/0/input.txt
-        modified:   workspace/tmux/tmux/0/5-sudo/.commonplace.json
-        modified:   workspace/tmux/tmux/0/5-sudo/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/5-sudo/0/content.txt
-        deleted:    workspace/tmux/tmux/0/5-sudo/0/input.txt
-        modified:   workspace/tmux/tmux/0/5-vi/.commonplace.json
-        modified:   workspace/tmux/tmux/0/5-vi/0/.commonplace.json
-        deleted:    workspace/tmux/tmux/0/5-vi/0/content.txt
-        deleted:    workspace/tmux/tmux/0/5-vi/0/input.txt
-        modified:   workspace/tmux/tmux/0/windows.json
-
-Untracked files:
-  (use "git add <file>..." to include in what will be committed)
-        .beads/.issues.jsonl.commonplace-sync.json
-        .beads/last-touched
-        commonplaced-2025/
-        workspace/.commonplace-sync.lock
-        workspace/.commonplace-synced-dirs.json
-        workspace/bartleby/bartleby/
-        workspace/beads/
-        workspace/tmux/tmux/0/1-codex/
-        workspace/tmux/tmux/0/2-git/0/content.txt
-        workspace/tmux/tmux/0/2-git/0/input.txt
-        workspace/tmux/tmux/0/4-bash/
-        workspace/tmux/tmux/0/4-git/
-        workspace/tmux/tmux/0/4-node/
-        workspace/tmux/tmux/0/5-bd/
-        workspace/tmux/tmux/0/5-claude/
-        workspace/tmux/tmux/0/5-commonplace-log/
-        workspace/tmux/tmux/0/5-git/
-        workspace/tmux/tmux/0/5-node/
-
-no changes added to commit (use "git add" and/or "git commit -a")
-jes@commonplace:~/commonplace$ ls workspace/tmux/
-.commonplace.json  init.txt           processes.json     tmux/
-jes@commonplace:~/commonplace$ ls workspace/tmux/
-init.txt  processes.json  tmux
-jes@commonplace:~/commonplace$ ls workspace/tmux/tmux/
-0  1
-jes@commonplace:~/commonplace$ ls workspace/tmux/tmux/0/
-0-_tmux_  1-_tmux_  2-_tmux_  2-cat   2-sleep  3-_tmux_  3-node  4-claude  5-_tmux_  5-claude           5-node  windows.json
-0-bash    1-codex   2-bash    2-git   2-tail   3-bash    3-vi    4-git     5-bash    5-commonplace-log  5-sudo
-0-claude  1-node    2-bd      2-less  2-vi     3-claude  4-bash  4-node    5-bd      5-git              5-vi
-jes@commonplace:~/commonplace$ ls workspace/tmux/tmux/0/0-bash/
-0
-jes@commonplace:~/commonplace$ ls workspace/tmux/tmux/0/0-bash/0/.commonplace.json
-workspace/tmux/tmux/0/0-bash/0/.commonplace.json
-jes@commonplace:~/commonplace$ cd ..
-jes@commonplace:~$ cd text-to-telegram/
-jes@commonplace:~/text-to-telegram$ cd ..
-jes@commonplace:~$ cd file-tmux-file/
-jes@commonplace:~/file-tmux-file$ ls
-README.md  docs  logs  pyproject.toml  src  tasks  tests  tmux  uv.lock
-jes@commonplace:~/file-tmux-file$ claude
 
 ╭─── Claude Code v2.0.76 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
 │                                       │ Tips for getting started                                                                                 │
@@ -336,33 +83,30 @@ jes@commonplace:~/file-tmux-file$ claude
 
   What level of cleanup are you looking for?
 
-  1. Within pane directories only - Remove any file except content.txt and input.txt from within pane directories (e.g., if something drops a temp f
-ile in there)
+  1. Within pane directories only - Remove any file except content.txt and input.txt from within pane directories (e.g., if something drops a temp file in there)
   2. Within session directories - Also remove stray files at the session level (outside of window directories)
-  3. Full directory ownership - Treat the entire output directory as fully managed, removing ANY file or directory that isn't part of the active str
-ucture (session dirs, window dirs, pane dirs, and their expected files)
+  3. Full directory ownership - Treat the entire output directory as fully managed, removing ANY file or directory that isn't part of the active structure (session dirs, window dirs, pane
+dirs, and their expected files)
 
 > if a directory exists for a pane or window that does not match one that we have, we should delete it and any files within it. for live
 windows/panes, don't worry about it
 
-● Got it. Looking at the current code more carefully, I see it already removes stale window/pane directories. But it explicitly skips non-directory
-entries:
+● Got it. Looking at the current code more carefully, I see it already removes stale window/pane directories. But it explicitly skips non-directory entries:
 
   # cleanup.py:113-115
   for window_dir in session_dir.iterdir():
       if not window_dir.is_dir():
           continue  # <-- stray files ignored here
 
-  So to confirm - you want to also delete stray files that appear at the session level or window level (files that aren't inside a pane directory),
-correct?
+  So to confirm - you want to also delete stray files that appear at the session level or window level (files that aren't inside a pane directory), correct?
 
   For example, if someone drops a random.log file in tmux/my-session/, it should get deleted?
 
 > if they drop a random.log in session_name/1-window/ but 1-window is closed, we should delete it and tear down the directory. otherwise I don't
  care
 
-● Got it, that clarifies things. Looking at the current code, it actually already does delete stale window/pane directories recursively (including a
-ny files inside via _remove_dir_recursive).
+● Got it, that clarifies things. Looking at the current code, it actually already does delete stale window/pane directories recursively (including any files inside via _remove_dir_recursiv
+e).
 
   Is the current behavior not working as expected? Or are you seeing directories that should be cleaned up but aren't?
 
@@ -393,8 +137,7 @@ ny files inside via _remove_dir_recursive).
   - tmux/1/ - directories for windows 0-5
   - tmux/tmux/ - nested structure with tmux/tmux/1/ containing windows 0-6
 
-  This looks off. The active session is named 0, but you have directories for sessions 1 and tmux. Neither matches. Let me check how the session nam
-e is being determined:
+  This looks off. The active session is named 0, but you have directories for sessions 1 and tmux. Neither matches. Let me check how the session name is being determined:
 
 ● Read(src/file_tmux_file/tmux.py)
   ⎿  Read 113 lines
@@ -409,8 +152,7 @@ e is being determined:
   - tmux/1/ - stale (no session named "1" exists)
   - tmux/tmux/ - stale (no session named "tmux" exists)
 
-  There's no tmux/0/ directory for the actual active session. These stale directories should be getting cleaned up. Let me check if file-tmux-file i
-s running:
+  There's no tmux/0/ directory for the actual active session. These stale directories should be getting cleaned up. Let me check if file-tmux-file is running:
 
 ● Bash(cat tmux/.lock 2>/dev/null; ps aux | grep file-tmux-file | grep -v grep)
   ⎿ 219213
@@ -437,8 +179,7 @@ s running:
   2. Stale pane directories within windows
   3. Empty session directories
 
-  It does NOT remove session directories that don't correspond to any active session. That's why tmux/1/ and tmux/tmux/ are sitting there even thoug
-h session "0" is the only active one.
+  It does NOT remove session directories that don't correspond to any active session. That's why tmux/1/ and tmux/tmux/ are sitting there even though session "0" is the only active one.
 
   ---
   Proposed fix: Add cleanup of stale session directories - any session directory not in active_session_dirs should be removed entirely.
@@ -543,11 +284,9 @@ h session "0" is the only active one.
 
 ● Done. Committed and pushed a67de45.
 
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-> restart the daemon                                                                                                                         ↵ send
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> restart the daemon                                                                                                                                                                 ↵ send
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   [Opus 4.5] 📁 file-tmux-file | 🌿 main | 📊 22%
   ⏵⏵ bypass permissions on (shift+tab to cycle)
-
-
 

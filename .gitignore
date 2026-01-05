@@ -3,6 +3,7 @@
 .claude/wiggum-loop.local.md
 .worktrees/
 .commonplaced-2025
+workspace/tmux
 
 # Python
 __pycache__/
