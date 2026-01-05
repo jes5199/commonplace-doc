@@ -12,8 +12,10 @@ use commonplace_doc::sync::{
     ensure_fs_root_exists, file_watcher_task, fork_node, get_all_node_backed_dir_ids,
     handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
     initial_sync, is_binary_content, push_schema_to_server, scan_directory_with_contents,
-    spawn_file_sync_tasks, sse_task, subdir_sse_task, sync_schema, sync_single_file, upload_task,
-    DirEvent, FileEvent, FileSyncState, ReplaceResponse, ScanOptions, SyncState, SCHEMA_FILENAME,
+    shadow_watcher_task, shadow_write_handler_task, spawn_file_sync_tasks, sse_task,
+    sse_task_with_tracker, subdir_sse_task, sync_schema, sync_single_file, upload_task, DirEvent,
+    FileEvent, FileSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions,
+    ShadowWriteEvent, SyncState, SCHEMA_FILENAME,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -117,6 +119,18 @@ struct Args {
     /// Use case: source-of-truth files, recovery scenarios
     #[arg(long)]
     force_push: bool,
+
+    /// Shadow directory for inode tracking hardlinks.
+    /// When syncing with atomic writes, old inodes are hardlinked here so
+    /// slow writers to old inodes can be detected and merged.
+    /// Must be on the same filesystem as the synced directory.
+    /// Set to empty string to disable inode tracking.
+    #[arg(
+        long,
+        default_value = "/tmp/commonplace-sync/hardlinks",
+        env = "COMMONPLACE_SHADOW_DIR"
+    )]
+    shadow_dir: String,
 }
 
 /// Discover the fs-root document ID from the server.
@@ -635,6 +649,7 @@ async fn main() -> ExitCode {
             args.push_only,
             args.pull_only,
             args.force_push,
+            args.shadow_dir,
         )
         .await
         .map(|_| 0u8)
@@ -660,6 +675,7 @@ async fn run_file_mode(
     push_only: bool,
     pull_only: bool,
     force_push: bool,
+    shadow_dir: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mode = if force_push {
         "force-push"
@@ -766,6 +782,49 @@ async fn run_file_mode(
     // Perform initial sync
     initial_sync(&client, &server, &node_id, &file, &state).await?;
 
+    // Set up inode tracking if shadow_dir is configured
+    let inode_tracker: Option<Arc<RwLock<InodeTracker>>> = if !shadow_dir.is_empty() {
+        let shadow_path = PathBuf::from(&shadow_dir);
+
+        // Create shadow directory
+        if let Err(e) = tokio::fs::create_dir_all(&shadow_path).await {
+            warn!(
+                "Failed to create shadow directory {}: {} - disabling inode tracking",
+                shadow_dir, e
+            );
+            None
+        } else {
+            // Create tracker and track the initial file's inode
+            let tracker = Arc::new(RwLock::new(InodeTracker::new(shadow_path)));
+
+            // Track the initial inode after initial_sync
+            if file.exists() {
+                if let Ok(inode_key) = InodeKey::from_path(&file) {
+                    let cid = {
+                        let s = state.read().await;
+                        s.last_written_cid.clone().unwrap_or_default()
+                    };
+                    if !cid.is_empty() {
+                        let mut t = tracker.write().await;
+                        t.track(inode_key, cid, file.clone());
+                        info!(
+                            "Tracking initial inode {:x}-{:x} for {}",
+                            inode_key.dev,
+                            inode_key.ino,
+                            file.display()
+                        );
+                    }
+                }
+            }
+
+            info!("Inode tracking enabled with shadow dir: {}", shadow_dir);
+            Some(tracker)
+        }
+    } else {
+        debug!("Inode tracking disabled (no shadow_dir configured)");
+        None
+    };
+
     // Create channel for file events
     let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
 
@@ -794,16 +853,56 @@ async fn run_file_mode(
         None
     };
 
-    // Start SSE subscription task (skip if push-only)
-    let sse_handle = if !push_only {
-        Some(tokio::spawn(sse_task(
+    // Start shadow watcher and handler if inode tracking is enabled
+    let (shadow_watcher_handle, shadow_handler_handle) = if let Some(ref tracker) = inode_tracker {
+        let shadow_path = {
+            let t = tracker.read().await;
+            t.shadow_dir.clone()
+        };
+
+        // Create channel for shadow write events
+        let (shadow_tx, shadow_rx) = mpsc::channel::<ShadowWriteEvent>(100);
+
+        // Start shadow watcher
+        let watcher = tokio::spawn(shadow_watcher_task(shadow_path, shadow_tx));
+
+        // Start shadow write handler
+        let handler = tokio::spawn(shadow_write_handler_task(
             client.clone(),
             server.clone(),
-            node_id.clone(),
-            file.clone(),
-            state.clone(),
+            shadow_rx,
+            tracker.clone(),
             false, // use_paths: file mode uses ID-based API
-        )))
+        ));
+
+        (Some(watcher), Some(handler))
+    } else {
+        (None, None)
+    };
+
+    // Start SSE subscription task (skip if push-only)
+    // Use tracker-aware version if inode tracking is enabled
+    let sse_handle = if !push_only {
+        if let Some(ref tracker) = inode_tracker {
+            Some(tokio::spawn(sse_task_with_tracker(
+                client.clone(),
+                server.clone(),
+                node_id.clone(),
+                file.clone(),
+                state.clone(),
+                false, // use_paths: file mode uses ID-based API
+                tracker.clone(),
+            )))
+        } else {
+            Some(tokio::spawn(sse_task(
+                client.clone(),
+                server.clone(),
+                node_id.clone(),
+                file.clone(),
+                state.clone(),
+                false, // use_paths: file mode uses ID-based API
+            )))
+        }
     } else {
         info!("Push-only mode: skipping SSE subscription");
         None
@@ -821,6 +920,12 @@ async fn run_file_mode(
         handle.abort();
     }
     if let Some(handle) = sse_handle {
+        handle.abort();
+    }
+    if let Some(handle) = shadow_watcher_handle {
+        handle.abort();
+    }
+    if let Some(handle) = shadow_handler_handle {
         handle.abort();
     }
 

@@ -422,6 +422,164 @@ pub async fn directory_watcher_task(
     }
 }
 
+/// Event from shadow directory watcher.
+#[derive(Debug)]
+pub struct ShadowWriteEvent {
+    /// The inode key parsed from the shadow filename.
+    pub inode_key: crate::sync::InodeKey,
+    /// Path to the shadow file.
+    pub shadow_path: PathBuf,
+    /// Content of the shadow file.
+    pub content: Vec<u8>,
+}
+
+/// Task that watches the shadow directory for writes to old inodes.
+///
+/// When a shadowed inode receives a write, this task reads its content and
+/// sends a [`ShadowWriteEvent`] so the caller can create a CRDT update.
+///
+/// # Arguments
+///
+/// * `shadow_dir` - Directory containing shadow hardlinks
+/// * `tx` - Channel sender for shadow write events
+///
+/// # Behavior
+///
+/// - Watches shadow directory non-recursively
+/// - Parses shadow filenames ({devHex}-{inoHex}) to get inode keys
+/// - On IN_MODIFY or IN_CLOSE_WRITE, reads content and sends event
+/// - Debounces with 100ms delay to handle rapid writes
+/// - Exits when receiver is dropped
+#[cfg(unix)]
+pub async fn shadow_watcher_task(shadow_dir: PathBuf, tx: mpsc::Sender<ShadowWriteEvent>) {
+    use crate::sync::InodeKey;
+
+    // Ensure shadow directory exists
+    if let Err(e) = tokio::fs::create_dir_all(&shadow_dir).await {
+        error!(
+            "Failed to create shadow directory {}: {}",
+            shadow_dir.display(),
+            e
+        );
+        return;
+    }
+
+    let (notify_tx, mut notify_rx) = mpsc::channel::<Result<Event, notify::Error>>(100);
+
+    let mut watcher = match RecommendedWatcher::new(
+        move |res| {
+            let _ = notify_tx.blocking_send(res);
+        },
+        Config::default().with_poll_interval(Duration::from_millis(FILE_DEBOUNCE_MS)),
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            error!("Failed to create shadow watcher: {}", e);
+            return;
+        }
+    };
+
+    // Watch shadow directory non-recursively
+    if let Err(e) = watcher.watch(&shadow_dir, RecursiveMode::NonRecursive) {
+        error!(
+            "Failed to watch shadow directory {}: {}",
+            shadow_dir.display(),
+            e
+        );
+        return;
+    }
+
+    info!("Watching shadow directory: {}", shadow_dir.display());
+
+    let debounce_duration = Duration::from_millis(FILE_DEBOUNCE_MS);
+    let mut pending_events: std::collections::HashMap<PathBuf, tokio::time::Instant> =
+        std::collections::HashMap::new();
+
+    loop {
+        tokio::select! {
+            Some(res) = notify_rx.recv() => {
+                match res {
+                    Ok(event) => {
+                        // Only handle modify events (writes to shadow files)
+                        if !event.kind.is_modify() {
+                            continue;
+                        }
+
+                        for path in event.paths {
+                            // Skip temp files
+                            if let Some(name) = path.file_name() {
+                                let name_str = name.to_string_lossy();
+                                if is_temp_file(&name_str) {
+                                    continue;
+                                }
+                            }
+
+                            debug!("Shadow write detected: {}", path.display());
+                            pending_events.insert(path, tokio::time::Instant::now() + debounce_duration);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Shadow watcher error: {}", e);
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                // Check for debounced events ready to process
+                let now = tokio::time::Instant::now();
+                let ready: Vec<PathBuf> = pending_events
+                    .iter()
+                    .filter(|(_, deadline)| now >= **deadline)
+                    .map(|(path, _)| path.clone())
+                    .collect();
+
+                for path in ready {
+                    pending_events.remove(&path);
+
+                    // Parse inode key from filename
+                    let filename = match path.file_name() {
+                        Some(name) => name.to_string_lossy().to_string(),
+                        None => continue,
+                    };
+
+                    let inode_key = match InodeKey::from_shadow_filename(&filename) {
+                        Some(key) => key,
+                        None => {
+                            debug!("Could not parse inode key from shadow filename: {}", filename);
+                            continue;
+                        }
+                    };
+
+                    // Read content
+                    let content = match tokio::fs::read(&path).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("Failed to read shadow file {}: {}", path.display(), e);
+                            continue;
+                        }
+                    };
+
+                    debug!(
+                        "Shadow write event: inode {:x}-{:x}, {} bytes",
+                        inode_key.dev,
+                        inode_key.ino,
+                        content.len()
+                    );
+
+                    let event = ShadowWriteEvent {
+                        inode_key,
+                        shadow_path: path,
+                        content,
+                    };
+
+                    if tx.send(event).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
