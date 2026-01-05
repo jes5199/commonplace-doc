@@ -23,7 +23,7 @@
     },
     "beads-sync": {
       "command": "/home/jes/commonplace/target/release/commonplace-sync",
-      "args": ["--server", "http://localhost:3000", "--node", "workspace/beads/commonplace-issues.jsonl", "--file", ".beads/issues.jsonl", "--push-only", "--force-push"],
+      "args": ["--server", "http://localhost:3000", "--path", "beads/commonplace-issues.jsonl", "--file", ".beads/issues.jsonl", "--push-only", "--force-push"],
       "restart": {
         "policy": "always",
         "backoff_ms": 500,
