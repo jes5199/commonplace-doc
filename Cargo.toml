@@ -67,6 +67,10 @@ path = "src/bin/show.rs"
 name = "commonplace"
 path = "src/bin/commonplace.rs"
 
+[[bin]]
+name = "cbd"
+path = "src/bin/cbd.rs"
+
 [dependencies]
 rmcp = { version = "0.12", features = ["server", "transport-io"] }
 axum = { version = "0.7", features = ["ws"] }
@@ -85,7 +89,7 @@ sha2 = "0.10"
 hex = "0.4"
 clap = { version = "4.0", features = ["derive", "env"] }
 similar = "2.4"
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 notify = "6.1"
 reqwest-eventsource = "0.5"
 async-recursion = "1.0"
