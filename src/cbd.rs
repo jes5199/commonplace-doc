@@ -157,6 +157,16 @@ struct Issue {
     labels: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dependencies: Option<Vec<Dependency>>,
+    // Additional beads fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    design: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comments: Option<Vec<serde_json::Value>>,
+    // Preserve any unknown fields for round-trip fidelity
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -526,6 +536,12 @@ fn cmd_show(client: &Client, cli: &Cli, id: &str) -> Result<(), Box<dyn std::err
         if !issue.description.is_empty() {
             println!("\nDescription:\n{}", issue.description);
         }
+        if let Some(design) = &issue.design {
+            println!("\nDesign:\n{}", design);
+        }
+        if let Some(notes) = &issue.notes {
+            println!("\nNotes:\n{}", notes);
+        }
         if let Some(reason) = &issue.close_reason {
             println!("\nClose reason: {}", reason);
         }
@@ -559,6 +575,10 @@ fn cmd_create(
         close_reason: None,
         labels: None,
         dependencies: None,
+        design: None,
+        notes: None,
+        comments: None,
+        extra: HashMap::new(),
     };
 
     append_issue(client, cli, &issue)?;
