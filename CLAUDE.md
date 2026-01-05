@@ -136,6 +136,19 @@ cargo run --bin commonplace-server -- --database ./data.redb --fs-root workspace
 cargo run --bin commonplace-sync -- --server http://localhost:3000 --node workspace --directory ./workspace
 ```
 
+### Working in workspace/
+
+The `workspace/` directory is synced bidirectionally by `commonplace-sync`. When the orchestrator is running:
+
+- **File edits**: Creating, modifying, or deleting files in `workspace/` automatically syncs to the server
+- **Schema updates**: Changes to `.commonplace.json` files propagate to the server
+- **Directory operations**: `mkdir`, `rm -r`, etc. are detected and synced
+- **No manual intervention needed**: The sync client watches for filesystem events and handles them
+
+This means you can edit files in `workspace/` directly and trust that changes will propagate. The sync uses CRDTs (Yjs) so concurrent edits from multiple sources merge automatically.
+
+**Note**: The sync client must be running (via orchestrator or standalone) for changes to propagate.
+
 ### CLI Tools
 
 #### commonplace-ps
