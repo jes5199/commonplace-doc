@@ -12,10 +12,13 @@ use commonplace_doc::sync::{
     ensure_fs_root_exists, file_watcher_task, fork_node, get_all_node_backed_dir_ids,
     handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
     initial_sync, is_binary_content, push_schema_to_server, scan_directory_with_contents,
-    shadow_watcher_task, shadow_write_handler_task, spawn_file_sync_tasks, sse_task,
-    sse_task_with_tracker, subdir_sse_task, sync_schema, sync_single_file, upload_task, DirEvent,
-    FileEvent, FileSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions,
+    spawn_file_sync_tasks, sse_task, subdir_sse_task, sync_schema, sync_single_file, upload_task,
+    DirEvent, FileEvent, FileSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions,
     ShadowWriteEvent, SyncState, SCHEMA_FILENAME,
+};
+#[cfg(unix)]
+use commonplace_doc::sync::{
+    shadow_gc_task, shadow_watcher_task, shadow_write_handler_task, sse_task_with_tracker,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -854,37 +857,49 @@ async fn run_file_mode(
         None
     };
 
-    // Start shadow watcher and handler if inode tracking is enabled
-    let (shadow_watcher_handle, shadow_handler_handle) = if let Some(ref tracker) = inode_tracker {
-        let shadow_path = {
-            let t = tracker.read().await;
-            t.shadow_dir.clone()
+    // Start shadow watcher, handler, and GC if inode tracking is enabled (unix only)
+    #[cfg(unix)]
+    let (shadow_watcher_handle, shadow_handler_handle, shadow_gc_handle) =
+        if let Some(ref tracker) = inode_tracker {
+            let shadow_path = {
+                let t = tracker.read().await;
+                t.shadow_dir.clone()
+            };
+
+            // Create channel for shadow write events
+            let (shadow_tx, shadow_rx) = mpsc::channel::<ShadowWriteEvent>(100);
+
+            // Start shadow watcher
+            let watcher = tokio::spawn(shadow_watcher_task(shadow_path, shadow_tx));
+
+            // Start shadow write handler
+            let handler = tokio::spawn(shadow_write_handler_task(
+                client.clone(),
+                server.clone(),
+                shadow_rx,
+                tracker.clone(),
+                false, // use_paths: file mode uses ID-based API
+            ));
+
+            // Start periodic shadow GC task
+            let gc = tokio::spawn(shadow_gc_task(tracker.clone()));
+
+            (Some(watcher), Some(handler), Some(gc))
+        } else {
+            (None, None, None)
         };
-
-        // Create channel for shadow write events
-        let (shadow_tx, shadow_rx) = mpsc::channel::<ShadowWriteEvent>(100);
-
-        // Start shadow watcher
-        let watcher = tokio::spawn(shadow_watcher_task(shadow_path, shadow_tx));
-
-        // Start shadow write handler
-        let handler = tokio::spawn(shadow_write_handler_task(
-            client.clone(),
-            server.clone(),
-            shadow_rx,
-            tracker.clone(),
-            false, // use_paths: file mode uses ID-based API
-        ));
-
-        (Some(watcher), Some(handler))
-    } else {
-        (None, None)
-    };
+    #[cfg(not(unix))]
+    let (shadow_watcher_handle, shadow_handler_handle, shadow_gc_handle): (
+        Option<tokio::task::JoinHandle<()>>,
+        Option<tokio::task::JoinHandle<()>>,
+        Option<tokio::task::JoinHandle<()>>,
+    ) = (None, None, None);
 
     // Start SSE subscription task (skip if push-only)
-    // Use tracker-aware version if inode tracking is enabled
+    // Use tracker-aware version if inode tracking is enabled (unix only)
     let sse_handle = if !push_only {
-        if let Some(ref tracker) = inode_tracker {
+        #[cfg(unix)]
+        let handle = if let Some(ref tracker) = inode_tracker {
             Some(tokio::spawn(sse_task_with_tracker(
                 client.clone(),
                 server.clone(),
@@ -903,7 +918,17 @@ async fn run_file_mode(
                 state.clone(),
                 false, // use_paths: file mode uses ID-based API
             )))
-        }
+        };
+        #[cfg(not(unix))]
+        let handle = Some(tokio::spawn(sse_task(
+            client.clone(),
+            server.clone(),
+            node_id.clone(),
+            file.clone(),
+            state.clone(),
+            false, // use_paths: file mode uses ID-based API
+        )));
+        handle
     } else {
         info!("Push-only mode: skipping SSE subscription");
         None
@@ -927,6 +952,9 @@ async fn run_file_mode(
         handle.abort();
     }
     if let Some(handle) = shadow_handler_handle {
+        handle.abort();
+    }
+    if let Some(handle) = shadow_gc_handle {
         handle.abort();
     }
 

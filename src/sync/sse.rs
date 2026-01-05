@@ -815,13 +815,24 @@ pub async fn atomic_write_with_shadow(
             } else {
                 // Update tracker to mark inode as shadowed
                 let mut tracker = inode_tracker.write().await;
-                tracker.shadow(old_key);
-                debug!(
-                    "Created shadow hardlink for inode {:x}-{:x} at {}",
-                    old_key.dev,
-                    old_key.ino,
-                    shadow_path.display()
-                );
+                if tracker.shadow(old_key).is_none() {
+                    // Race: inode was removed between read lock and write lock (e.g., by GC)
+                    // Delete the orphaned hardlink we just created
+                    warn!(
+                        "Inode {:x}-{:x} was removed from tracker after hardlink creation - removing orphaned shadow",
+                        old_key.dev, old_key.ino
+                    );
+                    if let Err(e) = std::fs::remove_file(&shadow_path) {
+                        warn!("Failed to remove orphaned shadow hardlink: {}", e);
+                    }
+                } else {
+                    debug!(
+                        "Created shadow hardlink for inode {:x}-{:x} at {}",
+                        old_key.dev,
+                        old_key.ino,
+                        shadow_path.display()
+                    );
+                }
             }
         }
 

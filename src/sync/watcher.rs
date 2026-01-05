@@ -8,8 +8,9 @@ use notify::event::{ModifyKind, RenameMode};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 /// Default debounce duration for file watcher (100ms)
@@ -574,6 +575,52 @@ pub async fn shadow_watcher_task(shadow_dir: PathBuf, tx: mpsc::Sender<ShadowWri
                     if tx.send(event).await.is_err() {
                         return;
                     }
+                }
+            }
+        }
+    }
+}
+
+/// GC interval for shadow inode cleanup (5 minutes)
+pub const SHADOW_GC_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Periodic garbage collection task for shadow inodes.
+///
+/// This task runs every SHADOW_GC_INTERVAL (5 minutes) and:
+/// 1. Calls tracker.gc() to find stale shadow entries
+/// 2. Removes the returned shadow hardlinks from disk
+///
+/// Exits when the tracker Arc is the last reference (sync shutdown).
+#[cfg(unix)]
+pub async fn shadow_gc_task(tracker: Arc<RwLock<crate::sync::InodeTracker>>) {
+    use tokio::time::interval;
+
+    let mut gc_interval = interval(SHADOW_GC_INTERVAL);
+    gc_interval.tick().await; // Skip immediate first tick
+
+    loop {
+        gc_interval.tick().await;
+
+        // Run GC and get shadow paths to clean up
+        let cleaned_paths = {
+            let mut t = tracker.write().await;
+            t.gc()
+        };
+
+        if !cleaned_paths.is_empty() {
+            info!(
+                "Shadow GC: cleaning up {} stale shadow links",
+                cleaned_paths.len()
+            );
+
+            for path in cleaned_paths {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    // ENOENT is fine - file might already be gone
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        warn!("Failed to remove shadow hardlink {}: {}", path.display(), e);
+                    }
+                } else {
+                    debug!("Removed stale shadow hardlink: {}", path.display());
                 }
             }
         }
