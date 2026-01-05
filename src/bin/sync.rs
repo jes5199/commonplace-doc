@@ -667,6 +667,7 @@ async fn main() -> ExitCode {
 }
 
 /// Run single-file sync mode (original behavior)
+#[allow(clippy::too_many_arguments)]
 async fn run_file_mode(
     client: Client,
     server: String,

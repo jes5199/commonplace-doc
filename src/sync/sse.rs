@@ -507,6 +507,7 @@ pub async fn sse_task_with_tracker(
 ///
 /// Like `handle_server_edit`, but uses atomic writes with shadow hardlinks.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_server_edit_with_tracker(
     client: &Client,
     server: &str,
