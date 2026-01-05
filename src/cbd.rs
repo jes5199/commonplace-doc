@@ -148,6 +148,36 @@ enum Commands {
         #[arg(long)]
         title: Option<String>,
     },
+    /// Manage dependencies
+    Dep {
+        #[command(subcommand)]
+        action: DepAction,
+    },
+    /// List blocked issues (open issues with unresolved blockers)
+    Blocked,
+}
+
+#[derive(Subcommand)]
+enum DepAction {
+    /// Add a dependency (issue_id depends on depends_on_id)
+    Add {
+        /// The issue that is blocked
+        issue_id: String,
+        /// The issue that blocks it
+        depends_on_id: String,
+    },
+    /// Remove a dependency
+    Remove {
+        /// The issue that was blocked
+        issue_id: String,
+        /// The issue that was blocking it
+        depends_on_id: String,
+    },
+    /// List dependencies for an issue
+    List {
+        /// Issue ID
+        issue_id: String,
+    },
 }
 
 /// Issue structure matching beads format
@@ -258,6 +288,18 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             priority,
             title,
         } => cmd_update(&client, &cli, id, status.clone(), *priority, title.clone()),
+        Commands::Dep { action } => match action {
+            DepAction::Add {
+                issue_id,
+                depends_on_id,
+            } => cmd_dep_add(&client, &cli, issue_id, depends_on_id),
+            DepAction::Remove {
+                issue_id,
+                depends_on_id,
+            } => cmd_dep_remove(&client, &cli, issue_id, depends_on_id),
+            DepAction::List { issue_id } => cmd_dep_list(&client, &cli, issue_id),
+        },
+        Commands::Blocked => cmd_blocked(&client, &cli),
     }
 }
 
@@ -536,19 +578,25 @@ fn cmd_ready(client: &Client, cli: &Cli) -> Result<(), Box<dyn std::error::Error
     // Get all open issues
     let open_issues: Vec<_> = map.values().filter(|i| i.status == "open").collect();
 
-    // Find issues that have blockers
-    let blocked_ids: std::collections::HashSet<_> = open_issues
-        .iter()
-        .filter_map(|i| i.dependencies.as_ref())
-        .flatten()
-        .filter(|d| d.dep_type == "blocks")
-        .map(|d| d.issue_id.clone())
-        .collect();
-
-    // Ready = open and not blocked
+    // Ready = open and has no OPEN blockers
+    // An issue is blocked only if it depends on another OPEN issue
     let mut ready: Vec<_> = open_issues
         .into_iter()
-        .filter(|i| !blocked_ids.contains(&i.id))
+        .filter(|i| {
+            // Check if this issue has any open blockers
+            let has_open_blocker = i
+                .dependencies
+                .as_ref()
+                .map(|deps| {
+                    deps.iter().filter(|d| d.dep_type == "blocks").any(|d| {
+                        map.get(&d.depends_on_id)
+                            .map(|blocker| blocker.status == "open")
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            !has_open_blocker
+        })
         .collect();
 
     ready.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.id.cmp(&b.id)));
@@ -722,6 +770,243 @@ fn cmd_update(
         println!("{}", serde_json::to_string_pretty(issue)?);
     } else {
         println!("✓ Updated {}: {}", issue.id, issue.title);
+    }
+
+    Ok(())
+}
+
+fn cmd_dep_add(
+    client: &Client,
+    cli: &Cli,
+    issue_id: &str,
+    depends_on_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let issues = fetch_issues(client, cli)?;
+    let mut map = build_issue_map(issues);
+
+    // Verify both issues exist
+    if !map.contains_key(issue_id) {
+        return Err(format!("Issue {} not found", issue_id).into());
+    }
+    if !map.contains_key(depends_on_id) {
+        return Err(format!("Issue {} not found", depends_on_id).into());
+    }
+
+    let issue = map.get_mut(issue_id).unwrap();
+    let now: DateTime<Utc> = Utc::now();
+
+    let dep = Dependency {
+        issue_id: issue_id.to_string(),
+        depends_on_id: depends_on_id.to_string(),
+        dep_type: "blocks".to_string(),
+        created_at: now.to_rfc3339(),
+        created_by: std::env::var("USER").unwrap_or_else(|_| "unknown".to_string()),
+    };
+
+    // Add to existing dependencies or create new list
+    if let Some(ref mut deps) = issue.dependencies {
+        // Check if dependency already exists
+        if deps
+            .iter()
+            .any(|d| d.depends_on_id == depends_on_id && d.dep_type == "blocks")
+        {
+            return Err(format!(
+                "Dependency already exists: {} is blocked by {}",
+                issue_id, depends_on_id
+            )
+            .into());
+        }
+        deps.push(dep);
+    } else {
+        issue.dependencies = Some(vec![dep]);
+    }
+
+    issue.updated_at = now.to_rfc3339();
+    append_issue(client, cli, issue)?;
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(issue)?);
+    } else {
+        println!(
+            "✓ Added dependency: {} is now blocked by {}",
+            issue_id, depends_on_id
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_dep_remove(
+    client: &Client,
+    cli: &Cli,
+    issue_id: &str,
+    depends_on_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let issues = fetch_issues(client, cli)?;
+    let mut map = build_issue_map(issues);
+
+    let issue = map
+        .get_mut(issue_id)
+        .ok_or_else(|| format!("Issue {} not found", issue_id))?;
+
+    let now: DateTime<Utc> = Utc::now();
+
+    if let Some(ref mut deps) = issue.dependencies {
+        let orig_len = deps.len();
+        deps.retain(|d| !(d.depends_on_id == depends_on_id && d.dep_type == "blocks"));
+        if deps.len() == orig_len {
+            return Err(format!(
+                "No dependency found: {} blocked by {}",
+                issue_id, depends_on_id
+            )
+            .into());
+        }
+        if deps.is_empty() {
+            issue.dependencies = None;
+        }
+    } else {
+        return Err(format!("Issue {} has no dependencies", issue_id).into());
+    }
+
+    issue.updated_at = now.to_rfc3339();
+    append_issue(client, cli, issue)?;
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(issue)?);
+    } else {
+        println!(
+            "✓ Removed dependency: {} is no longer blocked by {}",
+            issue_id, depends_on_id
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_dep_list(
+    client: &Client,
+    cli: &Cli,
+    issue_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let issues = fetch_issues(client, cli)?;
+    let map = build_issue_map(issues);
+
+    let issue = map
+        .get(issue_id)
+        .ok_or_else(|| format!("Issue {} not found", issue_id))?;
+
+    // Find what this issue depends on (blockers)
+    let blockers: Vec<_> = issue
+        .dependencies
+        .as_ref()
+        .map(|deps| {
+            deps.iter()
+                .filter(|d| d.dep_type == "blocks")
+                .filter_map(|d| map.get(&d.depends_on_id))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Find what depends on this issue (blocks)
+    let blocks: Vec<_> = map
+        .values()
+        .filter(|i| {
+            i.dependencies
+                .as_ref()
+                .map(|deps| {
+                    deps.iter()
+                        .any(|d| d.depends_on_id == issue_id && d.dep_type == "blocks")
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if cli.json {
+        #[derive(Serialize)]
+        struct DepInfo<'a> {
+            blockers: Vec<&'a Issue>,
+            blocks: Vec<&'a Issue>,
+        }
+        let info = DepInfo { blockers, blocks };
+        println!("{}", serde_json::to_string_pretty(&info)?);
+    } else {
+        println!("Dependencies for {}:\n", issue_id);
+        if blockers.is_empty() {
+            println!("Blocked by: (none)");
+        } else {
+            println!("Blocked by:");
+            for b in &blockers {
+                println!("  → {}: {} [{}]", b.id, b.title, b.status);
+            }
+        }
+        println!();
+        if blocks.is_empty() {
+            println!("Blocks: (none)");
+        } else {
+            println!("Blocks:");
+            for b in &blocks {
+                println!("  ← {}: {} [{}]", b.id, b.title, b.status);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_blocked(client: &Client, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let issues = fetch_issues(client, cli)?;
+    let map = build_issue_map(issues);
+
+    // Get open issues
+    let open_issues: Vec<_> = map.values().filter(|i| i.status == "open").collect();
+
+    // Find issues that have open blockers
+    let mut blocked: Vec<(&Issue, Vec<&Issue>)> = Vec::new();
+
+    for issue in &open_issues {
+        if let Some(deps) = &issue.dependencies {
+            let open_blockers: Vec<_> = deps
+                .iter()
+                .filter(|d| d.dep_type == "blocks")
+                .filter_map(|d| map.get(&d.depends_on_id))
+                .filter(|blocker| blocker.status == "open")
+                .collect();
+
+            if !open_blockers.is_empty() {
+                blocked.push((issue, open_blockers));
+            }
+        }
+    }
+
+    blocked.sort_by(|a, b| a.0.priority.cmp(&b.0.priority));
+
+    if cli.json {
+        #[derive(Serialize)]
+        struct BlockedInfo<'a> {
+            issue: &'a Issue,
+            blocked_by: Vec<&'a Issue>,
+        }
+        let info: Vec<_> = blocked
+            .iter()
+            .map(|(issue, blockers)| BlockedInfo {
+                issue,
+                blocked_by: blockers.clone(),
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&info)?);
+    } else {
+        if blocked.is_empty() {
+            println!("No blocked issues");
+            return Ok(());
+        }
+        println!("🚫 Blocked issues ({}):\n", blocked.len());
+        for (issue, blockers) in &blocked {
+            println!("[P{}] {}: {}", issue.priority, issue.id, issue.title);
+            for blocker in blockers {
+                println!("  ↳ blocked by {}: {}", blocker.id, blocker.title);
+            }
+            println!();
+        }
     }
 
     Ok(())
