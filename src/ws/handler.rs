@@ -265,8 +265,10 @@ async fn handle_binary_message(
                 .await
                 .map_err(|e| e.to_string())?;
 
-            // Send response to the specific connection
-            conn.read().await.try_send_binary(response);
+            // Send response to the specific connection - must not drop sync responses
+            if !conn.read().await.try_send_binary(response) {
+                return Err("Failed to send SyncStep2 response: channel full or closed".to_string());
+            }
         }
         WsMessage::SyncStep2 { update } => {
             // Client is sending us updates we're missing
