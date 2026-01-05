@@ -721,6 +721,19 @@ impl DocumentService {
             (diff, current_head.into_iter().collect())
         };
 
+        // Skip creating commit if no changes (prevents empty Yjs updates)
+        if diff_result.summary.chars_inserted == 0 && diff_result.summary.chars_deleted == 0 {
+            debug!("SKIP: no changes detected, not creating commit");
+            let head_cid = parents.first().cloned().unwrap_or_default();
+            return Ok(ReplaceResult {
+                cid: head_cid.clone(),
+                edit_cid: head_cid,
+                chars_inserted: 0,
+                chars_deleted: 0,
+                operations: 0,
+            });
+        }
+
         let author = author.unwrap_or_else(|| "anonymous".to_string());
         let commit = Commit::new(parents, diff_result.update_b64.clone(), author, None);
         let timestamp = commit.timestamp;
