@@ -74,18 +74,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(get_process_cwd)
                     .or_else(|| proc.cwd.clone())
                     .unwrap_or_else(|| "-".to_string());
-                let cwd = cwd.as_str();
-
-                // Truncate cwd if too long
-                let cwd_display = if cwd.len() > 40 {
-                    format!("...{}", &cwd[cwd.len() - 37..])
-                } else {
-                    cwd.to_string()
-                };
-
                 println!(
-                    "{:<20} {:>8} {:<10} {:<40}",
-                    proc.name, pid_str, state_display, cwd_display
+                    "{:<20} {:>8} {:<10} {}",
+                    proc.name, pid_str, state_display, cwd
                 );
             }
         }
