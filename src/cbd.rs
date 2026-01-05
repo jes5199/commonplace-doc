@@ -92,6 +92,21 @@ enum Commands {
         /// Filter by status (open, closed, all)
         #[arg(long, default_value = "open")]
         status: String,
+        /// Filter by issue type (bug, feature, task, chore)
+        #[arg(long, short = 't')]
+        issue_type: Option<String>,
+        /// Filter by priority (1-4)
+        #[arg(long, short = 'p')]
+        priority: Option<u8>,
+        /// Filter by label
+        #[arg(long, short = 'l')]
+        label: Option<String>,
+        /// Search in title and description
+        #[arg(long, short = 's')]
+        search: Option<String>,
+        /// Sort by field (priority, created, updated)
+        #[arg(long, default_value = "priority")]
+        sort: String,
     },
     /// List issues ready to work on (open, no blockers)
     Ready,
@@ -204,7 +219,23 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match &cli.command {
-        Commands::List { status } => cmd_list(&client, &cli, status),
+        Commands::List {
+            status,
+            issue_type,
+            priority,
+            label,
+            search,
+            sort,
+        } => cmd_list(
+            &client,
+            &cli,
+            status,
+            issue_type.as_deref(),
+            *priority,
+            label.as_deref(),
+            search.as_deref(),
+            sort,
+        ),
         Commands::Ready => cmd_ready(&client, &cli),
         Commands::Show { id } => cmd_show(&client, &cli, id),
         Commands::Create {
@@ -416,6 +447,11 @@ fn cmd_list(
     client: &Client,
     cli: &Cli,
     status_filter: &str,
+    type_filter: Option<&str>,
+    priority_filter: Option<u8>,
+    label_filter: Option<&str>,
+    search_filter: Option<&str>,
+    sort_by: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let issues = fetch_issues(client, cli)?;
     let map = build_issue_map(issues);
@@ -428,14 +464,37 @@ fn cmd_list(
             "all" => true,
             _ => i.status == status_filter,
         })
+        .filter(|i| type_filter.is_none_or(|t| i.issue_type == t))
+        .filter(|i| priority_filter.is_none_or(|p| i.priority == p))
+        .filter(|i| {
+            label_filter.is_none_or(|l| {
+                i.labels
+                    .as_ref()
+                    .is_some_and(|labels| labels.iter().any(|lab| lab == l))
+            })
+        })
+        .filter(|i| {
+            search_filter.is_none_or(|s| {
+                let s_lower = s.to_lowercase();
+                i.title.to_lowercase().contains(&s_lower)
+                    || i.description.to_lowercase().contains(&s_lower)
+            })
+        })
         .collect();
 
-    // Sort by priority ascending, then by created_at descending (newest first)
-    filtered.sort_by(|a, b| {
-        a.priority
-            .cmp(&b.priority)
-            .then_with(|| b.created_at.cmp(&a.created_at))
-    });
+    // Sort based on sort_by parameter
+    match sort_by {
+        "created" => filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
+        "updated" => filtered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at)),
+        _ => {
+            // Default: priority ascending, then created_at descending
+            filtered.sort_by(|a, b| {
+                a.priority
+                    .cmp(&b.priority)
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+            });
+        }
+    }
 
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&filtered)?);
