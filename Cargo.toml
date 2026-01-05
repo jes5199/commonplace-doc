@@ -71,6 +71,10 @@ path = "src/bin/commonplace.rs"
 name = "cbd"
 path = "src/bin/cbd.rs"
 
+[[bin]]
+name = "commonplace-bd"
+path = "src/bin/commonplace_bd.rs"
+
 [dependencies]
 rmcp = { version = "0.12", features = ["server", "transport-io"] }
 axum = { version = "0.7", features = ["ws"] }

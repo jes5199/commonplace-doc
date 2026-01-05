@@ -1,5 +1,6 @@
 pub mod api;
 pub mod b64;
+pub mod cbd;
 pub mod cli;
 pub mod commit;
 pub mod content_type;
