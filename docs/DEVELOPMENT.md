@@ -135,6 +135,115 @@ This means:
 - JSON must be valid (top-level object or array).
 - Server serialization may normalize whitespace or key ordering.
 
+## cbd (Commonplace Bug Database)
+
+`cbd` is a lightweight issue tracker CLI that stores issues in a JSONL file synced through commonplace. It's designed for use alongside [beads](https://github.com/steveyegge/beads) but operates in a simpler JSONL-only mode.
+
+### Basic Usage
+
+```bash
+# List all open issues
+cbd list --status open
+
+# List issues ready to work on (no blockers)
+cbd ready
+
+# Show issue details
+cbd show CP-abc1
+
+# Create an issue
+cbd create "Fix the login bug" -t bug -p 1
+
+# Create with full options
+cbd create "Add user profiles" \
+  -t feature -p 2 \
+  -a jes \
+  -l backend,api \
+  --deps blocks:CP-abc1 \
+  -d "Users need profile pages"
+
+# Update an issue
+cbd update CP-abc1 --status closed
+cbd update CP-abc1 --priority 1 --labels urgent,blocking
+
+# Close an issue
+cbd close CP-abc1 -r "Fixed in commit abc123"
+
+# Manage dependencies
+cbd dep add CP-abc1 CP-xyz9    # CP-abc1 is blocked by CP-xyz9
+cbd dep remove CP-abc1 CP-xyz9
+cbd dep list CP-abc1
+
+# List blocked issues
+cbd blocked
+```
+
+### Config Discovery
+
+cbd looks for configuration in this order:
+
+1. Command-line flags (`--server`, `--path`)
+2. Environment variables (`COMMONPLACE_SERVER`, `CBD_PATH`)
+3. Config file `.cbd.json` (searched up from cwd)
+4. Config file `.beads/.cbd.json` (searched up from cwd)
+5. Defaults (`http://localhost:3000`, `beads/commonplace-issues.jsonl`)
+
+Example `.cbd.json`:
+```json
+{
+  "path": "beads/my-project-issues.jsonl",
+  "server": "http://localhost:3000"
+}
+```
+
+### JSON Output
+
+Use `--json` for machine-readable output:
+
+```bash
+# List as JSON array
+cbd list --json
+
+# Single issue as JSON
+cbd show CP-abc1 --json
+```
+
+Example JSON output:
+```json
+{
+  "id": "CP-abc1",
+  "title": "Fix login bug",
+  "status": "open",
+  "priority": 1,
+  "issue_type": "bug",
+  "created_at": "2026-01-05T10:00:00Z",
+  "created_by": "jes",
+  "updated_at": "2026-01-05T10:00:00Z",
+  "labels": ["urgent"],
+  "dependencies": []
+}
+```
+
+### Differences from bd
+
+cbd is intentionally simpler than the full `bd` CLI:
+
+| Feature | bd | cbd |
+|---------|-----|-----|
+| Storage | SQLite + JSONL export | JSONL only (via commonplace) |
+| Daemon | Background sync daemon | None (direct HTTP) |
+| Sync modes | `--no-db`, `--readonly`, `--sandbox` | Always JSONL-only |
+| Prefix routing | Multi-rig support | Single JSONL file |
+| Epics/molecules | Full hierarchy | Basic parent field |
+| Events/agents | Specialized types | Standard types only |
+
+**Why the difference?** cbd is designed for:
+- Simple projects that don't need SQLite
+- Environments where commonplace provides the sync layer
+- Cases where JSONL portability matters more than query speed
+
+For full beads functionality, use `bd` directly.
+
 ## Troubleshooting
 
 - `POST /docs/:id/commit` returns `501`: start the server with `--database <path>`.
