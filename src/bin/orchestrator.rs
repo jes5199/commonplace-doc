@@ -7,13 +7,18 @@ use clap::Parser;
 use commonplace_doc::cli::OrchestratorArgs;
 use commonplace_doc::orchestrator::{DiscoveredProcessManager, OrchestratorConfig, ProcessManager};
 use fs2::FileExt;
+use notify::{
+    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use std::fs::File;
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::time::Duration;
 #[cfg(not(unix))]
 use tokio::signal;
 #[cfg(unix)]
 use tokio::signal::unix::{signal as unix_signal, SignalKind};
+use tokio::sync::mpsc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Wait for either SIGINT (Ctrl+C) or SIGTERM.
@@ -41,6 +46,124 @@ async fn wait_for_shutdown_signal() {
         .await
         .expect("Failed to register Ctrl+C handler");
     tracing::info!("[orchestrator] Received Ctrl+C");
+}
+
+/// Config file change event
+#[derive(Debug)]
+enum ConfigEvent {
+    Changed,
+}
+
+/// Task that watches the config file for changes.
+/// Sends ConfigEvent::Changed when the file is modified.
+async fn config_watcher_task(config_path: PathBuf, tx: mpsc::Sender<ConfigEvent>) {
+    // Get the parent directory - we watch this to catch atomic renames
+    let parent_dir = match config_path.parent() {
+        Some(p) if p.as_os_str().is_empty() => PathBuf::from("."),
+        Some(p) => p.to_path_buf(),
+        None => {
+            tracing::error!(
+                "[orchestrator] Cannot watch config without parent directory: {}",
+                config_path.display()
+            );
+            return;
+        }
+    };
+
+    // Canonicalize the file path for reliable comparison
+    let canonical_config_path = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.clone());
+
+    // Create a channel for notify events
+    let (notify_tx, mut notify_rx) = mpsc::channel::<Result<Event, notify::Error>>(100);
+
+    // Create watcher
+    let mut watcher = match RecommendedWatcher::new(
+        move |res| {
+            let _ = notify_tx.blocking_send(res);
+        },
+        NotifyConfig::default().with_poll_interval(Duration::from_millis(100)),
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::error!("[orchestrator] Failed to create config watcher: {}", e);
+            return;
+        }
+    };
+
+    // Watch the parent directory to catch atomic renames
+    if let Err(e) = watcher.watch(&parent_dir, RecursiveMode::NonRecursive) {
+        tracing::error!(
+            "[orchestrator] Failed to watch config directory {}: {}",
+            parent_dir.display(),
+            e
+        );
+        return;
+    }
+
+    tracing::info!(
+        "[orchestrator] Watching config file: {} (via parent dir: {})",
+        config_path.display(),
+        parent_dir.display()
+    );
+
+    // Debounce timer
+    let debounce_duration = Duration::from_millis(500);
+    let mut debounce_timer: Option<tokio::time::Instant> = None;
+
+    // Helper to check if an event path matches our target file
+    let matches_target = |event_path: &PathBuf| -> bool {
+        if let Ok(canonical) = event_path.canonicalize() {
+            if canonical == canonical_config_path {
+                return true;
+            }
+        }
+        event_path.file_name() == config_path.file_name()
+            && event_path.parent() == config_path.parent()
+    };
+
+    loop {
+        tokio::select! {
+            Some(res) = notify_rx.recv() => {
+                match res {
+                    Ok(event) => {
+                        let affects_target = event.paths.iter().any(&matches_target);
+                        if !affects_target {
+                            continue;
+                        }
+
+                        // Handle modify, create, and rename events
+                        let should_trigger = matches!(
+                            event.kind,
+                            EventKind::Modify(_) | EventKind::Create(_)
+                        );
+
+                        if should_trigger {
+                            tracing::debug!("[orchestrator] Config file change detected: {:?}", event.kind);
+                            debounce_timer = Some(tokio::time::Instant::now() + debounce_duration);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("[orchestrator] Config watcher error: {}", e);
+                    }
+                }
+            }
+            _ = async {
+                if let Some(deadline) = debounce_timer {
+                    tokio::time::sleep_until(deadline).await;
+                    true
+                } else {
+                    std::future::pending::<bool>().await
+                }
+            } => {
+                debounce_timer = None;
+                if tx.send(ConfigEvent::Changed).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Schema structure for parsing fs-root content
@@ -401,8 +524,19 @@ async fn main() {
         &fs_root_id[..8.min(fs_root_id.len())]
     );
 
+    // Start config file watcher
+    let (config_tx, mut config_rx) = mpsc::channel::<ConfigEvent>(10);
+    let config_path_for_watcher = args.config.clone();
+    tokio::spawn(async move {
+        config_watcher_task(config_path_for_watcher, config_tx).await;
+    });
+
+    // Keep a copy of the config path for reloading
+    let config_path = args.config.clone();
+
     // Run the recursive watcher with shutdown handling
     // Also monitor base processes (server, sync) for restarts
+    // And handle config file changes
     let mut monitor_interval = tokio::time::interval(Duration::from_millis(500));
     tokio::select! {
         result = discovered_manager.run_with_recursive_watch(&client, &fs_root_id) => {
@@ -412,8 +546,25 @@ async fn main() {
         }
         _ = async {
             loop {
-                monitor_interval.tick().await;
-                base_manager.check_and_restart().await;
+                tokio::select! {
+                    _ = monitor_interval.tick() => {
+                        base_manager.check_and_restart().await;
+                    }
+                    Some(ConfigEvent::Changed) = config_rx.recv() => {
+                        tracing::info!("[orchestrator] Config file changed, reloading...");
+                        match OrchestratorConfig::load(&config_path) {
+                            Ok(new_config) => {
+                                base_manager.reload_config(new_config).await;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "[orchestrator] Failed to reload config: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
             }
         } => {}
         _ = wait_for_shutdown_signal() => {

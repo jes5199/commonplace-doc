@@ -425,6 +425,145 @@ impl ProcessManager {
         }
     }
 
+    /// Stop a specific process by name
+    pub async fn stop_process(&mut self, name: &str) {
+        if let Some(process) = self.processes.get_mut(name) {
+            if let Some(ref mut child) = process.handle {
+                tracing::info!("[orchestrator] Stopping '{}'", name);
+
+                #[cfg(unix)]
+                {
+                    if let Some(pid) = child.id() {
+                        tracing::debug!("[orchestrator] Sending SIGTERM to process group {}", pid);
+                        unsafe {
+                            libc::killpg(pid as i32, libc::SIGTERM);
+                        }
+                    }
+                }
+
+                let timeout = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+
+                match timeout {
+                    Ok(Ok(_)) => {
+                        tracing::info!("[orchestrator] '{}' stopped gracefully", name);
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "[orchestrator] '{}' didn't stop gracefully, force killing",
+                            name
+                        );
+                        #[cfg(unix)]
+                        if let Some(pid) = child.id() {
+                            unsafe {
+                                libc::killpg(pid as i32, libc::SIGKILL);
+                            }
+                        }
+                        let _ = child.kill().await;
+                    }
+                }
+
+                process.handle = None;
+                process.state = ProcessState::Stopped;
+            }
+        }
+        self.write_status();
+    }
+
+    /// Reload configuration, stopping removed processes and starting new ones
+    pub async fn reload_config(&mut self, new_config: OrchestratorConfig) {
+        tracing::info!("[orchestrator] Reloading configuration...");
+
+        let old_processes: std::collections::HashSet<_> =
+            self.config.processes.keys().cloned().collect();
+        let new_processes: std::collections::HashSet<_> =
+            new_config.processes.keys().cloned().collect();
+
+        // Find removed processes
+        let removed: Vec<_> = old_processes.difference(&new_processes).cloned().collect();
+        // Find added processes
+        let added: Vec<_> = new_processes.difference(&old_processes).cloned().collect();
+        // Find processes with changed config
+        let mut changed: Vec<String> = Vec::new();
+        for name in old_processes.intersection(&new_processes) {
+            let old_cfg = &self.config.processes[name];
+            let new_cfg = &new_config.processes[name];
+            // Compare key fields
+            if old_cfg.command != new_cfg.command
+                || old_cfg.args != new_cfg.args
+                || old_cfg.cwd != new_cfg.cwd
+            {
+                changed.push(name.clone());
+            }
+        }
+
+        // Stop removed processes
+        for name in &removed {
+            tracing::info!("[orchestrator] Config reload: removing process '{}'", name);
+            self.stop_process(name).await;
+            self.processes.remove(name);
+        }
+
+        // Stop and remove changed processes (will be re-added with new config)
+        for name in &changed {
+            tracing::info!(
+                "[orchestrator] Config reload: restarting changed process '{}'",
+                name
+            );
+            self.stop_process(name).await;
+            self.processes.remove(name);
+        }
+
+        // Update config
+        self.config = new_config;
+
+        // Add new and changed processes to the map
+        for name in added.iter().chain(changed.iter()) {
+            if let Some(cfg) = self.config.processes.get(name) {
+                self.processes.insert(
+                    name.clone(),
+                    ManagedProcess {
+                        config: cfg.clone(),
+                        handle: None,
+                        state: ProcessState::Stopped,
+                        consecutive_failures: 0,
+                        last_start: None,
+                    },
+                );
+            }
+        }
+
+        // Start added processes (in dependency order)
+        for name in &added {
+            if self.disabled.contains(name) {
+                continue;
+            }
+            tracing::info!(
+                "[orchestrator] Config reload: starting new process '{}'",
+                name
+            );
+            if let Err(e) = self.spawn_process(name).await {
+                tracing::error!("[orchestrator] Failed to start '{}': {}", name, e);
+            }
+        }
+
+        // Start changed processes
+        for name in &changed {
+            if self.disabled.contains(name) {
+                continue;
+            }
+            if let Err(e) = self.spawn_process(name).await {
+                tracing::error!("[orchestrator] Failed to restart '{}': {}", name, e);
+            }
+        }
+
+        tracing::info!(
+            "[orchestrator] Config reload complete: {} removed, {} added, {} changed",
+            removed.len(),
+            added.len(),
+            changed.len()
+        );
+    }
+
     pub async fn shutdown(&mut self) {
         tracing::info!("[orchestrator] Shutting down...");
 
