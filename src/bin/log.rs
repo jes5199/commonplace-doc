@@ -502,71 +502,42 @@ fn colorize_diff(diff: &str) -> String {
 }
 
 fn compute_diff_stats(old: &str, new: &str) -> ChangeStats {
-    // Simple line-based diff stats
-    let old_lines: std::collections::HashSet<&str> = old.lines().collect();
-    let new_lines: std::collections::HashSet<&str> = new.lines().collect();
+    use similar::{ChangeTag, TextDiff};
 
-    let added: usize = new_lines.difference(&old_lines).count();
-    let removed: usize = old_lines.difference(&new_lines).count();
+    let diff = TextDiff::from_lines(old, new);
+    let mut lines_added = 0;
+    let mut lines_removed = 0;
+    let mut chars_added = 0;
+    let mut chars_removed = 0;
 
-    // Character diff (simple approximation)
-    let chars_added = if new.len() > old.len() {
-        new.len() - old.len()
-    } else {
-        0
-    };
-    let chars_removed = if old.len() > new.len() {
-        old.len() - new.len()
-    } else {
-        0
-    };
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Insert => {
+                lines_added += 1;
+                chars_added += change.value().len();
+            }
+            ChangeTag::Delete => {
+                lines_removed += 1;
+                chars_removed += change.value().len();
+            }
+            ChangeTag::Equal => {}
+        }
+    }
 
     ChangeStats {
-        lines_added: added,
-        lines_removed: removed,
+        lines_added,
+        lines_removed,
         chars_added,
         chars_removed,
     }
 }
 
 fn compute_unified_diff(old: &str, new: &str) -> String {
-    // Simple unified diff format
-    let old_lines: Vec<&str> = old.lines().collect();
-    let new_lines: Vec<&str> = new.lines().collect();
+    use similar::TextDiff;
 
-    let mut out = String::new();
-
-    // Find lines that changed
-    let old_set: std::collections::HashSet<&str> = old_lines.iter().copied().collect();
-    let new_set: std::collections::HashSet<&str> = new_lines.iter().copied().collect();
-
-    let removed: Vec<&str> = old_lines
-        .iter()
-        .filter(|l| !new_set.contains(*l))
-        .copied()
-        .collect();
-    let added: Vec<&str> = new_lines
-        .iter()
-        .filter(|l| !old_set.contains(*l))
-        .copied()
-        .collect();
-
-    if !removed.is_empty() || !added.is_empty() {
-        out.push_str(&format!(
-            "@@ -{},{} +{},{} @@\n",
-            1,
-            old_lines.len(),
-            1,
-            new_lines.len()
-        ));
-
-        for line in &removed {
-            out.push_str(&format!("-{}\n", line));
-        }
-        for line in &added {
-            out.push_str(&format!("+{}\n", line));
-        }
-    }
-
-    out
+    let diff = TextDiff::from_lines(old, new);
+    diff.unified_diff()
+        .context_radius(3)
+        .header("old", "new")
+        .to_string()
 }

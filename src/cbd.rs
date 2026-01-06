@@ -693,6 +693,7 @@ fn generate_id() -> String {
     format!("CP-{}", short)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_list(
     client: &Client,
     cli: &Cli,
