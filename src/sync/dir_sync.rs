@@ -16,8 +16,8 @@ use crate::sync::{
     FileSyncState, HeadResponse, SyncState,
 };
 use futures::StreamExt;
-use reqwest::Client;
-use reqwest_eventsource::{Event as SseEvent, EventSource};
+use reqwest::{Client, StatusCode};
+use reqwest_eventsource::{Error as SseError, Event as SseEvent, EventSource};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -777,13 +777,21 @@ pub async fn directory_sse_task(
                     }
                 }
                 Err(e) => {
+                    // Handle 404 gracefully - document may not exist yet
+                    if let SseError::InvalidStatusCode(status, _) = &e {
+                        if *status == StatusCode::NOT_FOUND {
+                            debug!("fs-root SSE: Document not found (404), retrying in 1s...");
+                            sleep(Duration::from_secs(1)).await;
+                            break;
+                        }
+                    }
                     error!("fs-root SSE error: {}", e);
                     break;
                 }
             }
         }
 
-        warn!("fs-root SSE connection closed, reconnecting in 5s...");
+        debug!("fs-root SSE connection closed, reconnecting in 5s...");
         sleep(Duration::from_secs(5)).await;
     }
 }
@@ -877,13 +885,24 @@ pub async fn subdir_sse_task(
                     }
                 }
                 Err(e) => {
+                    // Handle 404 gracefully - document may not exist yet
+                    if let SseError::InvalidStatusCode(status, _) = &e {
+                        if *status == StatusCode::NOT_FOUND {
+                            debug!(
+                                "Subdir {} SSE: Document not found (404), retrying in 1s...",
+                                subdir_path
+                            );
+                            sleep(Duration::from_secs(1)).await;
+                            break;
+                        }
+                    }
                     error!("Subdir {} SSE error: {}", subdir_path, e);
                     break;
                 }
             }
         }
 
-        warn!(
+        debug!(
             "Subdir {} SSE connection closed, reconnecting in 5s...",
             subdir_path
         );
