@@ -118,6 +118,139 @@ async fn cleanup_orphaned_directories(directory: &Path, schema: &FsSchema) {
     }
 }
 
+/// Handle a subdirectory schema change by fetching, validating, cleaning up, and
+/// deleting files that were removed from the server.
+///
+/// This function handles SSE "edit" events for node-backed subdirectories by:
+/// 1. Fetching the subdirectory schema from the server
+/// 2. Validating and writing it to the local .commonplace.json file
+/// 3. Deleting local files that no longer exist in the server schema
+/// 4. Cleaning up orphaned directories not in the schema
+///
+/// File sync tasks for NEW files in subdirectories are tracked in CP-fs3x.
+/// This function focuses on cleanup (deletions), not pulling new content.
+pub async fn handle_subdir_schema_cleanup(
+    client: &Client,
+    server: &str,
+    subdir_node_id: &str,
+    subdir_path: &str,
+    subdir_directory: &Path,
+    root_directory: &Path,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Fetch current schema from server
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(subdir_node_id));
+    let resp = client.get(&head_url).send().await?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Failed to fetch subdir HEAD: {}", resp.status()).into());
+    }
+
+    let head: HeadResponse = resp.json().await?;
+    if head.content.is_empty() {
+        return Ok(());
+    }
+
+    // Parse and validate schema BEFORE writing to disk
+    let schema: FsSchema = match serde_json::from_str(&head.content) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to parse subdir schema: {}", e);
+            return Ok(());
+        }
+    };
+
+    // Validate that schema has a populated root with entries
+    let has_valid_root = match &schema.root {
+        Some(Entry::Dir(dir)) => dir.entries.is_some() || dir.node_id.is_some(),
+        _ => false,
+    };
+    if !has_valid_root {
+        warn!("Server returned subdir schema without valid root, not overwriting local schema");
+        return Ok(());
+    }
+
+    // Only write valid schema to local .commonplace.json file
+    if let Err(e) = write_schema_file(subdir_directory, &head.content).await {
+        warn!("Failed to write subdir schema file: {}", e);
+    }
+
+    // Build UUID map for the subdirectory (paths relative to subdir)
+    let subdir_uuid_map = build_uuid_map_recursive(client, server, subdir_node_id).await;
+
+    // Safety check: if the UUID map is empty, skip file deletions to avoid
+    // accidentally deleting all files due to transient fetch failures.
+    // The schema was already validated above, so an empty UUID map likely
+    // indicates a network issue during recursive fetching.
+    if subdir_uuid_map.is_empty() {
+        debug!(
+            "Subdir {} UUID map is empty, skipping file deletion to avoid accidental data loss",
+            subdir_path
+        );
+    } else {
+        // Convert subdir-relative paths to root-relative paths for comparison with file_states
+        let schema_paths: std::collections::HashSet<String> = subdir_uuid_map
+            .keys()
+            .map(|p| {
+                if subdir_path.is_empty() {
+                    p.clone()
+                } else {
+                    format!("{}/{}", subdir_path, p)
+                }
+            })
+            .collect();
+
+        // Find files in file_states that are under this subdir but no longer in schema
+        let deleted_paths: Vec<String> = {
+            let states = file_states.read().await;
+            states
+                .keys()
+                .filter(|p| {
+                    // Only consider files under this subdirectory
+                    let is_in_subdir = if subdir_path.is_empty() {
+                        true
+                    } else {
+                        p.starts_with(&format!("{}/", subdir_path))
+                    };
+                    is_in_subdir && !schema_paths.contains(*p)
+                })
+                .cloned()
+                .collect()
+        };
+
+        // Delete files that were removed from server
+        for path in &deleted_paths {
+            info!(
+                "Subdir {} removed file: {} - deleting local copy",
+                subdir_path, path
+            );
+            let file_path = root_directory.join(path);
+
+            // Stop sync tasks and remove from file_states
+            {
+                let mut states = file_states.write().await;
+                if let Some(file_state) = states.remove(path) {
+                    for handle in file_state.task_handles {
+                        handle.abort();
+                    }
+                }
+            }
+
+            // Delete the file from disk
+            if file_path.exists() && file_path.is_file() {
+                if let Err(e) = tokio::fs::remove_file(&file_path).await {
+                    warn!("Failed to delete file {}: {}", file_path.display(), e);
+                }
+            }
+        }
+    }
+
+    // Clean up directories that exist locally but not in the schema
+    cleanup_orphaned_directories(subdir_directory, &schema).await;
+
+    Ok(())
+}
+
 /// Detect directories that were synced but are now deleted locally.
 ///
 /// This returns directories that:
@@ -798,22 +931,27 @@ pub async fn directory_sse_task(
 
 /// SSE task for a node-backed subdirectory.
 ///
-/// This task subscribes to a subdirectory's SSE stream and triggers full schema
-/// resync when the subdirectory's schema changes. This allows files created in
-/// node-backed subdirectories to propagate to other sync clients.
+/// This task subscribes to a subdirectory's SSE stream and handles schema changes.
+/// When the subdirectory's schema changes, it:
+/// 1. Fetches and writes the updated schema to the local .commonplace.json file
+/// 2. Deletes local files that were removed from the server schema
+/// 3. Cleans up orphaned directories that no longer exist in the schema
+///
+/// Note: File syncing for NEW files in subdirectories is tracked in CP-fs3x.
+/// Currently, new file sync relies on initial sync and file watchers.
 #[allow(clippy::too_many_arguments)]
 pub async fn subdir_sse_task(
     client: Client,
     server: String,
-    fs_root_id: String,
+    _fs_root_id: String,
     subdir_path: String,
     subdir_node_id: String,
     directory: PathBuf,
     file_states: Arc<RwLock<HashMap<String, FileSyncState>>>,
-    use_paths: bool,
-    push_only: bool,
-    pull_only: bool,
-    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    _use_paths: bool,
+    _push_only: bool,
+    _pull_only: bool,
+    #[cfg(unix)] _inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
 ) {
     let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&subdir_node_id));
 
@@ -852,28 +990,32 @@ pub async fn subdir_sse_task(
                             debug!("Subdir {} SSE connected", subdir_path);
                         }
                         "edit" => {
-                            // Subdirectory schema changed - trigger full resync
-                            info!("Subdir {} schema changed, triggering resync", subdir_path);
-                            match handle_schema_change(
+                            // Subdirectory schema changed - fetch schema, delete removed files,
+                            // and clean up orphaned directories.
+                            //
+                            // Note: Pulling NEW files in subdirectories is tracked in CP-fs3x.
+                            // This handler focuses on cleanup (deletions and orphans).
+                            info!("Subdir {} schema changed, triggering cleanup", subdir_path);
+                            let subdir_full_path = directory.join(&subdir_path);
+                            match handle_subdir_schema_cleanup(
                                 &client,
                                 &server,
-                                &fs_root_id,
+                                &subdir_node_id,
+                                &subdir_path,
+                                &subdir_full_path,
                                 &directory,
                                 &file_states,
-                                true, // spawn_tasks: true for runtime schema changes
-                                use_paths,
-                                push_only,
-                                pull_only,
-                                #[cfg(unix)]
-                                inode_tracker.clone(),
                             )
                             .await
                             {
                                 Ok(()) => {
-                                    debug!("Subdir schema change processed successfully");
+                                    debug!("Subdir {} schema cleanup completed", subdir_path);
                                 }
                                 Err(e) => {
-                                    warn!("Failed to handle subdir schema change: {}", e);
+                                    warn!(
+                                        "Failed to handle subdir {} schema cleanup: {}",
+                                        subdir_path, e
+                                    );
                                 }
                             }
                         }
