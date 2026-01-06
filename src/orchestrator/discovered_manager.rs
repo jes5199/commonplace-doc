@@ -219,7 +219,7 @@ impl DiscoveredProcessManager {
         let config = &process.config;
         let document_path = &process.document_path;
 
-        // Build command - either from sandbox-exec or command field
+        // Build command - either from sandbox-exec, command, or evaluate field
         let mut cmd = if let Some(ref exec_cmd) = config.sandbox_exec {
             // sandbox-exec: construct commonplace-sync --sandbox --exec "<cmd>"
             // Find commonplace-sync in the same directory as the orchestrator
@@ -267,9 +267,51 @@ impl DiscoveredProcessManager {
                 cwd
             );
             cmd
+        } else if let Some(ref script) = config.evaluate {
+            // evaluate: spawn Deno with the script URL from the server
+            let server = self.server_url.clone();
+            let broker = self.mqtt_broker.clone();
+
+            // Construct the script URL: http://{server}/files/{dir}/{script}
+            let script_url = format!("{}/files/{}/{}", server, document_path, script);
+
+            // Generate a unique client ID for this process instance
+            let client_id = format!("{}-{}", name, &uuid::Uuid::new_v4().to_string()[..8]);
+
+            // Extract host:port from server URL for --allow-net
+            let server_host = server.replace("http://", "").replace("https://", "");
+
+            let mut cmd = Command::new("deno");
+            cmd.arg("run")
+                .arg(format!("--allow-net={},{}", server_host, broker))
+                .arg(&script_url);
+
+            // Set environment variables for the SDK
+            cmd.env("COMMONPLACE_SERVER", &server);
+            cmd.env("COMMONPLACE_BROKER", &broker);
+            cmd.env("COMMONPLACE_CLIENT_ID", &client_id);
+
+            // If this process owns an output file, set COMMONPLACE_OUTPUT
+            if let Some(ref output) = config.owns {
+                let output_path = format!("{}/{}", document_path, output);
+                cmd.env("COMMONPLACE_OUTPUT", output_path);
+            }
+
+            // Set cwd if specified
+            if let Some(ref cwd) = config.cwd {
+                cmd.current_dir(cwd);
+            }
+
+            tracing::info!(
+                "[discovery] Starting evaluate process '{}' (script: {}, url: {})",
+                name,
+                script,
+                script_url
+            );
+            cmd
         } else {
             return Err(format!(
-                "Process '{}' must have either 'command' or 'sandbox-exec'",
+                "Process '{}' must have 'command', 'sandbox-exec', or 'evaluate'",
                 name
             ));
         };
@@ -594,6 +636,11 @@ impl DiscoveredProcessManager {
 
         // Check if sandbox-exec changed
         if current.sandbox_exec != new.sandbox_exec {
+            return true;
+        }
+
+        // Check if evaluate changed
+        if current.evaluate != new.evaluate {
             return true;
         }
 
