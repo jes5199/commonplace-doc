@@ -23,14 +23,35 @@ pub fn create_yjs_text_update(content: &str) -> String {
     base64_encode(&update)
 }
 
-/// Create a Yjs update that applies a full JSON replacement.
+/// Create a Yjs update that applies a JSON replacement.
 /// Supports object roots (Y.Map) and array roots (Y.Array).
 ///
 /// When base_state is provided, it applies the state first so that removals
 /// create proper CRDT tombstones for the server's existing items.
+///
+/// When additive_only is true, only inserts/updates keys without removing
+/// missing keys. This is used for schema syncs where multiple clients
+/// each contribute their own entries.
 pub fn create_yjs_json_update(
     new_json: &str,
     base_state: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    create_yjs_json_update_impl(new_json, base_state, false)
+}
+
+/// Create a Yjs update that merges JSON additively (no deletions).
+/// Used for schema syncs where multiple sync clients contribute entries.
+pub fn create_yjs_json_merge(
+    new_json: &str,
+    base_state: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    create_yjs_json_update_impl(new_json, base_state, true)
+}
+
+fn create_yjs_json_update_impl(
+    new_json: &str,
+    base_state: Option<&str>,
+    additive_only: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let new_value: serde_json::Value = serde_json::from_str(new_json)?;
 
@@ -54,12 +75,16 @@ pub fn create_yjs_json_update(
         match new_value {
             serde_json::Value::Object(obj) => {
                 let map = txn.get_or_insert_map(TEXT_ROOT_NAME);
-                let existing_keys: std::collections::HashSet<String> =
-                    map.keys(&txn).map(|k| k.to_string()).collect();
-                let new_keys: std::collections::HashSet<String> = obj.keys().cloned().collect();
 
-                for key in existing_keys.difference(&new_keys) {
-                    map.remove(&mut txn, key.as_str());
+                // For full replacement, remove keys not in new JSON
+                if !additive_only {
+                    let existing_keys: std::collections::HashSet<String> =
+                        map.keys(&txn).map(|k| k.to_string()).collect();
+                    let new_keys: std::collections::HashSet<String> = obj.keys().cloned().collect();
+
+                    for key in existing_keys.difference(&new_keys) {
+                        map.remove(&mut txn, key.as_str());
+                    }
                 }
 
                 for (key, val) in obj {
