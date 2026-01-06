@@ -314,10 +314,29 @@ fn stream_output_yjs(
 
     for (i, commit) in commits.iter().enumerate() {
         // Apply update to doc and keep raw bytes for --show-yjs
-        let raw_update = BASE64_STANDARD.decode(&commit.update).unwrap_or_default();
-        if let Ok(update) = Update::decode_v1(&raw_update) {
-            let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+        let raw_update = match BASE64_STANDARD.decode(&commit.update) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "Warning: commit {} has invalid base64 update: {}",
+                    commit.commit_id, e
+                );
+                Vec::new()
+            }
+        };
+        match Update::decode_v1(&raw_update) {
+            Ok(update) => {
+                let mut txn = doc.transact_mut();
+                txn.apply_update(update);
+            }
+            Err(e) => {
+                if !raw_update.is_empty() {
+                    eprintln!(
+                        "Warning: commit {} has invalid Yjs update: {}",
+                        commit.commit_id, e
+                    );
+                }
+            }
         }
 
         let current_content = text.get_string(&doc.transact());
