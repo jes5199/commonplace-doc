@@ -16,8 +16,8 @@ use crate::sync::{
     FileSyncState, HeadResponse, SyncState,
 };
 use futures::StreamExt;
-use reqwest::Client;
-use reqwest_eventsource::{Event as SseEvent, EventSource};
+use reqwest::{Client, StatusCode};
+use reqwest_eventsource::{Error as SseError, Event as SseEvent, EventSource};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -714,7 +714,7 @@ pub async fn directory_sse_task(
     // Track last processed schema to prevent redundant processing
     let mut last_schema_hash: Option<String> = None;
 
-    loop {
+    'reconnect: loop {
         info!("Connecting to fs-root SSE: {}", sse_url);
 
         let request_builder = client.get(&sse_url);
@@ -777,13 +777,21 @@ pub async fn directory_sse_task(
                     }
                 }
                 Err(e) => {
+                    // Handle 404 gracefully - document may not exist yet
+                    if let SseError::InvalidStatusCode(status, _) = &e {
+                        if *status == StatusCode::NOT_FOUND {
+                            debug!("fs-root SSE: Document not found (404), retrying in 1s...");
+                            sleep(Duration::from_secs(1)).await;
+                            continue 'reconnect; // Skip outer 5s sleep
+                        }
+                    }
                     error!("fs-root SSE error: {}", e);
                     break;
                 }
             }
         }
 
-        warn!("fs-root SSE connection closed, reconnecting in 5s...");
+        debug!("fs-root SSE connection closed, reconnecting in 5s...");
         sleep(Duration::from_secs(5)).await;
     }
 }
@@ -809,7 +817,7 @@ pub async fn subdir_sse_task(
 ) {
     let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&subdir_node_id));
 
-    loop {
+    'reconnect: loop {
         info!(
             "Connecting to subdir SSE: {} (path: {})",
             sse_url, subdir_path
@@ -877,13 +885,24 @@ pub async fn subdir_sse_task(
                     }
                 }
                 Err(e) => {
+                    // Handle 404 gracefully - document may not exist yet
+                    if let SseError::InvalidStatusCode(status, _) = &e {
+                        if *status == StatusCode::NOT_FOUND {
+                            debug!(
+                                "Subdir {} SSE: Document not found (404), retrying in 1s...",
+                                subdir_path
+                            );
+                            sleep(Duration::from_secs(1)).await;
+                            continue 'reconnect; // Skip outer 5s sleep for 404
+                        }
+                    }
                     error!("Subdir {} SSE error: {}", subdir_path, e);
                     break;
                 }
             }
         }
 
-        warn!(
+        debug!(
             "Subdir {} SSE connection closed, reconnecting in 5s...",
             subdir_path
         );

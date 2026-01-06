@@ -9,7 +9,8 @@ use crate::sync::{
 };
 use futures::StreamExt;
 use reqwest::Client;
-use reqwest_eventsource::{Event as SseEvent, EventSource};
+use reqwest::StatusCode;
+use reqwest_eventsource::{Error as SseError, Event as SseEvent, EventSource};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,7 +36,7 @@ pub async fn sse_task(
 ) {
     let sse_url = build_sse_url(&server, &identifier, use_paths);
 
-    loop {
+    'reconnect: loop {
         info!("Connecting to SSE: {}", sse_url);
 
         let request_builder = client.get(&sse_url);
@@ -94,13 +95,21 @@ pub async fn sse_task(
                     }
                 }
                 Err(e) => {
+                    // Handle 404 gracefully - document may not exist yet
+                    if let SseError::InvalidStatusCode(status, _) = &e {
+                        if *status == StatusCode::NOT_FOUND {
+                            debug!("SSE: Document not found (404), retrying in 1s...");
+                            sleep(Duration::from_secs(1)).await;
+                            continue 'reconnect; // Skip outer 5s sleep
+                        }
+                    }
                     error!("SSE error: {}", e);
                     break;
                 }
             }
         }
 
-        warn!("SSE connection closed, reconnecting in 5s...");
+        debug!("SSE connection closed, reconnecting in 5s...");
         sleep(Duration::from_secs(5)).await;
     }
 }
@@ -432,7 +441,7 @@ pub async fn sse_task_with_tracker(
 ) {
     let sse_url = build_sse_url(&server, &identifier, use_paths);
 
-    loop {
+    'reconnect: loop {
         info!("Connecting to SSE (with inode tracking): {}", sse_url);
 
         let request_builder = client.get(&sse_url);
@@ -492,13 +501,21 @@ pub async fn sse_task_with_tracker(
                     }
                 }
                 Err(e) => {
+                    // Handle 404 gracefully - document may not exist yet
+                    if let SseError::InvalidStatusCode(status, _) = &e {
+                        if *status == StatusCode::NOT_FOUND {
+                            debug!("SSE: Document not found (404), retrying in 1s...");
+                            sleep(Duration::from_secs(1)).await;
+                            continue 'reconnect; // Skip outer 5s sleep
+                        }
+                    }
                     error!("SSE error: {}", e);
                     break;
                 }
             }
         }
 
-        warn!("SSE connection closed, reconnecting in 5s...");
+        debug!("SSE connection closed, reconnecting in 5s...");
         sleep(Duration::from_secs(5)).await;
     }
 }
