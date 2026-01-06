@@ -1,4 +1,6 @@
 import type { CommonplaceSDK, DocHandle, OutputHandle } from "./types.ts";
+import { connect, publish, subscribe } from "./mqtt.ts";
+import * as Y from "npm:yjs@13";
 
 const SERVER = Deno.env.get("COMMONPLACE_SERVER") || "http://localhost:3000";
 const BROKER = Deno.env.get("COMMONPLACE_BROKER") || "localhost:1883";
@@ -30,16 +32,38 @@ class DocHandleImpl implements DocHandle {
 }
 
 class OutputHandleImpl implements OutputHandle {
+  private doc = new Y.Doc();
+  private text = this.doc.getText("content");
+  private parentCommit: string | null = null;
+
   constructor(private path: string) {}
 
   async get(): Promise<string> {
-    // TODO: Get current content
-    throw new Error("Not implemented");
+    return this.text.toString();
   }
 
-  async set(_content: string, _opts?: { message?: string }): Promise<void> {
-    // TODO: Publish to blue port
-    throw new Error("Not implemented");
+  async set(content: string, opts?: { message?: string }): Promise<void> {
+    // Compute Yjs update
+    const oldContent = this.text.toString();
+    if (content !== oldContent) {
+      this.doc.transact(() => {
+        this.text.delete(0, this.text.length);
+        this.text.insert(0, content);
+      });
+    }
+
+    const update = Y.encodeStateAsUpdate(this.doc);
+    const updateB64 = btoa(String.fromCharCode(...update));
+
+    const editMsg = {
+      update: updateB64,
+      parents: this.parentCommit ? [this.parentCommit] : [],
+      author: CLIENT_ID,
+      message: opts?.message || "SDK update",
+      timestamp: Date.now(),
+    };
+
+    publish(`${this.path}/edits`, editMsg);
   }
 }
 
@@ -65,7 +89,26 @@ export const cp: CommonplaceSDK = {
     console.log(`[cp] Starting with client_id=${CLIENT_ID}`);
     console.log(`[cp] Server: ${SERVER}, Broker: ${BROKER}`);
     console.log(`[cp] Output: ${OUTPUT_PATH}`);
-    // TODO: Connect to MQTT and start event loop
+
+    await connect(BROKER, CLIENT_ID);
+
+    // Subscribe to commands for our output
+    if (OUTPUT_PATH) {
+      subscribe(`${OUTPUT_PATH}/commands/#`, (topic, payload) => {
+        const verb = topic.split("/").pop()!;
+        const handler = commandHandlers.get(verb);
+        if (handler) {
+          try {
+            const msg = JSON.parse(payload.toString());
+            handler(msg.payload);
+          } catch (e) {
+            console.error(`[cp] Error handling command ${verb}:`, e);
+          }
+        }
+      });
+    }
+
+    console.log(`[cp] Ready`);
   },
 };
 
