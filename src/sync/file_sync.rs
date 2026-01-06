@@ -877,6 +877,7 @@ pub fn spawn_file_sync_tasks(
     push_only: bool,
     pull_only: bool,
     force_push: bool,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
 ) -> Vec<JoinHandle<()>> {
     let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
     let mut handles = Vec::new();
@@ -897,7 +898,19 @@ pub fn spawn_file_sync_tasks(
     }
 
     // SSE task (skip if push-only)
+    // Use tracker variant for atomic writes when inode tracker is available
     if !push_only {
+        #[cfg(unix)]
+        if let Some(tracker) = inode_tracker {
+            handles.push(tokio::spawn(crate::sync::sse_task_with_tracker(
+                client, server, identifier, file_path, state, use_paths, tracker,
+            )));
+        } else {
+            handles.push(tokio::spawn(sse_task(
+                client, server, identifier, file_path, state, use_paths,
+            )));
+        }
+        #[cfg(not(unix))]
         handles.push(tokio::spawn(sse_task(
             client, server, identifier, file_path, state, use_paths,
         )));

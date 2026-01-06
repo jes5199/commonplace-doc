@@ -1021,6 +1021,8 @@ async fn run_directory_mode(
             use_paths,
             push_only,
             pull_only,
+            #[cfg(unix)]
+            None, // TODO: pass inode_tracker when initialized
         )
         .await?;
         info!("Server files pulled to local directory");
@@ -1110,6 +1112,8 @@ async fn run_directory_mode(
             use_paths,
             push_only,
             pull_only,
+            #[cfg(unix)]
+            None, // TODO: pass inode_tracker when initialized
         )))
     } else {
         info!("Push-only mode: skipping SSE subscription");
@@ -1140,6 +1144,8 @@ async fn run_directory_mode(
                 use_paths,
                 push_only,
                 pull_only,
+                #[cfg(unix)]
+                None, // TODO: pass inode_tracker when initialized
             ));
         }
     }
@@ -1161,6 +1167,8 @@ async fn run_directory_mode(
                 push_only,
                 pull_only,
                 false, // force_push: directory mode doesn't support force-push
+                #[cfg(unix)]
+                None, // TODO: pass inode_tracker when initialized
             );
         }
     }
@@ -1188,6 +1196,8 @@ async fn run_directory_mode(
                             use_paths,
                             push_only,
                             pull_only,
+                            #[cfg(unix)]
+                            None, // TODO: pass inode_tracker when initialized
                         )
                         .await;
                     }
@@ -1313,6 +1323,8 @@ async fn run_exec_mode(
             use_paths,
             push_only,
             pull_only,
+            #[cfg(unix)]
+            None, // TODO: pass inode_tracker when initialized
         )
         .await?;
         info!("Server files pulled to local directory");
@@ -1402,6 +1414,8 @@ async fn run_exec_mode(
             use_paths,
             push_only,
             pull_only,
+            #[cfg(unix)]
+            None, // TODO: pass inode_tracker when initialized
         )))
     } else {
         info!("Push-only mode: skipping SSE subscription");
@@ -1431,6 +1445,8 @@ async fn run_exec_mode(
                 use_paths,
                 push_only,
                 pull_only,
+                #[cfg(unix)]
+                None, // TODO: pass inode_tracker when initialized
             ));
         }
     }
@@ -1450,6 +1466,8 @@ async fn run_exec_mode(
                 push_only,
                 pull_only,
                 false, // force_push: sandbox mode doesn't support force-push
+                #[cfg(unix)]
+                None, // TODO: pass inode_tracker when initialized
             );
         }
     }
@@ -1477,6 +1495,8 @@ async fn run_exec_mode(
                             use_paths,
                             push_only,
                             pull_only,
+                            #[cfg(unix)]
+                            None, // TODO: pass inode_tracker when initialized
                         )
                         .await;
                     }

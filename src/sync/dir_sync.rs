@@ -426,6 +426,7 @@ pub async fn handle_schema_change(
     use_paths: bool,
     push_only: bool,
     pull_only: bool,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Fetch current schema from server (fs-root schema always uses ID-based API)
     let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
@@ -613,6 +614,8 @@ pub async fn handle_schema_change(
                                 push_only,
                                 pull_only,
                                 false, // force_push: directory mode doesn't support force-push
+                                #[cfg(unix)]
+                                inode_tracker.clone(),
                             )
                         } else {
                             Vec::new()
@@ -703,6 +706,7 @@ pub async fn directory_sse_task(
     use_paths: bool,
     push_only: bool,
     pull_only: bool,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
 ) {
     // fs-root schema subscription always uses ID-based API
     let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&fs_root_id));
@@ -749,6 +753,8 @@ pub async fn directory_sse_task(
                                 &mut last_schema_hash,
                                 push_only,
                                 pull_only,
+                                #[cfg(unix)]
+                                inode_tracker.clone(),
                             )
                             .await
                             {
@@ -799,6 +805,7 @@ pub async fn subdir_sse_task(
     use_paths: bool,
     push_only: bool,
     pull_only: bool,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
 ) {
     let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&subdir_node_id));
 
@@ -849,6 +856,8 @@ pub async fn subdir_sse_task(
                                 use_paths,
                                 push_only,
                                 pull_only,
+                                #[cfg(unix)]
+                                inode_tracker.clone(),
                             )
                             .await
                             {
@@ -897,6 +906,7 @@ async fn handle_schema_change_with_dedup(
     last_schema_hash: &mut Option<String>,
     push_only: bool,
     pull_only: bool,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     // Fetch current schema from server
     let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
@@ -933,6 +943,8 @@ async fn handle_schema_change_with_dedup(
         use_paths,
         push_only,
         pull_only,
+        #[cfg(unix)]
+        inode_tracker,
     )
     .await?;
 
@@ -1081,6 +1093,7 @@ pub async fn handle_file_created(
     use_paths: bool,
     push_only: bool,
     pull_only: bool,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
 ) {
     debug!("Directory event: file created: {}", path.display());
 
@@ -1325,6 +1338,8 @@ pub async fn handle_file_created(
             push_only,
             pull_only,
             false, // force_push: directory mode doesn't support force-push
+            #[cfg(unix)]
+            inode_tracker.clone(),
         );
 
         // Add to file_states with task handles
