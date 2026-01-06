@@ -14,63 +14,87 @@ const BROKER = Deno.env.get("COMMONPLACE_BROKER") || "localhost:1883";
 const OUTPUT_PATH = Deno.env.get("COMMONPLACE_OUTPUT") || "";
 const CLIENT_ID = Deno.env.get("COMMONPLACE_CLIENT_ID") || `cp-${crypto.randomUUID()}`;
 
+// Track MQTT connection state - subscriptions deferred until started
+let mqttStarted = false;
+const pendingDocHandles: DocHandleImpl[] = [];
+
 class DocHandleImpl implements DocHandle {
   private doc = new Y.Doc();
   private text = this.doc.getText("content");
   private changeCallbacks: ((content: string) => void)[] = [];
+  private eventSubscriptions: { topic: string; handler: (t: string, p: Buffer) => void }[] = [];
   private subscribed = false;
+  private needsSubscription = false;
 
   constructor(private path: string) {
     sanitizePath(path);
   }
 
-  private async ensureSubscribed(): Promise<void> {
-    if (this.subscribed) return;
+  // Called by cp.start() after MQTT is connected
+  async activateSubscriptions(): Promise<void> {
+    if (!this.needsSubscription || this.subscribed) return;
     this.subscribed = true;
 
-    // Subscribe to edits
-    subscribe(`${this.path}/edits`, (_topic, payload) => {
-      try {
-        const msg = JSON.parse(payload.toString());
-        const update = Uint8Array.from(atob(msg.update), c => c.charCodeAt(0));
-        Y.applyUpdate(this.doc, update);
+    // Subscribe to edits for onChange callbacks
+    if (this.changeCallbacks.length > 0) {
+      subscribe(`${this.path}/edits`, (_topic, payload) => {
+        try {
+          const msg = JSON.parse(payload.toString());
+          const update = Uint8Array.from(atob(msg.update), (c) => c.charCodeAt(0));
+          Y.applyUpdate(this.doc, update);
 
-        const content = this.text.toString();
-        for (const cb of this.changeCallbacks) {
-          cb(content);
+          const content = this.text.toString();
+          for (const cb of this.changeCallbacks) {
+            cb(content);
+          }
+        } catch (e) {
+          console.error(`[cp] Error applying edit for ${this.path}:`, e);
         }
-      } catch (e) {
-        console.error(`[cp] Error applying edit for ${this.path}:`, e);
-      }
-    });
+      });
+    }
 
-    // Fetch initial state via HTTP
-    const res = await fetch(`${SERVER}/docs/${encodeURIComponent(this.path)}/head`);
+    // Activate event subscriptions
+    for (const { topic, handler } of this.eventSubscriptions) {
+      subscribe(topic, handler);
+    }
+
+    // Fetch initial state via HTTP using path-based endpoint
+    // Use /files/*path/head which resolves filesystem paths, not /docs/:id which expects UUIDs
+    const pathEncoded = this.path.split('/').map(encodeURIComponent).join('/');
+    const res = await fetch(`${SERVER}/files/${pathEncoded}/head`);
     if (res.ok) {
       const head = await res.json();
       if (head.state) {
-        const state = Uint8Array.from(atob(head.state), c => c.charCodeAt(0));
+        const state = Uint8Array.from(atob(head.state), (c) => c.charCodeAt(0));
         Y.applyUpdate(this.doc, state);
       }
     }
   }
 
   async get(): Promise<string> {
-    await this.ensureSubscribed();
+    // get() waits for MQTT to be ready
+    if (!mqttStarted) {
+      throw new Error("MQTT not connected. Call cp.start() before using doc.get()");
+    }
+    if (!this.subscribed) {
+      await this.activateSubscriptions();
+    }
     return this.text.toString();
   }
 
   onChange(cb: (content: string) => void): void {
     this.changeCallbacks.push(cb);
-    this.ensureSubscribed();
+    this.needsSubscription = true;
+    // Register for activation after cp.start()
+    if (!pendingDocHandles.includes(this)) {
+      pendingDocHandles.push(this);
+    }
   }
 
   onEvent(name: string, cb: (payload: unknown) => void): void {
-    const topic = name === "*"
-      ? `${this.path}/events/#`
-      : `${this.path}/events/${name}`;
+    const topic = name === "*" ? `${this.path}/events/#` : `${this.path}/events/${name}`;
 
-    subscribe(topic, (t, payload) => {
+    const handler = (t: string, payload: Buffer) => {
       try {
         const msg = JSON.parse(payload.toString());
         if (name === "*") {
@@ -82,7 +106,14 @@ class DocHandleImpl implements DocHandle {
       } catch (e) {
         console.error(`[cp] Error handling event:`, e);
       }
-    });
+    };
+
+    this.eventSubscriptions.push({ topic, handler });
+    this.needsSubscription = true;
+    // Register for activation after cp.start()
+    if (!pendingDocHandles.includes(this)) {
+      pendingDocHandles.push(this);
+    }
   }
 
   async command(verb: string, payload?: unknown): Promise<void> {
@@ -164,6 +195,7 @@ export const cp: CommonplaceSDK = {
     console.log(`[cp] Output: ${OUTPUT_PATH}`);
 
     await connect(BROKER, CLIENT_ID);
+    mqttStarted = true;
 
     // Subscribe to commands for our output
     if (OUTPUT_PATH) {
@@ -179,6 +211,11 @@ export const cp: CommonplaceSDK = {
           }
         }
       });
+    }
+
+    // Activate pending doc handle subscriptions (registered before start)
+    for (const handle of pendingDocHandles) {
+      await handle.activateSubscriptions();
     }
 
     console.log(`[cp] Ready`);

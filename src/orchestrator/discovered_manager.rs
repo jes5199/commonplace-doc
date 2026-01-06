@@ -578,12 +578,16 @@ impl DiscoveredProcessManager {
                 // Add with new config
                 // Priority: explicit path > owns > base_path (__processes.json location)
                 // sandbox-exec processes sync at the directory containing their __processes.json
+                // NOTE: evaluate processes use base_path for script URL, NOT owns (owns is just output)
                 let document_path = if let Some(ref explicit_path) = new_config.path {
                     if explicit_path == "/" || explicit_path.is_empty() {
                         base_path.to_string()
                     } else {
                         format!("{}/{}", base_path, explicit_path.trim_start_matches('/'))
                     }
+                } else if new_config.evaluate.is_some() {
+                    // evaluate processes: script is relative to base_path, not owns
+                    base_path.to_string()
                 } else if let Some(ref owns) = new_config.owns {
                     format!("{}/{}", base_path, owns)
                 } else {
@@ -610,12 +614,16 @@ impl DiscoveredProcessManager {
             let new_config = &config.processes[name];
             // Priority: explicit path > owns > base_path (processes.json location)
             // sandbox-exec processes sync at the directory containing their processes.json
+            // NOTE: evaluate processes use base_path for script URL, NOT owns (owns is just output)
             let document_path = if let Some(ref explicit_path) = new_config.path {
                 if explicit_path == "/" || explicit_path.is_empty() {
                     base_path.to_string()
                 } else {
                     format!("{}/{}", base_path, explicit_path.trim_start_matches('/'))
                 }
+            } else if new_config.evaluate.is_some() {
+                // evaluate processes: script is relative to base_path, not owns
+                base_path.to_string()
             } else if let Some(ref owns) = new_config.owns {
                 format!("{}/{}", base_path, owns)
             } else {
