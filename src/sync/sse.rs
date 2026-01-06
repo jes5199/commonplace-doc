@@ -36,7 +36,7 @@ pub async fn sse_task(
 ) {
     let sse_url = build_sse_url(&server, &identifier, use_paths);
 
-    loop {
+    'reconnect: loop {
         info!("Connecting to SSE: {}", sse_url);
 
         let request_builder = client.get(&sse_url);
@@ -100,7 +100,7 @@ pub async fn sse_task(
                         if *status == StatusCode::NOT_FOUND {
                             debug!("SSE: Document not found (404), retrying in 1s...");
                             sleep(Duration::from_secs(1)).await;
-                            break;
+                            continue 'reconnect; // Skip outer 5s sleep
                         }
                     }
                     error!("SSE error: {}", e);
@@ -441,7 +441,7 @@ pub async fn sse_task_with_tracker(
 ) {
     let sse_url = build_sse_url(&server, &identifier, use_paths);
 
-    loop {
+    'reconnect: loop {
         info!("Connecting to SSE (with inode tracking): {}", sse_url);
 
         let request_builder = client.get(&sse_url);
@@ -506,7 +506,7 @@ pub async fn sse_task_with_tracker(
                         if *status == StatusCode::NOT_FOUND {
                             debug!("SSE: Document not found (404), retrying in 1s...");
                             sleep(Duration::from_secs(1)).await;
-                            break;
+                            continue 'reconnect; // Skip outer 5s sleep
                         }
                     }
                     error!("SSE error: {}", e);

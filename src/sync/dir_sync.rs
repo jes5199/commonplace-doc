@@ -714,7 +714,7 @@ pub async fn directory_sse_task(
     // Track last processed schema to prevent redundant processing
     let mut last_schema_hash: Option<String> = None;
 
-    loop {
+    'reconnect: loop {
         info!("Connecting to fs-root SSE: {}", sse_url);
 
         let request_builder = client.get(&sse_url);
@@ -782,7 +782,7 @@ pub async fn directory_sse_task(
                         if *status == StatusCode::NOT_FOUND {
                             debug!("fs-root SSE: Document not found (404), retrying in 1s...");
                             sleep(Duration::from_secs(1)).await;
-                            break;
+                            continue 'reconnect; // Skip outer 5s sleep
                         }
                     }
                     error!("fs-root SSE error: {}", e);
@@ -817,7 +817,7 @@ pub async fn subdir_sse_task(
 ) {
     let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&subdir_node_id));
 
-    loop {
+    'reconnect: loop {
         info!(
             "Connecting to subdir SSE: {} (path: {})",
             sse_url, subdir_path
@@ -893,7 +893,7 @@ pub async fn subdir_sse_task(
                                 subdir_path
                             );
                             sleep(Duration::from_secs(1)).await;
-                            break;
+                            continue 'reconnect; // Skip outer 5s sleep for 404
                         }
                     }
                     error!("Subdir {} SSE error: {}", subdir_path, e);
