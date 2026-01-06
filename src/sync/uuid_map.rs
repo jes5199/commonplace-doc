@@ -155,8 +155,11 @@ pub async fn build_uuid_map_from_doc_with_status(
     let schema: FsSchema = match serde_json::from_str(&head.content) {
         Ok(s) => s,
         Err(e) => {
-            debug!("Document {} is not a schema ({}), skipping", doc_id, e);
-            // Note: This is not a network failure, just a non-schema doc
+            // In the context of deletion cleanup, a node-backed directory that doesn't
+            // parse as a schema is unexpected and could indicate corruption or truncation.
+            // Treat this as a failure to prevent accidental file deletions.
+            warn!("Document {} failed to parse as schema ({})", doc_id, e);
+            *all_succeeded = false;
             return;
         }
     };
