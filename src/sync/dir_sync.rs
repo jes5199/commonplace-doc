@@ -9,7 +9,7 @@ use crate::sync::state_file::{
     compute_content_hash, load_synced_directories, mark_directory_synced, unmark_directory_synced,
 };
 use crate::sync::uuid_map::{
-    build_uuid_map_recursive, collect_paths_from_entry, fetch_node_id_from_schema,
+    build_uuid_map_recursive, build_uuid_map_recursive_with_status, fetch_node_id_from_schema,
 };
 use crate::sync::{
     build_head_url, delete_schema_entry, detect_from_path, encode_node_id, fork_node,
@@ -177,61 +177,19 @@ pub async fn handle_subdir_schema_cleanup(
         warn!("Failed to write subdir schema file: {}", e);
     }
 
-    // Check if schema may contain files (from inline entries or node-backed directories)
-    // This lets us distinguish between a legitimately empty schema vs a fetch failure
-    let (schema_file_count, has_node_backed_entries) =
-        if let Some(Entry::Dir(root_dir)) = &schema.root {
-            let mut paths = Vec::new();
+    // Build UUID map for the subdirectory (paths relative to subdir), tracking fetch success
+    let (subdir_uuid_map, all_fetches_succeeded) =
+        build_uuid_map_recursive_with_status(client, server, subdir_node_id).await;
 
-            if let Some(ref entries) = root_dir.entries {
-                for (name, entry) in entries {
-                    collect_paths_from_entry(entry, name, &mut paths);
-                }
-            }
-
-            // Recursively check for node-backed directories at any depth
-            fn has_node_backed_recursive(entry: &Entry) -> bool {
-                match entry {
-                    Entry::Dir(dir) => {
-                        // This directory itself is node-backed
-                        if dir.node_id.is_some() {
-                            return true;
-                        }
-                        // Check children recursively
-                        if let Some(ref entries) = dir.entries {
-                            for child in entries.values() {
-                                if has_node_backed_recursive(child) {
-                                    return true;
-                                }
-                            }
-                        }
-                        false
-                    }
-                    Entry::Doc(_) => false,
-                }
-            }
-
-            let has_node_backed = has_node_backed_recursive(&Entry::Dir(root_dir.clone()));
-            (paths.len(), has_node_backed)
-        } else {
-            (0, false)
-        };
-
-    // Build UUID map for the subdirectory (paths relative to subdir)
-    let subdir_uuid_map = build_uuid_map_recursive(client, server, subdir_node_id).await;
-
-    // Safety check: if the schema could contain files but the UUID map is empty, this indicates
-    // a network failure during recursive fetching. Skip deletions to avoid data loss.
-    // A schema "may have files" if:
-    // - It has inline file entries (schema_file_count > 0), OR
-    // - It has node-backed directories that need recursive fetching (has_node_backed_entries)
-    // Only proceed with deletions if the schema is truly empty (no files, no node-backed dirs).
-    let schema_may_have_files = schema_file_count > 0 || has_node_backed_entries;
-    let is_fetch_failure = schema_may_have_files && subdir_uuid_map.is_empty();
+    // Safety check: if any network fetch failed during recursive traversal AND the UUID map
+    // is empty, we can't distinguish between "legitimately empty" and "incomplete due to
+    // failure". Skip deletions to avoid data loss in this ambiguous case.
+    // If all fetches succeeded, trust the result - even an empty map means legitimately empty.
+    let is_fetch_failure = !all_fetches_succeeded && subdir_uuid_map.is_empty();
     if is_fetch_failure {
         debug!(
-            "Subdir {} schema has {} files but UUID map is empty - likely network failure, skipping file deletion",
-            subdir_path, schema_file_count
+            "Subdir {} UUID map is empty but some fetches failed - skipping file deletion to avoid data loss",
+            subdir_path
         );
     } else {
         // Convert subdir-relative paths to root-relative paths for comparison with file_states

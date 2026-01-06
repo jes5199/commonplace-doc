@@ -62,9 +62,33 @@ pub async fn build_uuid_map_recursive(
     server: &str,
     doc_id: &str,
 ) -> HashMap<String, String> {
-    let mut uuid_map = HashMap::new();
-    build_uuid_map_from_doc(client, server, doc_id, "", &mut uuid_map).await;
+    let (uuid_map, _success) = build_uuid_map_recursive_with_status(client, server, doc_id).await;
     uuid_map
+}
+
+/// Recursively build a map of relative paths to UUIDs, also returning success status.
+///
+/// Returns (uuid_map, all_fetches_succeeded). If all_fetches_succeeded is false,
+/// at least one network fetch failed during recursive traversal, and the uuid_map
+/// may be incomplete. This helps distinguish between "legitimately empty" and
+/// "fetch failed" scenarios.
+pub async fn build_uuid_map_recursive_with_status(
+    client: &Client,
+    server: &str,
+    doc_id: &str,
+) -> (HashMap<String, String>, bool) {
+    let mut uuid_map = HashMap::new();
+    let mut all_succeeded = true;
+    build_uuid_map_from_doc_with_status(
+        client,
+        server,
+        doc_id,
+        "",
+        &mut uuid_map,
+        &mut all_succeeded,
+    )
+    .await;
+    (uuid_map, all_succeeded)
 }
 
 /// Helper function to recursively build the UUID map from a document and its children.
@@ -76,12 +100,35 @@ pub async fn build_uuid_map_from_doc(
     path_prefix: &str,
     uuid_map: &mut HashMap<String, String>,
 ) {
+    let mut success = true;
+    build_uuid_map_from_doc_with_status(
+        client,
+        server,
+        doc_id,
+        path_prefix,
+        uuid_map,
+        &mut success,
+    )
+    .await;
+}
+
+/// Helper function to recursively build the UUID map, tracking fetch success.
+#[async_recursion::async_recursion]
+pub async fn build_uuid_map_from_doc_with_status(
+    client: &Client,
+    server: &str,
+    doc_id: &str,
+    path_prefix: &str,
+    uuid_map: &mut HashMap<String, String>,
+    all_succeeded: &mut bool,
+) {
     // Fetch the schema from this document
     let head_url = format!("{}/docs/{}/head", server, encode_node_id(doc_id));
     let resp = match client.get(&head_url).send().await {
         Ok(r) => r,
         Err(e) => {
             warn!("Failed to fetch schema for {}: {}", doc_id, e);
+            *all_succeeded = false;
             return;
         }
     };
@@ -92,6 +139,7 @@ pub async fn build_uuid_map_from_doc(
             doc_id,
             resp.status()
         );
+        *all_succeeded = false;
         return;
     }
 
@@ -99,6 +147,7 @@ pub async fn build_uuid_map_from_doc(
         Ok(h) => h,
         Err(e) => {
             warn!("Failed to parse schema response for {}: {}", doc_id, e);
+            *all_succeeded = false;
             return;
         }
     };
@@ -107,13 +156,22 @@ pub async fn build_uuid_map_from_doc(
         Ok(s) => s,
         Err(e) => {
             debug!("Document {} is not a schema ({}), skipping", doc_id, e);
+            // Note: This is not a network failure, just a non-schema doc
             return;
         }
     };
 
     // Traverse the schema and collect UUIDs
     if let Some(ref root) = schema.root {
-        collect_paths_with_node_backed_dirs(client, server, root, path_prefix, uuid_map).await;
+        collect_paths_with_node_backed_dirs_with_status(
+            client,
+            server,
+            root,
+            path_prefix,
+            uuid_map,
+            all_succeeded,
+        )
+        .await;
     }
 }
 
@@ -149,6 +207,63 @@ pub async fn collect_paths_with_node_backed_dirs(
                         child,
                         &child_path,
                         uuid_map,
+                    )
+                    .await;
+                }
+            }
+        }
+        Entry::Doc(doc) => {
+            // This is a file - add it to the map if it has a node_id
+            if let Some(ref node_id) = doc.node_id {
+                debug!("Found UUID: {} -> {}", prefix, node_id);
+                uuid_map.insert(prefix.to_string(), node_id.clone());
+            }
+        }
+    }
+}
+
+/// Recursively collect paths from an entry, following node-backed directories, with status tracking.
+#[async_recursion::async_recursion]
+pub async fn collect_paths_with_node_backed_dirs_with_status(
+    client: &Client,
+    server: &str,
+    entry: &Entry,
+    prefix: &str,
+    uuid_map: &mut HashMap<String, String>,
+    all_succeeded: &mut bool,
+) {
+    match entry {
+        Entry::Dir(dir) => {
+            // If this is a node-backed directory (entries: null, node_id: Some),
+            // fetch its schema and continue recursively
+            if dir.entries.is_none() {
+                if let Some(ref node_id) = dir.node_id {
+                    // This is a node-backed directory - fetch its schema
+                    build_uuid_map_from_doc_with_status(
+                        client,
+                        server,
+                        node_id,
+                        prefix,
+                        uuid_map,
+                        all_succeeded,
+                    )
+                    .await;
+                }
+            } else if let Some(ref entries) = dir.entries {
+                // Inline directory - traverse its entries
+                for (name, child) in entries {
+                    let child_path = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", prefix, name)
+                    };
+                    collect_paths_with_node_backed_dirs_with_status(
+                        client,
+                        server,
+                        child,
+                        &child_path,
+                        uuid_map,
+                        all_succeeded,
                     )
                     .await;
                 }
