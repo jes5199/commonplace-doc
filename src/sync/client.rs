@@ -4,9 +4,9 @@
 //! via HTTP: forking nodes, pushing content, and syncing schemas.
 
 use crate::sync::{
-    build_edit_url, build_fork_url, build_head_url, build_replace_url, create_yjs_json_update,
-    create_yjs_jsonl_update, create_yjs_text_update, encode_node_id, EditRequest, EditResponse,
-    ForkResponse, HeadResponse, ReplaceResponse, SyncState,
+    build_edit_url, build_fork_url, build_head_url, build_replace_url, create_yjs_json_merge,
+    create_yjs_json_update, create_yjs_jsonl_update, create_yjs_text_update, encode_node_id,
+    EditRequest, EditResponse, ForkResponse, HeadResponse, ReplaceResponse, SyncState,
 };
 use reqwest::Client;
 use std::sync::Arc;
@@ -77,8 +77,9 @@ pub async fn push_schema_to_server(
         }
     }
 
-    // Create an update that properly handles deletions (using server state for CRDT consistency)
-    let update = create_yjs_json_update(schema_json, base_state.as_deref())
+    // Create an additive merge (don't remove entries that other sync clients may have added)
+    // This allows multiple sync clients to each contribute their own schema entries
+    let update = create_yjs_json_merge(schema_json, base_state.as_deref())
         .map_err(|e| format!("Failed to create JSON update: {}", e))?;
     let edit_url = format!("{}/docs/{}/edit", server, encode_node_id(fs_root_id));
     let edit_req = EditRequest {
