@@ -1,0 +1,1 @@
+{"processes":{"bartleby":{"sandbox-exec":"/home/jes/.local/bin/uv run --project /home/jes/bartleby python /home/jes/bartleby/bartleby.py"}}}
