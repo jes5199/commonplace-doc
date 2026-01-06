@@ -225,6 +225,9 @@ enum Commands {
         /// New external reference
         #[arg(long)]
         external_ref: Option<String>,
+        /// Close reason (used when status=closed)
+        #[arg(long, short = 'r')]
+        reason: Option<String>,
     },
     /// Manage dependencies
     Dep {
@@ -299,6 +302,7 @@ struct UpdateOptions {
     design: Option<String>,
     notes: Option<String>,
     external_ref: Option<String>,
+    close_reason: Option<String>,
 }
 
 /// Issue structure matching beads format
@@ -463,6 +467,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             design,
             notes,
             external_ref,
+            reason,
         } => cmd_update(
             &client,
             &cli,
@@ -484,6 +489,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 design: design.clone(),
                 notes: notes.clone(),
                 external_ref: external_ref.clone(),
+                close_reason: reason.clone(),
             },
         ),
         Commands::Dep { action } => match action {
@@ -1005,8 +1011,16 @@ fn cmd_update(
     issue.updated_at = now.to_rfc3339();
 
     // Update only fields that are explicitly set
-    if let Some(s) = opts.status {
-        issue.status = s;
+    if let Some(ref s) = opts.status {
+        issue.status = s.clone();
+        // Set closed_at when status changes to closed
+        if s == "closed" {
+            issue.closed_at = Some(now.to_rfc3339());
+        }
+    }
+    // Set close_reason if provided (typically with status=closed)
+    if let Some(r) = opts.close_reason {
+        issue.close_reason = Some(r);
     }
     if let Some(p) = opts.priority {
         issue.priority = p;
