@@ -181,14 +181,13 @@ pub async fn handle_subdir_schema_cleanup(
     let (subdir_uuid_map, all_fetches_succeeded) =
         build_uuid_map_recursive_with_status(client, server, subdir_node_id).await;
 
-    // Safety check: if any network fetch failed during recursive traversal AND the UUID map
-    // is empty, we can't distinguish between "legitimately empty" and "incomplete due to
-    // failure". Skip deletions to avoid data loss in this ambiguous case.
-    // If all fetches succeeded, trust the result - even an empty map means legitimately empty.
-    let is_fetch_failure = !all_fetches_succeeded && subdir_uuid_map.is_empty();
-    if is_fetch_failure {
+    // Safety check: if ANY network fetch failed during recursive traversal, the UUID map
+    // may be incomplete (missing files from failed subtrees). Skip ALL deletions to avoid
+    // data loss. We only proceed with deletions when we're certain we have the complete
+    // picture (all fetches succeeded).
+    if !all_fetches_succeeded {
         debug!(
-            "Subdir {} UUID map is empty but some fetches failed - skipping file deletion to avoid data loss",
+            "Subdir {} had fetch failures during UUID map building - skipping file deletion to avoid data loss",
             subdir_path
         );
     } else {
