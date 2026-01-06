@@ -516,6 +516,18 @@ impl ProcessManager {
         // Update config
         self.config = new_config;
 
+        // Update config for unchanged processes (fields other than command/args/cwd may have changed)
+        for name in old_processes.intersection(&new_processes) {
+            if !changed.contains(name) {
+                if let (Some(cfg), Some(proc)) = (
+                    self.config.processes.get(name),
+                    self.processes.get_mut(name),
+                ) {
+                    proc.config = cfg.clone();
+                }
+            }
+        }
+
         // Add new and changed processes to the map
         for name in added.iter().chain(changed.iter()) {
             if let Some(cfg) = self.config.processes.get(name) {
@@ -532,27 +544,29 @@ impl ProcessManager {
             }
         }
 
-        // Start added processes (in dependency order)
-        for name in &added {
-            if self.disabled.contains(name) {
+        // Start added and changed processes in dependency order
+        let to_start: std::collections::HashSet<_> =
+            added.iter().chain(changed.iter()).cloned().collect();
+        let startup_order = self.config.startup_order().unwrap_or_default();
+        for name in startup_order {
+            if !to_start.contains(&name) {
                 continue;
             }
+            if self.disabled.contains(&name) {
+                continue;
+            }
+            let action = if added.contains(&name) {
+                "starting new"
+            } else {
+                "restarting changed"
+            };
             tracing::info!(
-                "[orchestrator] Config reload: starting new process '{}'",
+                "[orchestrator] Config reload: {} process '{}'",
+                action,
                 name
             );
-            if let Err(e) = self.spawn_process(name).await {
+            if let Err(e) = self.spawn_process(&name).await {
                 tracing::error!("[orchestrator] Failed to start '{}': {}", name, e);
-            }
-        }
-
-        // Start changed processes
-        for name in &changed {
-            if self.disabled.contains(name) {
-                continue;
-            }
-            if let Err(e) = self.spawn_process(name).await {
-                tracing::error!("[orchestrator] Failed to restart '{}': {}", name, e);
             }
         }
 
