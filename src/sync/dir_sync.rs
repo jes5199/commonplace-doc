@@ -8,7 +8,9 @@ use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
 use crate::sync::state_file::{
     compute_content_hash, load_synced_directories, mark_directory_synced, unmark_directory_synced,
 };
-use crate::sync::uuid_map::{build_uuid_map_recursive, fetch_node_id_from_schema};
+use crate::sync::uuid_map::{
+    build_uuid_map_recursive, collect_paths_from_entry, fetch_node_id_from_schema,
+};
 use crate::sync::{
     build_head_url, delete_schema_entry, detect_from_path, encode_node_id, fork_node,
     is_allowed_extension, is_binary_content, looks_like_base64_binary, normalize_path,
@@ -175,17 +177,48 @@ pub async fn handle_subdir_schema_cleanup(
         warn!("Failed to write subdir schema file: {}", e);
     }
 
+    // Check if schema may contain files (from inline entries or node-backed directories)
+    // This lets us distinguish between a legitimately empty schema vs a fetch failure
+    let (schema_file_count, has_node_backed_entries) =
+        if let Some(Entry::Dir(root_dir)) = &schema.root {
+            let mut paths = Vec::new();
+            let mut has_node_backed = false;
+
+            if let Some(ref entries) = root_dir.entries {
+                for (name, entry) in entries {
+                    collect_paths_from_entry(entry, name, &mut paths);
+                    // Check if any entry is a node-backed directory
+                    if let Entry::Dir(dir) = entry {
+                        if dir.node_id.is_some() {
+                            has_node_backed = true;
+                        }
+                    }
+                }
+            }
+            // The root itself being node-backed counts too
+            if root_dir.node_id.is_some() {
+                has_node_backed = true;
+            }
+            (paths.len(), has_node_backed)
+        } else {
+            (0, false)
+        };
+
     // Build UUID map for the subdirectory (paths relative to subdir)
     let subdir_uuid_map = build_uuid_map_recursive(client, server, subdir_node_id).await;
 
-    // Safety check: if the UUID map is empty, skip file deletions to avoid
-    // accidentally deleting all files due to transient fetch failures.
-    // The schema was already validated above, so an empty UUID map likely
-    // indicates a network issue during recursive fetching.
-    if subdir_uuid_map.is_empty() {
+    // Safety check: if the schema could contain files but the UUID map is empty, this indicates
+    // a network failure during recursive fetching. Skip deletions to avoid data loss.
+    // A schema "may have files" if:
+    // - It has inline file entries (schema_file_count > 0), OR
+    // - It has node-backed directories that need recursive fetching (has_node_backed_entries)
+    // Only proceed with deletions if the schema is truly empty (no files, no node-backed dirs).
+    let schema_may_have_files = schema_file_count > 0 || has_node_backed_entries;
+    let is_fetch_failure = schema_may_have_files && subdir_uuid_map.is_empty();
+    if is_fetch_failure {
         debug!(
-            "Subdir {} UUID map is empty, skipping file deletion to avoid accidental data loss",
-            subdir_path
+            "Subdir {} schema has {} files but UUID map is empty - likely network failure, skipping file deletion",
+            subdir_path, schema_file_count
         );
     } else {
         // Convert subdir-relative paths to root-relative paths for comparison with file_states
