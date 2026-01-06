@@ -869,9 +869,9 @@ pub async fn atomic_write_with_shadow(
 
     {
         let mut tracker = inode_tracker.write().await;
-        if let Some(cid) = commit_id {
-            tracker.track(new_key, cid, file_path.clone());
-        }
+        // Track with commit_id or empty string for genesis (empty document)
+        let cid = commit_id.unwrap_or_default();
+        tracker.track(new_key, cid, file_path.clone());
     }
 
     debug!(
