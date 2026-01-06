@@ -46,6 +46,11 @@ pub struct DiscoveredProcess {
     /// Working directory (optional for sandbox-exec, required for command)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+
+    /// Script to evaluate with Deno (for JS evaluator processes).
+    /// Path is relative to the process directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluate: Option<String>,
 }
 
 /// Command specification - supports both simple string and array formats.
@@ -253,5 +258,22 @@ mod tests {
 
         let sandbox = &config.processes["sandbox"];
         assert!(sandbox.owns.is_none());
+    }
+
+    #[test]
+    fn test_evaluate_process() {
+        let json = r#"{
+            "processes": {
+                "transform": {
+                    "evaluate": "transform.ts",
+                    "owns": "output.txt"
+                }
+            }
+        }"#;
+
+        let config = ProcessesConfig::parse(json).unwrap();
+        let transform = &config.processes["transform"];
+        assert_eq!(transform.evaluate, Some("transform.ts".to_string()));
+        assert_eq!(transform.owns, Some("output.txt".to_string()));
     }
 }

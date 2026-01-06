@@ -1245,6 +1245,7 @@ mod tests {
             path: None,
             owns: Some("test.json".to_string()),
             cwd: Some(PathBuf::from("/tmp")),
+            evaluate: None,
         };
 
         manager.add_process(
@@ -1275,6 +1276,7 @@ mod tests {
             path: None,
             owns: None,
             cwd: Some(PathBuf::from("/tmp")),
+            evaluate: None,
         };
 
         // For directory-attached, document_path is just the directory
