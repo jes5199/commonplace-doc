@@ -25,12 +25,33 @@ class DocHandleImpl implements DocHandle {
   private eventSubscriptions: { topic: string; handler: (t: string, p: Buffer) => void }[] = [];
   private subscribed = false;
   private needsSubscription = false;
+  private initialFetched = false;
 
   constructor(private path: string) {
     sanitizePath(path);
   }
 
-  // Called by cp.start() after MQTT is connected
+  // Fetch initial state from server (separated from subscription activation)
+  private async fetchInitialState(): Promise<void> {
+    if (this.initialFetched) return;
+    this.initialFetched = true;
+
+    try {
+      const pathEncoded = this.path.split("/").map(encodeURIComponent).join("/");
+      const res = await fetch(`${SERVER}/files/${pathEncoded}/head`);
+      if (res.ok) {
+        const head = await res.json();
+        if (head.state) {
+          const state = Uint8Array.from(atob(head.state), (c) => c.charCodeAt(0));
+          Y.applyUpdate(this.doc, state);
+        }
+      }
+    } catch (e) {
+      console.error(`[cp] Error fetching initial state for ${this.path}:`, e);
+    }
+  }
+
+  // Called by cp.start() after MQTT is connected - sets up MQTT subscriptions
   async activateSubscriptions(): Promise<void> {
     if (!this.needsSubscription || this.subscribed) return;
     this.subscribed = true;
@@ -58,17 +79,8 @@ class DocHandleImpl implements DocHandle {
       subscribe(topic, handler);
     }
 
-    // Fetch initial state via HTTP using path-based endpoint
-    // Use /files/*path/head which resolves filesystem paths, not /docs/:id which expects UUIDs
-    const pathEncoded = this.path.split('/').map(encodeURIComponent).join('/');
-    const res = await fetch(`${SERVER}/files/${pathEncoded}/head`);
-    if (res.ok) {
-      const head = await res.json();
-      if (head.state) {
-        const state = Uint8Array.from(atob(head.state), (c) => c.charCodeAt(0));
-        Y.applyUpdate(this.doc, state);
-      }
-    }
+    // Fetch initial state via HTTP
+    await this.fetchInitialState();
   }
 
   async get(): Promise<string> {
@@ -76,7 +88,10 @@ class DocHandleImpl implements DocHandle {
     if (!mqttStarted) {
       throw new Error("MQTT not connected. Call cp.start() before using doc.get()");
     }
-    if (!this.subscribed) {
+    // Always fetch initial state if not done (even without subscriptions)
+    await this.fetchInitialState();
+    // Also activate subscriptions if needed
+    if (this.needsSubscription && !this.subscribed) {
       await this.activateSubscriptions();
     }
     return this.text.toString();
@@ -129,16 +144,44 @@ class OutputHandleImpl implements OutputHandle {
   private doc = new Y.Doc();
   private text = this.doc.getText("content");
   private parentCommit: string | null = null;
+  private initialized = false;
 
   constructor(private path: string) {
     if (path) sanitizePath(path);
   }
 
+  // Fetch current state from server before first update
+  private async ensureInitialized(): Promise<void> {
+    if (this.initialized || !this.path) return;
+    this.initialized = true;
+
+    try {
+      const pathEncoded = this.path.split("/").map(encodeURIComponent).join("/");
+      const res = await fetch(`${SERVER}/files/${pathEncoded}/head`);
+      if (res.ok) {
+        const head = await res.json();
+        if (head.state) {
+          const state = Uint8Array.from(atob(head.state), (c) => c.charCodeAt(0));
+          Y.applyUpdate(this.doc, state);
+        }
+        if (head.cid) {
+          this.parentCommit = head.cid;
+        }
+      }
+    } catch (e) {
+      console.error(`[cp] Error fetching output state:`, e);
+    }
+  }
+
   async get(): Promise<string> {
+    await this.ensureInitialized();
     return this.text.toString();
   }
 
   async set(content: string, opts?: { message?: string }): Promise<void> {
+    // Ensure we have current state before updating
+    await this.ensureInitialized();
+
     // Compute Yjs update
     const oldContent = this.text.toString();
     if (content !== oldContent) {

@@ -304,6 +304,7 @@ impl DiscoveredProcessManager {
             let mut cmd = Command::new("deno");
             cmd.arg("run")
                 .arg(format!("--allow-net={},{}", server_host, broker))
+                .arg("--allow-env=COMMONPLACE_SERVER,COMMONPLACE_BROKER,COMMONPLACE_OUTPUT,COMMONPLACE_CLIENT_ID,COMMONPLACE_PATH")
                 .arg(&script_url);
 
             // Set environment variables for the SDK
@@ -1350,11 +1351,14 @@ impl DiscoveredProcessManager {
                                 }
 
                                 // Update script watches if processes changed
+                                // Always rebuild and compare actual content (not just length)
+                                // to catch renames/swaps that keep the same count
                                 let mut scripts_changed = false;
                                 if added_new_pj || had_removed_pj {
-                                    let old_script_count = script_watches.len();
-                                    script_watches = self.resolve_script_watches(client, fs_root_id).await;
-                                    scripts_changed = script_watches.len() != old_script_count;
+                                    let new_script_watches = self.resolve_script_watches(client, fs_root_id).await;
+                                    // Compare actual map content, not just length
+                                    scripts_changed = new_script_watches != script_watches;
+                                    script_watches = new_script_watches;
                                 }
 
                                 // Reconnect SSE if schemas changed, new __processes.json added, or scripts changed
