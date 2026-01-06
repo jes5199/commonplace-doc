@@ -9,7 +9,8 @@ use crate::sync::state_file::{
     compute_content_hash, load_synced_directories, mark_directory_synced, unmark_directory_synced,
 };
 use crate::sync::uuid_map::{
-    build_uuid_map_recursive, build_uuid_map_recursive_with_status, fetch_node_id_from_schema,
+    build_uuid_map_recursive, build_uuid_map_recursive_with_status, collect_paths_from_entry,
+    fetch_node_id_from_schema,
 };
 use crate::sync::{
     build_head_url, delete_schema_entry, detect_from_path, encode_node_id, fork_node,
@@ -177,19 +178,46 @@ pub async fn handle_subdir_schema_cleanup(
         warn!("Failed to write subdir schema file: {}", e);
     }
 
+    // Count inline doc entries in the schema (includes docs without node_id)
+    // This helps detect if docs are waiting for reconciler to assign node_ids
+    let schema_doc_count = if let Some(Entry::Dir(root_dir)) = &schema.root {
+        let mut paths = Vec::new();
+        if let Some(ref entries) = root_dir.entries {
+            for (name, entry) in entries {
+                collect_paths_from_entry(entry, name, &mut paths);
+            }
+        }
+        paths.len()
+    } else {
+        0
+    };
+
     // Build UUID map for the subdirectory (paths relative to subdir), tracking fetch success
     let (subdir_uuid_map, all_fetches_succeeded) =
         build_uuid_map_recursive_with_status(client, server, subdir_node_id).await;
 
-    // Safety check: if ANY network fetch failed during recursive traversal, the UUID map
-    // may be incomplete (missing files from failed subtrees). Skip ALL deletions to avoid
-    // data loss. We only proceed with deletions when we're certain we have the complete
-    // picture (all fetches succeeded).
-    if !all_fetches_succeeded {
+    // Safety checks for deletion:
+    // 1. If ANY fetch failed → map may be incomplete, skip deletions
+    // 2. If schema has doc entries but UUID map is empty → docs may be waiting for node_id
+    //    assignment by the reconciler, skip deletions during this race window
+    let skip_deletions = if !all_fetches_succeeded {
         debug!(
             "Subdir {} had fetch failures during UUID map building - skipping file deletion to avoid data loss",
             subdir_path
         );
+        true
+    } else if schema_doc_count > 0 && subdir_uuid_map.is_empty() {
+        debug!(
+            "Subdir {} schema has {} doc entries but UUID map is empty - docs may be awaiting node_id, skipping deletions",
+            subdir_path, schema_doc_count
+        );
+        true
+    } else {
+        false
+    };
+
+    if skip_deletions {
+        // Don't proceed with deletions, just clean up orphaned directories
     } else {
         // Convert subdir-relative paths to root-relative paths for comparison with file_states
         let schema_paths: std::collections::HashSet<String> = subdir_uuid_map
