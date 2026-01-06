@@ -8,7 +8,9 @@ use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
 use crate::sync::state_file::{
     compute_content_hash, load_synced_directories, mark_directory_synced, unmark_directory_synced,
 };
-use crate::sync::uuid_map::{build_uuid_map_recursive, fetch_node_id_from_schema};
+use crate::sync::uuid_map::{
+    build_uuid_map_recursive, build_uuid_map_recursive_with_status, fetch_node_id_from_schema,
+};
 use crate::sync::{
     build_head_url, delete_schema_entry, detect_from_path, encode_node_id, fork_node,
     is_allowed_extension, is_binary_content, looks_like_base64_binary, normalize_path,
@@ -175,18 +177,46 @@ pub async fn handle_subdir_schema_cleanup(
         warn!("Failed to write subdir schema file: {}", e);
     }
 
-    // Build UUID map for the subdirectory (paths relative to subdir)
-    let subdir_uuid_map = build_uuid_map_recursive(client, server, subdir_node_id).await;
+    // Check if schema has any entries at all (inline docs, inline dirs, or node-backed dirs)
+    // If schema has entries but UUID map is empty, something is wrong (e.g., docs awaiting node_id)
+    let schema_has_entries = if let Some(Entry::Dir(root_dir)) = &schema.root {
+        if let Some(ref entries) = root_dir.entries {
+            !entries.is_empty()
+        } else {
+            // entries is None means this is a node-backed directory (has node_id but no inline entries)
+            // which may contain files - treat as "has entries" to be safe
+            root_dir.node_id.is_some()
+        }
+    } else {
+        false
+    };
 
-    // Safety check: if the UUID map is empty, skip file deletions to avoid
-    // accidentally deleting all files due to transient fetch failures.
-    // The schema was already validated above, so an empty UUID map likely
-    // indicates a network issue during recursive fetching.
-    if subdir_uuid_map.is_empty() {
+    // Build UUID map for the subdirectory (paths relative to subdir), tracking fetch success
+    let (subdir_uuid_map, all_fetches_succeeded) =
+        build_uuid_map_recursive_with_status(client, server, subdir_node_id).await;
+
+    // Safety checks for deletion:
+    // 1. If ANY fetch failed → map may be incomplete, skip deletions
+    // 2. If schema has entries (inline or node-backed) but UUID map is empty → entries may be
+    //    waiting for node_id assignment by the reconciler, skip deletions during this race window
+    let skip_deletions = if !all_fetches_succeeded {
         debug!(
-            "Subdir {} UUID map is empty, skipping file deletion to avoid accidental data loss",
+            "Subdir {} had fetch failures during UUID map building - skipping file deletion to avoid data loss",
             subdir_path
         );
+        true
+    } else if schema_has_entries && subdir_uuid_map.is_empty() {
+        debug!(
+            "Subdir {} schema has entries but UUID map is empty - entries may be awaiting node_id, skipping deletions",
+            subdir_path
+        );
+        true
+    } else {
+        false
+    };
+
+    if skip_deletions {
+        // Don't proceed with deletions, just clean up orphaned directories
     } else {
         // Convert subdir-relative paths to root-relative paths for comparison with file_states
         let schema_paths: std::collections::HashSet<String> = subdir_uuid_map
