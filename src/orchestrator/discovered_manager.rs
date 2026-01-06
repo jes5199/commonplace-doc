@@ -75,6 +75,10 @@ struct DiscoveryResult {
     schema_node_ids: Vec<String>,
 }
 
+/// Mapping from script document UUID to the process name that uses it.
+/// Used to restart evaluate processes when their script changes.
+type ScriptWatchMap = HashMap<String, String>;
+
 impl DiscoveredProcessManager {
     /// Create a new discovered process manager.
     pub fn new(mqtt_broker: String, server_url: String) -> Self {
@@ -741,6 +745,199 @@ impl DiscoveredProcessManager {
         })
     }
 
+    /// Resolve a document path to its UUID by traversing the schema tree.
+    ///
+    /// For example, "bartleby/script.js" would:
+    /// 1. Fetch fs-root, find bartleby's node_id
+    /// 2. Fetch bartleby's schema, find script.js's node_id
+    async fn resolve_path_to_uuid(
+        client: &Client,
+        server_url: &str,
+        fs_root_id: &str,
+        path: &str,
+    ) -> Result<String, String> {
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+        if segments.is_empty() {
+            return Ok(fs_root_id.to_string());
+        }
+
+        let mut current_id = fs_root_id.to_string();
+
+        for (i, segment) in segments.iter().enumerate() {
+            let url = format!("{}/docs/{}/head", server_url, current_id);
+            let resp = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| format!("Failed to fetch schema: {}", e))?;
+
+            if !resp.status().is_success() {
+                return Err(format!(
+                    "Failed to fetch schema for '{}': HTTP {}",
+                    segments[..=i].join("/"),
+                    resp.status()
+                ));
+            }
+
+            #[derive(Deserialize)]
+            struct HeadResponse {
+                content: String,
+            }
+
+            #[derive(Deserialize, Default)]
+            struct Schema {
+                #[serde(default)]
+                root: SchemaRoot,
+            }
+
+            #[derive(Deserialize, Default)]
+            struct SchemaRoot {
+                entries: Option<HashMap<String, SchemaEntry>>,
+            }
+
+            #[derive(Deserialize)]
+            struct SchemaEntry {
+                node_id: Option<String>,
+            }
+
+            let head: HeadResponse = resp
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+            let schema: Schema = if head.content.trim() == "{}" {
+                Schema::default()
+            } else {
+                serde_json::from_str(&head.content)
+                    .map_err(|e| format!("Failed to parse schema: {}", e))?
+            };
+
+            let entries = schema.root.entries.ok_or_else(|| {
+                format!(
+                    "Path '{}' not found: '{}' has no entries",
+                    path,
+                    if i == 0 {
+                        "fs-root".to_string()
+                    } else {
+                        segments[..i].join("/")
+                    }
+                )
+            })?;
+
+            let entry = entries.get(*segment).ok_or_else(|| {
+                format!(
+                    "Path '{}' not found: no entry '{}' in '{}'",
+                    path,
+                    segment,
+                    if i == 0 {
+                        "fs-root".to_string()
+                    } else {
+                        segments[..i].join("/")
+                    }
+                )
+            })?;
+
+            let node_id = entry.node_id.clone().ok_or_else(|| {
+                format!(
+                    "Path '{}' not found: entry '{}' has no node_id",
+                    path, segment
+                )
+            })?;
+
+            current_id = node_id;
+        }
+
+        Ok(current_id)
+    }
+
+    /// Resolve script paths for all evaluate processes and build a watch map.
+    ///
+    /// Returns a map of script_uuid -> process_name for all evaluate processes
+    /// that have scripts that can be resolved.
+    async fn resolve_script_watches(&self, client: &Client, fs_root_id: &str) -> ScriptWatchMap {
+        let mut script_watches = ScriptWatchMap::new();
+
+        for (name, process) in &self.processes {
+            if let Some(ref script) = process.config.evaluate {
+                // Construct the full script path: document_path/script
+                let script_path = format!("{}/{}", process.document_path, script);
+
+                match Self::resolve_path_to_uuid(client, &self.server_url, fs_root_id, &script_path)
+                    .await
+                {
+                    Ok(script_uuid) => {
+                        tracing::info!(
+                            "[discovery] Watching script '{}' (uuid: {}) for process '{}'",
+                            script_path,
+                            script_uuid,
+                            name
+                        );
+                        script_watches.insert(script_uuid, name.clone());
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[discovery] Could not resolve script '{}' for process '{}': {}",
+                            script_path,
+                            name,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        script_watches
+    }
+
+    /// Restart a process by name.
+    ///
+    /// This is used when a script file changes - we stop and restart the evaluate process.
+    async fn restart_process(&mut self, name: &str) -> Result<(), String> {
+        // Scope the mutable borrow to stop the process
+        {
+            let process = self
+                .processes
+                .get_mut(name)
+                .ok_or_else(|| format!("Process '{}' not found", name))?;
+
+            // Stop the process if running
+            if let Some(ref mut child) = process.handle {
+                tracing::info!("[discovery] Stopping process '{}' for restart", name);
+
+                #[cfg(unix)]
+                {
+                    if let Some(pid) = child.id() {
+                        unsafe {
+                            libc::killpg(pid as i32, libc::SIGTERM);
+                        }
+                    }
+                }
+
+                let timeout = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+
+                if timeout.is_err() {
+                    #[cfg(unix)]
+                    if let Some(pid) = child.id() {
+                        unsafe {
+                            libc::killpg(pid as i32, libc::SIGKILL);
+                        }
+                    }
+                    let _ = child.kill().await;
+                }
+
+                process.handle = None;
+            }
+
+            // Reset failure count since this is an intentional restart
+            process.consecutive_failures = 0;
+            process.state = DiscoveredProcessState::Stopped;
+        }
+
+        // Respawn (borrow is released)
+        self.spawn_process(name).await
+    }
+
     /// Watch a __processes.json document for changes and dynamically update processes.
     ///
     /// This method subscribes to the SSE stream for a document and calls
@@ -1018,6 +1215,11 @@ impl DiscoveredProcessManager {
         let mut current_schema_ids: HashSet<String> =
             discovery.schema_node_ids.iter().cloned().collect();
 
+        // Resolve and track script files for evaluate processes
+        // script_uuid -> process_name
+        let mut script_watches: ScriptWatchMap =
+            self.resolve_script_watches(client, fs_root_id).await;
+
         // Monitor interval for checking process health
         let mut monitor_interval = tokio::time::interval(Duration::from_millis(500));
 
@@ -1025,11 +1227,15 @@ impl DiscoveredProcessManager {
         let mut discovery_interval = tokio::time::interval(Duration::from_secs(30));
 
         loop {
-            // Build SSE URL from current watched state (schemas + __processes.json files)
+            // Build SSE URL from current watched state (schemas + __processes.json files + scripts)
             // Rebuilt on every reconnect to ensure we don't miss newly discovered docs
             let mut all_ids: Vec<String> = current_schema_ids.iter().cloned().collect();
             for node_id in watched.keys() {
                 all_ids.push(node_id.clone());
+            }
+            // Add script UUIDs to watch list
+            for script_uuid in script_watches.keys() {
+                all_ids.push(script_uuid.clone());
             }
             let all_ids_param = all_ids.join(",");
             let sse_url = format!(
@@ -1086,11 +1292,12 @@ impl DiscoveredProcessManager {
 
                                 // Check for removed __processes.json files
                                 let new_ids: HashSet<_> = new_discovery.processes_json_files.iter().map(|(_, id)| id.clone()).collect();
-                                let removed: Vec<_> = watched.keys()
+                                let removed_pj: Vec<_> = watched.keys()
                                     .filter(|id| !new_ids.contains(*id))
                                     .cloned()
                                     .collect();
-                                for node_id in removed {
+                                let had_removed_pj = !removed_pj.is_empty();
+                                for node_id in removed_pj {
                                     if let Some(base_path) = watched.remove(&node_id) {
                                         tracing::info!("[discovery] __processes.json removed at {}", base_path);
                                         // Remove processes that were from this base_path
@@ -1118,9 +1325,17 @@ impl DiscoveredProcessManager {
                                     current_schema_ids = new_schema_ids;
                                 }
 
-                                // Reconnect SSE if schemas changed or new __processes.json added
+                                // Update script watches if processes changed
+                                let mut scripts_changed = false;
+                                if added_new_pj || had_removed_pj {
+                                    let old_script_count = script_watches.len();
+                                    script_watches = self.resolve_script_watches(client, fs_root_id).await;
+                                    scripts_changed = script_watches.len() != old_script_count;
+                                }
+
+                                // Reconnect SSE if schemas changed, new __processes.json added, or scripts changed
                                 // (URL is rebuilt on each loop iteration with current watch set)
-                                if schema_changed || added_new_pj {
+                                if schema_changed || added_new_pj || scripts_changed {
                                     sse_closed = true;
                                 }
                             }
@@ -1158,6 +1373,23 @@ impl DiscoveredProcessManager {
                                                     tracing::error!(
                                                         "[discovery] Failed to reconcile {}/__processes.json: {}",
                                                         base_path, e
+                                                    );
+                                                }
+                                                // After reconciling, update script watches
+                                                // (processes may have been added/removed/changed)
+                                                script_watches = self.resolve_script_watches(client, fs_root_id).await;
+                                            } else if let Some(process_name) = script_watches.get(doc_id) {
+                                                // This is a script file change - restart the associated process
+                                                tracing::info!(
+                                                    "[discovery] Script {} changed, restarting process '{}'",
+                                                    doc_id,
+                                                    process_name
+                                                );
+                                                let process_name = process_name.clone();
+                                                if let Err(e) = self.restart_process(&process_name).await {
+                                                    tracing::error!(
+                                                        "[discovery] Failed to restart '{}' after script change: {}",
+                                                        process_name, e
                                                     );
                                                 }
                                             } else {
@@ -1347,5 +1579,35 @@ mod tests {
         );
 
         assert_eq!(manager.server_url(), "http://localhost:3000");
+    }
+
+    #[test]
+    fn test_add_evaluate_process() {
+        let mut manager = DiscoveredProcessManager::new(
+            "localhost:1883".to_string(),
+            "http://localhost:3000".to_string(),
+        );
+
+        let config = DiscoveredProcess {
+            command: None,
+            sandbox_exec: None,
+            path: None,
+            owns: Some("output.json".to_string()),
+            cwd: None,
+            evaluate: Some("script.js".to_string()),
+        };
+
+        manager.add_process(
+            "evaluator".to_string(),
+            "workspace/myapp".to_string(),
+            "workspace/myapp".to_string(),
+            config,
+        );
+
+        assert_eq!(manager.processes().len(), 1);
+        let process = manager.processes().get("evaluator").unwrap();
+        assert_eq!(process.name, "evaluator");
+        assert_eq!(process.document_path, "workspace/myapp");
+        assert_eq!(process.config.evaluate, Some("script.js".to_string()));
     }
 }
