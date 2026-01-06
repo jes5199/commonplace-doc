@@ -133,9 +133,16 @@ export const cp: CommonplaceSDK = {
     commandHandlers.set(verb, cb);
   },
 
-  emit(_name: string, _payload?: unknown): void {
-    // TODO: Publish to red port
-    throw new Error("Not implemented");
+  emit(name: string, payload?: unknown): void {
+    if (!OUTPUT_PATH) {
+      console.warn("[cp] Cannot emit: no output path configured");
+      return;
+    }
+
+    publish(`${OUTPUT_PATH}/events/${name}`, {
+      payload: payload || {},
+      source: CLIENT_ID,
+    });
   },
 
   async start(): Promise<void> {
