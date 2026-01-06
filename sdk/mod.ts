@@ -2,6 +2,13 @@ import type { CommonplaceSDK, DocHandle, OutputHandle } from "./types.ts";
 import { connect, publish, subscribe } from "./mqtt.ts";
 import * as Y from "npm:yjs@13";
 
+function sanitizePath(path: string): string {
+  if (path.includes('#') || path.includes('+') || path.includes('\0')) {
+    throw new Error(`Invalid path contains MQTT wildcards: ${path}`);
+  }
+  return path;
+}
+
 const SERVER = Deno.env.get("COMMONPLACE_SERVER") || "http://localhost:3000";
 const BROKER = Deno.env.get("COMMONPLACE_BROKER") || "localhost:1883";
 const OUTPUT_PATH = Deno.env.get("COMMONPLACE_OUTPUT") || "";
@@ -13,7 +20,9 @@ class DocHandleImpl implements DocHandle {
   private changeCallbacks: ((content: string) => void)[] = [];
   private subscribed = false;
 
-  constructor(private path: string) {}
+  constructor(private path: string) {
+    sanitizePath(path);
+  }
 
   private async ensureSubscribed(): Promise<void> {
     if (this.subscribed) return;
@@ -77,6 +86,7 @@ class DocHandleImpl implements DocHandle {
   }
 
   async command(verb: string, payload?: unknown): Promise<void> {
+    sanitizePath(verb);
     publish(`${this.path}/commands/${verb}`, {
       payload: payload || {},
       source: CLIENT_ID,
@@ -89,7 +99,9 @@ class OutputHandleImpl implements OutputHandle {
   private text = this.doc.getText("content");
   private parentCommit: string | null = null;
 
-  constructor(private path: string) {}
+  constructor(private path: string) {
+    if (path) sanitizePath(path);
+  }
 
   async get(): Promise<string> {
     return this.text.toString();
@@ -139,6 +151,7 @@ export const cp: CommonplaceSDK = {
       return;
     }
 
+    sanitizePath(name);
     publish(`${OUTPUT_PATH}/events/${name}`, {
       payload: payload || {},
       source: CLIENT_ID,

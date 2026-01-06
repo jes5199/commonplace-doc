@@ -276,6 +276,22 @@ impl DiscoveredProcessManager {
             let server = self.server_url.clone();
             let broker = self.mqtt_broker.clone();
 
+            // Validate script path - reject potentially dangerous patterns
+            if script.contains("..")
+                || script.contains('?')
+                || script.contains('#')
+                || script.starts_with('/')
+            {
+                tracing::error!(
+                    "Invalid evaluate script path '{}': must be a simple filename",
+                    script
+                );
+                return Err(format!(
+                    "Invalid evaluate script path '{}': must be a simple filename",
+                    script
+                ));
+            }
+
             // Construct the script URL: http://{server}/files/{dir}/{script}
             let script_url = format!("{}/files/{}/{}", server, document_path, script);
 
