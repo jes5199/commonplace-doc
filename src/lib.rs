@@ -14,6 +14,7 @@ pub mod mqtt;
 pub mod orchestrator;
 pub mod path;
 pub mod replay;
+pub mod sdk;
 pub mod services;
 pub mod sse;
 pub mod store;
@@ -201,6 +202,9 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
         router = router.merge(viewer_router);
     }
 
+    // Add SDK routes for JS evaluator
+    router = router.merge(sdk::router());
+
     router.layer(CorsLayer::permissive())
 }
 
@@ -245,6 +249,7 @@ pub fn create_router_with_store(store: Option<CommitStore>) -> Router {
             commit_broadcaster,
             None,
         ))
+        .merge(sdk::router())
         .layer(CorsLayer::permissive())
 }
 
