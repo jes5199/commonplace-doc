@@ -182,23 +182,36 @@ pub async fn handle_subdir_schema_cleanup(
     let (schema_file_count, has_node_backed_entries) =
         if let Some(Entry::Dir(root_dir)) = &schema.root {
             let mut paths = Vec::new();
-            let mut has_node_backed = false;
 
             if let Some(ref entries) = root_dir.entries {
                 for (name, entry) in entries {
                     collect_paths_from_entry(entry, name, &mut paths);
-                    // Check if any entry is a node-backed directory
-                    if let Entry::Dir(dir) = entry {
-                        if dir.node_id.is_some() {
-                            has_node_backed = true;
-                        }
-                    }
                 }
             }
-            // The root itself being node-backed counts too
-            if root_dir.node_id.is_some() {
-                has_node_backed = true;
+
+            // Recursively check for node-backed directories at any depth
+            fn has_node_backed_recursive(entry: &Entry) -> bool {
+                match entry {
+                    Entry::Dir(dir) => {
+                        // This directory itself is node-backed
+                        if dir.node_id.is_some() {
+                            return true;
+                        }
+                        // Check children recursively
+                        if let Some(ref entries) = dir.entries {
+                            for child in entries.values() {
+                                if has_node_backed_recursive(child) {
+                                    return true;
+                                }
+                            }
+                        }
+                        false
+                    }
+                    Entry::Doc(_) => false,
+                }
             }
+
+            let has_node_backed = has_node_backed_recursive(&Entry::Dir(root_dir.clone()));
             (paths.len(), has_node_backed)
         } else {
             (0, false)
