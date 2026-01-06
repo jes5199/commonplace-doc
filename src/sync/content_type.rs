@@ -91,7 +91,7 @@ const BINARY_EXTENSIONS: &[&str] = &[
 /// Allowed file extensions for sync operations.
 /// Only files with these extensions will be synced.
 pub const ALLOWED_EXTENSIONS: &[&str] = &[
-    "json", "jsonl", "ndjson", "txt", "xml", "xhtml", "bin", "md",
+    "json", "jsonl", "ndjson", "txt", "xml", "xhtml", "bin", "md", "ts", "js",
 ];
 
 /// Check if a file path has an allowed extension for syncing.
@@ -323,6 +323,12 @@ mod tests {
         assert!(!is_allowed_extension(Path::new("foo.py")));
         assert!(!is_allowed_extension(Path::new("foo.png")));
         assert!(!is_allowed_extension(Path::new("foo.html")));
+
+        // TypeScript and JavaScript
+        assert!(is_allowed_extension(Path::new("foo.ts")));
+        assert!(is_allowed_extension(Path::new("foo.js")));
+        assert!(is_allowed_extension(Path::new("foo.TS")));
+        assert!(is_allowed_extension(Path::new("foo.JS")));
 
         // No extension
         assert!(!is_allowed_extension(Path::new("Makefile")));
