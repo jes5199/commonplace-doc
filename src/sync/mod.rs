@@ -54,7 +54,8 @@ pub fn acquire_sync_lock(directory: &Path) -> io::Result<File> {
 }
 
 pub use client::{
-    fork_node, push_file_content, push_json_content, push_jsonl_content, push_schema_to_server,
+    delete_schema_entry, fork_node, push_file_content, push_json_content, push_jsonl_content,
+    push_schema_to_server,
 };
 pub use dir_sync::{
     check_server_has_content, directory_sse_task, ensure_fs_root_exists, handle_file_created,
@@ -100,7 +101,7 @@ pub use watcher::{directory_watcher_task, file_watcher_task, ShadowWriteEvent};
 #[cfg(unix)]
 pub use watcher::{shadow_gc_task, shadow_watcher_task, SHADOW_GC_INTERVAL};
 pub use yjs::{
-    base64_decode, base64_encode, create_yjs_json_merge, create_yjs_json_update,
-    create_yjs_jsonl_update, create_yjs_text_diff_update, create_yjs_text_update,
-    json_value_to_any, TEXT_ROOT_NAME,
+    base64_decode, base64_encode, create_yjs_json_delete_key, create_yjs_json_merge,
+    create_yjs_json_update, create_yjs_jsonl_update, create_yjs_text_diff_update,
+    create_yjs_text_update, json_value_to_any, TEXT_ROOT_NAME,
 };

@@ -10,10 +10,10 @@ use crate::sync::state_file::{
 };
 use crate::sync::uuid_map::{build_uuid_map_recursive, fetch_node_id_from_schema};
 use crate::sync::{
-    build_head_url, detect_from_path, encode_node_id, fork_node, is_allowed_extension,
-    is_binary_content, looks_like_base64_binary, normalize_path, push_file_content,
-    push_json_content, push_jsonl_content, push_schema_to_server, spawn_file_sync_tasks,
-    FileSyncState, HeadResponse, SyncState,
+    build_head_url, delete_schema_entry, detect_from_path, encode_node_id, fork_node,
+    is_allowed_extension, is_binary_content, looks_like_base64_binary, normalize_path,
+    push_file_content, push_json_content, push_jsonl_content, push_schema_to_server,
+    spawn_file_sync_tasks, FileSyncState, HeadResponse, SyncState,
 };
 use futures::StreamExt;
 use reqwest::{Client, StatusCode};
@@ -1585,7 +1585,7 @@ pub async fn handle_file_deleted(
     fs_root_id: &str,
     directory: &Path,
     path: &Path,
-    options: &ScanOptions,
+    _options: &ScanOptions,
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
 ) {
     debug!("Directory event: file deleted: {}", path.display());
@@ -1627,12 +1627,31 @@ pub async fn handle_file_deleted(
         }
     }
 
-    // Rescan and push updated schema
-    if let Ok(schema) = scan_directory(directory, options) {
-        if let Ok(json) = schema_to_json(&schema) {
-            if let Err(e) = push_schema_to_server(client, server, fs_root_id, &json).await {
-                warn!("Failed to push updated schema: {}", e);
-            }
+    // Delete from schema
+    // For nested paths, check if the immediate subdirectory is node-backed (has its own sync)
+    // Node-backed directories have their own .commonplace.json and sync process
+    if relative_path.contains('/') {
+        // Extract first path component (the immediate subdirectory)
+        let first_component = relative_path.split('/').next().unwrap();
+        let subdir_schema_path = directory.join(first_component).join(SCHEMA_FILENAME);
+
+        if subdir_schema_path.exists() {
+            // Node-backed directory has its own sync - skip deletion here
+            debug!(
+                "Skipping schema delete for {} - subdirectory {} has its own sync",
+                relative_path, first_component
+            );
+            return;
         }
+        // Non-node-backed subdirectory: fall through to delete from this schema
+        debug!(
+            "Deleting {} from parent schema (subdirectory {} is inline)",
+            relative_path, first_component
+        );
+    }
+
+    // Delete from schema (top-level files or files in non-node-backed subdirectories)
+    if let Err(e) = delete_schema_entry(client, server, fs_root_id, &relative_path).await {
+        warn!("Failed to delete schema entry {}: {}", relative_path, e);
     }
 }

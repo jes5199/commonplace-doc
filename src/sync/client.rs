@@ -4,9 +4,10 @@
 //! via HTTP: forking nodes, pushing content, and syncing schemas.
 
 use crate::sync::{
-    build_edit_url, build_fork_url, build_head_url, build_replace_url, create_yjs_json_merge,
-    create_yjs_json_update, create_yjs_jsonl_update, create_yjs_text_update, encode_node_id,
-    EditRequest, EditResponse, ForkResponse, HeadResponse, ReplaceResponse, SyncState,
+    build_edit_url, build_fork_url, build_head_url, build_replace_url, create_yjs_json_delete_key,
+    create_yjs_json_merge, create_yjs_json_update, create_yjs_jsonl_update, create_yjs_text_update,
+    encode_node_id, EditRequest, EditResponse, ForkResponse, HeadResponse, ReplaceResponse,
+    SyncState,
 };
 use reqwest::Client;
 use std::sync::Arc;
@@ -95,6 +96,49 @@ pub async fn push_schema_to_server(
         return Err(format!("Failed to push schema: {} - {}", status, body).into());
     }
 
+    Ok(())
+}
+
+/// Delete a specific entry from a schema on the server.
+///
+/// This function removes a single entry without affecting other entries,
+/// allowing file deletions to propagate while preserving entries from other clients.
+pub async fn delete_schema_entry(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    entry_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Fetch current server state
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
+    let head_resp = client.get(&head_url).send().await?;
+    let base_state = if head_resp.status().is_success() {
+        let head: HeadResponse = head_resp.json().await?;
+        head.state
+    } else {
+        None
+    };
+
+    // Create an update that deletes just this entry
+    let key_path = format!("root.entries.{}", entry_name);
+    let update = create_yjs_json_delete_key(&key_path, base_state.as_deref())
+        .map_err(|e| format!("Failed to create delete update: {}", e))?;
+
+    let edit_url = format!("{}/docs/{}/edit", server, encode_node_id(fs_root_id));
+    let edit_req = EditRequest {
+        update,
+        author: Some("sync-client".to_string()),
+        message: Some(format!("Delete schema entry: {}", entry_name)),
+    };
+
+    let resp = client.post(&edit_url).json(&edit_req).send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Failed to delete schema entry: {} - {}", status, body).into());
+    }
+
+    info!("Deleted schema entry: {}", entry_name);
     Ok(())
 }
 

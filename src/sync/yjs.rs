@@ -48,6 +48,132 @@ pub fn create_yjs_json_merge(
     create_yjs_json_update_impl(new_json, base_state, true)
 }
 
+/// Create a Yjs update that deletes a specific key from a JSON object.
+/// Used to propagate file deletions to the schema without affecting other entries.
+///
+/// # Errors
+/// Returns an error if base_state is None or invalid - base state is required to locate
+/// and delete the existing entry. Without it, we can't create a proper deletion tombstone.
+pub fn create_yjs_json_delete_key(
+    key_path: &str,
+    base_state: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // Base state is REQUIRED for deletion - without it, we can't find the existing entry
+    // to create a proper deletion tombstone
+    let state_b64 = base_state
+        .ok_or("Cannot delete schema entry: base state is required but was not provided")?;
+
+    let state_bytes = base64_decode(state_b64).map_err(|e| {
+        format!(
+            "Cannot delete schema entry: failed to decode base state: {}",
+            e
+        )
+    })?;
+
+    if state_bytes.is_empty() {
+        return Err("Cannot delete schema entry: base state is empty".into());
+    }
+
+    let doc = Doc::with_client_id(1);
+
+    // Apply base state (critical for proper deletion tombstones)
+    let update_result = Update::decode_v1(&state_bytes).map_err(|e| {
+        format!(
+            "Cannot delete schema entry: failed to decode Yjs update: {}",
+            e
+        )
+    })?;
+    {
+        let mut txn = doc.transact_mut();
+        txn.apply_update(update_result);
+    }
+
+    let update = {
+        let mut txn = doc.transact_mut();
+        let map = txn.get_or_insert_map(TEXT_ROOT_NAME);
+
+        // Navigate to the parent and delete the key
+        // Support simple top-level key or "root.entries.{path}" where path can be:
+        // - "filename.txt" (top-level file)
+        // - "subdir/nested.txt" (nested in inline subdirectory)
+        if let Some(rest) = key_path.strip_prefix("root.entries.") {
+            // Schema path: root.entries.{path}
+            // The path might contain slashes for nested entries in inline subdirectories
+            delete_nested_entry(&mut txn, map, rest);
+        } else if !key_path.contains('.') {
+            // Simple top-level key (no dots)
+            map.remove(&mut txn, key_path);
+        }
+
+        txn.encode_update_v1()
+    };
+
+    Ok(base64_encode(&update))
+}
+
+/// Delete a nested entry from a schema's entries hierarchy.
+/// Path can be "file.txt" or "subdir/nested.txt" (multiple levels).
+fn delete_nested_entry(txn: &mut yrs::TransactionMut, map: yrs::MapRef, path: &str) {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.is_empty() {
+        return;
+    }
+
+    if let Some(yrs::types::Value::Any(Any::Map(root_map))) = map.get(txn, "root") {
+        if let Some(Any::Map(entries_map)) = root_map.get("entries") {
+            // Clone entries for modification
+            let new_entries = delete_from_entries_recursive(&parts, entries_map);
+
+            // Rebuild root with updated entries
+            let mut new_root: std::collections::HashMap<String, Any> = root_map
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            new_root.insert("entries".to_string(), Any::Map(new_entries.into()));
+
+            map.insert(txn, "root", Any::Map(new_root.into()));
+        }
+    }
+}
+
+/// Recursively navigate entries and delete the target key.
+/// Returns the updated entries map.
+fn delete_from_entries_recursive(
+    path_parts: &[&str],
+    entries: &std::sync::Arc<std::collections::HashMap<String, Any>>,
+) -> std::collections::HashMap<String, Any> {
+    let mut new_entries: std::collections::HashMap<String, Any> = entries
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    if path_parts.len() == 1 {
+        // Last part - delete this key
+        new_entries.remove(path_parts[0]);
+    } else if path_parts.len() > 1 {
+        // Navigate into subdirectory
+        let subdir_name = path_parts[0];
+        if let Some(Any::Map(subdir_map)) = entries.get(subdir_name) {
+            if let Some(Any::Map(sub_entries)) = subdir_map.get("entries") {
+                // Recursively delete from subdirectory's entries
+                let updated_sub_entries =
+                    delete_from_entries_recursive(&path_parts[1..], sub_entries);
+
+                // Rebuild the subdirectory entry
+                let mut new_subdir: std::collections::HashMap<String, Any> = subdir_map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                new_subdir.insert("entries".to_string(), Any::Map(updated_sub_entries.into()));
+
+                new_entries.insert(subdir_name.to_string(), Any::Map(new_subdir.into()));
+            }
+        }
+    }
+
+    new_entries
+}
+
 fn create_yjs_json_update_impl(
     new_json: &str,
     base_state: Option<&str>,
