@@ -76,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let source = proc
                     .source_path
                     .clone()
-                    .unwrap_or_else(|| "commonplace.json".to_string());
+                    .unwrap_or_else(|| "(commonplace.json)".to_string());
 
                 // Look up CWD dynamically to find sandbox directories
                 // This finds the deepest child's CWD for sandbox processes
