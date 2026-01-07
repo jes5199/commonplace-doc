@@ -281,6 +281,234 @@ pub async fn handle_subdir_schema_cleanup(
     Ok(())
 }
 
+/// Handle syncing NEW files that appear in a subdirectory schema.
+///
+/// This is called from `subdir_sse_task` when a subdirectory schema changes.
+/// It finds files in the server schema that don't exist locally and syncs them.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_subdir_new_files(
+    client: &Client,
+    server: &str,
+    subdir_node_id: &str,
+    subdir_path: &str,
+    _subdir_directory: &Path,
+    root_directory: &Path,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    use_paths: bool,
+    push_only: bool,
+    pull_only: bool,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Don't pull if push_only mode
+    if push_only {
+        return Ok(());
+    }
+
+    // Fetch current schema from server
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(subdir_node_id));
+    let resp = client.get(&head_url).send().await?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Failed to fetch subdir HEAD: {}", resp.status()).into());
+    }
+
+    let head: HeadResponse = resp.json().await?;
+    if head.content.is_empty() {
+        return Ok(());
+    }
+
+    // Parse and validate schema (early return if invalid)
+    let _schema: FsSchema = match serde_json::from_str(&head.content) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to parse subdir schema: {}", e);
+            return Ok(());
+        }
+    };
+
+    // Build UUID map for the subdirectory
+    let subdir_uuid_map = build_uuid_map_recursive(client, server, subdir_node_id).await;
+
+    // Convert to path -> (subdir_relative_path, node_id) pairs
+    // We need the subdir-relative path for API calls but root-relative path for file_states
+    let schema_paths: Vec<(String, String, String)> = subdir_uuid_map
+        .into_iter()
+        .map(|(subdir_relative_path, node_id)| {
+            let root_relative_path = if subdir_path.is_empty() {
+                subdir_relative_path.clone()
+            } else {
+                format!("{}/{}", subdir_path, subdir_relative_path)
+            };
+            (root_relative_path, subdir_relative_path, node_id)
+        })
+        .collect();
+
+    // Get known paths from file_states
+    let known_paths: Vec<String> = {
+        let states = file_states.read().await;
+        states.keys().cloned().collect()
+    };
+
+    // Load synced directories from root_directory (where they're stored)
+    // The synced_dirs contains root-relative paths like "bartleby/nested"
+    let synced_dirs = load_synced_directories(root_directory).await;
+
+    // Find and sync new files
+    for (root_relative_path, _subdir_relative_path, node_id) in &schema_paths {
+        if known_paths.contains(root_relative_path) {
+            continue; // Already tracking this file
+        }
+
+        // Check if the file's parent directory was deleted locally
+        // synced_dirs contains root-relative paths, so we check all ancestor directories
+        let path_parts: Vec<&str> = root_relative_path.split('/').collect();
+        let mut should_skip = false;
+        for i in 1..path_parts.len() {
+            // Check each parent directory (root-relative)
+            let parent_dir: String = path_parts[..i].join("/");
+            let parent_path = root_directory.join(&parent_dir);
+            // Directory was synced but doesn't exist locally = user deleted it
+            if synced_dirs.contains(&parent_dir) && !parent_path.exists() {
+                debug!(
+                    "Skipping file {} - parent directory '{}' was deleted locally",
+                    root_relative_path, parent_dir
+                );
+                should_skip = true;
+                break;
+            }
+        }
+        if should_skip {
+            continue;
+        }
+
+        // New file from server - create local file and fetch content
+        let file_path = root_directory.join(root_relative_path);
+
+        // Skip files with disallowed extensions
+        if !is_allowed_extension(&file_path) {
+            debug!(
+                "Ignoring server file with disallowed extension: {}",
+                root_relative_path
+            );
+            continue;
+        }
+
+        info!(
+            "Subdir {} server created new file: {} -> {}",
+            subdir_path,
+            root_relative_path,
+            file_path.display()
+        );
+
+        // Create parent directories if needed
+        if let Some(parent) = file_path.parent() {
+            if !parent.exists() {
+                tokio::fs::create_dir_all(parent).await?;
+                // Track the directories we created
+                let mut current = parent;
+                while let Ok(rel) = current.strip_prefix(root_directory) {
+                    let rel_str = rel.to_string_lossy().to_string();
+                    if !rel_str.is_empty() {
+                        if let Err(e) = mark_directory_synced(root_directory, &rel_str).await {
+                            debug!("Failed to mark directory synced: {}", e);
+                        }
+                    }
+                    if let Some(p) = current.parent() {
+                        current = p;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // When use_paths=true, use path for /files/* API
+        // When use_paths=false, use node_id for /docs/* API
+        let identifier = if use_paths {
+            root_relative_path.clone()
+        } else {
+            node_id.clone()
+        };
+
+        // Fetch content from server
+        let file_head_url = build_head_url(server, &identifier, use_paths);
+        if let Ok(resp) = client.get(&file_head_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(file_head) = resp.json::<HeadResponse>().await {
+                    // Detect if file is binary and decode base64 if needed
+                    use base64::{engine::general_purpose::STANDARD, Engine};
+                    let content_info = detect_from_path(&file_path);
+                    let bytes_written: Vec<u8> = if content_info.is_binary {
+                        // Extension indicates binary - decode base64
+                        match STANDARD.decode(&file_head.content) {
+                            Ok(decoded) => decoded,
+                            Err(e) => {
+                                warn!("Failed to decode binary content: {}", e);
+                                file_head.content.as_bytes().to_vec()
+                            }
+                        }
+                    } else if looks_like_base64_binary(&file_head.content) {
+                        // Extension says text, but content looks like base64 binary
+                        match STANDARD.decode(&file_head.content) {
+                            Ok(decoded) if is_binary_content(&decoded) => decoded,
+                            _ => file_head.content.as_bytes().to_vec(),
+                        }
+                    } else {
+                        file_head.content.as_bytes().to_vec()
+                    };
+                    tokio::fs::write(&file_path, &bytes_written).await?;
+
+                    // Hash the actual bytes written to disk
+                    let content_hash = compute_content_hash(&bytes_written);
+
+                    // Add to file states
+                    let state = Arc::new(RwLock::new(SyncState {
+                        last_written_cid: file_head.cid.clone(),
+                        last_written_content: file_head.content,
+                        current_write_id: 0,
+                        pending_write: None,
+                        needs_head_refresh: false,
+                        state_file: None,
+                        state_file_path: None,
+                    }));
+
+                    info!("Created local file from subdir: {}", file_path.display());
+
+                    // Spawn sync tasks for the new file
+                    let task_handles = spawn_file_sync_tasks(
+                        client.clone(),
+                        server.to_string(),
+                        identifier.clone(),
+                        file_path.clone(),
+                        state.clone(),
+                        use_paths,
+                        push_only,
+                        pull_only,
+                        false, // force_push: directory mode doesn't support force-push
+                        #[cfg(unix)]
+                        inode_tracker.clone(),
+                    );
+
+                    let mut states = file_states.write().await;
+                    states.insert(
+                        root_relative_path.clone(),
+                        FileSyncState {
+                            relative_path: root_relative_path.clone(),
+                            identifier,
+                            state,
+                            task_handles,
+                            use_paths,
+                            content_hash: Some(content_hash),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Detect directories that were synced but are now deleted locally.
 ///
 /// This returns directories that:
@@ -966,9 +1194,7 @@ pub async fn directory_sse_task(
 /// 1. Fetches and writes the updated schema to the local .commonplace.json file
 /// 2. Deletes local files that were removed from the server schema
 /// 3. Cleans up orphaned directories that no longer exist in the schema
-///
-/// Note: File syncing for NEW files in subdirectories is tracked in CP-fs3x.
-/// Currently, new file sync relies on initial sync and file watchers.
+/// 4. Syncs NEW files that were added to the server schema
 #[allow(clippy::too_many_arguments)]
 pub async fn subdir_sse_task(
     client: Client,
@@ -978,10 +1204,10 @@ pub async fn subdir_sse_task(
     subdir_node_id: String,
     directory: PathBuf,
     file_states: Arc<RwLock<HashMap<String, FileSyncState>>>,
-    _use_paths: bool,
-    _push_only: bool,
-    _pull_only: bool,
-    #[cfg(unix)] _inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    use_paths: bool,
+    push_only: bool,
+    pull_only: bool,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
 ) {
     let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&subdir_node_id));
 
@@ -1020,13 +1246,11 @@ pub async fn subdir_sse_task(
                             debug!("Subdir {} SSE connected", subdir_path);
                         }
                         "edit" => {
-                            // Subdirectory schema changed - fetch schema, delete removed files,
-                            // and clean up orphaned directories.
-                            //
-                            // Note: Pulling NEW files in subdirectories is tracked in CP-fs3x.
-                            // This handler focuses on cleanup (deletions and orphans).
-                            info!("Subdir {} schema changed, triggering cleanup", subdir_path);
+                            // Subdirectory schema changed - handle cleanup and sync new files
+                            info!("Subdir {} schema changed, triggering sync", subdir_path);
                             let subdir_full_path = directory.join(&subdir_path);
+
+                            // First, cleanup deleted files and orphaned directories
                             match handle_subdir_schema_cleanup(
                                 &client,
                                 &server,
@@ -1044,6 +1268,34 @@ pub async fn subdir_sse_task(
                                 Err(e) => {
                                     warn!(
                                         "Failed to handle subdir {} schema cleanup: {}",
+                                        subdir_path, e
+                                    );
+                                }
+                            }
+
+                            // Then, sync NEW files from server
+                            match handle_subdir_new_files(
+                                &client,
+                                &server,
+                                &subdir_node_id,
+                                &subdir_path,
+                                &subdir_full_path,
+                                &directory,
+                                &file_states,
+                                use_paths,
+                                push_only,
+                                pull_only,
+                                #[cfg(unix)]
+                                inode_tracker.clone(),
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    debug!("Subdir {} new files sync completed", subdir_path);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to sync new files for subdir {}: {}",
                                         subdir_path, e
                                     );
                                 }
