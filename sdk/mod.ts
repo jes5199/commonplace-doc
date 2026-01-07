@@ -22,8 +22,8 @@ class DocHandleImpl implements DocHandle {
   private doc = new Y.Doc();
   private text = this.doc.getText("content");
   private changeCallbacks: ((content: string) => void)[] = [];
-  private eventSubscriptions: { topic: string; handler: (t: string, p: Buffer) => void }[] = [];
-  private subscribed = false;
+  private eventSubscriptions: { topic: string; handler: (t: string, p: Buffer) => void; activated: boolean }[] = [];
+  private editsSubscribed = false;
   private needsSubscription = false;
   private initialFetched = false;
 
@@ -51,13 +51,14 @@ class DocHandleImpl implements DocHandle {
     }
   }
 
-  // Called by cp.start() after MQTT is connected - sets up MQTT subscriptions
+  // Called by cp.start() or when adding subscriptions after start - sets up MQTT subscriptions
+  // Idempotent: can be called multiple times, only activates new subscriptions
   async activateSubscriptions(): Promise<void> {
-    if (!this.needsSubscription || this.subscribed) return;
-    this.subscribed = true;
+    if (!this.needsSubscription) return;
 
-    // Subscribe to edits for onChange callbacks
-    if (this.changeCallbacks.length > 0) {
+    // Subscribe to edits for onChange callbacks (only once)
+    if (!this.editsSubscribed && this.changeCallbacks.length > 0) {
+      this.editsSubscribed = true;
       subscribe(`${this.path}/edits`, (_topic, payload) => {
         try {
           const msg = JSON.parse(payload.toString());
@@ -74,9 +75,12 @@ class DocHandleImpl implements DocHandle {
       });
     }
 
-    // Activate event subscriptions
-    for (const { topic, handler } of this.eventSubscriptions) {
-      subscribe(topic, handler);
+    // Activate event subscriptions that haven't been activated yet
+    for (const sub of this.eventSubscriptions) {
+      if (!sub.activated) {
+        sub.activated = true;
+        subscribe(sub.topic, sub.handler);
+      }
     }
 
     // Fetch initial state via HTTP
@@ -90,8 +94,8 @@ class DocHandleImpl implements DocHandle {
     }
     // Always fetch initial state if not done (even without subscriptions)
     await this.fetchInitialState();
-    // Also activate subscriptions if needed
-    if (this.needsSubscription && !this.subscribed) {
+    // Also activate subscriptions if needed (activateSubscriptions is idempotent)
+    if (this.needsSubscription) {
       await this.activateSubscriptions();
     }
     return this.text.toString();
@@ -100,8 +104,10 @@ class DocHandleImpl implements DocHandle {
   onChange(cb: (content: string) => void): void {
     this.changeCallbacks.push(cb);
     this.needsSubscription = true;
-    // Register for activation after cp.start()
-    if (!pendingDocHandles.includes(this)) {
+    // If MQTT already started, activate immediately; otherwise queue for later
+    if (mqttStarted) {
+      this.activateSubscriptions();
+    } else if (!pendingDocHandles.includes(this)) {
       pendingDocHandles.push(this);
     }
   }
@@ -123,10 +129,12 @@ class DocHandleImpl implements DocHandle {
       }
     };
 
-    this.eventSubscriptions.push({ topic, handler });
+    this.eventSubscriptions.push({ topic, handler, activated: false });
     this.needsSubscription = true;
-    // Register for activation after cp.start()
-    if (!pendingDocHandles.includes(this)) {
+    // If MQTT already started, activate immediately; otherwise queue for later
+    if (mqttStarted) {
+      this.activateSubscriptions();
+    } else if (!pendingDocHandles.includes(this)) {
       pendingDocHandles.push(this);
     }
   }
