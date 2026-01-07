@@ -14,10 +14,41 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::content_type::ContentType;
 use crate::document::DocumentStore;
 use crate::events::CommitBroadcaster;
 use crate::services::{DocumentService, ServiceError};
 use crate::store::CommitStore;
+
+/// Get the MIME type to serve for a file based on its extension.
+/// For text files, returns the appropriate specific MIME type (text/typescript, etc.)
+/// For other types, delegates to ContentType::to_mime().
+fn get_serving_mime_type(path: &str, content_type: &ContentType) -> &'static str {
+    // Only override for Text content type - other types have specific MIME types
+    if *content_type != ContentType::Text {
+        return content_type.to_mime();
+    }
+
+    // Get extension from path
+    let ext = path.rsplit('.').next().unwrap_or("");
+    match ext.to_lowercase().as_str() {
+        "ts" => "text/typescript",
+        "tsx" => "text/typescript",
+        "js" => "text/javascript",
+        "jsx" => "text/javascript",
+        "mjs" => "text/javascript",
+        "rs" => "text/x-rust",
+        "py" => "text/x-python",
+        "rb" => "text/x-ruby",
+        "sh" => "text/x-shellscript",
+        "css" => "text/css",
+        "html" | "htm" => "text/html",
+        "md" => "text/markdown",
+        "yaml" | "yml" => "text/yaml",
+        "toml" => "text/x-toml",
+        _ => "text/plain",
+    }
+}
 
 /// Shared state for file handlers.
 #[derive(Clone)]
@@ -276,11 +307,8 @@ async fn handle_file_request(
             .await
             .ok_or(PathResolveError::PathNotFound)?;
 
-        Ok((
-            [(axum::http::header::CONTENT_TYPE, doc.content_type.to_mime())],
-            doc.content,
-        )
-            .into_response())
+        let mime_type = get_serving_mime_type(&path, &doc.content_type);
+        Ok(([(axum::http::header::CONTENT_TYPE, mime_type)], doc.content).into_response())
     }
 }
 

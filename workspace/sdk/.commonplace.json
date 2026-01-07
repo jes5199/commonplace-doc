@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "root": {
+    "type": "dir",
+    "entries": {
+      "mod.ts": {
+        "type": "doc",
+        "node_id": "f32436e9-d4ec-4fc4-b147-12de3a98afc2",
+        "content_type": "text/typescript"
+      },
+      "types.ts": {
+        "type": "doc",
+        "node_id": "dc5cdf6c-1017-4c03-ada6-ef5a9e12ccc9",
+        "content_type": "text/typescript"
+      },
+      "mqtt.ts": {
+        "type": "doc",
+        "node_id": "0e9f0a24-4a25-4e6e-824d-1310c293b783",
+        "content_type": "text/typescript"
+      }
+    },
+    "node_id": null,
+    "content_type": null
+  }
+}

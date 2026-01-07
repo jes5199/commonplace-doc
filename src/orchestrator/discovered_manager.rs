@@ -305,7 +305,9 @@ impl DiscoveredProcessManager {
             // Construct the script URL: http://{server}/files/{dir}/{script}
             // URL-encode the path segments to handle spaces and special characters
             let full_path = format!("{}/{}", document_path, script);
-            let script_url = format!("{}/files/{}", server, encode_url_path(&full_path));
+            // Strip leading slash to avoid double-slash in URL
+            let full_path = full_path.trim_start_matches('/');
+            let script_url = format!("{}/files/{}", server, encode_url_path(full_path));
 
             // Generate a unique client ID for this process instance
             let client_id = format!("{}-{}", name, &uuid::Uuid::new_v4().to_string()[..8]);
@@ -315,8 +317,13 @@ impl DiscoveredProcessManager {
 
             let mut cmd = Command::new("deno");
             cmd.arg("run")
-                .arg(format!("--allow-net={},{}", server_host, broker))
-                .arg("--allow-env=COMMONPLACE_SERVER,COMMONPLACE_BROKER,COMMONPLACE_OUTPUT,COMMONPLACE_CLIENT_ID,COMMONPLACE_PATH")
+                // Allow npm registry for package downloads, plus server and broker
+                .arg(format!(
+                    "--allow-net={},{},registry.npmjs.org,cdn.jsdelivr.net,esm.sh",
+                    server_host, broker
+                ))
+                // Allow all env for npm package compatibility (readable-stream, etc.)
+                .arg("--allow-env")
                 .arg(&script_url);
 
             // Set environment variables for the SDK
