@@ -35,11 +35,51 @@ export function publish(topic: string, message: string | object): void {
   client.publish(topic, payload);
 }
 
+/**
+ * Check if a topic matches an MQTT wildcard pattern.
+ * - `+` matches exactly one level (single-level wildcard)
+ * - `#` matches zero or more levels (multi-level wildcard, must be at end)
+ */
+function topicMatches(pattern: string, topic: string): boolean {
+  // Exact match
+  if (pattern === topic) return true;
+
+  const patternParts = pattern.split('/');
+  const topicParts = topic.split('/');
+
+  for (let i = 0; i < patternParts.length; i++) {
+    const p = patternParts[i];
+
+    // Multi-level wildcard - matches everything from here
+    if (p === '#') {
+      return true; // # must be last, matches rest
+    }
+
+    // No more topic parts but pattern continues (and it's not #)
+    if (i >= topicParts.length) {
+      return false;
+    }
+
+    // Single-level wildcard - matches any single level
+    if (p === '+') {
+      continue; // matches this level, continue
+    }
+
+    // Literal match required
+    if (p !== topicParts[i]) {
+      return false;
+    }
+  }
+
+  // Pattern exhausted - topic must also be exhausted
+  return patternParts.length === topicParts.length;
+}
+
 export function subscribe(topic: string, handler: (topic: string, payload: Buffer) => void): void {
   const client = getClient();
   client.subscribe(topic);
   client.on("message", (t, p) => {
-    if (t === topic || topic.endsWith("#") && t.startsWith(topic.slice(0, -1))) {
+    if (topicMatches(topic, t)) {
       handler(t, p);
     }
   });
