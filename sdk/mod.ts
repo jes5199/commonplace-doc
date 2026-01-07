@@ -47,6 +47,38 @@ function serializeContent(value: JsonValue | JsonValue[] | string, type: Content
   }
 }
 
+// Read raw string content from Yjs doc based on content type
+// Uses the correct Yjs type (Text/Array/Map) for each content type
+function readYjsContent(doc: Y.Doc, type: ContentType): string {
+  switch (type) {
+    case 'json': {
+      const map = doc.getMap("content");
+      if (map.size === 0) return '';
+      // Convert Y.Map to JSON object
+      const obj: Record<string, unknown> = {};
+      for (const [key, value] of map.entries()) {
+        obj[key] = value;
+      }
+      return JSON.stringify(obj, null, 2);
+    }
+    case 'jsonl': {
+      const arr = doc.getArray("content");
+      if (arr.length === 0) return '';
+      // Convert Y.Array to JSONL string
+      const lines: string[] = [];
+      for (let i = 0; i < arr.length; i++) {
+        lines.push(JSON.stringify(arr.get(i)));
+      }
+      return lines.join('\n') + '\n';
+    }
+    case 'text':
+    default: {
+      const text = doc.getText("content");
+      return text.toString();
+    }
+  }
+}
+
 function sanitizePath(path: string): string {
   if (path.includes('#') || path.includes('+') || path.includes('\0')) {
     throw new Error(`Invalid path contains MQTT wildcards: ${path}`);
@@ -65,13 +97,13 @@ const pendingDocHandles: DocHandleImpl[] = [];
 
 class DocHandleImpl implements DocHandle {
   private doc = new Y.Doc();
-  private text = this.doc.getText("content");
   private changeCallbacks: ((content: ParsedContent) => void)[] = [];
   private eventSubscriptions: { topic: string; handler: (t: string, p: Buffer) => void; activated: boolean }[] = [];
   private editsSubscribed = false;
   private needsSubscription = false;
   private initialFetched = false;
   private contentType: ContentType;
+  private cachedContent: string | null = null; // Cache for initial content before Yjs updates
 
   constructor(private path: string) {
     sanitizePath(path);
@@ -88,13 +120,13 @@ class DocHandleImpl implements DocHandle {
       const res = await fetch(`${SERVER}/files/${pathEncoded}/head`);
       if (res.ok) {
         const head = await res.json();
-        // Use content directly - Yjs state from Rust yrs isn't compatible with JS yjs
-        if (head.content) {
-          this.doc.transact(() => {
-            this.text.delete(0, this.text.length);
-            this.text.insert(0, head.content);
-          });
+        // Apply Yjs state if available (for CRDT sync compatibility)
+        if (head.state) {
+          const state = Uint8Array.from(atob(head.state), (c) => c.charCodeAt(0));
+          Y.applyUpdate(this.doc, state);
         }
+        // Store raw content in cache for get() to use
+        this.cachedContent = head.content || '';
       }
     } catch (e) {
       console.error(`[cp] Error fetching initial state for ${this.path}:`, e);
@@ -115,7 +147,11 @@ class DocHandleImpl implements DocHandle {
           const update = Uint8Array.from(atob(msg.update), (c) => c.charCodeAt(0));
           Y.applyUpdate(this.doc, update);
 
-          const raw = this.text.toString();
+          // Clear cache so subsequent get() reads from Yjs
+          this.cachedContent = null;
+
+          // Read from correct Yjs type based on content type
+          const raw = readYjsContent(this.doc, this.contentType);
           const parsed = parseContent(raw, this.contentType);
           for (const cb of this.changeCallbacks) {
             cb(parsed);
@@ -149,7 +185,10 @@ class DocHandleImpl implements DocHandle {
     if (this.needsSubscription) {
       await this.activateSubscriptions();
     }
-    const raw = this.text.toString();
+    // Use cached content if available (for initial read), otherwise read from Yjs
+    const raw = this.cachedContent !== null
+      ? this.cachedContent
+      : readYjsContent(this.doc, this.contentType);
     return parseContent(raw, this.contentType);
   }
 
@@ -206,6 +245,7 @@ class OutputHandleImpl implements OutputHandle {
   private parentCommit: string | null = null;
   private initialized = false;
   private contentType: ContentType;
+  private cachedContent: string | null = null;
 
   constructor(private path: string) {
     if (path) sanitizePath(path);
@@ -222,13 +262,13 @@ class OutputHandleImpl implements OutputHandle {
       const res = await fetch(`${SERVER}/files/${pathEncoded}/head`);
       if (res.ok) {
         const head = await res.json();
-        // Use content directly - Yjs state from Rust yrs isn't compatible with JS yjs
-        if (head.content) {
-          this.doc.transact(() => {
-            this.text.delete(0, this.text.length);
-            this.text.insert(0, head.content);
-          });
+        // Apply Yjs state if available (for CRDT sync compatibility)
+        if (head.state) {
+          const state = Uint8Array.from(atob(head.state), (c) => c.charCodeAt(0));
+          Y.applyUpdate(this.doc, state);
         }
+        // Cache content for initial read
+        this.cachedContent = head.content || '';
         if (head.cid) {
           this.parentCommit = head.cid;
         }
@@ -240,7 +280,9 @@ class OutputHandleImpl implements OutputHandle {
 
   async get(): Promise<ParsedContent> {
     await this.ensureInitialized();
-    const raw = this.text.toString();
+    const raw = this.cachedContent !== null
+      ? this.cachedContent
+      : readYjsContent(this.doc, this.contentType);
     return parseContent(raw, this.contentType);
   }
 
