@@ -18,6 +18,7 @@ use futures::StreamExt;
 use reqwest::Client;
 use reqwest_eventsource::{Event as SseEvent, EventSource};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, GetString, Transact, Update};
@@ -252,8 +253,10 @@ fn stream_output_yjs(
     let doc = Doc::new();
     let text = doc.get_or_insert_text("content");
 
-    // Track previous content for diff computation
-    let mut prev_content = String::new();
+    // Track content per commit for proper parent-based diffs
+    let mut content_by_commit: HashMap<String, String> = HashMap::new();
+    // Empty string represents the "root" state before any commits
+    content_by_commit.insert(String::new(), String::new());
 
     // JSON mode: buffer all data
     if args.json {
@@ -270,8 +273,18 @@ fn stream_output_yjs(
 
             let current_content = text.get_string(&doc.transact());
 
+            // Get parent content for proper diff (use first parent, or empty for root)
+            let parent_content = if commit.parents.is_empty() {
+                String::new()
+            } else {
+                content_by_commit
+                    .get(&commit.parents[0])
+                    .cloned()
+                    .unwrap_or_default()
+            };
+
             let stats = if args.stat {
-                let s = if prev_content.is_empty() && !current_content.is_empty() {
+                let s = if parent_content.is_empty() && !current_content.is_empty() {
                     ChangeStats {
                         lines_added: current_content.lines().count(),
                         lines_removed: 0,
@@ -279,14 +292,15 @@ fn stream_output_yjs(
                         chars_removed: 0,
                     }
                 } else {
-                    compute_diff_stats(&prev_content, &current_content)
+                    compute_diff_stats(&parent_content, &current_content)
                 };
-                prev_content = current_content;
                 Some(s)
             } else {
-                prev_content = current_content;
                 None
             };
+
+            // Store content for this commit
+            content_by_commit.insert(commit.commit_id.clone(), current_content);
 
             commit_infos.push(CommitInfo {
                 cid: commit.commit_id.clone(),
@@ -341,15 +355,50 @@ fn stream_output_yjs(
 
         let current_content = text.get_string(&doc.transact());
 
-        let decoration = if decorate && i == head_idx {
-            " \x1b[36m(HEAD)\x1b[0m"
+        // Get parent content for proper diff (use first parent, or empty for root)
+        let parent_content = if commit.parents.is_empty() {
+            String::new()
         } else {
-            ""
+            content_by_commit
+                .get(&commit.parents[0])
+                .cloned()
+                .unwrap_or_default()
         };
 
-        // Compute stats if needed
+        // Check if this is a merge commit
+        let is_merge = commit.parents.len() > 1;
+
+        let decoration = if decorate && i == head_idx {
+            if is_merge {
+                format!(
+                    " \x1b[36m(HEAD)\x1b[0m \x1b[35m(merge: {})\x1b[0m",
+                    commit
+                        .parents
+                        .iter()
+                        .map(|p| &p[..8.min(p.len())])
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            } else {
+                " \x1b[36m(HEAD)\x1b[0m".to_string()
+            }
+        } else if is_merge {
+            format!(
+                " \x1b[35m(merge: {})\x1b[0m",
+                commit
+                    .parents
+                    .iter()
+                    .map(|p| &p[..8.min(p.len())])
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else {
+            String::new()
+        };
+
+        // Compute stats if needed (against first parent)
         let stats = if args.stat {
-            if prev_content.is_empty() && !current_content.is_empty() {
+            if parent_content.is_empty() && !current_content.is_empty() {
                 Some(ChangeStats {
                     lines_added: current_content.lines().count(),
                     lines_removed: 0,
@@ -357,15 +406,15 @@ fn stream_output_yjs(
                     chars_removed: 0,
                 })
             } else {
-                Some(compute_diff_stats(&prev_content, &current_content))
+                Some(compute_diff_stats(&parent_content, &current_content))
             }
         } else {
             None
         };
 
-        // Compute diff if needed
+        // Compute diff if needed (against first parent)
         let diff = if show_patch {
-            if prev_content.is_empty() && !current_content.is_empty() {
+            if parent_content.is_empty() && !current_content.is_empty() {
                 Some(
                     current_content
                         .lines()
@@ -374,14 +423,14 @@ fn stream_output_yjs(
                         .join("\n"),
                 )
             } else {
-                Some(compute_unified_diff(&prev_content, &current_content))
+                Some(compute_unified_diff(&parent_content, &current_content))
             }
         } else {
             None
         };
 
-        // Update prev_content
-        prev_content = current_content;
+        // Store content for this commit
+        content_by_commit.insert(commit.commit_id.clone(), current_content.clone());
 
         // Format and output this commit
         if args.oneline {
