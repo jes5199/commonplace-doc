@@ -296,6 +296,79 @@ pub fn compute_xml_diff_update(
     })
 }
 
+/// Compute diff update for XML documents using actual server Yjs state.
+///
+/// This function is similar to `compute_xml_diff_update` but starts from the
+/// server's actual Yjs state rather than creating a fresh document. This ensures
+/// proper CRDT merging when the server's state may have received other updates.
+///
+/// # Arguments
+/// * `base_state_bytes` - The Yjs state update bytes from the server
+/// * `old_content` - The XML document content (with header and root) from the server
+/// * `new_content` - The desired new XML document (with header and root)
+///
+/// # Returns
+/// A `DiffResult` containing the Yjs update for XmlFragment
+pub fn compute_xml_diff_update_with_base(
+    base_state_bytes: &[u8],
+    old_content: &str,
+    new_content: &str,
+) -> Result<DiffResult, DiffError> {
+    let old_inner = strip_xml_wrapper(old_content);
+    let new_inner = strip_xml_wrapper(new_content);
+
+    // Create target doc and sync to actual base state
+    let target_doc = Doc::with_client_id(2);
+    let target_fragment = target_doc.get_or_insert_xml_fragment(TEXT_ROOT_NAME);
+
+    // Apply the actual base state from server
+    {
+        let update = yrs::Update::decode_v1(base_state_bytes)
+            .map_err(|e| DiffError::YrsOperationFailed(e.to_string()))?;
+        let mut txn = target_doc.transact_mut();
+        txn.apply_update(update);
+    }
+
+    // Compute summary from text diff (for statistics)
+    let diff = TextDiff::from_chars(old_inner, new_inner);
+    let mut summary = DiffSummary::default();
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => summary.unchanged_chars += change.value().len(),
+            ChangeTag::Delete => summary.chars_deleted += change.value().len(),
+            ChangeTag::Insert => summary.chars_inserted += change.value().len(),
+        }
+    }
+
+    // Apply XmlFragment operations: clear old content and add new
+    let update_bytes = {
+        let mut txn = target_doc.transact_mut();
+
+        // Remove all existing children
+        let len = target_fragment.len(&txn);
+        if len > 0 {
+            target_fragment.remove_range(&mut txn, 0, len);
+        }
+
+        // Add new content as XmlText
+        if !new_inner.is_empty() {
+            target_fragment.push_back(&mut txn, XmlTextPrelim::new(new_inner));
+        }
+
+        txn.encode_update_v1()
+    };
+
+    let update_b64 = b64::encode(&update_bytes);
+    let operation_count = if old_inner != new_inner { 1 } else { 0 };
+
+    Ok(DiffResult {
+        update_bytes,
+        update_b64,
+        operation_count,
+        summary,
+    })
+}
+
 /// A batched diff operation
 #[derive(Debug)]
 enum DiffOp {
