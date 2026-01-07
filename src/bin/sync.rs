@@ -579,6 +579,7 @@ async fn main() -> ExitCode {
             true, // sandbox mode
             args.push_only,
             args.pull_only,
+            args.shadow_dir,
         )
         .await;
 
@@ -625,6 +626,7 @@ async fn main() -> ExitCode {
                 false, // not sandbox mode
                 args.push_only,
                 args.pull_only,
+                args.shadow_dir,
             )
             .await
         } else {
@@ -639,6 +641,7 @@ async fn main() -> ExitCode {
                 args.use_paths,
                 args.push_only,
                 args.pull_only,
+                args.shadow_dir,
             )
             .await
             .map(|_| 0u8)
@@ -974,6 +977,7 @@ async fn run_directory_mode(
     use_paths: bool,
     push_only: bool,
     pull_only: bool,
+    shadow_dir: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mode = if push_only {
         "push-only"
@@ -996,6 +1000,30 @@ async fn run_directory_mode(
         error!("Not a directory: {}", directory.display());
         return Err(format!("Not a directory: {}", directory.display()).into());
     }
+
+    // Set up inode tracking if shadow_dir is configured (unix only)
+    #[cfg(unix)]
+    let inode_tracker: Option<Arc<RwLock<InodeTracker>>> = if !shadow_dir.is_empty() {
+        let shadow_path = PathBuf::from(&shadow_dir);
+
+        // Create shadow directory
+        if let Err(e) = tokio::fs::create_dir_all(&shadow_path).await {
+            warn!(
+                "Failed to create shadow directory {}: {} - disabling inode tracking",
+                shadow_dir, e
+            );
+            None
+        } else {
+            let tracker = Arc::new(RwLock::new(InodeTracker::new(shadow_path)));
+            info!("Inode tracking enabled with shadow dir: {}", shadow_dir);
+            Some(tracker)
+        }
+    } else {
+        debug!("Inode tracking disabled (no shadow_dir configured)");
+        None
+    };
+    #[cfg(not(unix))]
+    let inode_tracker: Option<Arc<RwLock<InodeTracker>>> = None;
 
     // Verify fs-root document exists (or create it)
     ensure_fs_root_exists(&client, &server, &fs_root_id).await?;
@@ -1022,7 +1050,7 @@ async fn run_directory_mode(
             push_only,
             pull_only,
             #[cfg(unix)]
-            None, // TODO: pass inode_tracker when initialized
+            inode_tracker.clone(),
         )
         .await?;
         info!("Server files pulled to local directory");
@@ -1113,7 +1141,7 @@ async fn run_directory_mode(
             push_only,
             pull_only,
             #[cfg(unix)]
-            None, // TODO: pass inode_tracker when initialized
+            inode_tracker.clone(),
         )))
     } else {
         info!("Push-only mode: skipping SSE subscription");
@@ -1145,7 +1173,7 @@ async fn run_directory_mode(
                 push_only,
                 pull_only,
                 #[cfg(unix)]
-                None, // TODO: pass inode_tracker when initialized
+                inode_tracker.clone(),
             ));
         }
     }
@@ -1168,10 +1196,48 @@ async fn run_directory_mode(
                 pull_only,
                 false, // force_push: directory mode doesn't support force-push
                 #[cfg(unix)]
-                None, // TODO: pass inode_tracker when initialized
+                inode_tracker.clone(),
             );
         }
     }
+
+    // Start shadow watcher, handler, and GC if inode tracking is enabled (unix only)
+    #[cfg(unix)]
+    let (shadow_watcher_handle, shadow_handler_handle, shadow_gc_handle) =
+        if let Some(ref tracker) = inode_tracker {
+            let shadow_path = {
+                let t = tracker.read().await;
+                t.shadow_dir.clone()
+            };
+
+            // Create channel for shadow write events
+            let (shadow_tx, shadow_rx) = mpsc::channel::<ShadowWriteEvent>(100);
+
+            // Start shadow watcher
+            let watcher = tokio::spawn(shadow_watcher_task(shadow_path, shadow_tx));
+
+            // Start shadow write handler
+            let handler = tokio::spawn(shadow_write_handler_task(
+                client.clone(),
+                server.clone(),
+                shadow_rx,
+                tracker.clone(),
+                use_paths,
+            ));
+
+            // Start periodic shadow GC task
+            let gc = tokio::spawn(shadow_gc_task(tracker.clone()));
+
+            (Some(watcher), Some(handler), Some(gc))
+        } else {
+            (None, None, None)
+        };
+    #[cfg(not(unix))]
+    let (shadow_watcher_handle, shadow_handler_handle, shadow_gc_handle): (
+        Option<tokio::task::JoinHandle<()>>,
+        Option<tokio::task::JoinHandle<()>>,
+        Option<tokio::task::JoinHandle<()>>,
+    ) = (None, None, None);
 
     // Handle directory-level events (file creation/deletion)
     let dir_event_handle = tokio::spawn({
@@ -1181,6 +1247,8 @@ async fn run_directory_mode(
         let directory = directory.clone();
         let options = options.clone();
         let file_states = file_states.clone();
+        #[cfg(unix)]
+        let inode_tracker = inode_tracker.clone();
         async move {
             while let Some(event) = dir_rx.recv().await {
                 match event {
@@ -1197,7 +1265,7 @@ async fn run_directory_mode(
                             push_only,
                             pull_only,
                             #[cfg(unix)]
-                            None, // TODO: pass inode_tracker when initialized
+                            inode_tracker.clone(),
                         )
                         .await;
                     }
@@ -1242,6 +1310,17 @@ async fn run_directory_mode(
     }
     dir_event_handle.abort();
 
+    // Abort shadow tasks
+    if let Some(handle) = shadow_watcher_handle {
+        handle.abort();
+    }
+    if let Some(handle) = shadow_handler_handle {
+        handle.abort();
+    }
+    if let Some(handle) = shadow_gc_handle {
+        handle.abort();
+    }
+
     // Abort all per-file sync tasks
     {
         let states = file_states.read().await;
@@ -1274,6 +1353,7 @@ async fn run_exec_mode(
     sandbox: bool,
     push_only: bool,
     pull_only: bool,
+    shadow_dir: String,
 ) -> Result<u8, Box<dyn std::error::Error>> {
     let mode = if push_only {
         "push-only"
@@ -1301,6 +1381,30 @@ async fn run_exec_mode(
         return Err(format!("Not a directory: {}", directory.display()).into());
     }
 
+    // Set up inode tracking if shadow_dir is configured (unix only)
+    #[cfg(unix)]
+    let inode_tracker: Option<Arc<RwLock<InodeTracker>>> = if !shadow_dir.is_empty() {
+        let shadow_path = PathBuf::from(&shadow_dir);
+
+        // Create shadow directory
+        if let Err(e) = tokio::fs::create_dir_all(&shadow_path).await {
+            warn!(
+                "Failed to create shadow directory {}: {} - disabling inode tracking",
+                shadow_dir, e
+            );
+            None
+        } else {
+            let tracker = Arc::new(RwLock::new(InodeTracker::new(shadow_path)));
+            info!("Inode tracking enabled with shadow dir: {}", shadow_dir);
+            Some(tracker)
+        }
+    } else {
+        debug!("Inode tracking disabled (no shadow_dir configured)");
+        None
+    };
+    #[cfg(not(unix))]
+    let inode_tracker: Option<Arc<RwLock<InodeTracker>>> = None;
+
     // Verify fs-root document exists (or create it)
     ensure_fs_root_exists(&client, &server, &fs_root_id).await?;
 
@@ -1324,7 +1428,7 @@ async fn run_exec_mode(
             push_only,
             pull_only,
             #[cfg(unix)]
-            None, // TODO: pass inode_tracker when initialized
+            inode_tracker.clone(),
         )
         .await?;
         info!("Server files pulled to local directory");
@@ -1415,7 +1519,7 @@ async fn run_exec_mode(
             push_only,
             pull_only,
             #[cfg(unix)]
-            None, // TODO: pass inode_tracker when initialized
+            inode_tracker.clone(),
         )))
     } else {
         info!("Push-only mode: skipping SSE subscription");
@@ -1446,7 +1550,7 @@ async fn run_exec_mode(
                 push_only,
                 pull_only,
                 #[cfg(unix)]
-                None, // TODO: pass inode_tracker when initialized
+                inode_tracker.clone(),
             ));
         }
     }
@@ -1467,10 +1571,48 @@ async fn run_exec_mode(
                 pull_only,
                 false, // force_push: sandbox mode doesn't support force-push
                 #[cfg(unix)]
-                None, // TODO: pass inode_tracker when initialized
+                inode_tracker.clone(),
             );
         }
     }
+
+    // Start shadow watcher, handler, and GC if inode tracking is enabled (unix only)
+    #[cfg(unix)]
+    let (shadow_watcher_handle, shadow_handler_handle, shadow_gc_handle) =
+        if let Some(ref tracker) = inode_tracker {
+            let shadow_path = {
+                let t = tracker.read().await;
+                t.shadow_dir.clone()
+            };
+
+            // Create channel for shadow write events
+            let (shadow_tx, shadow_rx) = mpsc::channel::<ShadowWriteEvent>(100);
+
+            // Start shadow watcher
+            let watcher = tokio::spawn(shadow_watcher_task(shadow_path, shadow_tx));
+
+            // Start shadow write handler
+            let handler = tokio::spawn(shadow_write_handler_task(
+                client.clone(),
+                server.clone(),
+                shadow_rx,
+                tracker.clone(),
+                use_paths,
+            ));
+
+            // Start periodic shadow GC task
+            let gc = tokio::spawn(shadow_gc_task(tracker.clone()));
+
+            (Some(watcher), Some(handler), Some(gc))
+        } else {
+            (None, None, None)
+        };
+    #[cfg(not(unix))]
+    let (shadow_watcher_handle, shadow_handler_handle, shadow_gc_handle): (
+        Option<tokio::task::JoinHandle<()>>,
+        Option<tokio::task::JoinHandle<()>>,
+        Option<tokio::task::JoinHandle<()>>,
+    ) = (None, None, None);
 
     // Start directory event handler (same logic as run_directory_mode)
     let dir_event_handle = tokio::spawn({
@@ -1480,6 +1622,8 @@ async fn run_exec_mode(
         let directory = directory.clone();
         let options = options.clone();
         let file_states = file_states.clone();
+        #[cfg(unix)]
+        let inode_tracker = inode_tracker.clone();
         async move {
             while let Some(event) = dir_rx.recv().await {
                 match event {
@@ -1496,7 +1640,7 @@ async fn run_exec_mode(
                             push_only,
                             pull_only,
                             #[cfg(unix)]
-                            None, // TODO: pass inode_tracker when initialized
+                            inode_tracker.clone(),
                         )
                         .await;
                     }
@@ -1669,6 +1813,20 @@ async fn run_exec_mode(
         handle.abort();
     }
     dir_event_handle.abort();
+
+    // Abort shadow tracking tasks
+    #[cfg(unix)]
+    {
+        if let Some(handle) = shadow_watcher_handle {
+            handle.abort();
+        }
+        if let Some(handle) = shadow_handler_handle {
+            handle.abort();
+        }
+        if let Some(handle) = shadow_gc_handle {
+            handle.abort();
+        }
+    }
 
     // Abort all per-file sync tasks
     {
