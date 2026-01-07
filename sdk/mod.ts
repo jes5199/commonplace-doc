@@ -88,9 +88,12 @@ class DocHandleImpl implements DocHandle {
       const res = await fetch(`${SERVER}/files/${pathEncoded}/head`);
       if (res.ok) {
         const head = await res.json();
-        if (head.state) {
-          const state = Uint8Array.from(atob(head.state), (c) => c.charCodeAt(0));
-          Y.applyUpdate(this.doc, state);
+        // Use content directly - Yjs state from Rust yrs isn't compatible with JS yjs
+        if (head.content) {
+          this.doc.transact(() => {
+            this.text.delete(0, this.text.length);
+            this.text.insert(0, head.content);
+          });
         }
       }
     } catch (e) {
@@ -219,9 +222,12 @@ class OutputHandleImpl implements OutputHandle {
       const res = await fetch(`${SERVER}/files/${pathEncoded}/head`);
       if (res.ok) {
         const head = await res.json();
-        if (head.state) {
-          const state = Uint8Array.from(atob(head.state), (c) => c.charCodeAt(0));
-          Y.applyUpdate(this.doc, state);
+        // Use content directly - Yjs state from Rust yrs isn't compatible with JS yjs
+        if (head.content) {
+          this.doc.transact(() => {
+            this.text.delete(0, this.text.length);
+            this.text.insert(0, head.content);
+          });
         }
         if (head.cid) {
           this.parentCommit = head.cid;
