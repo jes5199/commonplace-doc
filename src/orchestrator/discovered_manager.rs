@@ -20,6 +20,15 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
+/// URL-encode a path for use in `/files/*` endpoints.
+/// Each path segment is encoded individually to preserve the `/` separators.
+fn encode_url_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// State of a managed discovered process.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DiscoveredProcessState {
@@ -293,7 +302,9 @@ impl DiscoveredProcessManager {
             }
 
             // Construct the script URL: http://{server}/files/{dir}/{script}
-            let script_url = format!("{}/files/{}/{}", server, document_path, script);
+            // URL-encode the path segments to handle spaces and special characters
+            let full_path = format!("{}/{}", document_path, script);
+            let script_url = format!("{}/files/{}", server, encode_url_path(&full_path));
 
             // Generate a unique client ID for this process instance
             let client_id = format!("{}-{}", name, &uuid::Uuid::new_v4().to_string()[..8]);
