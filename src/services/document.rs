@@ -593,6 +593,9 @@ impl DocumentService {
             ContentType::Json | ContentType::JsonArray | ContentType::Jsonl
         );
 
+        // Check if this is an XML document (uses Y.XmlFragment)
+        let is_xml_type = matches!(doc.content_type, ContentType::Xml);
+
         // Determine parents and compute diff appropriately
         let (diff_result, parents) = if let Some(ref parent) = parent_cid {
             // Check if parent differs from current HEAD
@@ -636,8 +639,12 @@ impl DocumentService {
                     let base_state_b64 = b64::encode(&base_state_bytes);
                     let is_jsonl = doc.content_type == ContentType::Jsonl;
                     compute_json_diff(new_content, &old_content, Some(&base_state_b64), is_jsonl)?
+                } else if is_xml_type {
+                    // XML documents use Y.XmlFragment
+                    diff::compute_xml_diff_update(&old_content, new_content)
+                        .map_err(|e| ServiceError::Internal(e.to_string()))?
                 } else {
-                    // Text/XML documents use Y.Text - use character-level diff
+                    // Text documents use Y.Text - use character-level diff
                     diff::compute_diff_update_with_base(
                         &base_state_bytes,
                         &old_content,
@@ -676,8 +683,12 @@ impl DocumentService {
                         .map(|b| b64::encode(&b));
                     let is_jsonl = doc.content_type == ContentType::Jsonl;
                     compute_json_diff(new_content, &doc.content, base_state.as_deref(), is_jsonl)?
+                } else if is_xml_type {
+                    // XML documents use Y.XmlFragment
+                    diff::compute_xml_diff_update(&doc.content, new_content)
+                        .map_err(|e| ServiceError::Internal(e.to_string()))?
                 } else {
-                    // Text/XML: use server's actual Yjs state for proper CRDT merge
+                    // Text: use server's actual Yjs state for proper CRDT merge
                     let base_state = self.doc_store.get_yjs_state(id).await;
                     match base_state {
                         Some(state_bytes) => diff::compute_diff_update_with_base(
@@ -706,8 +717,12 @@ impl DocumentService {
                     .map(|b| b64::encode(&b));
                 let is_jsonl = doc.content_type == ContentType::Jsonl;
                 compute_json_diff(new_content, &doc.content, base_state.as_deref(), is_jsonl)?
+            } else if is_xml_type {
+                // XML documents use Y.XmlFragment
+                diff::compute_xml_diff_update(&doc.content, new_content)
+                    .map_err(|e| ServiceError::Internal(e.to_string()))?
             } else {
-                // Text/XML: use server's actual Yjs state for proper CRDT merge
+                // Text: use server's actual Yjs state for proper CRDT merge
                 let base_state = self.doc_store.get_yjs_state(id).await;
                 match base_state {
                     Some(state_bytes) => {

@@ -660,4 +660,38 @@ mod tests {
         assert_eq!(result.summary.chars_inserted, 0);
         assert_eq!(result.summary.chars_deleted, 0);
     }
+
+    #[test]
+    fn test_xml_diff_server_scenario() {
+        // This test simulates EXACTLY what the server does:
+        // 1. Server creates doc with empty XmlFragment (no children)
+        // 2. diff is computed against old content
+        // 3. Update is applied to server's doc
+
+        let old = r#"<?xml version="1.0" encoding="UTF-8"?><root/>"#;
+        let new = r#"<?xml version="1.0" encoding="UTF-8"?><root><filetree><file name="test.txt"/></filetree></root>"#;
+
+        // Step 1: Create server doc EXACTLY like DocumentStore does
+        // (empty XmlFragment, no XmlText added)
+        let server_doc = Doc::with_client_id(1);
+        let _server_fragment = server_doc.get_or_insert_xml_fragment(TEXT_ROOT_NAME);
+        // NOTE: Server does NOT add any XmlText - just creates empty XmlFragment
+
+        // Step 2: Compute diff update
+        let result = compute_xml_diff_update(old, new).unwrap();
+
+        // Step 3: Apply update to server doc
+        {
+            let update = yrs::Update::decode_v1(&result.update_bytes).unwrap();
+            let mut txn = server_doc.transact_mut();
+            txn.apply_update(update);
+        }
+
+        // Step 4: Read content back
+        let txn = server_doc.transact();
+        let fragment = txn.get_xml_fragment(TEXT_ROOT_NAME).unwrap();
+        let inner = fragment.get_string(&txn);
+
+        assert_eq!(inner, r#"<filetree><file name="test.txt"/></filetree>"#);
+    }
 }
