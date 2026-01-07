@@ -1,6 +1,51 @@
-import type { CommonplaceSDK, DocHandle, OutputHandle } from "./types.ts";
+import type { CommonplaceSDK, DocHandle, OutputHandle, ContentType, JsonValue, ParsedContent } from "./types.ts";
 import { connect, publish, subscribe } from "./mqtt.ts";
 import * as Y from "npm:yjs@13";
+
+// Detect content type from file extension
+function getContentType(path: string): ContentType {
+  const ext = path.split('.').pop()?.toLowerCase() || '';
+  switch (ext) {
+    case 'json':
+      return 'json';
+    case 'jsonl':
+      return 'jsonl';
+    default:
+      return 'text';
+  }
+}
+
+// Parse string content based on content type
+function parseContent(content: string, type: ContentType): JsonValue | JsonValue[] | string {
+  switch (type) {
+    case 'json':
+      return content.trim() ? JSON.parse(content) : null;
+    case 'jsonl':
+      return content.trim()
+        .split('\n')
+        .filter(line => line.trim())
+        .map(line => JSON.parse(line));
+    case 'text':
+    default:
+      return content;
+  }
+}
+
+// Serialize value to string based on content type
+function serializeContent(value: JsonValue | JsonValue[] | string, type: ContentType): string {
+  switch (type) {
+    case 'json':
+      return JSON.stringify(value, null, 2);
+    case 'jsonl':
+      if (!Array.isArray(value)) {
+        throw new Error('JSONL output requires an array');
+      }
+      return value.map(item => JSON.stringify(item)).join('\n') + (value.length > 0 ? '\n' : '');
+    case 'text':
+    default:
+      return String(value);
+  }
+}
 
 function sanitizePath(path: string): string {
   if (path.includes('#') || path.includes('+') || path.includes('\0')) {
@@ -21,14 +66,16 @@ const pendingDocHandles: DocHandleImpl[] = [];
 class DocHandleImpl implements DocHandle {
   private doc = new Y.Doc();
   private text = this.doc.getText("content");
-  private changeCallbacks: ((content: string) => void)[] = [];
+  private changeCallbacks: ((content: ParsedContent) => void)[] = [];
   private eventSubscriptions: { topic: string; handler: (t: string, p: Buffer) => void; activated: boolean }[] = [];
   private editsSubscribed = false;
   private needsSubscription = false;
   private initialFetched = false;
+  private contentType: ContentType;
 
   constructor(private path: string) {
     sanitizePath(path);
+    this.contentType = getContentType(path);
   }
 
   // Fetch initial state from server (separated from subscription activation)
@@ -65,9 +112,10 @@ class DocHandleImpl implements DocHandle {
           const update = Uint8Array.from(atob(msg.update), (c) => c.charCodeAt(0));
           Y.applyUpdate(this.doc, update);
 
-          const content = this.text.toString();
+          const raw = this.text.toString();
+          const parsed = parseContent(raw, this.contentType);
           for (const cb of this.changeCallbacks) {
-            cb(content);
+            cb(parsed);
           }
         } catch (e) {
           console.error(`[cp] Error applying edit for ${this.path}:`, e);
@@ -87,7 +135,7 @@ class DocHandleImpl implements DocHandle {
     await this.fetchInitialState();
   }
 
-  async get(): Promise<string> {
+  async get(): Promise<ParsedContent> {
     // get() waits for MQTT to be ready
     if (!mqttStarted) {
       throw new Error("MQTT not connected. Call cp.start() before using doc.get()");
@@ -98,10 +146,11 @@ class DocHandleImpl implements DocHandle {
     if (this.needsSubscription) {
       await this.activateSubscriptions();
     }
-    return this.text.toString();
+    const raw = this.text.toString();
+    return parseContent(raw, this.contentType);
   }
 
-  onChange(cb: (content: string) => void): void {
+  onChange(cb: (content: ParsedContent) => void): void {
     this.changeCallbacks.push(cb);
     this.needsSubscription = true;
     // If MQTT already started, activate immediately; otherwise queue for later
@@ -153,9 +202,11 @@ class OutputHandleImpl implements OutputHandle {
   private text = this.doc.getText("content");
   private parentCommit: string | null = null;
   private initialized = false;
+  private contentType: ContentType;
 
   constructor(private path: string) {
     if (path) sanitizePath(path);
+    this.contentType = path ? getContentType(path) : 'text';
   }
 
   // Fetch current state from server before first update
@@ -181,14 +232,18 @@ class OutputHandleImpl implements OutputHandle {
     }
   }
 
-  async get(): Promise<string> {
+  async get(): Promise<ParsedContent> {
     await this.ensureInitialized();
-    return this.text.toString();
+    const raw = this.text.toString();
+    return parseContent(raw, this.contentType);
   }
 
-  async set(content: string, opts?: { message?: string }): Promise<void> {
+  async set(value: ParsedContent, opts?: { message?: string }): Promise<void> {
     // Ensure we have current state before updating
     await this.ensureInitialized();
+
+    // Serialize value based on content type
+    const content = serializeContent(value, this.contentType);
 
     // Compute Yjs update
     const oldContent = this.text.toString();
