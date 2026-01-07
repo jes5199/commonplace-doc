@@ -258,10 +258,17 @@ impl DocumentStore {
 
         // Create update based on content type
         let update_bytes = match doc.content_type {
-            ContentType::Text | ContentType::Xml => {
-                // Use text diff for text-based content
+            ContentType::Text => {
+                // Use text diff for plain text content
                 use crate::diff;
                 let diff_result = diff::compute_diff_update(&doc.content, new_content)
+                    .map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
+                diff_result.update_bytes
+            }
+            ContentType::Xml => {
+                // Use XML diff for XmlFragment-based content
+                use crate::diff;
+                let diff_result = diff::compute_xml_diff_update(&doc.content, new_content)
                     .map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
                 diff_result.update_bytes
             }

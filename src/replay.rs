@@ -16,6 +16,19 @@ use yrs::{Doc, GetString, ReadTxn, Transact, Value};
 /// Text root name used in Yrs documents (must match DocumentNode)
 const TEXT_ROOT_NAME: &str = "content";
 
+/// XML document constants (must match DocumentStore)
+const XML_HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
+const XML_ROOT_START: &str = "<root>";
+const XML_ROOT_END: &str = "</root>";
+
+/// Wrap inner XML content with header and root tags
+fn wrap_xml_root(inner: &str) -> String {
+    if inner.is_empty() {
+        return format!("{}<root/>", XML_HEADER);
+    }
+    format!("{}{}{}{}", XML_HEADER, XML_ROOT_START, inner, XML_ROOT_END)
+}
+
 /// Error type for replay operations
 #[derive(Debug)]
 pub enum ReplayError {
@@ -113,9 +126,7 @@ impl<'a> CommitReplayer<'a> {
                 ydoc.get_or_insert_array(TEXT_ROOT_NAME);
             }
             ContentType::Xml => {
-                return Err(ReplayError::UnsupportedContentType(
-                    content_type.to_mime().to_string(),
-                ));
+                ydoc.get_or_insert_xml_fragment(TEXT_ROOT_NAME);
             }
         }
 
@@ -235,8 +246,11 @@ impl<'a> CommitReplayer<'a> {
                 }
             }
             ContentType::Xml => {
-                // Already returned error above
-                unreachable!()
+                let fragment = txn.get_xml_fragment(TEXT_ROOT_NAME).ok_or_else(|| {
+                    ReplayError::InvalidUpdate("XmlFragment not found".to_string())
+                })?;
+                let inner = fragment.get_string(&txn);
+                wrap_xml_root(&inner)
             }
         };
         let state_bytes = txn.encode_state_as_update_v1(&yrs::StateVector::default());
@@ -326,7 +340,7 @@ impl<'a> CommitReplayer<'a> {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
-    use yrs::{Text, TextRef};
+    use yrs::{Text, TextRef, XmlFragment, XmlTextPrelim};
 
     /// Helper to create a Yjs update that inserts text
     fn create_text_update(text: &str) -> String {
@@ -345,6 +359,20 @@ mod tests {
         let update = {
             let mut txn = doc.transact_mut();
             ytext.push(&mut txn, text);
+            txn.encode_update_v1()
+        };
+        b64::encode(&update)
+    }
+
+    /// Helper to create a Yjs update that inserts XML content (as XmlText in XmlFragment)
+    fn create_xml_update(inner_content: &str) -> String {
+        let doc = Doc::with_client_id(1);
+        let fragment = doc.get_or_insert_xml_fragment(TEXT_ROOT_NAME);
+        let update = {
+            let mut txn = doc.transact_mut();
+            if !inner_content.is_empty() {
+                fragment.push_back(&mut txn, XmlTextPrelim::new(inner_content));
+            }
             txn.encode_update_v1()
         };
         b64::encode(&update)
@@ -563,23 +591,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unsupported_content_type() {
+    async fn test_xml_content_type() {
         let temp_file = NamedTempFile::new().unwrap();
         let store = CommitStore::new(temp_file.path()).unwrap();
 
-        let c1 = Commit::new(vec![], create_text_update("{}"), "alice".to_string(), None);
+        let doc_id = "xml-doc";
+
+        // Create XML commit with inner content "<hello>world</hello>"
+        let update = create_xml_update("<hello>world</hello>");
+        let c1 = Commit::new(vec![], update, "alice".to_string(), None);
         let cid1 = store.store_commit(&c1).await.unwrap();
+        store.set_document_head(doc_id, &cid1).await.unwrap();
 
         let replayer = CommitReplayer::new(&store);
 
-        // XML content type should fail (JSON now supported)
-        let result = replayer
-            .get_content_at_commit("doc", &cid1, &ContentType::Xml)
-            .await;
+        // XML content type should now work
+        let content = replayer
+            .get_content_at_commit(doc_id, &cid1, &ContentType::Xml)
+            .await
+            .unwrap();
 
-        assert!(matches!(
-            result,
-            Err(ReplayError::UnsupportedContentType(_))
-        ));
+        // Should have XML header, root, and inner content
+        assert_eq!(
+            content,
+            r#"<?xml version="1.0" encoding="UTF-8"?><root><hello>world</hello></root>"#
+        );
+    }
+
+    #[tokio::test]
+    async fn test_xml_empty_content() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let store = CommitStore::new(temp_file.path()).unwrap();
+
+        let doc_id = "xml-empty";
+
+        // Create XML commit with empty content
+        let update = create_xml_update("");
+        let c1 = Commit::new(vec![], update, "alice".to_string(), None);
+        let cid1 = store.store_commit(&c1).await.unwrap();
+        store.set_document_head(doc_id, &cid1).await.unwrap();
+
+        let replayer = CommitReplayer::new(&store);
+
+        let content = replayer
+            .get_content_at_commit(doc_id, &cid1, &ContentType::Xml)
+            .await
+            .unwrap();
+
+        // Empty XML should have self-closing root
+        assert_eq!(content, r#"<?xml version="1.0" encoding="UTF-8"?><root/>"#);
     }
 }

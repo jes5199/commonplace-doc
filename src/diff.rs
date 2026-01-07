@@ -7,7 +7,7 @@
 use crate::b64;
 use similar::{ChangeTag, TextDiff};
 use yrs::updates::decoder::Decode;
-use yrs::{Doc, ReadTxn, Text, TextRef, Transact};
+use yrs::{Doc, ReadTxn, Text, TextRef, Transact, XmlFragment, XmlTextPrelim};
 
 /// Text root name used in Yrs documents (must match DocumentNode)
 const TEXT_ROOT_NAME: &str = "content";
@@ -168,6 +168,125 @@ pub fn compute_diff_update_with_base(
     };
 
     let update_b64 = b64::encode(&update_bytes);
+
+    Ok(DiffResult {
+        update_bytes,
+        update_b64,
+        operation_count,
+        summary,
+    })
+}
+
+/// Strip XML header and root wrapper to extract inner content.
+///
+/// Handles formats like:
+/// - `<?xml version="1.0" encoding="UTF-8"?><root>content</root>` -> `content`
+/// - `<?xml ...?><root/>` -> ``
+fn strip_xml_wrapper(xml: &str) -> &str {
+    // Strip XML declaration if present
+    let without_decl = if let Some(pos) = xml.find("?>") {
+        &xml[pos + 2..]
+    } else {
+        xml
+    };
+
+    // Strip root element
+    let trimmed = without_decl.trim();
+
+    // Handle self-closing root: <root/>
+    if trimmed == "<root/>" {
+        return "";
+    }
+
+    // Handle <root>...</root>
+    if let Some(start) = trimmed.find("<root>") {
+        let after_open = &trimmed[start + 6..];
+        if let Some(end) = after_open.rfind("</root>") {
+            return &after_open[..end];
+        }
+    }
+
+    // Fallback: return as-is if no root wrapper found
+    trimmed
+}
+
+/// Compute diff update for XML documents using XmlFragment.
+///
+/// This function handles XML content by:
+/// 1. Stripping the XML header and root wrapper to get inner content
+/// 2. Creating XmlFragment with XmlText for the inner content
+/// 3. Generating an update that replaces old content with new
+///
+/// # Arguments
+/// * `old_content` - The current XML document (with header and root)
+/// * `new_content` - The desired new XML document (with header and root)
+///
+/// # Returns
+/// A `DiffResult` containing the Yjs update for XmlFragment
+pub fn compute_xml_diff_update(
+    old_content: &str,
+    new_content: &str,
+) -> Result<DiffResult, DiffError> {
+    let old_inner = strip_xml_wrapper(old_content);
+    let new_inner = strip_xml_wrapper(new_content);
+
+    // Create base doc with old content (client ID 1)
+    let base_doc = Doc::with_client_id(1);
+    let base_fragment = base_doc.get_or_insert_xml_fragment(TEXT_ROOT_NAME);
+    {
+        let mut txn = base_doc.transact_mut();
+        if !old_inner.is_empty() {
+            base_fragment.push_back(&mut txn, XmlTextPrelim::new(old_inner));
+        }
+    }
+
+    // Create target doc (client ID 2) and sync to base state
+    let target_doc = Doc::with_client_id(2);
+    let target_fragment = target_doc.get_or_insert_xml_fragment(TEXT_ROOT_NAME);
+
+    // Sync target_doc to match base_doc state
+    let base_state = {
+        let txn = base_doc.transact();
+        txn.encode_state_as_update_v1(&yrs::StateVector::default())
+    };
+    {
+        let update = yrs::Update::decode_v1(&base_state)
+            .map_err(|e| DiffError::YrsOperationFailed(e.to_string()))?;
+        let mut txn = target_doc.transact_mut();
+        txn.apply_update(update);
+    }
+
+    // Compute summary from text diff (for statistics)
+    let diff = TextDiff::from_chars(old_inner, new_inner);
+    let mut summary = DiffSummary::default();
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => summary.unchanged_chars += change.value().len(),
+            ChangeTag::Delete => summary.chars_deleted += change.value().len(),
+            ChangeTag::Insert => summary.chars_inserted += change.value().len(),
+        }
+    }
+
+    // Apply XmlFragment operations: clear old content and add new
+    let update_bytes = {
+        let mut txn = target_doc.transact_mut();
+
+        // Remove all existing children
+        let len = target_fragment.len(&txn);
+        if len > 0 {
+            target_fragment.remove_range(&mut txn, 0, len);
+        }
+
+        // Add new content as XmlText
+        if !new_inner.is_empty() {
+            target_fragment.push_back(&mut txn, XmlTextPrelim::new(new_inner));
+        }
+
+        txn.encode_update_v1()
+    };
+
+    let update_b64 = b64::encode(&update_bytes);
+    let operation_count = if old_inner != new_inner { 1 } else { 0 };
 
     Ok(DiffResult {
         update_bytes,
@@ -468,5 +587,77 @@ mod tests {
         let txn = doc.transact();
         let final_text = text.get_string(&txn);
         assert_eq!(final_text, new);
+    }
+
+    // XML diff tests
+
+    #[test]
+    fn test_xml_strip_wrapper() {
+        assert_eq!(
+            strip_xml_wrapper(r#"<?xml version="1.0" encoding="UTF-8"?><root><hello/></root>"#),
+            "<hello/>"
+        );
+        assert_eq!(
+            strip_xml_wrapper(r#"<?xml version="1.0" encoding="UTF-8"?><root/>"#),
+            ""
+        );
+        assert_eq!(
+            strip_xml_wrapper(r#"<?xml version="1.0"?><root>content</root>"#),
+            "content"
+        );
+    }
+
+    #[test]
+    fn test_xml_diff_simple_change() {
+        let old = r#"<?xml version="1.0" encoding="UTF-8"?><root><hello>world</hello></root>"#;
+        let new = r#"<?xml version="1.0" encoding="UTF-8"?><root><hello>rust</hello></root>"#;
+
+        let result = compute_xml_diff_update(old, new).unwrap();
+        assert!(result.operation_count > 0);
+
+        // Verify the update applies correctly
+        let doc = Doc::with_client_id(1);
+        let fragment = doc.get_or_insert_xml_fragment(TEXT_ROOT_NAME);
+        {
+            let mut txn = doc.transact_mut();
+            fragment.push_back(&mut txn, XmlTextPrelim::new("<hello>world</hello>"));
+        }
+        {
+            let update = yrs::Update::decode_v1(&result.update_bytes).unwrap();
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update);
+        }
+        let txn = doc.transact();
+        assert_eq!(fragment.get_string(&txn), "<hello>rust</hello>");
+    }
+
+    #[test]
+    fn test_xml_diff_empty_to_content() {
+        let old = r#"<?xml version="1.0" encoding="UTF-8"?><root/>"#;
+        let new = r#"<?xml version="1.0" encoding="UTF-8"?><root><data>test</data></root>"#;
+
+        let result = compute_xml_diff_update(old, new).unwrap();
+        assert!(result.operation_count > 0);
+        assert!(result.summary.chars_inserted > 0);
+    }
+
+    #[test]
+    fn test_xml_diff_content_to_empty() {
+        let old = r#"<?xml version="1.0" encoding="UTF-8"?><root><data>test</data></root>"#;
+        let new = r#"<?xml version="1.0" encoding="UTF-8"?><root/>"#;
+
+        let result = compute_xml_diff_update(old, new).unwrap();
+        assert!(result.operation_count > 0);
+        assert!(result.summary.chars_deleted > 0);
+    }
+
+    #[test]
+    fn test_xml_diff_no_change() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?><root><same/></root>"#;
+
+        let result = compute_xml_diff_update(xml, xml).unwrap();
+        assert_eq!(result.operation_count, 0);
+        assert_eq!(result.summary.chars_inserted, 0);
+        assert_eq!(result.summary.chars_deleted, 0);
     }
 }
