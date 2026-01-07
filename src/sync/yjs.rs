@@ -220,10 +220,15 @@ fn create_yjs_json_update_impl(
             }
             serde_json::Value::Array(items) => {
                 let array = txn.get_or_insert_array(TEXT_ROOT_NAME);
-                let len = array.len(&txn);
-                if len > 0 {
-                    array.remove_range(&mut txn, 0, len);
+
+                // For full replacement, clear existing items first
+                if !additive_only {
+                    let len = array.len(&txn);
+                    if len > 0 {
+                        array.remove_range(&mut txn, 0, len);
+                    }
                 }
+
                 for item in items {
                     let any_val = json_value_to_any(item);
                     array.push_back(&mut txn, any_val);
