@@ -84,9 +84,10 @@ struct DiscoveryResult {
     schema_node_ids: Vec<String>,
 }
 
-/// Mapping from script document UUID to the process name that uses it.
+/// Mapping from script document UUID to the process names that use it.
 /// Used to restart evaluate processes when their script changes.
-type ScriptWatchMap = HashMap<String, String>;
+/// Multiple processes can share the same script.
+type ScriptWatchMap = HashMap<String, Vec<String>>;
 
 impl DiscoveredProcessManager {
     /// Create a new discovered process manager.
@@ -909,7 +910,10 @@ impl DiscoveredProcessManager {
                             script_uuid,
                             name
                         );
-                        script_watches.insert(script_uuid, name.clone());
+                        script_watches
+                            .entry(script_uuid)
+                            .or_default()
+                            .push(name.clone());
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1417,19 +1421,20 @@ impl DiscoveredProcessManager {
                                                 // After reconciling, update script watches
                                                 // (processes may have been added/removed/changed)
                                                 script_watches = self.resolve_script_watches(client, fs_root_id).await;
-                                            } else if let Some(process_name) = script_watches.get(doc_id) {
-                                                // This is a script file change - restart the associated process
-                                                tracing::info!(
-                                                    "[discovery] Script {} changed, restarting process '{}'",
-                                                    doc_id,
-                                                    process_name
-                                                );
-                                                let process_name = process_name.clone();
-                                                if let Err(e) = self.restart_process(&process_name).await {
-                                                    tracing::error!(
-                                                        "[discovery] Failed to restart '{}' after script change: {}",
-                                                        process_name, e
+                                            } else if let Some(process_names) = script_watches.get(doc_id) {
+                                                // This is a script file change - restart all associated processes
+                                                for process_name in process_names.clone() {
+                                                    tracing::info!(
+                                                        "[discovery] Script {} changed, restarting process '{}'",
+                                                        doc_id,
+                                                        process_name
                                                     );
+                                                    if let Err(e) = self.restart_process(&process_name).await {
+                                                        tracing::error!(
+                                                            "[discovery] Failed to restart '{}' after script change: {}",
+                                                            process_name, e
+                                                        );
+                                                    }
                                                 }
                                             } else {
                                                 // It's a schema change - trigger re-discovery
