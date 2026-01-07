@@ -79,6 +79,63 @@ function readYjsContent(doc: Y.Doc, type: ContentType): string {
   }
 }
 
+// Write parsed content to Yjs doc based on content type
+// Uses the correct Yjs type (Text/Array/Map) for each content type
+// Note: For JSON, we dynamically choose Y.Map or Y.Array based on value type
+// (matches server behavior in yjs.rs create_yjs_json_update_impl)
+function writeYjsContent(doc: Y.Doc, type: ContentType, value: ParsedContent): void {
+  doc.transact(() => {
+    switch (type) {
+      case 'json': {
+        // JSON can be object or array at root - choose Yjs type dynamically
+        if (Array.isArray(value)) {
+          // Use Y.Array for array roots
+          const arr = doc.getArray("content");
+          if (arr.length > 0) {
+            arr.delete(0, arr.length);
+          }
+          for (const item of value) {
+            arr.push([item]);
+          }
+        } else if (value !== null && typeof value === 'object') {
+          // Use Y.Map for object roots
+          const map = doc.getMap("content");
+          for (const key of [...map.keys()]) {
+            map.delete(key);
+          }
+          for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+            map.set(k, v);
+          }
+        }
+        // Note: primitives (null, string, number, bool) at JSON root are not
+        // supported by Y.Map/Y.Array - server also rejects these
+        break;
+      }
+      case 'jsonl': {
+        const arr = doc.getArray("content");
+        // Clear existing items
+        if (arr.length > 0) {
+          arr.delete(0, arr.length);
+        }
+        // Add new items
+        if (Array.isArray(value)) {
+          for (const item of value) {
+            arr.push([item]);
+          }
+        }
+        break;
+      }
+      case 'text':
+      default: {
+        const text = doc.getText("content");
+        text.delete(0, text.length);
+        text.insert(0, String(value));
+        break;
+      }
+    }
+  });
+}
+
 function sanitizePath(path: string): string {
   if (path.includes('#') || path.includes('+') || path.includes('\0')) {
     throw new Error(`Invalid path contains MQTT wildcards: ${path}`);
@@ -241,7 +298,6 @@ class DocHandleImpl implements DocHandle {
 
 class OutputHandleImpl implements OutputHandle {
   private doc = new Y.Doc();
-  private text = this.doc.getText("content");
   private parentCommit: string | null = null;
   private initialized = false;
   private contentType: ContentType;
@@ -290,17 +346,8 @@ class OutputHandleImpl implements OutputHandle {
     // Ensure we have current state before updating
     await this.ensureInitialized();
 
-    // Serialize value based on content type
-    const content = serializeContent(value, this.contentType);
-
-    // Compute Yjs update
-    const oldContent = this.text.toString();
-    if (content !== oldContent) {
-      this.doc.transact(() => {
-        this.text.delete(0, this.text.length);
-        this.text.insert(0, content);
-      });
-    }
+    // Write value to Yjs doc using correct type (Map/Array/Text) based on content type
+    writeYjsContent(this.doc, this.contentType, value);
 
     const update = Y.encodeStateAsUpdate(this.doc);
     const updateB64 = btoa(String.fromCharCode(...update));
