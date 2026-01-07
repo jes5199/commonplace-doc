@@ -51,8 +51,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("No processes running");
         } else {
             // Print header
-            println!("{:<20} {:>8} {:<10} {:<40}", "NAME", "PID", "STATE", "CWD");
-            println!("{}", "-".repeat(80));
+            println!(
+                "{:<25} {:>8} {:<10} {:<20} {}",
+                "NAME", "PID", "STATE", "SOURCE", "CWD"
+            );
+            println!("{}", "-".repeat(100));
 
             for proc in &status.processes {
                 // Check if the PID is still running
@@ -67,6 +70,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ("-".to_string(), proc.state.clone())
                 };
 
+                // Source: where this process is defined
+                // - Discovered processes have source_path (e.g., "/beads")
+                // - Base processes (from commonplace.json) have None
+                let source = proc
+                    .source_path
+                    .clone()
+                    .unwrap_or_else(|| "commonplace.json".to_string());
+
                 // Look up CWD dynamically to find sandbox directories
                 // This finds the deepest child's CWD for sandbox processes
                 let cwd = proc
@@ -75,8 +86,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .or_else(|| proc.cwd.clone())
                     .unwrap_or_else(|| "-".to_string());
                 println!(
-                    "{:<20} {:>8} {:<10} {}",
-                    proc.name, pid_str, state_display, cwd
+                    "{:<25} {:>8} {:<10} {:<20} {}",
+                    proc.name, pid_str, state_display, source, cwd
                 );
             }
         }
