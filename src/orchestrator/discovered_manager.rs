@@ -1336,7 +1336,7 @@ impl DiscoveredProcessManager {
                                     .filter(|id| !new_ids.contains(*id))
                                     .cloned()
                                     .collect();
-                                let had_removed_pj = !removed_pj.is_empty();
+                                let _had_removed_pj = !removed_pj.is_empty();
                                 for node_id in removed_pj {
                                     if let Some(base_path) = watched.remove(&node_id) {
                                         tracing::info!("[discovery] __processes.json removed at {}", base_path);
@@ -1365,16 +1365,12 @@ impl DiscoveredProcessManager {
                                     current_schema_ids = new_schema_ids;
                                 }
 
-                                // Update script watches if processes changed
-                                // Always rebuild and compare actual content (not just length)
-                                // to catch renames/swaps that keep the same count
-                                let mut scripts_changed = false;
-                                if added_new_pj || had_removed_pj {
-                                    let new_script_watches = self.resolve_script_watches(client, fs_root_id).await;
-                                    // Compare actual map content, not just length
-                                    scripts_changed = new_script_watches != script_watches;
-                                    script_watches = new_script_watches;
-                                }
+                                // Update script watches - always rebuild to catch any changes
+                                // (not just when files are added/removed, but also when existing
+                                // __processes.json files are edited to add/change evaluate entries)
+                                let new_script_watches = self.resolve_script_watches(client, fs_root_id).await;
+                                let scripts_changed = new_script_watches != script_watches;
+                                script_watches = new_script_watches;
 
                                 // Reconnect SSE if schemas changed, new __processes.json added, or scripts changed
                                 // (URL is rebuilt on each loop iteration with current watch set)
