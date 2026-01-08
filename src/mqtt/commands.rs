@@ -88,7 +88,7 @@ impl CommandsHandler {
     /// Handle an incoming command on a path-specific topic.
     ///
     /// Note: Path-specific commands are not currently implemented.
-    /// Use store-level commands like `$store/commands/create-document` instead.
+    /// Use store-level commands like `{workspace}/commands/create-document` instead.
     pub async fn handle_command(&self, topic: &Topic, payload: &[u8]) -> Result<(), MqttError> {
         let verb = topic.qualifier.as_deref().ok_or_else(|| {
             MqttError::InvalidTopic("Command topic missing verb qualifier".to_string())
@@ -112,7 +112,7 @@ impl CommandsHandler {
     }
 
     /// Handle create-document command.
-    /// Topic: $store/commands/create-document
+    /// Topic: {workspace}/commands/create-document
     pub async fn handle_create_document(&self, payload: &[u8]) -> Result<(), MqttError> {
         let request: CreateDocumentRequest = serde_json::from_slice(payload)
             .map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
