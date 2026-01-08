@@ -31,6 +31,7 @@ pub struct ProcessManager {
     processes: HashMap<String, ManagedProcess>,
     mqtt_broker_override: Option<String>,
     disabled: Vec<String>,
+    workspace: String,
 }
 
 impl ProcessManager {
@@ -39,6 +40,7 @@ impl ProcessManager {
         mqtt_broker_override: Option<String>,
         disabled: Vec<String>,
     ) -> Self {
+        let workspace = config.workspace.clone();
         let processes = config
             .processes
             .iter()
@@ -61,6 +63,7 @@ impl ProcessManager {
             processes,
             mqtt_broker_override,
             disabled,
+            workspace,
         }
     }
 
@@ -115,8 +118,9 @@ impl ProcessManager {
             return Ok(());
         }
 
-        // Clone the broker string before getting mutable reference to process
+        // Clone values before getting mutable reference to process
         let mqtt_broker = self.mqtt_broker().to_string();
+        let workspace = self.workspace.clone();
 
         let process = self
             .processes
@@ -133,6 +137,9 @@ impl ProcessManager {
         if let Some(ref cwd) = config.cwd {
             cmd.current_dir(cwd);
         }
+
+        // Set MQTT_WORKSPACE environment variable for child processes
+        cmd.env("MQTT_WORKSPACE", &workspace);
 
         // Add mqtt-broker arg if the process likely needs it
         if config.command.contains("commonplace") {
@@ -513,7 +520,8 @@ impl ProcessManager {
             self.processes.remove(name);
         }
 
-        // Update config
+        // Update config and workspace
+        self.workspace = new_config.workspace.clone();
         self.config = new_config;
 
         // Update config for unchanged processes (fields other than command/args/cwd may have changed)
