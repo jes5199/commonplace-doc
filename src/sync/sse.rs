@@ -3,23 +3,268 @@
 //! This module handles SSE connections to the server, processing incoming
 //! edit events and managing reconnection logic.
 
+#[cfg(unix)]
+use crate::sync::{
+    ancestry::all_are_ancestors,
+    flock::{try_flock_exclusive, FlockResult},
+    flock_state::PathState,
+};
 use crate::sync::{
     build_head_url, build_sse_url, detect_from_path, is_binary_content, looks_like_base64_binary,
-    EditEventData, HeadResponse, PendingWrite, SyncState,
+    process_pending_inbound_after_confirm, EditEventData, FlockSyncState, HeadResponse,
+    PendingWrite, SyncState,
 };
+use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::Client;
 use reqwest::StatusCode;
 use reqwest_eventsource::{Error as SseError, Event as SseEvent, EventSource};
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 /// Timeout for pending write barrier (30 seconds)
 pub const PENDING_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Error type for inbound write operations
+#[derive(Debug, Error)]
+pub enum InboundWriteError {
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
+
+    #[error("HTTP error checking ancestry: {0}")]
+    Http(#[from] reqwest::Error),
+}
+
+/// Result of an inbound write attempt
+#[derive(Debug)]
+pub enum InboundWriteResult {
+    /// Write succeeded
+    Written,
+    /// Write was queued because pending outbound commits aren't in server state yet
+    Queued,
+    /// Write was skipped (e.g., file doesn't exist and we're checking ancestry)
+    Skipped,
+}
+
+/// Write an inbound update with flock and ancestry checking.
+///
+/// This function coordinates inbound writes from the server with:
+/// 1. **Ancestry checking**: If there are pending outbound commits, verifies they
+///    are ancestors of the incoming commit before writing. If not, queues the
+///    write for later to avoid overwriting local edits with stale server state.
+/// 2. **Flock coordination**: Attempts to acquire an exclusive flock before
+///    writing to coordinate with agents that hold files open during editing.
+///    Proceeds anyway after timeout.
+///
+/// Returns:
+/// - `Ok(InboundWriteResult::Written)` - Content was written to disk
+/// - `Ok(InboundWriteResult::Queued)` - Content was queued (pending outbound not merged)
+/// - `Ok(InboundWriteResult::Skipped)` - Write was skipped (file doesn't exist for ancestry check)
+/// - `Err(_)` - IO or HTTP error occurred
+#[cfg(unix)]
+pub async fn write_inbound_with_checks(
+    path: &Path,
+    content: &Bytes,
+    commit_id: &str,
+    doc_id: Option<&Uuid>,
+    path_state: &mut PathState,
+    client: &Client,
+    server_url: &str,
+) -> Result<InboundWriteResult, InboundWriteError> {
+    // If file doesn't exist, just create it
+    if !path.exists() {
+        tokio::fs::write(path, content).await?;
+        tracing::debug!(?path, commit_id, "created new file from inbound update");
+        return Ok(InboundWriteResult::Written);
+    }
+
+    // Check ancestry if we have pending outbound commits and a doc_id
+    if path_state.has_pending_outbound() {
+        if let Some(doc_id) = doc_id {
+            let all_included = all_are_ancestors(
+                client,
+                server_url,
+                doc_id,
+                &path_state.pending_outbound,
+                commit_id,
+            )
+            .await?;
+
+            if !all_included {
+                // Queue for later - our edits aren't in this update yet
+                path_state.queue_inbound(content.clone(), commit_id.to_string());
+                tracing::debug!(
+                    ?path,
+                    commit_id,
+                    pending = ?path_state.pending_outbound,
+                    "queuing inbound - pending outbound not yet merged"
+                );
+                return Ok(InboundWriteResult::Queued);
+            }
+
+            // All pending outbound are ancestors - clear them
+            let confirmed: Vec<String> = path_state.pending_outbound.iter().cloned().collect();
+            path_state.confirm_outbound(&confirmed);
+            tracing::debug!(
+                ?path,
+                commit_id,
+                "cleared pending_outbound - all are ancestors of incoming commit"
+            );
+        } else {
+            // No doc_id available - can't check ancestry, queue to be safe
+            path_state.queue_inbound(content.clone(), commit_id.to_string());
+            tracing::debug!(
+                ?path,
+                commit_id,
+                "queuing inbound - no doc_id for ancestry check"
+            );
+            return Ok(InboundWriteResult::Queued);
+        }
+    }
+
+    // Try to acquire flock before writing
+    match try_flock_exclusive(path, None).await {
+        Ok(FlockResult::Acquired(_guard)) => {
+            // Lock acquired - write content
+            // Note: guard is held until end of this block
+            tokio::fs::write(path, content).await?;
+            tracing::debug!(?path, commit_id, "wrote inbound update with flock");
+        }
+        Ok(FlockResult::Timeout) => {
+            // Timeout - write anyway (agent's problem if they lose data)
+            tokio::fs::write(path, content).await?;
+            tracing::warn!(?path, commit_id, "wrote inbound update after flock timeout");
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // File was deleted between our exists check and flock attempt
+            // Just create it
+            tokio::fs::write(path, content).await?;
+            tracing::debug!(
+                ?path,
+                commit_id,
+                "file deleted during flock, created new file"
+            );
+        }
+        Err(e) => return Err(InboundWriteError::Io(e)),
+    }
+
+    Ok(InboundWriteResult::Written)
+}
+
+/// Write an inbound update using atomic write with shadow hardlink for inode tracking.
+///
+/// Like `write_inbound_with_checks` but uses `atomic_write_with_shadow` for the
+/// actual write, enabling detection of slow writers to old inodes.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+pub async fn write_inbound_with_checks_atomic(
+    path: &Path,
+    content: &Bytes,
+    commit_id: Option<String>,
+    doc_id: Option<&Uuid>,
+    path_state: &mut PathState,
+    client: &Client,
+    server_url: &str,
+    inode_tracker: &Arc<tokio::sync::RwLock<crate::sync::InodeTracker>>,
+) -> Result<InboundWriteResult, InboundWriteError> {
+    // If file doesn't exist, use atomic write to create it
+    if !path.exists() {
+        let path_buf = path.to_path_buf();
+        atomic_write_with_shadow(&path_buf, content, commit_id, inode_tracker).await?;
+        tracing::debug!(?path, "created new file from inbound update (atomic)");
+        return Ok(InboundWriteResult::Written);
+    }
+
+    // Check ancestry if we have pending outbound commits and a doc_id
+    if path_state.has_pending_outbound() {
+        if let Some(doc_id) = doc_id {
+            let cid = commit_id.as_deref().unwrap_or("");
+            let all_included = all_are_ancestors(
+                client,
+                server_url,
+                doc_id,
+                &path_state.pending_outbound,
+                cid,
+            )
+            .await?;
+
+            if !all_included {
+                // Queue for later - our edits aren't in this update yet
+                path_state.queue_inbound(content.clone(), cid.to_string());
+                tracing::debug!(
+                    ?path,
+                    commit_id = cid,
+                    pending = ?path_state.pending_outbound,
+                    "queuing inbound - pending outbound not yet merged"
+                );
+                return Ok(InboundWriteResult::Queued);
+            }
+
+            // All pending outbound are ancestors - clear them
+            let confirmed: Vec<String> = path_state.pending_outbound.iter().cloned().collect();
+            path_state.confirm_outbound(&confirmed);
+            tracing::debug!(
+                ?path,
+                commit_id = cid,
+                "cleared pending_outbound - all are ancestors of incoming commit"
+            );
+        } else {
+            // No doc_id available - can't check ancestry, queue to be safe
+            let cid = commit_id.as_deref().unwrap_or("").to_string();
+            path_state.queue_inbound(content.clone(), cid.clone());
+            tracing::debug!(
+                ?path,
+                commit_id = cid,
+                "queuing inbound - no doc_id for ancestry check"
+            );
+            return Ok(InboundWriteResult::Queued);
+        }
+    }
+
+    // Try to acquire flock before writing
+    let path_buf = path.to_path_buf();
+    match try_flock_exclusive(path, None).await {
+        Ok(FlockResult::Acquired(_guard)) => {
+            // Lock acquired - do atomic write
+            // Note: guard is held until end of this block
+            atomic_write_with_shadow(&path_buf, content, commit_id.clone(), inode_tracker).await?;
+            tracing::debug!(
+                ?path,
+                ?commit_id,
+                "wrote inbound update with flock (atomic)"
+            );
+        }
+        Ok(FlockResult::Timeout) => {
+            // Timeout - write anyway (agent's problem if they lose data)
+            atomic_write_with_shadow(&path_buf, content, commit_id.clone(), inode_tracker).await?;
+            tracing::warn!(
+                ?path,
+                ?commit_id,
+                "wrote inbound update after flock timeout (atomic)"
+            );
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // File was deleted between our exists check and flock attempt
+            // Just create it with atomic write
+            atomic_write_with_shadow(&path_buf, content, commit_id.clone(), inode_tracker).await?;
+            tracing::debug!(
+                ?path,
+                ?commit_id,
+                "file deleted during flock, created new file (atomic)"
+            );
+        }
+        Err(e) => return Err(InboundWriteError::Io(e)),
+    }
+
+    Ok(InboundWriteResult::Written)
+}
 
 /// Task that subscribes to SSE and handles server changes for a single file.
 ///
@@ -112,6 +357,273 @@ pub async fn sse_task(
         debug!("SSE connection closed, reconnecting in 5s...");
         sleep(Duration::from_secs(5)).await;
     }
+}
+
+/// Task that subscribes to SSE and handles server changes with flock-aware tracking.
+///
+/// This is an enhanced version of `sse_task` that uses `FlockSyncState` for tracking
+/// pending outbound commits. When an edit event arrives, it verifies that any pending
+/// uploads are ancestors of the incoming commit before writing to the local file.
+///
+/// This prevents the race condition where:
+/// 1. Local edit is uploaded
+/// 2. SSE receives an older commit that doesn't include our upload
+/// 3. Writing that older commit would overwrite our local changes
+///
+/// The doc_id parameter is needed for ancestry checking via the server API.
+#[allow(clippy::too_many_arguments)]
+pub async fn sse_task_with_flock(
+    client: Client,
+    server: String,
+    identifier: String,
+    file_path: PathBuf,
+    state: Arc<RwLock<SyncState>>,
+    use_paths: bool,
+    flock_state: FlockSyncState,
+    doc_id: Option<Uuid>,
+) {
+    let sse_url = build_sse_url(&server, &identifier, use_paths);
+
+    'reconnect: loop {
+        info!("Connecting to SSE (flock-aware): {}", sse_url);
+
+        let request_builder = client.get(&sse_url);
+
+        let mut es = match EventSource::new(request_builder) {
+            Ok(es) => es,
+            Err(e) => {
+                error!("Failed to create EventSource: {}", e);
+                sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        while let Some(event) = es.next().await {
+            match event {
+                Ok(SseEvent::Open) => {
+                    info!("SSE connection opened");
+                }
+                Ok(SseEvent::Message(msg)) => {
+                    debug!("SSE event: {} - {}", msg.event, msg.data);
+
+                    match msg.event.as_str() {
+                        "connected" => {
+                            info!("SSE connected to node");
+                        }
+                        "edit" => {
+                            // Parse edit event
+                            match serde_json::from_str::<EditEventData>(&msg.data) {
+                                Ok(edit) => {
+                                    handle_server_edit_with_flock(
+                                        &client,
+                                        &server,
+                                        &identifier,
+                                        &file_path,
+                                        &state,
+                                        &edit,
+                                        use_paths,
+                                        &flock_state,
+                                        doc_id.as_ref(),
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    warn!("Failed to parse edit event: {}", e);
+                                }
+                            }
+                        }
+                        "closed" => {
+                            warn!("SSE: Target node shut down");
+                            break;
+                        }
+                        "warning" => {
+                            warn!("SSE warning: {}", msg.data);
+                        }
+                        _ => {
+                            debug!("Unknown SSE event type: {}", msg.event);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Handle 404 gracefully - document may not exist yet
+                    if let SseError::InvalidStatusCode(status, _) = &e {
+                        if *status == StatusCode::NOT_FOUND {
+                            debug!("SSE: Document not found (404), retrying in 1s...");
+                            sleep(Duration::from_secs(1)).await;
+                            continue 'reconnect;
+                        }
+                    }
+                    error!("SSE error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        debug!("SSE connection closed, reconnecting in 5s...");
+        sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// Handle a server edit event with flock-aware ancestry checking.
+///
+/// This is an enhanced version of `handle_server_edit` that checks pending
+/// outbound commits before writing. If our pending uploads aren't yet
+/// included in the server's response, the write is queued for later.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_server_edit_with_flock(
+    client: &Client,
+    server: &str,
+    identifier: &str,
+    file_path: &PathBuf,
+    state: &Arc<RwLock<SyncState>>,
+    _edit: &EditEventData,
+    use_paths: bool,
+    flock_state: &FlockSyncState,
+    doc_id: Option<&Uuid>,
+) {
+    // Detect if this file is binary
+    let content_info = detect_from_path(file_path);
+
+    // Fetch new content from server first
+    let head_url = build_head_url(server, identifier, use_paths);
+    let resp = match client.get(&head_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Failed to fetch HEAD: {}", e);
+            return;
+        }
+    };
+
+    if !resp.status().is_success() {
+        error!("Failed to fetch HEAD: {}", resp.status());
+        return;
+    }
+
+    let head: HeadResponse = match resp.json().await {
+        Ok(h) => h,
+        Err(e) => {
+            error!("Failed to parse HEAD response: {}", e);
+            return;
+        }
+    };
+
+    // Get commit_id from HEAD response
+    let commit_id = match &head.cid {
+        Some(cid) => cid.clone(),
+        None => {
+            // No commit yet - just write
+            debug!("No commit_id in HEAD response, writing directly");
+            handle_server_edit(
+                client, server, identifier, file_path, state, _edit, use_paths,
+            )
+            .await;
+            return;
+        }
+    };
+
+    // Check if we have pending outbound commits
+    if flock_state.has_pending_outbound(file_path).await {
+        let pending = flock_state.get_pending_outbound(file_path).await;
+
+        // Check ancestry if we have a doc_id
+        if let Some(doc_id) = doc_id {
+            match all_are_ancestors(client, server, doc_id, &pending, &commit_id).await {
+                Ok(true) => {
+                    // All pending are ancestors - confirm them
+                    let confirmed: Vec<String> = pending.iter().cloned().collect();
+                    flock_state.confirm_outbound(file_path, &confirmed).await;
+                    debug!(
+                        ?file_path,
+                        commit_id,
+                        "confirmed {} pending outbound commits",
+                        confirmed.len()
+                    );
+
+                    // Check for any queued inbound write and process it if present
+                    if let Some((_content, _cid)) =
+                        process_pending_inbound_after_confirm(flock_state, file_path).await
+                    {
+                        debug!(?file_path, "processing previously queued inbound write");
+                    }
+                }
+                Ok(false) => {
+                    // Not all ancestors - queue the write
+                    use base64::{engine::general_purpose::STANDARD, Engine};
+                    let content_bytes = if content_info.is_binary {
+                        match STANDARD.decode(&head.content) {
+                            Ok(decoded) => decoded,
+                            Err(_) => head.content.as_bytes().to_vec(),
+                        }
+                    } else if looks_like_base64_binary(&head.content) {
+                        match STANDARD.decode(&head.content) {
+                            Ok(decoded) if is_binary_content(&decoded) => decoded,
+                            _ => head.content.as_bytes().to_vec(),
+                        }
+                    } else {
+                        head.content.as_bytes().to_vec()
+                    };
+
+                    flock_state
+                        .queue_inbound(file_path, Bytes::from(content_bytes), commit_id.clone())
+                        .await;
+                    info!(
+                        ?file_path,
+                        commit_id,
+                        pending_count = pending.len(),
+                        "queued inbound write - pending outbound not yet merged"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    // Ancestry check failed - queue to be safe
+                    warn!(
+                        ?file_path,
+                        commit_id, "ancestry check failed, queuing write: {}", e
+                    );
+                    use base64::{engine::general_purpose::STANDARD, Engine};
+                    let content_bytes = if content_info.is_binary {
+                        match STANDARD.decode(&head.content) {
+                            Ok(decoded) => decoded,
+                            Err(_) => head.content.as_bytes().to_vec(),
+                        }
+                    } else {
+                        head.content.as_bytes().to_vec()
+                    };
+
+                    flock_state
+                        .queue_inbound(file_path, Bytes::from(content_bytes), commit_id)
+                        .await;
+                    return;
+                }
+            }
+        } else {
+            // No doc_id - can't check ancestry, queue to be safe
+            debug!(
+                ?file_path,
+                "no doc_id for ancestry check, queuing inbound write"
+            );
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            let content_bytes = if content_info.is_binary {
+                match STANDARD.decode(&head.content) {
+                    Ok(decoded) => decoded,
+                    Err(_) => head.content.as_bytes().to_vec(),
+                }
+            } else {
+                head.content.as_bytes().to_vec()
+            };
+
+            flock_state
+                .queue_inbound(file_path, Bytes::from(content_bytes), commit_id)
+                .await;
+            return;
+        }
+    }
+
+    // No pending outbound or all confirmed - proceed with normal write
+    handle_server_edit(
+        client, server, identifier, file_path, state, _edit, use_paths,
+    )
+    .await;
 }
 
 /// Refresh local file from server HEAD if needed.
@@ -907,4 +1419,123 @@ pub async fn atomic_write_with_shadow(
     }
 
     Ok(new_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::flock_state::PathState;
+    use bytes::Bytes;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn test_write_inbound_creates_new_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("new_file.txt");
+        let content = Bytes::from("hello world");
+        let mut path_state = PathState::new(0);
+        let client = Client::new();
+
+        let result = write_inbound_with_checks(
+            &file_path,
+            &content,
+            "commit123",
+            None,
+            &mut path_state,
+            &client,
+            "http://localhost:3000",
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, InboundWriteResult::Written));
+        assert!(file_path.exists());
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_write_inbound_overwrites_existing_file() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(b"old content").unwrap();
+
+        let content = Bytes::from("new content");
+        let mut path_state = PathState::new(0);
+        let client = Client::new();
+
+        let result = write_inbound_with_checks(
+            temp_file.path(),
+            &content,
+            "commit123",
+            None,
+            &mut path_state,
+            &client,
+            "http://localhost:3000",
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, InboundWriteResult::Written));
+        assert_eq!(
+            std::fs::read_to_string(temp_file.path()).unwrap(),
+            "new content"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_inbound_queues_when_pending_outbound_no_doc_id() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(b"content").unwrap();
+
+        let content = Bytes::from("new content");
+        let mut path_state = PathState::new(0);
+        // Add pending outbound commit
+        path_state.add_pending_outbound("pending_cid".to_string());
+        let client = Client::new();
+
+        // Without doc_id, should queue
+        let result = write_inbound_with_checks(
+            temp_file.path(),
+            &content,
+            "commit123",
+            None,
+            &mut path_state,
+            &client,
+            "http://localhost:3000",
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, InboundWriteResult::Queued));
+        // Original content should be preserved
+        assert_eq!(
+            std::fs::read_to_string(temp_file.path()).unwrap(),
+            "content"
+        );
+        // Should have queued inbound
+        assert!(path_state.pending_inbound.is_some());
+        assert_eq!(
+            path_state.pending_inbound.as_ref().unwrap().commit_id,
+            "commit123"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inbound_write_error_display() {
+        let io_err =
+            InboundWriteError::Io(io::Error::new(io::ErrorKind::NotFound, "file not found"));
+        assert!(io_err.to_string().contains("IO error"));
+    }
+
+    #[tokio::test]
+    async fn test_inbound_write_result_variants() {
+        // Just verify the enum variants exist and can be pattern matched
+        let written = InboundWriteResult::Written;
+        let queued = InboundWriteResult::Queued;
+        let skipped = InboundWriteResult::Skipped;
+
+        assert!(matches!(written, InboundWriteResult::Written));
+        assert!(matches!(queued, InboundWriteResult::Queued));
+        assert!(matches!(skipped, InboundWriteResult::Skipped));
+    }
 }

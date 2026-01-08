@@ -9,9 +9,9 @@ use crate::sync::uuid_map::fetch_node_id_from_schema;
 use crate::sync::{
     build_edit_url, build_head_url, build_replace_url, create_yjs_text_update, detect_from_path,
     encode_node_id, file_watcher_task, is_binary_content, looks_like_base64_binary,
-    push_json_content, push_jsonl_content, push_schema_to_server, refresh_from_head, sse_task,
-    EditRequest, EditResponse, FileEvent, HeadResponse, ReplaceResponse, SyncState,
-    PENDING_WRITE_TIMEOUT,
+    push_json_content, push_jsonl_content, push_schema_to_server, record_upload_result,
+    refresh_from_head, sse_task, EditRequest, EditResponse, FileEvent, FlockSyncState,
+    HeadResponse, ReplaceResponse, SyncState, PENDING_WRITE_TIMEOUT,
 };
 use reqwest::Client;
 use std::path::{Path, PathBuf};
@@ -483,6 +483,411 @@ pub async fn upload_task(
     }
 }
 
+/// Task that handles file changes and uploads to server with flock-aware tracking.
+///
+/// This is an enhanced version of `upload_task` that tracks pending outbound commits
+/// for flock-aware synchronization. After each successful upload, the commit_id is
+/// recorded in the FlockSyncState so that SSE can verify ancestry before writing
+/// inbound updates.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_task_with_flock(
+    client: Client,
+    server: String,
+    identifier: String,
+    file_path: PathBuf,
+    state: Arc<RwLock<SyncState>>,
+    mut rx: mpsc::Receiver<FileEvent>,
+    use_paths: bool,
+    force_push: bool,
+    flock_state: FlockSyncState,
+) {
+    while let Some(event) = rx.recv().await {
+        // Extract captured content from the event
+        let FileEvent::Modified(raw_content) = event;
+
+        // Detect if file is binary and convert accordingly
+        let content_info = detect_from_path(&file_path);
+        let is_binary = content_info.is_binary || is_binary_content(&raw_content);
+        let is_json = !is_binary && content_info.mime_type == "application/json";
+        let is_jsonl = !is_binary && content_info.mime_type == "application/x-ndjson";
+
+        let mut content = if is_binary {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            STANDARD.encode(&raw_content)
+        } else {
+            String::from_utf8_lossy(&raw_content).to_string()
+        };
+
+        // Check for pending write barrier and handle echo detection
+        let mut echo_detected = false;
+        let mut should_refresh = false;
+
+        {
+            let mut s = state.write().await;
+
+            if let Some(pending) = s.pending_write.take() {
+                if pending.started_at.elapsed() > PENDING_WRITE_TIMEOUT {
+                    warn!(
+                        "Pending write timed out (id={}), clearing barrier",
+                        pending.write_id
+                    );
+                    if content == pending.content {
+                        debug!(
+                            "Timed-out pending matches current content, treating as delayed echo"
+                        );
+                        s.last_written_cid = pending.cid;
+                        s.last_written_content = pending.content;
+                        should_refresh = s.needs_head_refresh;
+                        s.needs_head_refresh = false;
+                        echo_detected = true;
+                    } else {
+                        debug!(
+                            "Timed-out pending differs from current content, uploading as user edit"
+                        );
+                    }
+                } else if content == pending.content {
+                    debug!(
+                        "Echo detected: content matches pending write (id={})",
+                        pending.write_id
+                    );
+                    s.last_written_cid = pending.cid;
+                    s.last_written_content = pending.content;
+                    should_refresh = s.needs_head_refresh;
+                    s.needs_head_refresh = false;
+                    echo_detected = true;
+                } else {
+                    let pending_content = pending.content.clone();
+                    let pending_cid = pending.cid.clone();
+                    let pending_write_id = pending.write_id;
+
+                    s.pending_write = Some(pending);
+                    drop(s);
+
+                    let mut is_echo = false;
+                    for i in 0..BARRIER_RETRY_COUNT {
+                        sleep(BARRIER_RETRY_DELAY).await;
+
+                        let raw = match tokio::fs::read(&file_path).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                error!("Failed to re-read file during retry: {}", e);
+                                break;
+                            }
+                        };
+
+                        let reread = if is_binary {
+                            use base64::{engine::general_purpose::STANDARD, Engine};
+                            STANDARD.encode(&raw)
+                        } else {
+                            String::from_utf8_lossy(&raw).to_string()
+                        };
+
+                        if reread == pending_content {
+                            debug!(
+                                "Retry {}: content now matches pending write (id={})",
+                                i + 1,
+                                pending_write_id
+                            );
+                            content = reread;
+                            is_echo = true;
+                            break;
+                        }
+
+                        if reread != content {
+                            debug!("Retry {}: content still changing", i + 1);
+                            content = reread;
+                        }
+                    }
+
+                    let mut s = state.write().await;
+
+                    if is_echo {
+                        debug!("Echo confirmed after retries (id={})", pending_write_id);
+                        s.last_written_cid = pending_cid;
+                        s.last_written_content = content.clone();
+                        s.pending_write = None;
+                        should_refresh = s.needs_head_refresh;
+                        s.needs_head_refresh = false;
+                        echo_detected = true;
+                    } else {
+                        info!(
+                            "User edit detected during server write (id={})",
+                            pending_write_id
+                        );
+                        s.pending_write = None;
+                        should_refresh = s.needs_head_refresh;
+                        s.needs_head_refresh = false;
+                    }
+                }
+            } else {
+                should_refresh = s.needs_head_refresh;
+                s.needs_head_refresh = false;
+
+                if content == s.last_written_content {
+                    debug!("Ignoring echo: content matches last written");
+                    echo_detected = true;
+                }
+            }
+        }
+
+        if echo_detected {
+            if should_refresh {
+                let refresh_succeeded =
+                    refresh_from_head(&client, &server, &identifier, &file_path, &state, use_paths)
+                        .await;
+                if !refresh_succeeded {
+                    let mut s = state.write().await;
+                    s.needs_head_refresh = true;
+                }
+            }
+            continue;
+        }
+
+        // Handle JSON/JSONL files separately
+        if is_json {
+            let json_upload_succeeded =
+                push_json_content(&client, &server, &identifier, &content, &state, use_paths)
+                    .await
+                    .is_ok();
+            if json_upload_succeeded {
+                // Record successful upload in flock state
+                // Note: push_json_content updates state.last_written_cid
+                let cid = state.read().await.last_written_cid.clone();
+                if let Some(cid) = cid {
+                    record_upload_result(Some(&flock_state), &file_path, &cid).await;
+                }
+            } else {
+                error!("JSON upload failed");
+            }
+            if should_refresh {
+                if json_upload_succeeded {
+                    let refresh_succeeded = refresh_from_head(
+                        &client,
+                        &server,
+                        &identifier,
+                        &file_path,
+                        &state,
+                        use_paths,
+                    )
+                    .await;
+                    if !refresh_succeeded {
+                        let mut s = state.write().await;
+                        s.needs_head_refresh = true;
+                    }
+                } else {
+                    let mut s = state.write().await;
+                    s.needs_head_refresh = true;
+                }
+            }
+            continue;
+        }
+
+        if is_jsonl {
+            let jsonl_upload_succeeded =
+                push_jsonl_content(&client, &server, &identifier, &content, &state, use_paths)
+                    .await
+                    .is_ok();
+            if jsonl_upload_succeeded {
+                // Record successful upload in flock state
+                let cid = state.read().await.last_written_cid.clone();
+                if let Some(cid) = cid {
+                    record_upload_result(Some(&flock_state), &file_path, &cid).await;
+                }
+            } else {
+                error!("JSONL upload failed");
+            }
+            if should_refresh {
+                if jsonl_upload_succeeded {
+                    let refresh_succeeded = refresh_from_head(
+                        &client,
+                        &server,
+                        &identifier,
+                        &file_path,
+                        &state,
+                        use_paths,
+                    )
+                    .await;
+                    if !refresh_succeeded {
+                        let mut s = state.write().await;
+                        s.needs_head_refresh = true;
+                    }
+                } else {
+                    let mut s = state.write().await;
+                    s.needs_head_refresh = true;
+                }
+            }
+            continue;
+        }
+
+        // Get parent CID for text file upload
+        let parent_cid = if force_push {
+            let head_url = build_head_url(&server, &identifier, use_paths);
+            match client.get(&head_url).send().await {
+                Ok(resp) if resp.status().is_success() => match resp.json::<HeadResponse>().await {
+                    Ok(head) => head.cid,
+                    Err(e) => {
+                        error!("Force-push: failed to parse HEAD response: {}", e);
+                        continue;
+                    }
+                },
+                Ok(resp) => {
+                    error!("Force-push: HEAD request failed with {}", resp.status());
+                    continue;
+                }
+                Err(e) => {
+                    error!("Force-push: HEAD request failed: {}", e);
+                    continue;
+                }
+            }
+        } else {
+            let s = state.read().await;
+            s.last_written_cid.clone()
+        };
+
+        let mut upload_succeeded = false;
+
+        match parent_cid {
+            Some(parent) => {
+                let replace_url = build_replace_url(&server, &identifier, &parent, use_paths);
+
+                match client
+                    .post(&replace_url)
+                    .header("content-type", "text/plain")
+                    .body(content.clone())
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        if resp.status().is_success() {
+                            match resp.json::<ReplaceResponse>().await {
+                                Ok(result) => {
+                                    info!(
+                                        "Uploaded: {} chars inserted, {} deleted (cid: {})",
+                                        result.summary.chars_inserted,
+                                        result.summary.chars_deleted,
+                                        &result.cid[..8.min(result.cid.len())]
+                                    );
+
+                                    let cid = result.cid.clone();
+                                    let file_bytes = tokio::fs::read(&file_path).await.ok();
+                                    let content_hash = file_bytes
+                                        .as_ref()
+                                        .map(|b| compute_content_hash(b))
+                                        .unwrap_or_default();
+                                    let file_name = file_path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "file".to_string());
+
+                                    let mut s = state.write().await;
+                                    s.last_written_cid = Some(result.cid);
+                                    s.last_written_content = content;
+                                    s.mark_synced(&cid, &content_hash, &file_name).await;
+                                    upload_succeeded = true;
+
+                                    // Record successful upload in flock state
+                                    record_upload_result(Some(&flock_state), &file_path, &cid)
+                                        .await;
+                                }
+                                Err(e) => {
+                                    error!("Failed to parse replace response: {}", e);
+                                }
+                            }
+                        } else {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            error!("Upload failed: {} - {}", status, body);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Upload request failed: {}", e);
+                    }
+                }
+            }
+            None => {
+                info!("Creating initial commit...");
+                let update = create_yjs_text_update(&content);
+                let edit_url = build_edit_url(&server, &identifier, use_paths);
+                let edit_req = EditRequest {
+                    update,
+                    author: Some("sync-client".to_string()),
+                    message: Some("Initial sync".to_string()),
+                };
+
+                match client.post(&edit_url).json(&edit_req).send().await {
+                    Ok(resp) => {
+                        if resp.status().is_success() {
+                            match resp.json::<EditResponse>().await {
+                                Ok(result) => {
+                                    info!(
+                                        "Created initial commit: {} bytes (cid: {})",
+                                        content.len(),
+                                        &result.cid[..8.min(result.cid.len())]
+                                    );
+
+                                    let cid = result.cid.clone();
+                                    let file_bytes = tokio::fs::read(&file_path).await.ok();
+                                    let content_hash = file_bytes
+                                        .as_ref()
+                                        .map(|b| compute_content_hash(b))
+                                        .unwrap_or_default();
+                                    let file_name = file_path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "file".to_string());
+
+                                    let mut s = state.write().await;
+                                    s.last_written_cid = Some(result.cid);
+                                    s.last_written_content = content;
+                                    s.mark_synced(&cid, &content_hash, &file_name).await;
+                                    upload_succeeded = true;
+
+                                    // Record successful upload in flock state
+                                    record_upload_result(Some(&flock_state), &file_path, &cid)
+                                        .await;
+                                }
+                                Err(e) => {
+                                    error!("Failed to parse edit response: {}", e);
+                                }
+                            }
+                        } else {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            error!("Initial commit failed: {} - {}", status, body);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Initial commit request failed: {}", e);
+                    }
+                }
+            }
+        }
+
+        // After successful upload, refresh from HEAD if needed
+        let needs_refresh = {
+            let mut s = state.write().await;
+            let needs = should_refresh || s.needs_head_refresh;
+            s.needs_head_refresh = false;
+            needs
+        };
+
+        if needs_refresh {
+            if upload_succeeded {
+                let refresh_succeeded =
+                    refresh_from_head(&client, &server, &identifier, &file_path, &state, use_paths)
+                        .await;
+                if !refresh_succeeded {
+                    let mut s = state.write().await;
+                    s.needs_head_refresh = true;
+                }
+            } else {
+                let mut s = state.write().await;
+                s.needs_head_refresh = true;
+            }
+        }
+    }
+}
+
 /// Perform initial sync: fetch HEAD and write to local file
 pub async fn initial_sync(
     client: &Client,
@@ -913,6 +1318,75 @@ pub fn spawn_file_sync_tasks(
         #[cfg(not(unix))]
         handles.push(tokio::spawn(sse_task(
             client, server, identifier, file_path, state, use_paths,
+        )));
+    }
+
+    handles
+}
+
+/// Spawn sync tasks (watcher, upload, SSE) for a single file with flock-aware tracking.
+///
+/// This is an enhanced version of `spawn_file_sync_tasks` that includes FlockSyncState
+/// for tracking pending outbound commits. This enables flock-aware synchronization
+/// where SSE can verify that pending uploads are included in server responses before
+/// writing inbound updates.
+///
+/// - push_only: Skip SSE subscription (only push local changes)
+/// - pull_only: Skip file watcher (only pull server changes)
+/// - force_push: Always fetch HEAD before upload to ensure local replaces server
+/// - flock_state: Shared state for tracking pending outbound commits
+/// - doc_id: Optional UUID for the document (needed for ancestry checking)
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_file_sync_tasks_with_flock(
+    client: Client,
+    server: String,
+    identifier: String,
+    file_path: PathBuf,
+    state: Arc<RwLock<SyncState>>,
+    use_paths: bool,
+    push_only: bool,
+    pull_only: bool,
+    force_push: bool,
+    flock_state: FlockSyncState,
+    doc_id: Option<uuid::Uuid>,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+) -> Vec<JoinHandle<()>> {
+    let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
+    let mut handles = Vec::new();
+
+    // File watcher and flock-aware upload tasks (skip if pull-only)
+    if !pull_only {
+        handles.push(tokio::spawn(file_watcher_task(file_path.clone(), file_tx)));
+        handles.push(tokio::spawn(upload_task_with_flock(
+            client.clone(),
+            server.clone(),
+            identifier.clone(),
+            file_path.clone(),
+            state.clone(),
+            file_rx,
+            use_paths,
+            force_push,
+            flock_state.clone(),
+        )));
+    }
+
+    // SSE task (skip if push-only)
+    // Use flock-aware SSE task for ancestry checking
+    if !push_only {
+        // Note: inode_tracker is only used on unix for atomic writes with shadow hardlinks
+        // For flock-aware sync, we use sse_task_with_flock which handles ancestry checking
+        #[cfg(unix)]
+        let _ = inode_tracker; // Acknowledge unused parameter on unix
+
+        handles.push(tokio::spawn(crate::sync::sse_task_with_flock(
+            client,
+            server,
+            identifier,
+            file_path,
+            state,
+            use_paths,
+            flock_state,
+            doc_id,
         )));
     }
 

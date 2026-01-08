@@ -67,8 +67,8 @@ pub use dir_sync::{
     subdir_sse_task, sync_schema, write_nested_schemas, write_schema_file, SCHEMA_FILENAME,
 };
 pub use file_sync::{
-    initial_sync, spawn_file_sync_tasks, sync_single_file, upload_task, BARRIER_RETRY_COUNT,
-    BARRIER_RETRY_DELAY,
+    initial_sync, spawn_file_sync_tasks, spawn_file_sync_tasks_with_flock, sync_single_file,
+    upload_task, upload_task_with_flock, BARRIER_RETRY_COUNT, BARRIER_RETRY_DELAY,
 };
 pub use uuid_map::{
     build_uuid_map_from_doc, build_uuid_map_recursive, collect_node_backed_dir_ids,
@@ -85,11 +85,23 @@ pub use directory::{
     ScannedFile,
 };
 #[cfg(unix)]
+pub use flock::{
+    try_flock_exclusive, FlockGuard, FlockResult, FLOCK_RETRY_INTERVAL, FLOCK_TIMEOUT,
+};
+pub use flock_state::{
+    process_pending_inbound_after_confirm, record_upload_result, FlockSyncState, InboundWrite,
+    PathState,
+};
+#[cfg(unix)]
 pub use sse::{
     atomic_write_with_shadow, handle_server_edit_with_tracker, handle_shadow_write,
-    shadow_write_handler_task, sse_task_with_tracker,
+    shadow_write_handler_task, sse_task_with_tracker, write_inbound_with_checks,
+    write_inbound_with_checks_atomic, InboundWriteError, InboundWriteResult,
 };
-pub use sse::{handle_server_edit, refresh_from_head, sse_task, PENDING_WRITE_TIMEOUT};
+pub use sse::{
+    handle_server_edit, handle_server_edit_with_flock, refresh_from_head, sse_task,
+    sse_task_with_flock, PENDING_WRITE_TIMEOUT,
+};
 #[cfg(unix)]
 pub use state::{hardlink_from_fd, hardlink_from_path, SHADOW_IDLE_TIMEOUT, SHADOW_MIN_LIFETIME};
 pub use state::{InodeKey, InodeState, InodeTracker, PendingWrite, SyncState};
