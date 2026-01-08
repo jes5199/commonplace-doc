@@ -13,18 +13,19 @@ use tracing::debug;
 /// Handler for the events port.
 pub struct EventsHandler {
     client: Arc<MqttClient>,
+    workspace: String,
 }
 
 impl EventsHandler {
     /// Create a new events handler.
-    pub fn new(client: Arc<MqttClient>) -> Self {
-        Self { client }
+    pub fn new(client: Arc<MqttClient>, workspace: String) -> Self {
+        Self { client, workspace }
     }
 
     /// Publish an event from a node.
     ///
     /// This is called when a node emits an event on its red port.
-    /// The event is published to `{path}/events/{event_name}`.
+    /// The event is published to `{workspace}/{path}/events/{event_name}`.
     pub async fn publish_event(
         &self,
         path: &str,
@@ -32,7 +33,7 @@ impl EventsHandler {
         payload: &serde_json::Value,
         source: &str,
     ) -> Result<(), MqttError> {
-        let topic = Topic::events(path, event_name);
+        let topic = Topic::events(&self.workspace, path, event_name);
         let topic_str = topic.to_topic_string();
 
         let message = EventMessage {

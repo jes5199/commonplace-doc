@@ -17,24 +17,30 @@ use tracing::{debug, warn};
 pub struct CommandsHandler {
     client: Arc<MqttClient>,
     document_store: Arc<DocumentStore>,
+    workspace: String,
     /// Map of path -> set of subscribed verbs
     subscribed_commands: RwLock<HashMap<String, HashSet<String>>>,
 }
 
 impl CommandsHandler {
     /// Create a new commands handler.
-    pub fn new(client: Arc<MqttClient>, document_store: Arc<DocumentStore>) -> Self {
+    pub fn new(
+        client: Arc<MqttClient>,
+        document_store: Arc<DocumentStore>,
+        workspace: String,
+    ) -> Self {
         Self {
             client,
             document_store,
+            workspace,
             subscribed_commands: RwLock::new(HashMap::new()),
         }
     }
 
     /// Subscribe to commands for a path.
-    /// Uses wildcard: `{path}/commands/#`
+    /// Uses wildcard: `{workspace}/{path}/commands/#`
     pub async fn subscribe_commands(&self, path: &str) -> Result<(), MqttError> {
-        let topic_pattern = Topic::commands_wildcard(path);
+        let topic_pattern = Topic::commands_wildcard(&self.workspace, path);
 
         // Use QoS 1 for commands - important not to lose them
         self.client
@@ -50,7 +56,7 @@ impl CommandsHandler {
 
     /// Subscribe to a specific command verb for a path.
     pub async fn subscribe_command(&self, path: &str, verb: &str) -> Result<(), MqttError> {
-        let topic = Topic::commands(path, verb);
+        let topic = Topic::commands(&self.workspace, path, verb);
         let topic_str = topic.to_topic_string();
 
         // Use QoS 1 for commands
@@ -68,7 +74,7 @@ impl CommandsHandler {
 
     /// Unsubscribe from commands for a path.
     pub async fn unsubscribe_commands(&self, path: &str) -> Result<(), MqttError> {
-        let topic_pattern = Topic::commands_wildcard(path);
+        let topic_pattern = Topic::commands_wildcard(&self.workspace, path);
 
         self.client.unsubscribe(&topic_pattern).await?;
 
@@ -142,12 +148,13 @@ impl CommandsHandler {
             }
         };
 
-        // Publish response to $store/responses
+        // Publish response to {workspace}/responses
         let payload =
             serde_json::to_vec(&response).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
 
+        let response_topic = format!("{}/responses", self.workspace);
         self.client
-            .publish("$store/responses", &payload, QoS::AtLeastOnce)
+            .publish(&response_topic, &payload, QoS::AtLeastOnce)
             .await?;
 
         Ok(())

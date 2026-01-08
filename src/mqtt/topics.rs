@@ -1,6 +1,6 @@
 //! MQTT topic parsing and construction.
 //!
-//! Topics follow the pattern: `{path.ext}/{port}` or `{path.ext}/{port}/{qualifier}`
+//! Topics follow the pattern: `{workspace}/{path.ext}/{port}` or `{workspace}/{path.ext}/{port}/{qualifier}`
 //!
 //! Valid extensions: .txt, .json, .xml, .xhtml, .bin
 
@@ -59,22 +59,31 @@ pub struct Topic {
 impl Topic {
     /// Parse a topic string into its components.
     ///
-    /// Topic format: `{path}/{port}` or `{path}/{port}/{qualifier}`
+    /// Topic format: `{workspace}/{path}/{port}` or `{workspace}/{path}/{port}/{qualifier}`
     ///
     /// The path ends at the segment containing a dot (the extension).
-    pub fn parse(topic_str: &str) -> Result<Self, MqttError> {
+    pub fn parse(topic_str: &str, expected_workspace: &str) -> Result<Self, MqttError> {
         let segments: Vec<&str> = topic_str.split('/').collect();
 
-        if segments.len() < 2 {
+        if segments.len() < 3 {
             return Err(MqttError::InvalidTopic(format!(
-                "Topic must have at least path and port: {}",
+                "Topic must have at least workspace, path, and port: {}",
                 topic_str
+            )));
+        }
+
+        // First segment is workspace
+        let workspace = segments[0];
+        if workspace != expected_workspace {
+            return Err(MqttError::InvalidTopic(format!(
+                "Topic workspace '{}' does not match expected '{}'",
+                workspace, expected_workspace
             )));
         }
 
         // Find where the path ends (segment with a dot = has extension)
         let mut path_end_idx = None;
-        for (i, segment) in segments.iter().enumerate() {
+        for (i, segment) in segments.iter().enumerate().skip(1) {
             if segment.contains('.') {
                 path_end_idx = Some(i);
                 break;
@@ -85,8 +94,8 @@ impl Topic {
             MqttError::InvalidTopic(format!("Path must have an extension: {}", topic_str))
         })?;
 
-        // Path is everything up to and including the segment with the extension
-        let path = segments[..=path_end_idx].join("/");
+        // Path is from index 1 to path_end_idx (skip workspace)
+        let path = segments[1..=path_end_idx].join("/");
 
         // Validate the extension
         validate_extension(&path)?;
@@ -115,7 +124,7 @@ impl Topic {
         };
 
         Ok(Topic {
-            workspace: String::new(),
+            workspace: workspace.to_string(),
             path,
             port,
             qualifier,
@@ -165,8 +174,14 @@ impl Topic {
     /// Convert the topic to its string representation.
     pub fn to_topic_string(&self) -> String {
         match &self.qualifier {
-            Some(q) => format!("{}/{}/{}", self.path, self.port.as_str(), q),
-            None => format!("{}/{}", self.path, self.port.as_str()),
+            Some(q) => format!(
+                "{}/{}/{}/{}",
+                self.workspace,
+                self.path,
+                self.port.as_str(),
+                q
+            ),
+            None => format!("{}/{}/{}", self.workspace, self.path, self.port.as_str()),
         }
     }
 
@@ -257,7 +272,8 @@ mod tests {
 
     #[test]
     fn test_parse_edits_topic() {
-        let topic = Topic::parse("terminal/screen.txt/edits").unwrap();
+        let topic = Topic::parse("commonplace/terminal/screen.txt/edits", "commonplace").unwrap();
+        assert_eq!(topic.workspace, "commonplace");
         assert_eq!(topic.path, "terminal/screen.txt");
         assert_eq!(topic.port, Port::Edits);
         assert_eq!(topic.qualifier, None);
@@ -265,7 +281,12 @@ mod tests {
 
     #[test]
     fn test_parse_sync_topic() {
-        let topic = Topic::parse("terminal/screen.txt/sync/client-123").unwrap();
+        let topic = Topic::parse(
+            "commonplace/terminal/screen.txt/sync/client-123",
+            "commonplace",
+        )
+        .unwrap();
+        assert_eq!(topic.workspace, "commonplace");
         assert_eq!(topic.path, "terminal/screen.txt");
         assert_eq!(topic.port, Port::Sync);
         assert_eq!(topic.qualifier, Some("client-123".to_string()));
@@ -273,7 +294,12 @@ mod tests {
 
     #[test]
     fn test_parse_events_topic() {
-        let topic = Topic::parse("astrolabe/clock.json/events/planetary-hour").unwrap();
+        let topic = Topic::parse(
+            "commonplace/astrolabe/clock.json/events/planetary-hour",
+            "commonplace",
+        )
+        .unwrap();
+        assert_eq!(topic.workspace, "commonplace");
         assert_eq!(topic.path, "astrolabe/clock.json");
         assert_eq!(topic.port, Port::Events);
         assert_eq!(topic.qualifier, Some("planetary-hour".to_string()));
@@ -281,7 +307,12 @@ mod tests {
 
     #[test]
     fn test_parse_commands_topic() {
-        let topic = Topic::parse("terminal/screen.txt/commands/clear").unwrap();
+        let topic = Topic::parse(
+            "commonplace/terminal/screen.txt/commands/clear",
+            "commonplace",
+        )
+        .unwrap();
+        assert_eq!(topic.workspace, "commonplace");
         assert_eq!(topic.path, "terminal/screen.txt");
         assert_eq!(topic.port, Port::Commands);
         assert_eq!(topic.qualifier, Some("clear".to_string()));
@@ -289,33 +320,59 @@ mod tests {
 
     #[test]
     fn test_parse_nested_path() {
-        let topic = Topic::parse("deep/nested/path/doc.txt/edits").unwrap();
+        let topic =
+            Topic::parse("commonplace/deep/nested/path/doc.txt/edits", "commonplace").unwrap();
+        assert_eq!(topic.workspace, "commonplace");
         assert_eq!(topic.path, "deep/nested/path/doc.txt");
         assert_eq!(topic.port, Port::Edits);
     }
 
     #[test]
     fn test_reject_no_extension() {
-        let result = Topic::parse("terminal/screen/edits");
+        let result = Topic::parse("commonplace/terminal/screen/edits", "commonplace");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_invalid_extension() {
-        let result = Topic::parse("code/main.rs/edits");
+        let result = Topic::parse("commonplace/code/main.rs/edits", "commonplace");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_invalid_port() {
-        let result = Topic::parse("terminal/screen.txt/invalid");
+        let result = Topic::parse("commonplace/terminal/screen.txt/invalid", "commonplace");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_with_workspace() {
+        let topic = Topic::parse("commonplace/terminal/screen.txt/edits", "commonplace").unwrap();
+        assert_eq!(topic.workspace, "commonplace");
+        assert_eq!(topic.path, "terminal/screen.txt");
+        assert_eq!(topic.port, Port::Edits);
+    }
+
+    #[test]
+    fn test_parse_wrong_workspace() {
+        let result = Topic::parse("other/terminal/screen.txt/edits", "commonplace");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_with_qualifier() {
+        let topic = Topic::parse("myspace/doc.txt/sync/client-123", "myspace").unwrap();
+        assert_eq!(topic.workspace, "myspace");
+        assert_eq!(topic.qualifier, Some("client-123".to_string()));
     }
 
     #[test]
     fn test_construct_edits_topic() {
         let topic = Topic::edits("commonplace", "terminal/screen.txt");
-        assert_eq!(topic.to_topic_string(), "terminal/screen.txt/edits");
+        assert_eq!(
+            topic.to_topic_string(),
+            "commonplace/terminal/screen.txt/edits"
+        );
     }
 
     #[test]
@@ -323,8 +380,23 @@ mod tests {
         let topic = Topic::sync("commonplace", "terminal/screen.txt", "client-123");
         assert_eq!(
             topic.to_topic_string(),
-            "terminal/screen.txt/sync/client-123"
+            "commonplace/terminal/screen.txt/sync/client-123"
         );
+    }
+
+    #[test]
+    fn test_to_topic_string_with_workspace() {
+        let topic = Topic::edits("commonplace", "terminal/screen.txt");
+        assert_eq!(
+            topic.to_topic_string(),
+            "commonplace/terminal/screen.txt/edits"
+        );
+    }
+
+    #[test]
+    fn test_to_topic_string_with_qualifier() {
+        let topic = Topic::sync("myspace", "doc.txt", "client-123");
+        assert_eq!(topic.to_topic_string(), "myspace/doc.txt/sync/client-123");
     }
 
     #[test]

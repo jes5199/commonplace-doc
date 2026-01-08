@@ -23,6 +23,7 @@ pub struct EditsHandler {
     client: Arc<MqttClient>,
     document_store: Arc<DocumentStore>,
     commit_store: Option<Arc<CommitStore>>,
+    workspace: String,
     /// Cache of fs-root JSON content for path→UUID resolution.
     fs_root_content: RwLock<String>,
     /// The fs-root path, so we can refresh the cache when it's edited.
@@ -36,11 +37,13 @@ impl EditsHandler {
         client: Arc<MqttClient>,
         document_store: Arc<DocumentStore>,
         commit_store: Option<Arc<CommitStore>>,
+        workspace: String,
     ) -> Self {
         Self {
             client,
             document_store,
             commit_store,
+            workspace,
             fs_root_content: RwLock::new(String::new()),
             fs_root_path: RwLock::new(None),
             subscribed_paths: RwLock::new(HashSet::new()),
@@ -61,7 +64,7 @@ impl EditsHandler {
 
     /// Subscribe to edits for a path.
     pub async fn subscribe_path(&self, path: &str) -> Result<(), MqttError> {
-        let topic = Topic::edits(path);
+        let topic = Topic::edits(&self.workspace, path);
         let topic_str = topic.to_topic_string();
 
         // Use QoS 1 (at least once) for edits - important not to lose them
@@ -76,7 +79,7 @@ impl EditsHandler {
 
     /// Unsubscribe from edits for a path.
     pub async fn unsubscribe_path(&self, path: &str) -> Result<(), MqttError> {
-        let topic = Topic::edits(path);
+        let topic = Topic::edits(&self.workspace, path);
         let topic_str = topic.to_topic_string();
 
         self.client.unsubscribe(&topic_str).await?;

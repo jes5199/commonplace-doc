@@ -41,7 +41,7 @@ async fn subscribe_to_doc(
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(100);
 
     // Subscribe to the MQTT edits topic
-    let edits_topic = format!("{}/edits", id);
+    let edits_topic = format!("{}/{}/edits", gateway.workspace, id);
 
     let gateway_clone = gateway.clone();
     let edits_topic_clone = edits_topic.clone();

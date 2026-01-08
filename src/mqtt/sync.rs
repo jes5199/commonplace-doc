@@ -19,6 +19,7 @@ use tracing::{debug, warn};
 pub struct SyncHandler {
     client: Arc<MqttClient>,
     commit_store: Option<Arc<CommitStore>>,
+    workspace: String,
     subscribed_paths: RwLock<HashSet<String>>,
     /// Cache of fs-root JSON content for path→document ID resolution.
     fs_root_content: RwLock<String>,
@@ -28,10 +29,15 @@ pub struct SyncHandler {
 
 impl SyncHandler {
     /// Create a new sync handler.
-    pub fn new(client: Arc<MqttClient>, commit_store: Option<Arc<CommitStore>>) -> Self {
+    pub fn new(
+        client: Arc<MqttClient>,
+        commit_store: Option<Arc<CommitStore>>,
+        workspace: String,
+    ) -> Self {
         Self {
             client,
             commit_store,
+            workspace,
             subscribed_paths: RwLock::new(HashSet::new()),
             fs_root_content: RwLock::new(String::new()),
             fs_root_path: RwLock::new(None),
@@ -67,9 +73,9 @@ impl SyncHandler {
     }
 
     /// Subscribe to sync requests for a path.
-    /// Uses wildcard: `{path}/sync/+`
+    /// Uses wildcard: `{workspace}/{path}/sync/+`
     pub async fn subscribe_path(&self, path: &str) -> Result<(), MqttError> {
-        let topic_pattern = Topic::sync_wildcard(path);
+        let topic_pattern = Topic::sync_wildcard(&self.workspace, path);
 
         // Use QoS 0 for sync - ephemeral catch-up
         self.client
@@ -85,7 +91,7 @@ impl SyncHandler {
 
     /// Unsubscribe from sync requests for a path.
     pub async fn unsubscribe_path(&self, path: &str) -> Result<(), MqttError> {
-        let topic_pattern = Topic::sync_wildcard(path);
+        let topic_pattern = Topic::sync_wildcard(&self.workspace, path);
 
         self.client.unsubscribe(&topic_pattern).await?;
 
@@ -357,7 +363,7 @@ impl SyncHandler {
         client_id: &str,
         message: &SyncMessage,
     ) -> Result<(), MqttError> {
-        let topic = Topic::sync(path, client_id);
+        let topic = Topic::sync(&self.workspace, path, client_id);
         let topic_str = topic.to_topic_string();
 
         let payload = serde_json::to_vec(message)?;

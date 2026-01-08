@@ -91,7 +91,7 @@ async fn send_edit(
     };
 
     // Build the topic
-    let topic = Topic::edits(&id);
+    let topic = Topic::edits(&gateway.workspace, &id);
 
     // Serialize and publish
     let payload =
@@ -115,7 +115,7 @@ async fn send_event(
     Json(req): Json<SendEventRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     // Build the topic
-    let topic = Topic::events(&id, &req.event_type);
+    let topic = Topic::events(&gateway.workspace, &id, &req.event_type);
 
     // Serialize and publish
     let payload =

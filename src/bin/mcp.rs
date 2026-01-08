@@ -35,11 +35,15 @@ struct FireCommandParams {
 #[derive(Clone)]
 struct CommonplaceMcp {
     mqtt_broker: String,
+    workspace: String,
 }
 
 impl CommonplaceMcp {
-    fn new(mqtt_broker: String) -> Self {
-        Self { mqtt_broker }
+    fn new(mqtt_broker: String, workspace: String) -> Self {
+        Self {
+            mqtt_broker,
+            workspace,
+        }
     }
 
     async fn fire_command(&self, params: FireCommandParams) -> Result<String, String> {
@@ -50,7 +54,7 @@ impl CommonplaceMcp {
             source: Some("commonplace-mcp".to_string()),
         };
 
-        let topic = Topic::commands(&params.path, &params.verb);
+        let topic = Topic::commands(&self.workspace, &params.path, &params.verb);
         let topic_str = topic.to_topic_string();
 
         let config = MqttConfig {
@@ -221,8 +225,9 @@ impl ServerHandler for CommonplaceMcp {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mqtt_broker =
         std::env::var("MQTT_BROKER").unwrap_or_else(|_| "mqtt://localhost:1883".to_string());
+    let workspace = std::env::var("MQTT_WORKSPACE").unwrap_or_else(|_| "commonplace".to_string());
 
-    let server = CommonplaceMcp::new(mqtt_broker);
+    let server = CommonplaceMcp::new(mqtt_broker, workspace);
 
     // Start the MCP server on stdio
     let transport = stdio();

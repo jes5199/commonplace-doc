@@ -66,6 +66,8 @@ pub struct MqttConfig {
     pub broker_url: String,
     /// Client ID for this doc store instance
     pub client_id: String,
+    /// Workspace name for topic namespacing
+    pub workspace: String,
     /// Keep-alive interval in seconds
     pub keep_alive_secs: u64,
     /// Whether to use clean session
@@ -77,6 +79,7 @@ impl Default for MqttConfig {
         Self {
             broker_url: "mqtt://localhost:1883".to_string(),
             client_id: uuid::Uuid::new_v4().to_string(),
+            workspace: "commonplace".to_string(),
             keep_alive_secs: 60,
             clean_session: true,
         }
@@ -87,6 +90,7 @@ impl Default for MqttConfig {
 #[allow(dead_code)] // Fields used for future integration
 pub struct MqttService {
     client: Arc<MqttClient>,
+    workspace: String,
     document_store: Arc<DocumentStore>,
     commit_store: Option<Arc<CommitStore>>,
     edits_handler: edits::EditsHandler,
@@ -96,29 +100,39 @@ pub struct MqttService {
 }
 
 impl MqttService {
-    /// Store commands topic for create-document.
-    const STORE_COMMANDS_CREATE_DOCUMENT: &'static str = "$store/commands/create-document";
-
     /// Create a new MQTT service with the given configuration.
     pub async fn new(
         config: MqttConfig,
         document_store: Arc<DocumentStore>,
         commit_store: Option<Arc<CommitStore>>,
     ) -> Result<Self, MqttError> {
+        // Validate workspace name
+        topics::validate_workspace_name(&config.workspace)?;
+
+        let workspace = config.workspace.clone();
         let client = Arc::new(MqttClient::connect(config).await?);
 
-        let edits_handler =
-            edits::EditsHandler::new(client.clone(), document_store.clone(), commit_store.clone());
+        let edits_handler = edits::EditsHandler::new(
+            client.clone(),
+            document_store.clone(),
+            commit_store.clone(),
+            workspace.clone(),
+        );
 
-        let sync_handler = sync::SyncHandler::new(client.clone(), commit_store.clone());
+        let sync_handler =
+            sync::SyncHandler::new(client.clone(), commit_store.clone(), workspace.clone());
 
-        let events_handler = events::EventsHandler::new(client.clone());
+        let events_handler = events::EventsHandler::new(client.clone(), workspace.clone());
 
-        let commands_handler =
-            commands::CommandsHandler::new(client.clone(), document_store.clone());
+        let commands_handler = commands::CommandsHandler::new(
+            client.clone(),
+            document_store.clone(),
+            workspace.clone(),
+        );
 
         Ok(Self {
             client,
+            workspace,
             document_store,
             commit_store,
             edits_handler,
@@ -128,16 +142,17 @@ impl MqttService {
         })
     }
 
+    /// Get the store commands topic for create-document.
+    fn store_commands_topic(&self) -> String {
+        format!("{}/commands/create-document", self.workspace)
+    }
+
     /// Subscribe to store-level commands.
-    /// This subscribes to the `$store/commands/create-document` topic.
+    /// This subscribes to the `{workspace}/commands/create-document` topic.
     pub async fn subscribe_store_commands(&self) -> Result<(), MqttError> {
-        self.client
-            .subscribe(Self::STORE_COMMANDS_CREATE_DOCUMENT, QoS::AtLeastOnce)
-            .await?;
-        tracing::debug!(
-            "Subscribed to store commands: {}",
-            Self::STORE_COMMANDS_CREATE_DOCUMENT
-        );
+        let topic = self.store_commands_topic();
+        self.client.subscribe(&topic, QoS::AtLeastOnce).await?;
+        tracing::debug!("Subscribed to store commands: {}", topic);
         Ok(())
     }
 
@@ -193,12 +208,12 @@ impl MqttService {
     /// Dispatch an incoming message to the appropriate handler.
     async fn dispatch_message(&self, topic_str: &str, payload: &[u8]) -> Result<(), MqttError> {
         // Check for store-level commands first (these don't follow the document path pattern)
-        if topic_str == Self::STORE_COMMANDS_CREATE_DOCUMENT {
+        if topic_str == self.store_commands_topic() {
             return self.commands_handler.handle_create_document(payload).await;
         }
 
         // Parse the topic
-        let topic = match topics::Topic::parse(topic_str) {
+        let topic = match topics::Topic::parse(topic_str, &self.workspace) {
             Ok(t) => t,
             Err(e) => {
                 tracing::debug!("Ignoring unparseable topic {}: {}", topic_str, e);

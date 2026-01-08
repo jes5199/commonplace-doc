@@ -18,6 +18,8 @@ use tokio::sync::RwLock;
 pub struct HttpGateway {
     /// MQTT client for publishing and subscribing
     pub(crate) client: Arc<MqttClient>,
+    /// Workspace name for topic namespacing
+    pub(crate) workspace: String,
     /// Reference counts for MQTT topic subscriptions (for SSE)
     pub(crate) subscription_counts: Arc<RwLock<HashMap<String, usize>>>,
 }
@@ -28,6 +30,7 @@ impl HttpGateway {
     /// This spawns the MQTT event loop in the background so that
     /// publish/subscribe operations can actually execute.
     pub async fn new(config: MqttConfig) -> Result<Self, MqttError> {
+        let workspace = config.workspace.clone();
         let client = Arc::new(MqttClient::connect(config).await?);
 
         // Spawn the MQTT event loop so publishes/subscribes actually work
@@ -40,6 +43,7 @@ impl HttpGateway {
 
         Ok(Self {
             client,
+            workspace,
             subscription_counts: Arc::new(RwLock::new(HashMap::new())),
         })
     }
