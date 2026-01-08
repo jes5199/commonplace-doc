@@ -1,0 +1,1 @@
+{"processes":{"filter-open":{"output":"commonplace-issues.open.jsonl","evaluate":"filter-open.ts"}}}

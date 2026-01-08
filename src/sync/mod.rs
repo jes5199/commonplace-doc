@@ -86,7 +86,8 @@ pub use directory::{
 };
 #[cfg(unix)]
 pub use flock::{
-    try_flock_exclusive, FlockGuard, FlockResult, FLOCK_RETRY_INTERVAL, FLOCK_TIMEOUT,
+    try_flock_exclusive, try_flock_shared, FlockGuard, FlockResult, FLOCK_RETRY_INTERVAL,
+    FLOCK_TIMEOUT,
 };
 pub use flock_state::{
     process_pending_inbound_after_confirm, record_upload_result, FlockSyncState, InboundWrite,

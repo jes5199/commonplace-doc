@@ -117,6 +117,67 @@ pub async fn try_flock_exclusive(
     }
 }
 
+/// Attempt to acquire a shared (read) lock on a file, retrying until timeout.
+///
+/// This is used before reading a file to signal to agents that a read is in progress.
+/// Agents using LOCK_EX will wait for our shared lock to be released before writing.
+/// Multiple readers can hold LOCK_SH simultaneously.
+///
+/// # Arguments
+/// * `path` - Path to the file to lock
+/// * `timeout` - Maximum time to wait for lock (defaults to FLOCK_TIMEOUT)
+///
+/// # Returns
+/// * `FlockResult::Acquired` - Lock acquired, read can proceed safely
+/// * `FlockResult::Timeout` - Timed out, proceeding anyway
+pub async fn try_flock_shared(path: &Path, timeout: Option<Duration>) -> io::Result<FlockResult> {
+    let timeout = timeout.unwrap_or(FLOCK_TIMEOUT);
+    let start = Instant::now();
+
+    loop {
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+
+        let fd = file.as_raw_fd();
+
+        // Try non-blocking shared lock
+        // SAFETY: flock is safe on a valid file descriptor
+        let result = unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) };
+
+        if result == 0 {
+            return Ok(FlockResult::Acquired(FlockGuard { file }));
+        }
+
+        let errno = io::Error::last_os_error();
+        let raw_errno = errno.raw_os_error().unwrap_or(0);
+
+        if raw_errno == libc::EINTR {
+            continue;
+        }
+
+        if raw_errno != libc::EWOULDBLOCK && raw_errno != libc::EAGAIN {
+            return Err(errno);
+        }
+
+        if start.elapsed() >= timeout {
+            tracing::warn!(
+                ?path,
+                elapsed = ?start.elapsed(),
+                "flock_shared timeout after {:?}, proceeding anyway",
+                timeout
+            );
+            return Ok(FlockResult::Timeout);
+        }
+
+        tokio::time::sleep(FLOCK_RETRY_INTERVAL).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +228,63 @@ mod tests {
         assert!(start.elapsed() >= Duration::from_millis(200));
 
         // Release the lock
+        unsafe {
+            libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_flock_shared_acquires_on_unlocked_file() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"test content").unwrap();
+
+        let result = try_flock_shared(file.path(), Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+
+        assert!(matches!(result, FlockResult::Acquired(_)));
+    }
+
+    #[tokio::test]
+    async fn test_flock_shared_multiple_readers() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"test content").unwrap();
+
+        // First shared lock
+        let result1 = try_flock_shared(file.path(), Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert!(matches!(result1, FlockResult::Acquired(_)));
+
+        // Second shared lock should also succeed (multiple readers allowed)
+        let result2 = try_flock_shared(file.path(), Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert!(matches!(result2, FlockResult::Acquired(_)));
+    }
+
+    #[tokio::test]
+    async fn test_flock_shared_blocked_by_exclusive() {
+        use std::os::unix::io::AsRawFd;
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"test content").unwrap();
+
+        // Hold an exclusive lock
+        let lock_file = File::open(file.path()).unwrap();
+        unsafe {
+            libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX);
+        }
+
+        // Shared lock should timeout
+        let start = Instant::now();
+        let result = try_flock_shared(file.path(), Some(Duration::from_millis(200)))
+            .await
+            .unwrap();
+
+        assert!(matches!(result, FlockResult::Timeout));
+        assert!(start.elapsed() >= Duration::from_millis(200));
+
         unsafe {
             libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
         }

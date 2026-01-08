@@ -3,6 +3,8 @@
 //! This module provides async tasks that watch files and directories for changes
 //! using the `notify` crate, with debouncing to handle rapid file modifications.
 
+#[cfg(unix)]
+use crate::sync::flock::{try_flock_shared, FlockResult};
 use crate::sync::{DirEvent, FileEvent, ScanOptions};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -226,6 +228,30 @@ pub async fn file_watcher_task(file_path: PathBuf, tx: mpsc::Sender<FileEvent>) 
                 debounce_timer = None;
 
                 // Read file content immediately to capture user's edit
+                // Use shared lock to signal to agents that a read is in progress
+                #[cfg(unix)]
+                let content = {
+                    // Acquire shared lock to prevent agents from starting writes
+                    let _guard = match try_flock_shared(&file_path, None).await {
+                        Ok(FlockResult::Acquired(g)) => Some(g),
+                        Ok(FlockResult::Timeout) => {
+                            debug!("Shared lock timeout on {}, reading anyway", file_path.display());
+                            None
+                        }
+                        Err(e) => {
+                            debug!("Could not acquire shared lock on {}: {}", file_path.display(), e);
+                            None
+                        }
+                    };
+                    match tokio::fs::read(&file_path).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("Failed to read file for upload: {}", e);
+                            continue;
+                        }
+                    }
+                };
+                #[cfg(not(unix))]
                 let content = match tokio::fs::read(&file_path).await {
                     Ok(c) => c,
                     Err(e) => {
