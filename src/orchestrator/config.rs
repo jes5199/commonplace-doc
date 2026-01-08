@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestratorConfig {
+    #[serde(default = "default_workspace")]
+    pub workspace: String,
     #[serde(default = "default_mqtt_broker")]
     pub mqtt_broker: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -14,6 +16,10 @@ pub struct OrchestratorConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub managed_paths: Vec<String>,
     pub processes: HashMap<String, ProcessConfig>,
+}
+
+fn default_workspace() -> String {
+    "commonplace".to_string()
 }
 
 fn default_mqtt_broker() -> String {
@@ -340,5 +346,22 @@ mod tests {
         let json = r#"{ "processes": {} }"#;
         let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
         assert!(config.managed_paths.is_empty());
+    }
+
+    #[test]
+    fn test_workspace_field() {
+        let json = r#"{
+            "workspace": "myspace",
+            "processes": {}
+        }"#;
+        let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.workspace, "myspace");
+    }
+
+    #[test]
+    fn test_workspace_default() {
+        let json = r#"{ "processes": {} }"#;
+        let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.workspace, "commonplace");
     }
 }
