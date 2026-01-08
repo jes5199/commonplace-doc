@@ -13,6 +13,7 @@ pub mod directory;
 pub mod file_sync;
 #[cfg(unix)]
 pub mod flock;
+pub mod flock_state;
 pub mod sse;
 pub mod state;
 pub mod state_file;
