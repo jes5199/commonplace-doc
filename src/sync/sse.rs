@@ -572,6 +572,21 @@ pub async fn handle_server_edit_with_flock(
                                     );
                                 }
                             }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                // File was deleted - recreate it with the queued content
+                                if let Err(e) = tokio::fs::write(file_path, &content).await {
+                                    error!(
+                                        ?file_path,
+                                        ?e,
+                                        "failed to recreate file for queued inbound content"
+                                    );
+                                } else {
+                                    debug!(
+                                        ?file_path,
+                                        cid, "recreated file with queued inbound content"
+                                    );
+                                }
+                            }
                             Err(e) => {
                                 error!(
                                     ?file_path,
