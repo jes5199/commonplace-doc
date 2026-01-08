@@ -61,6 +61,10 @@ pub struct StoreArgs {
     /// Node ID for filesystem root document (required - determines MQTT subscriptions)
     #[clap(long, value_name = "NODE_ID")]
     pub fs_root: String,
+
+    /// Workspace name for MQTT topic namespacing
+    #[clap(long, default_value = "commonplace")]
+    pub workspace: String,
 }
 
 /// CLI arguments for commonplace-http (HTTP gateway via MQTT)
@@ -83,6 +87,10 @@ pub struct HttpArgs {
     /// MQTT client ID (defaults to "commonplace-http")
     #[clap(long, value_name = "ID", default_value = "commonplace-http")]
     pub mqtt_client_id: String,
+
+    /// Workspace name for MQTT topic namespacing
+    #[clap(long, default_value = "commonplace")]
+    pub workspace: String,
 }
 
 /// CLI arguments for the orchestrator binary
@@ -133,6 +141,10 @@ pub struct CmdArgs {
     /// Source identifier for the command
     #[clap(long, default_value = "commonplace-cmd")]
     pub source: String,
+
+    /// Workspace name for MQTT topic namespacing (can also be set via MQTT_WORKSPACE env var)
+    #[clap(long, env = "MQTT_WORKSPACE", default_value = "commonplace")]
+    pub workspace: String,
 }
 
 /// CLI arguments for commonplace-link (create document aliases)

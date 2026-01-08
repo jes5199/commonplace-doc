@@ -36,6 +36,7 @@ async fn main() {
     let mqtt_config = MqttConfig {
         broker_url: args.mqtt_broker.clone(),
         client_id: args.mqtt_client_id.clone(),
+        workspace: args.workspace.clone(),
         ..Default::default()
     };
 

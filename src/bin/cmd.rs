@@ -153,18 +153,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         source: Some(args.source.clone()),
     };
 
-    // Get workspace from environment or use default
-    let workspace = std::env::var("MQTT_WORKSPACE").unwrap_or_else(|_| "commonplace".to_string());
-
-    // Build the topic
-    let topic = Topic::commands(&workspace, &resolved_path, &args.verb);
+    // Build the topic (workspace comes from CLI arg or MQTT_WORKSPACE env var)
+    let topic = Topic::commands(&args.workspace, &resolved_path, &args.verb);
     let topic_str = topic.to_topic_string();
 
     // Connect to MQTT
     let config = MqttConfig {
         broker_url: args.mqtt_broker.clone(),
         client_id: format!("commonplace-cmd-{}", uuid::Uuid::new_v4()),
-        workspace,
+        workspace: args.workspace.clone(),
         ..Default::default()
     };
 
