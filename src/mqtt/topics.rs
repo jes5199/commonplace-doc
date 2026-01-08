@@ -203,6 +203,28 @@ pub fn validate_extension(path: &str) -> Result<(), MqttError> {
     }
 }
 
+/// Validate a workspace name.
+/// Valid characters: alphanumeric, hyphens, underscores.
+/// Must be at least one character.
+pub fn validate_workspace_name(name: &str) -> Result<(), MqttError> {
+    if name.is_empty() {
+        return Err(MqttError::InvalidTopic(
+            "Workspace name cannot be empty".to_string(),
+        ));
+    }
+
+    for c in name.chars() {
+        if !c.is_ascii_alphanumeric() && c != '-' && c != '_' {
+            return Err(MqttError::InvalidTopic(format!(
+                "Invalid character '{}' in workspace name. Allowed: alphanumeric, hyphen, underscore",
+                c
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Get the content type for a path based on its extension.
 pub fn content_type_for_path(path: &str) -> Result<ContentType, MqttError> {
     let ext = path
@@ -320,5 +342,22 @@ mod tests {
         );
         assert_eq!(content_type_for_path("doc.bin").unwrap(), ContentType::Text);
         assert_eq!(content_type_for_path("doc.md").unwrap(), ContentType::Text);
+    }
+
+    #[test]
+    fn test_validate_workspace_valid() {
+        assert!(validate_workspace_name("commonplace").is_ok());
+        assert!(validate_workspace_name("my-workspace").is_ok());
+        assert!(validate_workspace_name("workspace_1").is_ok());
+        assert!(validate_workspace_name("A").is_ok());
+    }
+
+    #[test]
+    fn test_validate_workspace_invalid() {
+        assert!(validate_workspace_name("").is_err());
+        assert!(validate_workspace_name("has/slash").is_err());
+        assert!(validate_workspace_name("has+plus").is_err());
+        assert!(validate_workspace_name("has#hash").is_err());
+        assert!(validate_workspace_name("has space").is_err());
     }
 }
