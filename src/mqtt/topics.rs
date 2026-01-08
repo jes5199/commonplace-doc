@@ -122,40 +122,40 @@ impl Topic {
         })
     }
 
-    /// Construct an edits topic for a path.
-    pub fn edits(path: &str) -> Self {
+    /// Construct an edits topic for a workspace and path.
+    pub fn edits(workspace: &str, path: &str) -> Self {
         Topic {
-            workspace: String::new(),
+            workspace: workspace.to_string(),
             path: path.to_string(),
             port: Port::Edits,
             qualifier: None,
         }
     }
 
-    /// Construct a sync topic for a path and client ID.
-    pub fn sync(path: &str, client_id: &str) -> Self {
+    /// Construct a sync topic for a workspace, path, and client ID.
+    pub fn sync(workspace: &str, path: &str, client_id: &str) -> Self {
         Topic {
-            workspace: String::new(),
+            workspace: workspace.to_string(),
             path: path.to_string(),
             port: Port::Sync,
             qualifier: Some(client_id.to_string()),
         }
     }
 
-    /// Construct an events topic for a path and event name.
-    pub fn events(path: &str, event_name: &str) -> Self {
+    /// Construct an events topic for a workspace, path, and event name.
+    pub fn events(workspace: &str, path: &str, event_name: &str) -> Self {
         Topic {
-            workspace: String::new(),
+            workspace: workspace.to_string(),
             path: path.to_string(),
             port: Port::Events,
             qualifier: Some(event_name.to_string()),
         }
     }
 
-    /// Construct a commands topic for a path and verb.
-    pub fn commands(path: &str, verb: &str) -> Self {
+    /// Construct a commands topic for a workspace, path, and verb.
+    pub fn commands(workspace: &str, path: &str, verb: &str) -> Self {
         Topic {
-            workspace: String::new(),
+            workspace: workspace.to_string(),
             path: path.to_string(),
             port: Port::Commands,
             qualifier: Some(verb.to_string()),
@@ -171,21 +171,21 @@ impl Topic {
     }
 
     /// Get the wildcard pattern for subscribing to sync requests.
-    /// Returns `{path}/sync/+`
-    pub fn sync_wildcard(path: &str) -> String {
-        format!("{}/sync/+", path)
+    /// Returns `{workspace}/{path}/sync/+`
+    pub fn sync_wildcard(workspace: &str, path: &str) -> String {
+        format!("{}/{}/sync/+", workspace, path)
     }
 
     /// Get the wildcard pattern for subscribing to all events.
-    /// Returns `{path}/events/#`
-    pub fn events_wildcard(path: &str) -> String {
-        format!("{}/events/#", path)
+    /// Returns `{workspace}/{path}/events/#`
+    pub fn events_wildcard(workspace: &str, path: &str) -> String {
+        format!("{}/{}/events/#", workspace, path)
     }
 
     /// Get the wildcard pattern for subscribing to all commands.
-    /// Returns `{path}/commands/#`
-    pub fn commands_wildcard(path: &str) -> String {
-        format!("{}/commands/#", path)
+    /// Returns `{workspace}/{path}/commands/#`
+    pub fn commands_wildcard(workspace: &str, path: &str) -> String {
+        format!("{}/{}/commands/#", workspace, path)
     }
 }
 
@@ -314,13 +314,13 @@ mod tests {
 
     #[test]
     fn test_construct_edits_topic() {
-        let topic = Topic::edits("terminal/screen.txt");
+        let topic = Topic::edits("commonplace", "terminal/screen.txt");
         assert_eq!(topic.to_topic_string(), "terminal/screen.txt/edits");
     }
 
     #[test]
     fn test_construct_sync_topic() {
-        let topic = Topic::sync("terminal/screen.txt", "client-123");
+        let topic = Topic::sync("commonplace", "terminal/screen.txt", "client-123");
         assert_eq!(
             topic.to_topic_string(),
             "terminal/screen.txt/sync/client-123"
@@ -330,9 +330,24 @@ mod tests {
     #[test]
     fn test_sync_wildcard() {
         assert_eq!(
-            Topic::sync_wildcard("terminal/screen.txt"),
-            "terminal/screen.txt/sync/+"
+            Topic::sync_wildcard("commonplace", "terminal/screen.txt"),
+            "commonplace/terminal/screen.txt/sync/+"
         );
+    }
+
+    #[test]
+    fn test_construct_edits_with_workspace() {
+        let topic = Topic::edits("commonplace", "terminal/screen.txt");
+        assert_eq!(topic.workspace, "commonplace");
+        assert_eq!(topic.path, "terminal/screen.txt");
+        assert_eq!(topic.port, Port::Edits);
+    }
+
+    #[test]
+    fn test_construct_sync_with_workspace() {
+        let topic = Topic::sync("myspace", "doc.txt", "client-123");
+        assert_eq!(topic.workspace, "myspace");
+        assert_eq!(topic.qualifier, Some("client-123".to_string()));
     }
 
     #[test]
