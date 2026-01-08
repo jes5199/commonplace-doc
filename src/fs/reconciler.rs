@@ -13,8 +13,6 @@ pub struct MigrationResult {
     pub schema: String,
     /// Whether any migration was performed
     pub migrated: bool,
-    /// Number of inline subdirectories that were migrated
-    pub subdirs_migrated: usize,
     /// Number of UUIDs generated for entries without node_id
     pub uuids_generated: usize,
 }
@@ -63,12 +61,6 @@ impl FilesystemReconciler {
         let migration_result = self.migrate_inline_subdirectories(content).await?;
 
         let effective_content = if migration_result.migrated {
-            if migration_result.subdirs_migrated > 0 {
-                tracing::info!(
-                    "Migrated {} inline subdirectories to separate documents",
-                    migration_result.subdirs_migrated
-                );
-            }
             if migration_result.uuids_generated > 0 {
                 tracing::info!(
                     "Generated {} UUIDs for entries without node_id",
@@ -634,19 +626,17 @@ impl FilesystemReconciler {
             return Ok(MigrationResult {
                 schema: content.to_string(),
                 migrated: false,
-                subdirs_migrated: 0,
                 uuids_generated: 0,
             });
         };
 
         // Migrate the root entry
-        let (migrated_root, subdirs_count, uuids_count) = self.migrate_entry(root).await?;
+        let (migrated_root, uuids_count) = self.migrate_entry(root).await?;
 
-        if subdirs_count == 0 && uuids_count == 0 {
+        if uuids_count == 0 {
             return Ok(MigrationResult {
                 schema: content.to_string(),
                 migrated: false,
-                subdirs_migrated: 0,
                 uuids_generated: 0,
             });
         }
@@ -663,13 +653,12 @@ impl FilesystemReconciler {
         Ok(MigrationResult {
             schema: schema_json,
             migrated: true,
-            subdirs_migrated: subdirs_count,
             uuids_generated: uuids_count,
         })
     }
 
-    /// Migrate a single entry, returning the migrated entry and (subdirs_migrated, uuids_generated).
-    async fn migrate_entry(&self, entry: Entry) -> Result<(Entry, usize, usize), FsError> {
+    /// Migrate a single entry, returning the migrated entry and uuids_generated.
+    async fn migrate_entry(&self, entry: Entry) -> Result<(Entry, usize), FsError> {
         match entry {
             Entry::Doc(mut doc) => {
                 // Generate UUID if doc doesn't have node_id
@@ -679,26 +668,23 @@ impl FilesystemReconciler {
                 } else {
                     0
                 };
-                Ok((Entry::Doc(doc), 0, uuid_count))
+                Ok((Entry::Doc(doc), uuid_count))
             }
             Entry::Dir(dir) => self.migrate_dir_entry(dir, "").await,
         }
     }
 
     /// Process a directory entry and ensure all children have UUIDs.
-    ///
-    /// Returns (entry, subdirs_migrated_always_0, uuids_generated).
-    /// Note: subdirs_migrated is always 0 since inline subdirectories are deprecated.
     async fn migrate_dir_entry(
         &self,
         dir: DirEntry,
         _current_path: &str,
-    ) -> Result<(Entry, usize, usize), FsError> {
+    ) -> Result<(Entry, usize), FsError> {
         // All directories should be node-backed now (inline subdirectories deprecated)
         let Some(entries) = dir.entries else {
             // Node-backed dir - ensure it has a UUID
             if dir.node_id.is_some() {
-                return Ok((Entry::Dir(dir), 0, 0));
+                return Ok((Entry::Dir(dir), 0));
             } else {
                 // Generate UUID for dir without node_id
                 return Ok((
@@ -707,7 +693,6 @@ impl FilesystemReconciler {
                         node_id: Some(uuid::Uuid::new_v4().to_string()),
                         content_type: dir.content_type,
                     }),
-                    0,
                     1,
                 ));
             }
@@ -761,7 +746,6 @@ impl FilesystemReconciler {
                 node_id: dir.node_id,
                 content_type: dir.content_type,
             }),
-            0, // subdirs_migrated always 0 (feature deprecated)
             total_uuids,
         ))
     }
@@ -799,7 +783,6 @@ mod tests {
 
         // Should migrate because UUID was generated for file.txt
         assert!(result.migrated);
-        assert_eq!(result.subdirs_migrated, 0);
         assert_eq!(result.uuids_generated, 1);
 
         // Verify the generated node_id is a UUID
@@ -840,7 +823,6 @@ mod tests {
 
         // No migration needed
         assert!(!result.migrated);
-        assert_eq!(result.subdirs_migrated, 0);
         assert_eq!(result.uuids_generated, 0);
     }
 
@@ -872,7 +854,6 @@ mod tests {
 
         // Already node-backed, no migration needed
         assert!(!result.migrated);
-        assert_eq!(result.subdirs_migrated, 0);
     }
 
     #[tokio::test]
