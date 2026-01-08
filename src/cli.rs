@@ -255,6 +255,11 @@ pub struct LogArgs {
     #[clap(short = 'f', long)]
     pub follow: bool,
 
+    /// Show commits in chronological order (oldest first)
+    /// Default is newest-first like git log
+    #[clap(long)]
+    pub reverse: bool,
+
     /// Server URL
     #[clap(long, default_value = "http://localhost:3000")]
     pub server: String,
