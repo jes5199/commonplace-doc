@@ -11,6 +11,8 @@ pub mod content_type;
 pub mod dir_sync;
 pub mod directory;
 pub mod file_sync;
+#[cfg(unix)]
+pub mod flock;
 pub mod sse;
 pub mod state;
 pub mod state_file;
