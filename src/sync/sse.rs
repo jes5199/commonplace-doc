@@ -544,8 +544,41 @@ pub async fn handle_server_edit_with_flock(
                         process_pending_inbound_after_confirm(flock_state, file_path).await
                     {
                         debug!(?file_path, cid, "writing previously queued inbound content");
-                        if let Err(e) = tokio::fs::write(file_path, &content).await {
-                            error!(?file_path, ?e, "failed to write queued inbound content");
+                        // Use flock protection for the write - ancestry already confirmed above
+                        match try_flock_exclusive(file_path, None).await {
+                            Ok(FlockResult::Acquired(_guard)) => {
+                                if let Err(e) = tokio::fs::write(file_path, &content).await {
+                                    error!(
+                                        ?file_path,
+                                        ?e,
+                                        "failed to write queued inbound content"
+                                    );
+                                } else {
+                                    debug!(?file_path, cid, "wrote queued inbound with flock");
+                                }
+                            }
+                            Ok(FlockResult::Timeout) => {
+                                // Timeout - write anyway (agent's problem if they lose data)
+                                if let Err(e) = tokio::fs::write(file_path, &content).await {
+                                    error!(
+                                        ?file_path,
+                                        ?e,
+                                        "failed to write queued inbound content"
+                                    );
+                                } else {
+                                    warn!(
+                                        ?file_path,
+                                        cid, "wrote queued inbound after flock timeout"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    ?file_path,
+                                    ?e,
+                                    "failed to acquire flock for queued inbound"
+                                );
+                            }
                         }
                     }
                 }
