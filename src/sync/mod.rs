@@ -6,6 +6,7 @@ use std::io;
 use std::path::Path;
 use tracing::{error, info};
 
+pub mod ancestry;
 pub mod client;
 pub mod content_type;
 pub mod dir_sync;

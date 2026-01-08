@@ -89,6 +89,22 @@ pub fn build_fork_url(server: &str, source_node: &str, at_commit: Option<&str>) 
     url
 }
 
+/// Build URL for ancestry check endpoint
+pub fn build_is_ancestor_url(
+    base: &str,
+    doc_id: &uuid::Uuid,
+    ancestor: &str,
+    descendant: &str,
+) -> String {
+    format!(
+        "{}/docs/{}/is-ancestor?ancestor={}&descendant={}",
+        base.trim_end_matches('/'),
+        doc_id,
+        urlencoding::encode(ancestor),
+        urlencoding::encode(descendant)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +263,20 @@ mod tests {
             assert_eq!(
                 url,
                 "http://localhost:3000/docs/my-node/fork?at_commit=abc123"
+            );
+        }
+
+        #[test]
+        fn test_build_is_ancestor_url() {
+            let url = build_is_ancestor_url(
+                "http://localhost:3000",
+                &uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+                "abc123",
+                "def456",
+            );
+            assert_eq!(
+                url,
+                "http://localhost:3000/docs/550e8400-e29b-41d4-a716-446655440000/is-ancestor?ancestor=abc123&descendant=def456"
             );
         }
     }
