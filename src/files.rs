@@ -207,21 +207,12 @@ async fn resolve_path(state: &FileApiState, path: &str) -> Result<String, PathRe
                 return Err(PathResolveError::PathNotFound);
             }
 
-            // Check if entries is null (subdirectory in separate document)
-            let sub_entries = entry.get("entries");
-            if sub_entries.is_none() || sub_entries.map(|e| e.is_null()).unwrap_or(true) {
-                // Need to fetch the subdirectory document
-                let node_id = entry
-                    .get("node_id")
-                    .and_then(|v| v.as_str())
-                    .ok_or(PathResolveError::PathNotFound)?;
-                current_doc_id = node_id.to_string();
-            } else {
-                // Entries are inline - this case shouldn't happen with current reconciler
-                // but handle it anyway by continuing to next segment
-                // We need to navigate within the same document
-                return Err(PathResolveError::PathNotFound);
-            }
+            // All directories are node-backed (inline subdirectories were deprecated)
+            let node_id = entry
+                .get("node_id")
+                .and_then(|v| v.as_str())
+                .ok_or(PathResolveError::PathNotFound)?;
+            current_doc_id = node_id.to_string();
         }
     }
 

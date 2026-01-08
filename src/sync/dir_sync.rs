@@ -177,14 +177,13 @@ pub async fn handle_subdir_schema_cleanup(
         warn!("Failed to write subdir schema file: {}", e);
     }
 
-    // Check if schema has any entries at all (inline docs, inline dirs, or node-backed dirs)
+    // Check if schema has any entries at all
     // If schema has entries but UUID map is empty, something is wrong (e.g., docs awaiting node_id)
     let schema_has_entries = if let Some(Entry::Dir(root_dir)) = &schema.root {
         if let Some(ref entries) = root_dir.entries {
             !entries.is_empty()
         } else {
-            // entries is None means this is a node-backed directory (has node_id but no inline entries)
-            // which may contain files - treat as "has entries" to be safe
+            // All directories are node-backed - check if it has a node_id
             root_dir.node_id.is_some()
         }
     } else {
@@ -197,8 +196,8 @@ pub async fn handle_subdir_schema_cleanup(
 
     // Safety checks for deletion:
     // 1. If ANY fetch failed → map may be incomplete, skip deletions
-    // 2. If schema has entries (inline or node-backed) but UUID map is empty → entries may be
-    //    waiting for node_id assignment by the reconciler, skip deletions during this race window
+    // 2. If schema has entries but UUID map is empty → entries may be waiting for node_id
+    //    assignment by the reconciler, skip deletions during this race window
     let skip_deletions = if !all_fetches_succeeded {
         debug!(
             "Subdir {} had fetch failures during UUID map building - skipping file deletion to avoid data loss",
@@ -668,23 +667,7 @@ async fn write_nested_schemas_recursive(
             }
         }
 
-        // Handle inline entries - traverse subdirectories
-        if let Some(ref entries) = dir.entries {
-            for (name, child) in entries {
-                if let Entry::Dir(_) = child {
-                    let child_dir = current_dir.join(name);
-                    write_nested_schemas_recursive(
-                        client,
-                        server,
-                        _base_dir,
-                        child,
-                        &child_dir,
-                        processed_hashes,
-                    )
-                    .await?;
-                }
-            }
-        }
+        // Note: inline subdirectories were deprecated - all directories are now node-backed
     }
     Ok(())
 }
@@ -785,17 +768,7 @@ async fn push_nested_schemas_recursive(
             }
         }
 
-        // Handle inline entries - traverse subdirectories
-        if let Some(ref entries) = dir.entries {
-            for (name, child) in entries {
-                if let Entry::Dir(_) = child {
-                    let child_dir = current_dir.join(name);
-                    pushed_count +=
-                        push_nested_schemas_recursive(client, server, _base_dir, child, &child_dir)
-                            .await?;
-                }
-            }
-        }
+        // Note: inline subdirectories were deprecated - all directories are now node-backed
     }
 
     Ok(pushed_count)
