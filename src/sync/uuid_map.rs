@@ -189,15 +189,13 @@ pub async fn collect_paths_with_node_backed_dirs(
 ) {
     match entry {
         Entry::Dir(dir) => {
-            // If this is a node-backed directory (entries: null, node_id: Some),
-            // fetch its schema and continue recursively
-            if dir.entries.is_none() {
-                if let Some(ref node_id) = dir.node_id {
-                    // This is a node-backed directory - fetch its schema
-                    build_uuid_map_from_doc(client, server, node_id, prefix, uuid_map).await;
-                }
-            } else if let Some(ref entries) = dir.entries {
-                // Inline directory - traverse its entries
+            // Node-backed directory: fetch its document and recurse
+            if let Some(ref node_id) = dir.node_id {
+                build_uuid_map_from_doc(client, server, node_id, prefix, uuid_map).await;
+            }
+            // Directory with inline entries (root or legacy): iterate over entries
+            // Note: nested inline subdirectories are deprecated, but root entries are valid
+            if let Some(ref entries) = dir.entries {
                 for (name, child) in entries {
                     let child_path = if prefix.is_empty() {
                         name.clone()
@@ -237,23 +235,21 @@ pub async fn collect_paths_with_node_backed_dirs_with_status(
 ) {
     match entry {
         Entry::Dir(dir) => {
-            // If this is a node-backed directory (entries: null, node_id: Some),
-            // fetch its schema and continue recursively
-            if dir.entries.is_none() {
-                if let Some(ref node_id) = dir.node_id {
-                    // This is a node-backed directory - fetch its schema
-                    build_uuid_map_from_doc_with_status(
-                        client,
-                        server,
-                        node_id,
-                        prefix,
-                        uuid_map,
-                        all_succeeded,
-                    )
-                    .await;
-                }
-            } else if let Some(ref entries) = dir.entries {
-                // Inline directory - traverse its entries
+            // Node-backed directory: fetch its document and recurse
+            if let Some(ref node_id) = dir.node_id {
+                build_uuid_map_from_doc_with_status(
+                    client,
+                    server,
+                    node_id,
+                    prefix,
+                    uuid_map,
+                    all_succeeded,
+                )
+                .await;
+            }
+            // Directory with inline entries (root or legacy): iterate over entries
+            // Note: nested inline subdirectories are deprecated, but root entries are valid
+            if let Some(ref entries) = dir.entries {
                 for (name, child) in entries {
                     let child_path = if prefix.is_empty() {
                         name.clone()
@@ -296,31 +292,31 @@ pub async fn collect_node_backed_dir_ids(
 ) {
     match entry {
         Entry::Dir(dir) => {
-            if dir.entries.is_none() {
-                if let Some(ref node_id) = dir.node_id {
-                    // This is a node-backed directory - add to result
-                    result.push((prefix.to_string(), node_id.clone()));
+            // Node-backed directory: add to result and recurse into its content
+            if let Some(ref node_id) = dir.node_id {
+                // Add to result
+                result.push((prefix.to_string(), node_id.clone()));
 
-                    // Also recursively check if this subdirectory has nested node-backed dirs
-                    let url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
-                    if let Ok(resp) = client.get(&url).send().await {
-                        if resp.status().is_success() {
-                            if let Ok(head) = resp.json::<HeadResponse>().await {
-                                if let Ok(schema) = serde_json::from_str::<FsSchema>(&head.content)
-                                {
-                                    if let Some(ref root) = schema.root {
-                                        collect_node_backed_dir_ids(
-                                            client, server, root, prefix, result,
-                                        )
-                                        .await;
-                                    }
+                // Also recursively check if this subdirectory has nested node-backed dirs
+                let url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
+                if let Ok(resp) = client.get(&url).send().await {
+                    if resp.status().is_success() {
+                        if let Ok(head) = resp.json::<HeadResponse>().await {
+                            if let Ok(schema) = serde_json::from_str::<FsSchema>(&head.content) {
+                                if let Some(ref root) = schema.root {
+                                    collect_node_backed_dir_ids(
+                                        client, server, root, prefix, result,
+                                    )
+                                    .await;
                                 }
                             }
                         }
                     }
                 }
-            } else if let Some(ref entries) = dir.entries {
-                // Inline directory - traverse its entries
+            }
+            // Directory with inline entries (root or legacy): iterate over entries
+            // to find node-backed subdirectories
+            if let Some(ref entries) = dir.entries {
                 for (name, child) in entries {
                     let child_path = if prefix.is_empty() {
                         name.clone()

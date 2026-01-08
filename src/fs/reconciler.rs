@@ -55,13 +55,11 @@ impl FilesystemReconciler {
 
     /// Reconcile current state: parse JSON, collect entries, create missing documents.
     ///
-    /// This method also handles migration of inline subdirectories to separate documents.
-    /// When inline subdirectories are found, they are extracted into new documents and
-    /// the parent schema is updated with `node_id` references.
+    /// This method ensures all entries have node_ids (UUIDs) and creates missing documents.
     ///
     /// Note: Uses cycle detection to prevent infinite recursion on cyclic node-backed dirs.
     pub async fn reconcile(&self, content: &str) -> Result<(), FsError> {
-        // 0. First, migrate any inline subdirectories
+        // 0. First, ensure all entries have UUIDs
         let migration_result = self.migrate_inline_subdirectories(content).await?;
 
         let effective_content = if migration_result.migrated {
@@ -282,12 +280,28 @@ impl FilesystemReconciler {
         // Try to get existing document - not an error if it doesn't exist yet
         let doc = self.document_store.get_document(doc_id).await?;
 
-        let content = doc.content;
-
         // Empty content is not an error (document just hasn't been populated)
-        if content.is_empty() || content == "{}" {
+        if doc.content.is_empty() || doc.content == "{}" {
             return None;
         }
+
+        // First, run UUID migration on this subdirectory document
+        // This ensures all entries have UUIDs before we collect them
+        if let Err(e) = self.migrate_subdirectory_document(doc_id).await {
+            // If migration fails (e.g., due to deprecated inline subdirectories),
+            // skip this document entirely to avoid generating unstable UUIDs
+            tracing::warn!(
+                "Skipping subdirectory document {} at {}: migration failed: {}",
+                doc_id,
+                base_path,
+                e
+            );
+            return None;
+        }
+
+        // Re-fetch the document after migration (content may have changed)
+        let doc = self.document_store.get_document(doc_id).await?;
+        let content = doc.content;
 
         // Try to parse as filesystem schema - fall back to cached on error
         let schema: FsSchema = match serde_json::from_str(&content) {
@@ -597,13 +611,12 @@ impl FilesystemReconciler {
         }
     }
 
-    /// Migrate inline subdirectories to separate documents.
+    /// Ensure all entries have node_ids (UUIDs).
     ///
-    /// Walks the schema tree, and for each directory with inline `entries`,
-    /// creates a new document with those entries and replaces the inline
-    /// entries with a `node_id` reference.
+    /// Walks the schema tree and generates UUIDs for any entries that don't have node_id set.
+    /// Note: Inline subdirectory migration was removed as that feature is deprecated.
     ///
-    /// Returns the migrated schema and whether any migration occurred.
+    /// Returns the updated schema and whether any changes were made.
     pub async fn migrate_inline_subdirectories(
         &self,
         content: &str,
@@ -672,21 +685,22 @@ impl FilesystemReconciler {
         }
     }
 
-    /// Migrate a directory entry and its children.
+    /// Process a directory entry and ensure all children have UUIDs.
     ///
-    /// Returns (migrated_entry, subdirs_migrated, uuids_generated).
+    /// Returns (entry, subdirs_migrated_always_0, uuids_generated).
+    /// Note: subdirs_migrated is always 0 since inline subdirectories are deprecated.
     async fn migrate_dir_entry(
         &self,
         dir: DirEntry,
-        current_path: &str,
+        _current_path: &str,
     ) -> Result<(Entry, usize, usize), FsError> {
-        // If already node-backed (no inline entries), just ensure it has a UUID
+        // All directories should be node-backed now (inline subdirectories deprecated)
         let Some(entries) = dir.entries else {
-            // Node-backed dir without entries - ensure it has a UUID
+            // Node-backed dir - ensure it has a UUID
             if dir.node_id.is_some() {
                 return Ok((Entry::Dir(dir), 0, 0));
             } else {
-                // Generate UUID for node-backed dir without node_id
+                // Generate UUID for dir without node_id
                 return Ok((
                     Entry::Dir(DirEntry {
                         entries: None,
@@ -699,18 +713,11 @@ impl FilesystemReconciler {
             }
         };
 
-        // Process each child entry
+        // Process each child entry - ensure they have UUIDs
         let mut new_entries: HashMap<String, Entry> = HashMap::new();
-        let mut total_subdirs = 0;
         let mut total_uuids = 0;
 
         for (name, child) in entries {
-            let child_path = if current_path.is_empty() {
-                name.clone()
-            } else {
-                format!("{}/{}", current_path, name)
-            };
-
             match child {
                 Entry::Doc(mut doc) => {
                     // Ensure doc has UUID
@@ -721,76 +728,28 @@ impl FilesystemReconciler {
                     new_entries.insert(name, Entry::Doc(doc));
                 }
                 Entry::Dir(child_dir) => {
-                    if child_dir.entries.is_some() {
-                        // This is an inline subdirectory - migrate it!
-                        let (migrated_child, child_subdirs, child_uuids) =
-                            Box::pin(self.migrate_dir_entry(child_dir, &child_path)).await?;
+                    // All directories must be node-backed (have node_id)
+                    // Inline subdirectories (entries without node_id) are no longer supported
+                    if child_dir.entries.is_some() && child_dir.node_id.is_none() {
+                        return Err(FsError::SchemaError(format!(
+                            "Inline subdirectory '{}' is not supported. All directories must be node-backed (have node_id).",
+                            name
+                        )));
+                    }
 
-                        // Generate a UUID for the new subdirectory document
-                        let new_doc_id = uuid::Uuid::new_v4().to_string();
-
-                        // Build the subdirectory's schema
-                        let subdir_schema = FsSchema {
-                            version: 1,
-                            root: Some(migrated_child),
-                        };
-
-                        let subdir_json =
-                            serde_json::to_string_pretty(&subdir_schema).map_err(|e| {
-                                FsError::SchemaError(format!("Failed to serialize: {}", e))
-                            })?;
-
-                        // Create the document (or get existing)
-                        self.document_store
-                            .get_or_create_with_id(&new_doc_id, ContentType::Json)
-                            .await;
-
-                        // Set its content
-                        if let Err(e) = self
-                            .document_store
-                            .set_content(&new_doc_id, &subdir_json)
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to set content for subdirectory document {}: {:?}",
-                                new_doc_id,
-                                e
-                            );
-                        } else {
-                            tracing::info!(
-                                "Migrated inline subdirectory '{}' to document {}",
-                                name,
-                                new_doc_id
-                            );
-                        }
-
-                        // Replace with node_id reference
+                    if child_dir.node_id.is_some() {
+                        new_entries.insert(name, Entry::Dir(child_dir));
+                    } else {
+                        // Directory without entries and without node_id - generate UUID
                         new_entries.insert(
                             name,
                             Entry::Dir(DirEntry {
                                 entries: None,
-                                node_id: Some(new_doc_id),
-                                content_type: Some("application/json".to_string()),
+                                node_id: Some(uuid::Uuid::new_v4().to_string()),
+                                content_type: child_dir.content_type,
                             }),
                         );
-
-                        total_subdirs += 1 + child_subdirs;
-                        total_uuids += child_uuids;
-                    } else {
-                        // Already node-backed - ensure it has a UUID
-                        if child_dir.node_id.is_some() {
-                            new_entries.insert(name, Entry::Dir(child_dir));
-                        } else {
-                            new_entries.insert(
-                                name,
-                                Entry::Dir(DirEntry {
-                                    entries: None,
-                                    node_id: Some(uuid::Uuid::new_v4().to_string()),
-                                    content_type: child_dir.content_type,
-                                }),
-                            );
-                            total_uuids += 1;
-                        }
+                        total_uuids += 1;
                     }
                 }
             }
@@ -802,7 +761,7 @@ impl FilesystemReconciler {
                 node_id: dir.node_id,
                 content_type: dir.content_type,
             }),
-            total_subdirs,
+            0, // subdirs_migrated always 0 (feature deprecated)
             total_uuids,
         ))
     }
@@ -885,157 +844,7 @@ mod tests {
         assert_eq!(result.uuids_generated, 0);
     }
 
-    #[tokio::test]
-    async fn test_migrate_inline_subdir() {
-        let store = Arc::new(DocumentStore::new());
-        let reconciler = FilesystemReconciler::new("fs-root".to_string(), store.clone());
-
-        // Schema with inline subdirectory
-        let content = r#"{
-            "version": 1,
-            "root": {
-                "type": "dir",
-                "entries": {
-                    "file.txt": {"type": "doc"},
-                    "notes": {
-                        "type": "dir",
-                        "entries": {
-                            "todo.txt": {"type": "doc"}
-                        }
-                    }
-                }
-            }
-        }"#;
-
-        let result = reconciler
-            .migrate_inline_subdirectories(content)
-            .await
-            .unwrap();
-
-        assert!(result.migrated);
-        assert_eq!(result.subdirs_migrated, 1);
-        // file.txt and todo.txt both get UUIDs
-        assert_eq!(result.uuids_generated, 2);
-
-        // Check that the migrated schema has node_id instead of entries
-        let migrated_schema: FsSchema = serde_json::from_str(&result.schema).unwrap();
-        let notes_node_id: String;
-        if let Some(Entry::Dir(root)) = &migrated_schema.root {
-            let entries = root.entries.as_ref().unwrap();
-            if let Some(Entry::Dir(notes)) = entries.get("notes") {
-                assert!(notes.node_id.is_some());
-                assert!(notes.entries.is_none());
-                // The node_id should be a UUID, not a derived path
-                notes_node_id = notes.node_id.clone().unwrap();
-                assert!(is_uuid_format(&notes_node_id));
-            } else {
-                panic!("Expected notes directory");
-            }
-            // Also check file.txt got a UUID
-            if let Some(Entry::Doc(file)) = entries.get("file.txt") {
-                assert!(file.node_id.is_some());
-                assert!(is_uuid_format(file.node_id.as_ref().unwrap()));
-            } else {
-                panic!("Expected file.txt doc");
-            }
-        } else {
-            panic!("Expected root directory");
-        }
-
-        // Check that the subdirectory document was created with the UUID
-        let subdir_doc = store.get_document(&notes_node_id).await;
-        assert!(subdir_doc.is_some());
-
-        // Check subdirectory content
-        let subdir_content = subdir_doc.unwrap().content;
-        let subdir_schema: FsSchema = serde_json::from_str(&subdir_content).unwrap();
-        assert_eq!(subdir_schema.version, 1);
-        if let Some(Entry::Dir(subdir_root)) = subdir_schema.root {
-            let entries = subdir_root.entries.unwrap();
-            assert!(entries.contains_key("todo.txt"));
-            // todo.txt should also have a UUID
-            if let Some(Entry::Doc(todo)) = entries.get("todo.txt") {
-                assert!(todo.node_id.is_some());
-                assert!(is_uuid_format(todo.node_id.as_ref().unwrap()));
-            }
-        } else {
-            panic!("Expected subdirectory root");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_migrate_nested_subdirs() {
-        let store = Arc::new(DocumentStore::new());
-        let reconciler = FilesystemReconciler::new("fs-root".to_string(), store.clone());
-
-        // Schema with nested subdirectories
-        let content = r#"{
-            "version": 1,
-            "root": {
-                "type": "dir",
-                "entries": {
-                    "level1": {
-                        "type": "dir",
-                        "entries": {
-                            "level2": {
-                                "type": "dir",
-                                "entries": {
-                                    "deep.txt": {"type": "doc"}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }"#;
-
-        let result = reconciler
-            .migrate_inline_subdirectories(content)
-            .await
-            .unwrap();
-
-        assert!(result.migrated);
-        assert_eq!(result.subdirs_migrated, 2); // level1 and level2
-        assert_eq!(result.uuids_generated, 1); // deep.txt
-
-        // Get the UUID for level1 from the migrated schema
-        let migrated_schema: FsSchema = serde_json::from_str(&result.schema).unwrap();
-        let level1_id = if let Some(Entry::Dir(root)) = &migrated_schema.root {
-            let entries = root.entries.as_ref().unwrap();
-            if let Some(Entry::Dir(level1)) = entries.get("level1") {
-                level1.node_id.clone().unwrap()
-            } else {
-                panic!("Expected level1 directory");
-            }
-        } else {
-            panic!("Expected root directory");
-        };
-
-        // Check level1 document was created
-        let level1_doc = store.get_document(&level1_id).await;
-        assert!(level1_doc.is_some());
-
-        // Get level2 UUID from level1's content
-        let level1_content = level1_doc.unwrap().content;
-        let level1_schema: FsSchema = serde_json::from_str(&level1_content).unwrap();
-        let level2_id = if let Some(Entry::Dir(root)) = &level1_schema.root {
-            let entries = root.entries.as_ref().unwrap();
-            if let Some(Entry::Dir(level2)) = entries.get("level2") {
-                level2.node_id.clone().unwrap()
-            } else {
-                panic!("Expected level2 directory");
-            }
-        } else {
-            panic!("Expected level1 root directory");
-        };
-
-        // Check level2 document was created
-        assert!(store.get_document(&level2_id).await.is_some());
-
-        // Verify both IDs are UUIDs
-        assert!(is_uuid_format(&level1_id));
-        assert!(is_uuid_format(&level2_id));
-    }
+    // Note: Tests for inline subdirectory migration removed - feature deprecated
 
     #[tokio::test]
     async fn test_migrate_already_node_backed() {
@@ -1064,5 +873,42 @@ mod tests {
         // Already node-backed, no migration needed
         assert!(!result.migrated);
         assert_eq!(result.subdirs_migrated, 0);
+    }
+
+    #[tokio::test]
+    async fn test_inline_subdirectory_rejected() {
+        let store = Arc::new(DocumentStore::new());
+        let reconciler = FilesystemReconciler::new("fs-root".to_string(), store);
+
+        // Schema with inline subdirectory (entries but no node_id) - should be rejected
+        let content = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "inline_subdir": {
+                        "type": "dir",
+                        "entries": {
+                            "nested_file.txt": {"type": "doc"}
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let result = reconciler.migrate_inline_subdirectories(content).await;
+
+        // Should fail because inline subdirectories are not supported
+        match result {
+            Ok(_) => panic!("Expected error for inline subdirectory"),
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("Inline subdirectory"),
+                    "Error should mention inline subdirectory: {}",
+                    err_msg
+                );
+            }
+        }
     }
 }

@@ -48,13 +48,9 @@ pub async fn resolve_path_to_doc_id(
             if entry_type != "dir" {
                 return None;
             }
-            let sub_entries = entry.get("entries");
-            if sub_entries.is_none() || sub_entries.map(|e| e.is_null()).unwrap_or(true) {
-                let node_id = entry.get("node_id")?.as_str()?;
-                current_doc_id = node_id.to_string();
-            } else {
-                return None;
-            }
+            // All directories are node-backed (inline subdirectories were deprecated)
+            let node_id = entry.get("node_id")?.as_str()?;
+            current_doc_id = node_id.to_string();
         }
     }
 
