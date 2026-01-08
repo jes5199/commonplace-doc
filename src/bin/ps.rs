@@ -52,8 +52,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             // Print header
             println!(
-                "{:<25} {:>8} {:<10} {:<20} {}",
-                "NAME", "PID", "STATE", "SOURCE", "CWD"
+                "{:<25} {:>8} {:<10} {:<20} CWD",
+                "NAME", "PID", "STATE", "SOURCE"
             );
             println!("{}", "-".repeat(100));
 
