@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::document::{ContentType, DocumentStore};
 use crate::events::CommitBroadcaster;
 use crate::services::{DocumentService, ServiceError};
-use crate::store::CommitStore;
+use crate::store::{CommitStore, StoreError};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -67,6 +67,7 @@ pub fn router(
         .route("/docs/:id/edit", post(edit_doc))
         .route("/docs/:id/replace", post(replace_doc))
         .route("/docs/:id/fork", post(fork_doc))
+        .route("/docs/:id/is-ancestor", get(is_ancestor_handler))
         // fs-root discovery endpoint
         .route("/fs-root", get(get_fs_root))
         .with_state(state)
@@ -361,6 +362,17 @@ struct ForkParams {
     at_commit: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AncestorQuery {
+    ancestor: String,
+    descendant: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AncestorResponse {
+    is_ancestor: bool,
+}
+
 #[derive(Serialize)]
 struct ForkResponse {
     id: String,
@@ -381,4 +393,29 @@ async fn fork_doc(
         id: result.id,
         head: result.head,
     }))
+}
+
+/// Check if one commit is an ancestor of another in the document's DAG.
+///
+/// Note: `_doc_id` is captured from the path for API consistency but not used because
+/// commits are global across documents - the is_ancestor check only needs the commit CIDs.
+pub async fn is_ancestor_handler(
+    Path(_doc_id): Path<String>,
+    Query(params): Query<AncestorQuery>,
+    State(state): State<ApiState>,
+) -> Result<Json<AncestorResponse>, ServiceError> {
+    let store = state
+        .commit_store
+        .as_ref()
+        .ok_or(ServiceError::NoPersistence)?;
+
+    let is_ancestor = store
+        .is_ancestor(&params.ancestor, &params.descendant)
+        .await
+        .map_err(|e| match e {
+            StoreError::CommitNotFound(_) => ServiceError::NotFound,
+            _ => ServiceError::Internal(e.to_string()),
+        })?;
+
+    Ok(Json(AncestorResponse { is_ancestor }))
 }

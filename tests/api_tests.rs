@@ -942,3 +942,106 @@ async fn test_replace_text_document() {
     let after_body = body_to_string(get_after.into_body()).await;
     assert_eq!(after_body, new_content);
 }
+
+#[tokio::test]
+async fn test_is_ancestor_endpoint() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    // Create a document
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/docs")
+                .header("Content-Type", "text/plain")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let doc_id = json["id"].as_str().unwrap();
+
+    // Make a commit via replace
+    let commit1_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/docs/{}/replace", doc_id))
+                .header("Content-Type", "text/plain")
+                .body(Body::from("version 2"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(commit1_response.status(), StatusCode::OK);
+    let commit1: serde_json::Value =
+        serde_json::from_str(&body_to_string(commit1_response.into_body()).await).unwrap();
+    let cid1 = commit1["cid"].as_str().unwrap();
+
+    // Make another commit
+    let commit2_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/docs/{}/replace", doc_id))
+                .header("Content-Type", "text/plain")
+                .body(Body::from("version 3"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(commit2_response.status(), StatusCode::OK);
+    let commit2: serde_json::Value =
+        serde_json::from_str(&body_to_string(commit2_response.into_body()).await).unwrap();
+    let cid2 = commit2["cid"].as_str().unwrap();
+
+    // Check ancestry: cid1 should be ancestor of cid2
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/docs/{}/is-ancestor?ancestor={}&descendant={}",
+                    doc_id, cid1, cid2
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_to_string(response.into_body()).await).unwrap();
+    assert_eq!(body["is_ancestor"], true);
+
+    // Check non-ancestry: cid2 should NOT be ancestor of cid1
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/docs/{}/is-ancestor?ancestor={}&descendant={}",
+                    doc_id, cid2, cid1
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_to_string(response.into_body()).await).unwrap();
+    assert_eq!(body["is_ancestor"], false);
+}
