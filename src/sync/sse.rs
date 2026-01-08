@@ -540,10 +540,13 @@ pub async fn handle_server_edit_with_flock(
                     );
 
                     // Check for any queued inbound write and process it if present
-                    if let Some((_content, _cid)) =
+                    if let Some((content, cid)) =
                         process_pending_inbound_after_confirm(flock_state, file_path).await
                     {
-                        debug!(?file_path, "processing previously queued inbound write");
+                        debug!(?file_path, cid, "writing previously queued inbound content");
+                        if let Err(e) = tokio::fs::write(file_path, &content).await {
+                            error!(?file_path, ?e, "failed to write queued inbound content");
+                        }
                     }
                 }
                 Ok(false) => {
