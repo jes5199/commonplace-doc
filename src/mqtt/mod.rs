@@ -276,3 +276,26 @@ impl MqttService {
         &self.commands_handler
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that MqttConfig::default() uses "commonplace" as the workspace
+    #[test]
+    fn test_config_default_workspace() {
+        let config = MqttConfig::default();
+        assert_eq!(config.workspace, "commonplace");
+    }
+
+    /// Test default values for MqttConfig
+    #[test]
+    fn test_config_default_values() {
+        let config = MqttConfig::default();
+        assert_eq!(config.broker_url, "mqtt://localhost:1883");
+        assert_eq!(config.keep_alive_secs, 60);
+        assert!(config.clean_session);
+        // client_id should be a valid UUID
+        assert!(!config.client_id.is_empty());
+    }
+}

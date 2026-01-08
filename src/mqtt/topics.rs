@@ -465,4 +465,158 @@ mod tests {
         };
         assert_eq!(topic.workspace, "commonplace");
     }
+
+    // ========================================
+    // Workspace namespacing integration tests
+    // ========================================
+
+    /// Test that topics roundtrip correctly: construct -> to_topic_string -> parse
+    #[test]
+    fn test_topic_roundtrip_with_workspace() {
+        let original = Topic::edits("myworkspace", "docs/notes.txt");
+        let topic_str = original.to_topic_string();
+        assert_eq!(topic_str, "myworkspace/docs/notes.txt/edits");
+
+        let parsed = Topic::parse(&topic_str, "myworkspace").unwrap();
+        assert_eq!(parsed.workspace, original.workspace);
+        assert_eq!(parsed.path, original.path);
+        assert_eq!(parsed.port, original.port);
+        assert_eq!(parsed.qualifier, original.qualifier);
+    }
+
+    /// Test that different workspaces produce different topic strings
+    #[test]
+    fn test_different_workspaces_different_topics() {
+        let t1 = Topic::edits("workspace-a", "doc.txt");
+        let t2 = Topic::edits("workspace-b", "doc.txt");
+
+        assert_ne!(t1.to_topic_string(), t2.to_topic_string());
+        assert_eq!(t1.to_topic_string(), "workspace-a/doc.txt/edits");
+        assert_eq!(t2.to_topic_string(), "workspace-b/doc.txt/edits");
+    }
+
+    /// Test roundtrip for sync topics with qualifiers
+    #[test]
+    fn test_sync_topic_roundtrip_with_workspace() {
+        let original = Topic::sync("my-workspace", "data/config.json", "client-abc");
+        let topic_str = original.to_topic_string();
+        assert_eq!(topic_str, "my-workspace/data/config.json/sync/client-abc");
+
+        let parsed = Topic::parse(&topic_str, "my-workspace").unwrap();
+        assert_eq!(parsed.workspace, original.workspace);
+        assert_eq!(parsed.path, original.path);
+        assert_eq!(parsed.port, original.port);
+        assert_eq!(parsed.qualifier, original.qualifier);
+    }
+
+    /// Test roundtrip for events topics with qualifiers
+    #[test]
+    fn test_events_topic_roundtrip_with_workspace() {
+        let original = Topic::events("test_workspace", "sensors/temp.json", "reading-update");
+        let topic_str = original.to_topic_string();
+        assert_eq!(
+            topic_str,
+            "test_workspace/sensors/temp.json/events/reading-update"
+        );
+
+        let parsed = Topic::parse(&topic_str, "test_workspace").unwrap();
+        assert_eq!(parsed.workspace, original.workspace);
+        assert_eq!(parsed.path, original.path);
+        assert_eq!(parsed.port, original.port);
+        assert_eq!(parsed.qualifier, original.qualifier);
+    }
+
+    /// Test roundtrip for commands topics with qualifiers
+    #[test]
+    fn test_commands_topic_roundtrip_with_workspace() {
+        let original = Topic::commands("prod-workspace", "control/device.json", "reset");
+        let topic_str = original.to_topic_string();
+        assert_eq!(
+            topic_str,
+            "prod-workspace/control/device.json/commands/reset"
+        );
+
+        let parsed = Topic::parse(&topic_str, "prod-workspace").unwrap();
+        assert_eq!(parsed.workspace, original.workspace);
+        assert_eq!(parsed.path, original.path);
+        assert_eq!(parsed.port, original.port);
+        assert_eq!(parsed.qualifier, original.qualifier);
+    }
+
+    /// Test that parsing with wrong workspace fails
+    #[test]
+    fn test_workspace_mismatch_fails() {
+        let topic = Topic::edits("workspace-a", "doc.txt");
+        let topic_str = topic.to_topic_string();
+
+        // Try to parse with different workspace
+        let result = Topic::parse(&topic_str, "workspace-b");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("does not match expected"));
+    }
+
+    /// Test wildcard patterns include workspace
+    #[test]
+    fn test_wildcards_include_workspace() {
+        let workspace = "my-workspace";
+        let path = "docs/notes.txt";
+
+        assert_eq!(
+            Topic::sync_wildcard(workspace, path),
+            "my-workspace/docs/notes.txt/sync/+"
+        );
+        assert_eq!(
+            Topic::events_wildcard(workspace, path),
+            "my-workspace/docs/notes.txt/events/#"
+        );
+        assert_eq!(
+            Topic::commands_wildcard(workspace, path),
+            "my-workspace/docs/notes.txt/commands/#"
+        );
+    }
+
+    /// Test that all port types work with workspace namespacing
+    #[test]
+    fn test_all_ports_with_workspace() {
+        let workspace = "test-ns";
+        let path = "file.txt";
+
+        // Edits
+        let edits = Topic::edits(workspace, path);
+        assert_eq!(edits.to_topic_string(), "test-ns/file.txt/edits");
+
+        // Sync
+        let sync = Topic::sync(workspace, path, "client");
+        assert_eq!(sync.to_topic_string(), "test-ns/file.txt/sync/client");
+
+        // Events
+        let events = Topic::events(workspace, path, "event");
+        assert_eq!(events.to_topic_string(), "test-ns/file.txt/events/event");
+
+        // Commands
+        let commands = Topic::commands(workspace, path, "cmd");
+        assert_eq!(commands.to_topic_string(), "test-ns/file.txt/commands/cmd");
+    }
+
+    /// Test workspace isolation: same paths in different workspaces are independent
+    #[test]
+    fn test_workspace_isolation() {
+        let path = "shared/document.txt";
+
+        let topic_ws1 = Topic::edits("workspace1", path);
+        let topic_ws2 = Topic::edits("workspace2", path);
+
+        // They should have different topic strings
+        assert_ne!(topic_ws1.to_topic_string(), topic_ws2.to_topic_string());
+
+        // Parsing one workspace's topic with the other should fail
+        let ws1_str = topic_ws1.to_topic_string();
+        assert!(Topic::parse(&ws1_str, "workspace2").is_err());
+
+        let ws2_str = topic_ws2.to_topic_string();
+        assert!(Topic::parse(&ws2_str, "workspace1").is_err());
+    }
 }
