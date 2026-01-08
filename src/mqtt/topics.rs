@@ -46,6 +46,8 @@ impl Port {
 /// A parsed MQTT topic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Topic {
+    /// The workspace namespace
+    pub workspace: String,
     /// The document path (e.g., "terminal/screen.txt")
     pub path: String,
     /// The port type
@@ -113,6 +115,7 @@ impl Topic {
         };
 
         Ok(Topic {
+            workspace: String::new(),
             path,
             port,
             qualifier,
@@ -122,6 +125,7 @@ impl Topic {
     /// Construct an edits topic for a path.
     pub fn edits(path: &str) -> Self {
         Topic {
+            workspace: String::new(),
             path: path.to_string(),
             port: Port::Edits,
             qualifier: None,
@@ -131,6 +135,7 @@ impl Topic {
     /// Construct a sync topic for a path and client ID.
     pub fn sync(path: &str, client_id: &str) -> Self {
         Topic {
+            workspace: String::new(),
             path: path.to_string(),
             port: Port::Sync,
             qualifier: Some(client_id.to_string()),
@@ -140,6 +145,7 @@ impl Topic {
     /// Construct an events topic for a path and event name.
     pub fn events(path: &str, event_name: &str) -> Self {
         Topic {
+            workspace: String::new(),
             path: path.to_string(),
             port: Port::Events,
             qualifier: Some(event_name.to_string()),
@@ -149,6 +155,7 @@ impl Topic {
     /// Construct a commands topic for a path and verb.
     pub fn commands(path: &str, verb: &str) -> Self {
         Topic {
+            workspace: String::new(),
             path: path.to_string(),
             port: Port::Commands,
             qualifier: Some(verb.to_string()),
@@ -359,5 +366,16 @@ mod tests {
         assert!(validate_workspace_name("has+plus").is_err());
         assert!(validate_workspace_name("has#hash").is_err());
         assert!(validate_workspace_name("has space").is_err());
+    }
+
+    #[test]
+    fn test_topic_with_workspace() {
+        let topic = Topic {
+            workspace: "commonplace".to_string(),
+            path: "terminal/screen.txt".to_string(),
+            port: Port::Edits,
+            qualifier: None,
+        };
+        assert_eq!(topic.workspace, "commonplace");
     }
 }
