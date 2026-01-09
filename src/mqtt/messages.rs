@@ -157,6 +157,124 @@ pub struct CreateDocumentResponse {
     pub error: Option<String>,
 }
 
+/// Request to delete a document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteDocumentRequest {
+    /// Request ID for correlation
+    pub req: String,
+    /// Document ID to delete
+    pub id: String,
+}
+
+/// Response to delete document request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteDocumentResponse {
+    /// Request ID for correlation
+    pub req: String,
+    /// Whether the document was deleted
+    pub deleted: bool,
+    /// Error message (present on failure)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Request to get document content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetContentRequest {
+    /// Request ID for correlation
+    pub req: String,
+    /// Document ID to get content for
+    pub id: String,
+}
+
+/// Response with document content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetContentResponse {
+    /// Request ID for correlation
+    pub req: String,
+    /// Document content (present on success)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Content type (present on success)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// Error message (present on failure)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Request to get document info/metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetInfoRequest {
+    /// Request ID for correlation
+    pub req: String,
+    /// Document ID to get info for
+    pub id: String,
+}
+
+/// Response with document info/metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetInfoResponse {
+    /// Request ID for correlation
+    pub req: String,
+    /// Document ID (present on success)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Content type (present on success)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// Error message (present on failure)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Request to replace document content (computes diff).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplaceContentRequest {
+    /// Request ID for correlation
+    pub req: String,
+    /// Document ID
+    pub id: String,
+    /// New content to replace with
+    pub content: String,
+    /// Optional parent commit ID (for offline sync)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_cid: Option<String>,
+    /// Optional author identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+}
+
+/// Summary of replace operation changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplaceSummary {
+    /// Number of characters inserted
+    pub chars_inserted: usize,
+    /// Number of characters deleted
+    pub chars_deleted: usize,
+    /// Number of diff operations
+    pub operations: usize,
+}
+
+/// Response to replace content request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplaceContentResponse {
+    /// Request ID for correlation
+    pub req: String,
+    /// Commit ID (present on success)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
+    /// Edit commit ID for the diff (present on success)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit_cid: Option<String>,
+    /// Summary of changes (present on success)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ReplaceSummary>,
+    /// Error message (present on failure)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 impl SyncMessage {
     /// Get the request ID from any sync message.
     pub fn req(&self) -> &str {
@@ -395,5 +513,138 @@ mod tests {
         assert!(json.contains("\"error\":\"Invalid content type\""));
         // uuid should be omitted when None
         assert!(!json.contains("\"uuid\""));
+    }
+
+    #[test]
+    fn test_delete_document_request_serialize() {
+        let req = DeleteDocumentRequest {
+            req: "r-001".to_string(),
+            id: "doc-123".to_string(),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"req\":\"r-001\""));
+        assert!(json.contains("\"id\":\"doc-123\""));
+    }
+
+    #[test]
+    fn test_delete_document_response_success() {
+        let resp = DeleteDocumentResponse {
+            req: "r-001".to_string(),
+            deleted: true,
+            error: None,
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"req\":\"r-001\""));
+        assert!(json.contains("\"deleted\":true"));
+        // error should be omitted when None
+        assert!(!json.contains("\"error\""));
+    }
+
+    #[test]
+    fn test_delete_document_response_not_found() {
+        let resp = DeleteDocumentResponse {
+            req: "r-001".to_string(),
+            deleted: false,
+            error: Some("Document not found".to_string()),
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"req\":\"r-001\""));
+        assert!(json.contains("\"deleted\":false"));
+        assert!(json.contains("\"error\":\"Document not found\""));
+    }
+
+    #[test]
+    fn test_get_content_request_serialize() {
+        let req = GetContentRequest {
+            req: "r-001".to_string(),
+            id: "doc-123".to_string(),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"req\":\"r-001\""));
+        assert!(json.contains("\"id\":\"doc-123\""));
+    }
+
+    #[test]
+    fn test_get_content_response_success() {
+        let resp = GetContentResponse {
+            req: "r-001".to_string(),
+            content: Some("Hello, world!".to_string()),
+            content_type: Some("text/plain".to_string()),
+            error: None,
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"req\":\"r-001\""));
+        assert!(json.contains("\"content\":\"Hello, world!\""));
+        assert!(json.contains("\"content_type\":\"text/plain\""));
+        // error should be omitted when None
+        assert!(!json.contains("\"error\""));
+    }
+
+    #[test]
+    fn test_get_content_response_not_found() {
+        let resp = GetContentResponse {
+            req: "r-001".to_string(),
+            content: None,
+            content_type: None,
+            error: Some("Document not found".to_string()),
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"req\":\"r-001\""));
+        assert!(json.contains("\"error\":\"Document not found\""));
+        // content and content_type should be omitted when None
+        assert!(!json.contains("\"content\":"));
+        assert!(!json.contains("\"content_type\":"));
+    }
+
+    #[test]
+    fn test_get_info_request_serialize() {
+        let req = GetInfoRequest {
+            req: "r-001".to_string(),
+            id: "doc-123".to_string(),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"req\":\"r-001\""));
+        assert!(json.contains("\"id\":\"doc-123\""));
+    }
+
+    #[test]
+    fn test_get_info_response_success() {
+        let resp = GetInfoResponse {
+            req: "r-001".to_string(),
+            id: Some("doc-123".to_string()),
+            content_type: Some("text/plain".to_string()),
+            error: None,
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"req\":\"r-001\""));
+        assert!(json.contains("\"id\":\"doc-123\""));
+        assert!(json.contains("\"content_type\":\"text/plain\""));
+        // error should be omitted when None
+        assert!(!json.contains("\"error\""));
+    }
+
+    #[test]
+    fn test_get_info_response_not_found() {
+        let resp = GetInfoResponse {
+            req: "r-001".to_string(),
+            id: None,
+            content_type: None,
+            error: Some("Document not found".to_string()),
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"req\":\"r-001\""));
+        assert!(json.contains("\"error\":\"Document not found\""));
+        // id and content_type should be omitted when None
+        assert!(!json.contains("\"id\":"));
+        assert!(!json.contains("\"content_type\":"));
     }
 }

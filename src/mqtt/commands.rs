@@ -4,7 +4,10 @@
 
 use crate::document::{ContentType, DocumentStore};
 use crate::mqtt::client::MqttClient;
-use crate::mqtt::messages::{CommandMessage, CreateDocumentRequest, CreateDocumentResponse};
+use crate::mqtt::messages::{
+    CommandMessage, CreateDocumentRequest, CreateDocumentResponse, DeleteDocumentRequest,
+    DeleteDocumentResponse, GetContentRequest, GetContentResponse, GetInfoRequest, GetInfoResponse,
+};
 use crate::mqtt::topics::Topic;
 use crate::mqtt::MqttError;
 use rumqttc::QoS;
@@ -156,6 +159,126 @@ impl CommandsHandler {
         self.client
             .publish(&response_topic, &payload, QoS::AtLeastOnce)
             .await?;
+
+        Ok(())
+    }
+
+    /// Handle delete-document command.
+    /// Topic: {workspace}/commands/delete-document
+    pub async fn handle_delete_document(&self, payload: &[u8]) -> Result<(), MqttError> {
+        let request: DeleteDocumentRequest = serde_json::from_slice(payload)
+            .map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+
+        debug!(
+            "Received delete-document command: req={}, id={}",
+            request.req, request.id
+        );
+
+        let deleted = self.document_store.delete_document(&request.id).await;
+
+        let response = DeleteDocumentResponse {
+            req: request.req,
+            deleted,
+            error: if deleted {
+                None
+            } else {
+                Some(format!("Document '{}' not found", request.id))
+            },
+        };
+
+        // Publish response to {workspace}/responses
+        let payload =
+            serde_json::to_vec(&response).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+
+        let response_topic = format!("{}/responses", self.workspace);
+        self.client
+            .publish(&response_topic, &payload, QoS::AtLeastOnce)
+            .await?;
+
+        debug!(
+            "Delete-document response: deleted={} for id={}",
+            deleted, response.req
+        );
+
+        Ok(())
+    }
+
+    /// Handle get-content command.
+    /// Topic: {workspace}/commands/get-content
+    pub async fn handle_get_content(&self, payload: &[u8]) -> Result<(), MqttError> {
+        let request: GetContentRequest = serde_json::from_slice(payload)
+            .map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+
+        debug!(
+            "Received get-content command: req={}, id={}",
+            request.req, request.id
+        );
+
+        let response = match self.document_store.get_document(&request.id).await {
+            Some(doc) => GetContentResponse {
+                req: request.req,
+                content: Some(doc.content.clone()),
+                content_type: Some(doc.content_type.to_mime().to_string()),
+                error: None,
+            },
+            None => GetContentResponse {
+                req: request.req,
+                content: None,
+                content_type: None,
+                error: Some(format!("Document '{}' not found", request.id)),
+            },
+        };
+
+        // Publish response to {workspace}/responses
+        let payload =
+            serde_json::to_vec(&response).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+
+        let response_topic = format!("{}/responses", self.workspace);
+        self.client
+            .publish(&response_topic, &payload, QoS::AtLeastOnce)
+            .await?;
+
+        debug!("Get-content response for id={}", response.req);
+
+        Ok(())
+    }
+
+    /// Handle get-info command.
+    /// Topic: {workspace}/commands/get-info
+    pub async fn handle_get_info(&self, payload: &[u8]) -> Result<(), MqttError> {
+        let request: GetInfoRequest = serde_json::from_slice(payload)
+            .map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+
+        debug!(
+            "Received get-info command: req={}, id={}",
+            request.req, request.id
+        );
+
+        let response = match self.document_store.get_document(&request.id).await {
+            Some(doc) => GetInfoResponse {
+                req: request.req,
+                id: Some(request.id.clone()),
+                content_type: Some(doc.content_type.to_mime().to_string()),
+                error: None,
+            },
+            None => GetInfoResponse {
+                req: request.req,
+                id: None,
+                content_type: None,
+                error: Some(format!("Document '{}' not found", request.id)),
+            },
+        };
+
+        // Publish response to {workspace}/responses
+        let payload =
+            serde_json::to_vec(&response).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+
+        let response_topic = format!("{}/responses", self.workspace);
+        self.client
+            .publish(&response_topic, &payload, QoS::AtLeastOnce)
+            .await?;
+
+        debug!("Get-info response for id={}", response.req);
 
         Ok(())
     }

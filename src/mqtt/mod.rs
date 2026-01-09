@@ -23,8 +23,9 @@ use thiserror::Error;
 
 pub use client::MqttClient;
 pub use messages::{
-    CommandMessage, CreateDocumentRequest, CreateDocumentResponse, EditMessage, EventMessage,
-    SyncMessage,
+    CommandMessage, CreateDocumentRequest, CreateDocumentResponse, DeleteDocumentRequest,
+    DeleteDocumentResponse, EditMessage, EventMessage, GetContentRequest, GetContentResponse,
+    GetInfoRequest, GetInfoResponse, SyncMessage,
 };
 pub use topics::{Port, Topic};
 
@@ -143,16 +144,52 @@ impl MqttService {
     }
 
     /// Get the store commands topic for create-document.
-    fn store_commands_topic(&self) -> String {
+    fn create_document_topic(&self) -> String {
         format!("{}/commands/create-document", self.workspace)
     }
 
+    /// Get the store commands topic for delete-document.
+    fn delete_document_topic(&self) -> String {
+        format!("{}/commands/delete-document", self.workspace)
+    }
+
+    /// Get the store commands topic for get-content.
+    fn get_content_topic(&self) -> String {
+        format!("{}/commands/get-content", self.workspace)
+    }
+
+    /// Get the store commands topic for get-info.
+    fn get_info_topic(&self) -> String {
+        format!("{}/commands/get-info", self.workspace)
+    }
+
     /// Subscribe to store-level commands.
-    /// This subscribes to the `{workspace}/commands/create-document` topic.
+    /// This subscribes to document management command topics.
     pub async fn subscribe_store_commands(&self) -> Result<(), MqttError> {
-        let topic = self.store_commands_topic();
-        self.client.subscribe(&topic, QoS::AtLeastOnce).await?;
-        tracing::debug!("Subscribed to store commands: {}", topic);
+        let create_topic = self.create_document_topic();
+        self.client
+            .subscribe(&create_topic, QoS::AtLeastOnce)
+            .await?;
+        tracing::debug!("Subscribed to create-document commands: {}", create_topic);
+
+        let delete_topic = self.delete_document_topic();
+        self.client
+            .subscribe(&delete_topic, QoS::AtLeastOnce)
+            .await?;
+        tracing::debug!("Subscribed to delete-document commands: {}", delete_topic);
+
+        let get_content_topic = self.get_content_topic();
+        self.client
+            .subscribe(&get_content_topic, QoS::AtLeastOnce)
+            .await?;
+        tracing::debug!("Subscribed to get-content commands: {}", get_content_topic);
+
+        let get_info_topic = self.get_info_topic();
+        self.client
+            .subscribe(&get_info_topic, QoS::AtLeastOnce)
+            .await?;
+        tracing::debug!("Subscribed to get-info commands: {}", get_info_topic);
+
         Ok(())
     }
 
@@ -208,8 +245,17 @@ impl MqttService {
     /// Dispatch an incoming message to the appropriate handler.
     async fn dispatch_message(&self, topic_str: &str, payload: &[u8]) -> Result<(), MqttError> {
         // Check for store-level commands first (these don't follow the document path pattern)
-        if topic_str == self.store_commands_topic() {
+        if topic_str == self.create_document_topic() {
             return self.commands_handler.handle_create_document(payload).await;
+        }
+        if topic_str == self.delete_document_topic() {
+            return self.commands_handler.handle_delete_document(payload).await;
+        }
+        if topic_str == self.get_content_topic() {
+            return self.commands_handler.handle_get_content(payload).await;
+        }
+        if topic_str == self.get_info_topic() {
+            return self.commands_handler.handle_get_info(payload).await;
         }
 
         // Parse the topic
