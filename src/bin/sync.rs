@@ -1826,13 +1826,20 @@ async fn run_exec_mode(
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args)
         .current_dir(&directory)
-        // Inherit stdin/stdout/stderr for interactive programs
         .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
         // Pass through key environment variables
         .env("COMMONPLACE_SERVER", &server)
         .env("COMMONPLACE_NODE", &fs_root_id);
+
+    // For sandbox mode, capture stdout/stderr to write to log files
+    // For non-sandbox mode, inherit stdout/stderr for interactive programs
+    if sandbox {
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+    } else {
+        cmd.stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+    }
 
     // Make child a process group leader and set death signal on Linux
     #[cfg(unix)]
@@ -1867,6 +1874,86 @@ async fn run_exec_mode(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn command '{}': {}", program, e))?;
+
+    // In sandbox mode, spawn tasks to log stdout/stderr to files
+    // Extract a simple name from the program for the log filename
+    let exec_name = std::path::Path::new(&program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("exec")
+        .to_string();
+
+    if sandbox {
+        use tokio::fs::OpenOptions;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        // Stdout logging
+        if let Some(stdout) = child.stdout.take() {
+            let log_path = directory.join(format!("__{}.stdout.txt", exec_name));
+            let exec_name_clone = exec_name.clone();
+            tokio::spawn(async move {
+                let mut log_file = match OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                    .await
+                {
+                    Ok(f) => Some(f),
+                    Err(e) => {
+                        tracing::warn!("Failed to open stdout log file {:?}: {}", log_path, e);
+                        None
+                    }
+                };
+
+                let reader = BufReader::new(stdout);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    // Print to console (like non-sandbox mode would)
+                    println!("[{}] {}", exec_name_clone, line);
+                    // Write to log file
+                    if let Some(ref mut file) = log_file {
+                        let log_line = format!("{}\n", line);
+                        if let Err(e) = file.write_all(log_line.as_bytes()).await {
+                            tracing::warn!("Failed to write to stdout log: {}", e);
+                        }
+                    }
+                }
+            });
+        }
+
+        // Stderr logging
+        if let Some(stderr) = child.stderr.take() {
+            let log_path = directory.join(format!("__{}.stderr.txt", exec_name));
+            tokio::spawn(async move {
+                let mut log_file = match OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                    .await
+                {
+                    Ok(f) => Some(f),
+                    Err(e) => {
+                        tracing::warn!("Failed to open stderr log file {:?}: {}", log_path, e);
+                        None
+                    }
+                };
+
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    // Print to console (like non-sandbox mode would)
+                    eprintln!("[{}] {}", exec_name, line);
+                    // Write to log file
+                    if let Some(ref mut file) = log_file {
+                        let log_line = format!("{}\n", line);
+                        if let Err(e) = file.write_all(log_line.as_bytes()).await {
+                            tracing::warn!("Failed to write to stderr log: {}", e);
+                        }
+                    }
+                }
+            });
+        }
+    }
 
     // Wait for child to exit OR signal
     let exit_code = tokio::select! {
