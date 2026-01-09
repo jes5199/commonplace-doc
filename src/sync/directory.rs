@@ -13,8 +13,46 @@ use tracing::warn;
 /// Schema filename for preserving node_ids
 const SCHEMA_FILENAME: &str = ".commonplace.json";
 
-/// Extract node_ids from an existing schema, building a path -> node_id map.
-fn extract_node_ids(entry: &Entry, prefix: &str) -> HashMap<String, String> {
+/// Load existing node_ids from .commonplace.json if present.
+/// Recursively loads from nested .commonplace.json files for node-backed directories.
+fn load_existing_node_ids(directory: &Path) -> HashMap<String, String> {
+    load_existing_node_ids_recursive(directory, directory, "")
+}
+
+/// Recursively load node_ids from a directory and its subdirectories.
+fn load_existing_node_ids_recursive(
+    _root: &Path,
+    current: &Path,
+    prefix: &str,
+) -> HashMap<String, String> {
+    let schema_path = current.join(SCHEMA_FILENAME);
+    if !schema_path.exists() {
+        return HashMap::new();
+    }
+
+    let mut result = HashMap::new();
+
+    match fs::read_to_string(&schema_path) {
+        Ok(content) => match serde_json::from_str::<FsSchema>(&content) {
+            Ok(schema) => {
+                if let Some(ref root_entry) = schema.root {
+                    // Extract node_ids from this schema level
+                    result.extend(extract_node_ids_with_prefix(root_entry, prefix));
+
+                    // For node-backed directories, recursively load from their .commonplace.json
+                    load_nested_node_ids(root_entry, current, prefix, &mut result);
+                }
+            }
+            Err(_) => {}
+        },
+        Err(_) => {}
+    }
+
+    result
+}
+
+/// Extract node_ids with a given prefix.
+fn extract_node_ids_with_prefix(entry: &Entry, prefix: &str) -> HashMap<String, String> {
     let mut result = HashMap::new();
 
     match entry {
@@ -24,10 +62,11 @@ fn extract_node_ids(entry: &Entry, prefix: &str) -> HashMap<String, String> {
             }
         }
         Entry::Dir(dir) => {
-            // Also capture directory node_ids
+            // Capture directory node_id
             if let Some(ref node_id) = dir.node_id {
                 result.insert(prefix.to_string(), node_id.clone());
             }
+            // For inline entries, recursively extract
             if let Some(ref entries) = dir.entries {
                 for (name, child) in entries {
                     let child_path = if prefix.is_empty() {
@@ -35,7 +74,7 @@ fn extract_node_ids(entry: &Entry, prefix: &str) -> HashMap<String, String> {
                     } else {
                         format!("{}/{}", prefix, name)
                     };
-                    result.extend(extract_node_ids(child, &child_path));
+                    result.extend(extract_node_ids_with_prefix(child, &child_path));
                 }
             }
         }
@@ -44,25 +83,62 @@ fn extract_node_ids(entry: &Entry, prefix: &str) -> HashMap<String, String> {
     result
 }
 
-/// Load existing node_ids from .commonplace.json if present.
-fn load_existing_node_ids(directory: &Path) -> HashMap<String, String> {
-    let schema_path = directory.join(SCHEMA_FILENAME);
-    if !schema_path.exists() {
-        return HashMap::new();
-    }
+/// Recursively load node_ids from nested .commonplace.json files.
+fn load_nested_node_ids(
+    entry: &Entry,
+    current_dir: &Path,
+    prefix: &str,
+    result: &mut HashMap<String, String>,
+) {
+    if let Entry::Dir(dir) = entry {
+        // For node-backed directories, check for nested .commonplace.json
+        if dir.node_id.is_some() && dir.entries.is_none() {
+            // This is a node-backed directory - don't recurse here as we handle
+            // it at the schema level by looking for .commonplace.json in subdirs
+        }
 
-    match fs::read_to_string(&schema_path) {
-        Ok(content) => match serde_json::from_str::<FsSchema>(&content) {
-            Ok(schema) => {
-                if let Some(ref root) = schema.root {
-                    extract_node_ids(root, "")
+        // For inline directories (shouldn't exist after fix, but handle for compatibility)
+        if let Some(ref entries) = dir.entries {
+            for (name, child) in entries {
+                let child_path = if prefix.is_empty() {
+                    name.clone()
                 } else {
-                    HashMap::new()
+                    format!("{}/{}", prefix, name)
+                };
+                let child_dir = current_dir.join(name);
+
+                // If this is a node-backed subdirectory, load its nested schema
+                if let Entry::Dir(child_dir_entry) = child {
+                    if child_dir_entry.node_id.is_some() {
+                        let nested_schema_path = child_dir.join(SCHEMA_FILENAME);
+                        if nested_schema_path.exists() {
+                            if let Ok(content) = fs::read_to_string(&nested_schema_path) {
+                                if let Ok(nested_schema) =
+                                    serde_json::from_str::<FsSchema>(&content)
+                                {
+                                    if let Some(ref nested_root) = nested_schema.root {
+                                        result.extend(extract_node_ids_with_prefix(
+                                            nested_root,
+                                            &child_path,
+                                        ));
+                                        // Recursively load from deeper levels
+                                        load_nested_node_ids(
+                                            nested_root,
+                                            &child_dir,
+                                            &child_path,
+                                            result,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
+
+                // Continue recursing into inline entries
+                load_nested_node_ids(child, &child_dir, &child_path, result);
             }
-            Err(_) => HashMap::new(),
-        },
-        Err(_) => HashMap::new(),
+        }
     }
 }
 
@@ -93,6 +169,9 @@ pub enum ScanError {
 
     #[error("Failed to read directory entry: {0}")]
     ReadEntry(String),
+
+    #[error("Failed to serialize schema: {0}")]
+    Serialization(String),
 }
 
 /// Options for directory scanning.
@@ -258,22 +337,36 @@ fn scan_dir_recursive(
 
         if file_type.is_dir() {
             // Check if this subdirectory has an existing node_id (already node-backed on server)
-            if let Some(existing_node_id) = existing_node_ids.get(&relative_path) {
-                // Subdirectory is already node-backed - preserve the reference
-                // Don't scan inline, as the server has a separate document for this directory
-                entries.insert(
-                    name,
-                    Entry::Dir(DirEntry {
-                        entries: None,
-                        node_id: Some(existing_node_id.clone()),
-                        content_type: Some("application/json".to_string()),
-                    }),
-                );
+            let node_id = if let Some(existing_node_id) = existing_node_ids.get(&relative_path) {
+                existing_node_id.clone()
             } else {
-                // No existing node_id - scan inline as usual
-                let sub_entry = scan_dir_recursive(root, &entry_path, options, existing_node_ids)?;
-                entries.insert(name, sub_entry);
-            }
+                // Generate a new UUID for this subdirectory
+                uuid::Uuid::new_v4().to_string()
+            };
+
+            // Always create node-backed directory references
+            // Recursively scan the subdirectory to build its schema
+            let sub_entry = scan_dir_recursive(root, &entry_path, options, existing_node_ids)?;
+
+            // Write the subdirectory schema to .commonplace.json
+            let sub_schema = FsSchema {
+                version: 1,
+                root: Some(sub_entry),
+            };
+            let sub_schema_json = serde_json::to_string(&sub_schema)
+                .map_err(|e| ScanError::Serialization(e.to_string()))?;
+            let sub_schema_path = entry_path.join(SCHEMA_FILENAME);
+            fs::write(&sub_schema_path, &sub_schema_json)?;
+
+            // Create node-backed reference in parent
+            entries.insert(
+                name,
+                Entry::Dir(DirEntry {
+                    entries: None,
+                    node_id: Some(node_id),
+                    content_type: Some("application/json".to_string()),
+                }),
+            );
         } else if file_type.is_file() {
             // Skip files with disallowed extensions
             if !is_allowed_extension(&entry_path) {
@@ -591,8 +684,29 @@ mod tests {
         if let Some(Entry::Dir(root)) = &schema.root {
             let entries = root.entries.as_ref().unwrap();
             if let Some(Entry::Dir(notes)) = entries.get("notes") {
-                let note_entries = notes.entries.as_ref().unwrap();
-                assert!(note_entries.contains_key("idea.md"));
+                // Subdirectories are now node-backed (have node_id, no inline entries)
+                assert!(notes.node_id.is_some(), "notes should have node_id");
+                assert!(
+                    notes.entries.is_none(),
+                    "notes should not have inline entries"
+                );
+
+                // Verify nested schema was written to .commonplace.json
+                let nested_schema_path = temp.path().join("notes").join(".commonplace.json");
+                assert!(
+                    nested_schema_path.exists(),
+                    "Nested .commonplace.json should be created"
+                );
+
+                // Read and verify the nested schema
+                let nested_content = std::fs::read_to_string(&nested_schema_path).unwrap();
+                let nested_schema: FsSchema = serde_json::from_str(&nested_content).unwrap();
+                if let Some(Entry::Dir(nested_root)) = &nested_schema.root {
+                    let note_entries = nested_root.entries.as_ref().unwrap();
+                    assert!(note_entries.contains_key("idea.md"));
+                } else {
+                    panic!("Expected nested schema root to be a Dir");
+                }
             } else {
                 panic!("Expected notes to be a Dir");
             }
@@ -787,7 +901,7 @@ mod tests {
             .write_all(b"nested content")
             .unwrap();
 
-        // Create existing .commonplace.json with node_ids
+        // Create existing .commonplace.json with node_ids (node-backed subdirectory)
         let existing_schema = r#"{
             "version": 1,
             "root": {
@@ -800,13 +914,8 @@ mod tests {
                     },
                     "subdir": {
                         "type": "dir",
-                        "entries": {
-                            "nested.txt": {
-                                "type": "doc",
-                                "node_id": "uuid-for-nested",
-                                "content_type": "text/plain"
-                            }
-                        }
+                        "node_id": "uuid-for-subdir",
+                        "content_type": "application/json"
                     }
                 }
             }
@@ -814,6 +923,25 @@ mod tests {
         File::create(temp.path().join(".commonplace.json"))
             .unwrap()
             .write_all(existing_schema.as_bytes())
+            .unwrap();
+
+        // Create nested .commonplace.json for subdir with nested file node_id
+        let nested_schema = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "nested.txt": {
+                        "type": "doc",
+                        "node_id": "uuid-for-nested",
+                        "content_type": "text/plain"
+                    }
+                }
+            }
+        }"#;
+        File::create(temp.path().join("subdir/.commonplace.json"))
+            .unwrap()
+            .write_all(nested_schema.as_bytes())
             .unwrap();
 
         // Scan should preserve existing node_ids
@@ -841,13 +969,29 @@ mod tests {
                 panic!("Expected file2.txt to be a Doc");
             }
 
-            // nested.txt should have preserved node_id
+            // subdir should be node-backed with preserved node_id
             if let Some(Entry::Dir(subdir)) = entries.get("subdir") {
-                let sub_entries = subdir.entries.as_ref().unwrap();
-                if let Some(Entry::Doc(doc)) = sub_entries.get("nested.txt") {
-                    assert_eq!(doc.node_id.as_deref(), Some("uuid-for-nested"));
-                } else {
-                    panic!("Expected nested.txt to be a Doc");
+                assert_eq!(
+                    subdir.node_id.as_deref(),
+                    Some("uuid-for-subdir"),
+                    "Subdirectory node_id should be preserved"
+                );
+                assert!(
+                    subdir.entries.is_none(),
+                    "Subdirectory should be node-backed (no inline entries)"
+                );
+
+                // Read the nested .commonplace.json to verify nested.txt node_id
+                let nested_schema_path = temp.path().join("subdir/.commonplace.json");
+                let nested_content = std::fs::read_to_string(&nested_schema_path).unwrap();
+                let nested_schema: FsSchema = serde_json::from_str(&nested_content).unwrap();
+                if let Some(Entry::Dir(nested_root)) = &nested_schema.root {
+                    let nested_entries = nested_root.entries.as_ref().unwrap();
+                    if let Some(Entry::Doc(doc)) = nested_entries.get("nested.txt") {
+                        assert_eq!(doc.node_id.as_deref(), Some("uuid-for-nested"));
+                    } else {
+                        panic!("Expected nested.txt to be a Doc");
+                    }
                 }
             } else {
                 panic!("Expected subdir to be a Dir");
