@@ -680,8 +680,8 @@ mod tests {
         if let Some(Entry::Dir(root)) = &schema.root {
             let entries = root.entries.as_ref().unwrap();
             if let Some(Entry::Dir(notes)) = entries.get("notes") {
-                // Subdirectories are now node-backed (have node_id, no inline entries)
-                assert!(notes.node_id.is_some(), "notes should have node_id");
+                // Subdirectories are node-backed (no inline entries).
+                // node_id is None for new directories - server assigns UUIDs.
                 assert!(
                     notes.entries.is_none(),
                     "notes should not have inline entries"
@@ -953,14 +953,13 @@ mod tests {
                 panic!("Expected file1.txt to be a Doc");
             }
 
-            // file2.txt should have a generated UUID (not in existing schema, so one is created)
+            // file2.txt should have None node_id (not in existing schema).
+            // Server will assign UUID when schema is pushed.
             if let Some(Entry::Doc(doc)) = entries.get("file2.txt") {
                 assert!(
-                    doc.node_id.is_some(),
-                    "New files should get a generated UUID"
+                    doc.node_id.is_none(),
+                    "New files should have None node_id (server assigns UUID)"
                 );
-                // Verify it's a valid UUID format
-                assert!(uuid::Uuid::parse_str(doc.node_id.as_ref().unwrap()).is_ok());
             } else {
                 panic!("Expected file2.txt to be a Doc");
             }
