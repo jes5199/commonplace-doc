@@ -64,8 +64,8 @@ pub use client::{
 pub use dir_sync::{
     check_server_has_content, directory_mqtt_task, directory_sse_task, ensure_fs_root_exists,
     handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
-    push_nested_schemas, subdir_mqtt_task, subdir_sse_task, sync_schema, write_nested_schemas,
-    write_schema_file, SCHEMA_FILENAME,
+    push_nested_schemas, spawn_subdir_mqtt_task, spawn_subdir_sse_task, subdir_mqtt_task,
+    subdir_sse_task, sync_schema, write_nested_schemas, write_schema_file, SCHEMA_FILENAME,
 };
 pub use file_sync::{
     initial_sync, spawn_file_sync_tasks, spawn_file_sync_tasks_with_flock, sync_single_file,

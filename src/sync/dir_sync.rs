@@ -1328,6 +1328,7 @@ pub async fn directory_sse_task(
                                             pull_only,
                                             #[cfg(unix)]
                                             inode_tracker.clone(),
+                                            watched_subdirs.clone(),
                                         ));
                                     }
                                 }
@@ -1360,6 +1361,40 @@ pub async fn directory_sse_task(
     }
 }
 
+/// Helper to spawn SSE tasks for subdirectories.
+/// This is separate from subdir_sse_task to avoid recursive type issues with tokio::spawn.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_subdir_sse_task(
+    client: Client,
+    server: String,
+    fs_root_id: String,
+    subdir_path: String,
+    subdir_node_id: String,
+    directory: PathBuf,
+    file_states: Arc<RwLock<HashMap<String, FileSyncState>>>,
+    use_paths: bool,
+    push_only: bool,
+    pull_only: bool,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    watched_subdirs: Arc<RwLock<HashSet<String>>>,
+) {
+    tokio::spawn(subdir_sse_task(
+        client,
+        server,
+        fs_root_id,
+        subdir_path,
+        subdir_node_id,
+        directory,
+        file_states,
+        use_paths,
+        push_only,
+        pull_only,
+        #[cfg(unix)]
+        inode_tracker,
+        watched_subdirs,
+    ));
+}
+
 /// SSE task for a node-backed subdirectory.
 ///
 /// This task subscribes to a subdirectory's SSE stream and handles schema changes.
@@ -1372,7 +1407,7 @@ pub async fn directory_sse_task(
 pub async fn subdir_sse_task(
     client: Client,
     server: String,
-    _fs_root_id: String,
+    fs_root_id: String,
     subdir_path: String,
     subdir_node_id: String,
     directory: PathBuf,
@@ -1381,6 +1416,7 @@ pub async fn subdir_sse_task(
     push_only: bool,
     pull_only: bool,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    watched_subdirs: Arc<RwLock<HashSet<String>>>,
 ) {
     let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&subdir_node_id));
 
@@ -1488,6 +1524,57 @@ pub async fn subdir_sse_task(
                                     "Failed to create nested directories for subdir {}: {}",
                                     subdir_path, e
                                 );
+                            }
+
+                            // Check for newly discovered nested node-backed subdirs and spawn SSE tasks
+                            // This handles cases like tmux/0 being created inside tmux
+                            if !push_only {
+                                let all_subdirs = crate::sync::get_all_node_backed_dir_ids(
+                                    &client,
+                                    &server,
+                                    &fs_root_id,
+                                )
+                                .await;
+
+                                // Collect new subdirs to spawn (must drop lock before spawning to avoid Send issues)
+                                let subdirs_to_spawn: Vec<(String, String)> = {
+                                    let mut watched = watched_subdirs.write().await;
+                                    all_subdirs
+                                        .into_iter()
+                                        .filter(|(_, node_id)| {
+                                            if watched.contains(node_id) {
+                                                false
+                                            } else {
+                                                watched.insert(node_id.clone());
+                                                true
+                                            }
+                                        })
+                                        .collect()
+                                };
+
+                                // Spawn tasks after releasing the lock
+                                for (nested_subdir_path, nested_subdir_node_id) in subdirs_to_spawn
+                                {
+                                    info!(
+                                        "Spawning SSE task for newly discovered nested subdir: {} ({})",
+                                        nested_subdir_path, nested_subdir_node_id
+                                    );
+                                    spawn_subdir_sse_task(
+                                        client.clone(),
+                                        server.clone(),
+                                        fs_root_id.clone(),
+                                        nested_subdir_path,
+                                        nested_subdir_node_id,
+                                        directory.clone(),
+                                        file_states.clone(),
+                                        use_paths,
+                                        push_only,
+                                        pull_only,
+                                        #[cfg(unix)]
+                                        inode_tracker.clone(),
+                                        watched_subdirs.clone(),
+                                    );
+                                }
                             }
                         }
                         "closed" => {
@@ -1639,6 +1726,7 @@ pub async fn directory_mqtt_task(
                                     inode_tracker.clone(),
                                     mqtt_client.clone(),
                                     workspace.clone(),
+                                    watched_subdirs.clone(),
                                 ));
                             }
                         }
@@ -1656,6 +1744,44 @@ pub async fn directory_mqtt_task(
     }
 }
 
+/// Helper to spawn MQTT tasks for subdirectories.
+/// This is separate from subdir_mqtt_task to avoid recursive type issues with tokio::spawn.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_subdir_mqtt_task(
+    http_client: Client,
+    server: String,
+    fs_root_id: String,
+    subdir_path: String,
+    subdir_node_id: String,
+    directory: PathBuf,
+    file_states: Arc<RwLock<HashMap<String, FileSyncState>>>,
+    use_paths: bool,
+    push_only: bool,
+    pull_only: bool,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    mqtt_client: Arc<MqttClient>,
+    workspace: String,
+    watched_subdirs: Arc<RwLock<HashSet<String>>>,
+) {
+    tokio::spawn(subdir_mqtt_task(
+        http_client,
+        server,
+        fs_root_id,
+        subdir_path,
+        subdir_node_id,
+        directory,
+        file_states,
+        use_paths,
+        push_only,
+        pull_only,
+        #[cfg(unix)]
+        inode_tracker,
+        mqtt_client,
+        workspace,
+        watched_subdirs,
+    ));
+}
+
 /// MQTT task for a node-backed subdirectory.
 ///
 /// This task subscribes to a subdirectory's edits topic via MQTT and handles schema changes.
@@ -1670,7 +1796,7 @@ pub async fn directory_mqtt_task(
 pub async fn subdir_mqtt_task(
     http_client: Client,
     server: String,
-    _fs_root_id: String,
+    fs_root_id: String,
     subdir_path: String,
     subdir_node_id: String,
     directory: PathBuf,
@@ -1681,6 +1807,7 @@ pub async fn subdir_mqtt_task(
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     mqtt_client: Arc<MqttClient>,
     workspace: String,
+    watched_subdirs: Arc<RwLock<HashSet<String>>>,
 ) {
     // Subscribe to edits for the subdirectory document
     let edits_topic = Topic::edits(&workspace, &subdir_node_id);
@@ -1785,6 +1912,57 @@ pub async fn subdir_mqtt_task(
                             "MQTT: Failed to create nested directories for subdir {}: {}",
                             subdir_path, e
                         );
+                    }
+
+                    // Check for newly discovered nested node-backed subdirs and spawn MQTT tasks
+                    if !push_only {
+                        let all_subdirs = crate::sync::get_all_node_backed_dir_ids(
+                            &http_client,
+                            &server,
+                            &fs_root_id,
+                        )
+                        .await;
+
+                        // Collect new subdirs to spawn (must drop lock before spawning to avoid Send issues)
+                        let subdirs_to_spawn: Vec<(String, String)> = {
+                            let mut watched = watched_subdirs.write().await;
+                            all_subdirs
+                                .into_iter()
+                                .filter(|(_, node_id)| {
+                                    if watched.contains(node_id) {
+                                        false
+                                    } else {
+                                        watched.insert(node_id.clone());
+                                        true
+                                    }
+                                })
+                                .collect()
+                        };
+
+                        // Spawn tasks after releasing the lock
+                        for (nested_subdir_path, nested_subdir_node_id) in subdirs_to_spawn {
+                            info!(
+                                "MQTT: Spawning task for newly discovered nested subdir: {} ({})",
+                                nested_subdir_path, nested_subdir_node_id
+                            );
+                            spawn_subdir_mqtt_task(
+                                http_client.clone(),
+                                server.clone(),
+                                fs_root_id.clone(),
+                                nested_subdir_path,
+                                nested_subdir_node_id,
+                                directory.clone(),
+                                file_states.clone(),
+                                use_paths,
+                                push_only,
+                                pull_only,
+                                #[cfg(unix)]
+                                inode_tracker.clone(),
+                                mqtt_client.clone(),
+                                workspace.clone(),
+                                watched_subdirs.clone(),
+                            );
+                        }
                     }
                 }
             }

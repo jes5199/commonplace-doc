@@ -1279,6 +1279,7 @@ async fn run_directory_mode(
                     inode_tracker.clone(),
                     mqtt.clone(),
                     workspace.clone(),
+                    watched_subdirs.clone(),
                 ));
             } else {
                 info!(
@@ -1299,6 +1300,7 @@ async fn run_directory_mode(
                     pull_only,
                     #[cfg(unix)]
                     inode_tracker.clone(),
+                    watched_subdirs.clone(),
                 ));
             }
         }
@@ -1684,6 +1686,7 @@ async fn run_exec_mode(
                 pull_only,
                 #[cfg(unix)]
                 inode_tracker.clone(),
+                watched_subdirs.clone(),
             ));
         }
         drop(watched); // Release lock before continuing
