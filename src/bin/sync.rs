@@ -1117,6 +1117,24 @@ async fn run_directory_mode(
     )
     .await?;
 
+    // Create local files for any schema entries that don't exist locally.
+    // This handles commonplace-link entries where the linked target exists but the
+    // link file needs to be created locally.
+    handle_schema_change(
+        &client,
+        &server,
+        &fs_root_id,
+        &directory,
+        &file_states,
+        false, // Don't spawn tasks - main loop will do that
+        use_paths,
+        push_only,
+        pull_only,
+        #[cfg(unix)]
+        inode_tracker.clone(),
+    )
+    .await?;
+
     // Scan files with contents and push each one
     info!("Syncing file contents...");
     let files = scan_directory_with_contents(&directory, &options)

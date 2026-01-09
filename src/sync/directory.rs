@@ -142,6 +142,74 @@ fn load_nested_node_ids(
     }
 }
 
+/// Load linked entries from the existing schema.
+///
+/// A "linked" entry is one where:
+/// - The file doesn't exist locally
+/// - But the entry has a node_id that is shared with another file that does exist
+///
+/// This supports `commonplace-link` which creates entries pointing to the same document.
+fn load_linked_entries(
+    directory: &Path,
+    scanned_entries: &HashMap<String, Entry>,
+) -> HashMap<String, Entry> {
+    let schema_path = directory.join(SCHEMA_FILENAME);
+    if !schema_path.exists() {
+        return HashMap::new();
+    }
+
+    let content = match fs::read_to_string(&schema_path) {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+
+    let schema: FsSchema = match serde_json::from_str(&content) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+
+    let existing_entries = match &schema.root {
+        Some(Entry::Dir(dir)) => match &dir.entries {
+            Some(e) => e.clone(),
+            None => return HashMap::new(),
+        },
+        _ => return HashMap::new(),
+    };
+
+    // Build a set of node_ids that exist in the scanned entries
+    let mut scanned_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entry in scanned_entries.values() {
+        if let Entry::Doc(doc) = entry {
+            if let Some(ref node_id) = doc.node_id {
+                scanned_node_ids.insert(node_id.clone());
+            }
+        }
+    }
+
+    // Find linked entries: entries in existing schema that:
+    // - Are not in scanned entries (file doesn't exist locally)
+    // - Have a node_id that IS in scanned entries (linked to an existing file)
+    let mut linked = HashMap::new();
+    for (name, entry) in &existing_entries {
+        // Skip if this entry was scanned (file exists locally)
+        if scanned_entries.contains_key(name) {
+            continue;
+        }
+
+        // Check if this is a linked entry (node_id shared with another file)
+        if let Entry::Doc(doc) = entry {
+            if let Some(ref node_id) = doc.node_id {
+                if scanned_node_ids.contains(node_id) {
+                    // This is a linked entry - preserve it
+                    linked.insert(name.clone(), entry.clone());
+                }
+            }
+        }
+    }
+
+    linked
+}
+
 /// Normalize a path to use forward slashes regardless of OS.
 ///
 /// Schema paths always use forward slashes, so relative paths must be
@@ -203,6 +271,9 @@ pub struct ScannedFile {
 ///
 /// If a `.commonplace.json` file exists in the directory, existing
 /// node_ids will be preserved for files that still exist.
+///
+/// Linked entries (from `commonplace-link`) are also preserved even if
+/// the local file doesn't exist, as long as the linked target exists.
 pub fn scan_directory(path: &Path, options: &ScanOptions) -> Result<FsSchema, ScanError> {
     if !path.is_dir() {
         return Err(ScanError::NotDirectory(path.display().to_string()));
@@ -211,7 +282,18 @@ pub fn scan_directory(path: &Path, options: &ScanOptions) -> Result<FsSchema, Sc
     // Load existing node_ids to preserve them
     let existing_node_ids = load_existing_node_ids(path);
 
-    let root_entry = scan_dir_recursive(path, path, options, &existing_node_ids)?;
+    let mut root_entry = scan_dir_recursive(path, path, options, &existing_node_ids)?;
+
+    // Preserve linked entries that don't have local files but share node_ids
+    // with files that do exist. This supports commonplace-link functionality.
+    if let Entry::Dir(ref mut dir) = root_entry {
+        if let Some(ref mut entries) = dir.entries {
+            let linked_entries = load_linked_entries(path, entries);
+            for (name, entry) in linked_entries {
+                entries.insert(name, entry);
+            }
+        }
+    }
 
     Ok(FsSchema {
         version: 1,
@@ -1299,6 +1381,130 @@ mod tests {
             assert!(
                 !entries.contains_key("link.txt"),
                 "Symlink to external file should be skipped"
+            );
+        } else {
+            panic!("Expected root to be a Dir");
+        }
+    }
+
+    #[test]
+    fn test_scan_preserves_linked_entries() {
+        // Test that commonplace-link entries are preserved even when
+        // the local file doesn't exist, as long as the target file exists.
+        let temp = TempDir::new().unwrap();
+
+        // Create source file (the linked target)
+        File::create(temp.path().join("source.txt"))
+            .unwrap()
+            .write_all(b"shared content")
+            .unwrap();
+
+        // Create .commonplace.json with both source and a link pointing to it
+        // The link file doesn't exist locally, but should be preserved
+        let existing_schema = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "source.txt": {
+                        "type": "doc",
+                        "node_id": "shared-uuid",
+                        "content_type": "text/plain"
+                    },
+                    "link.txt": {
+                        "type": "doc",
+                        "node_id": "shared-uuid",
+                        "content_type": "text/plain"
+                    }
+                }
+            }
+        }"#;
+        File::create(temp.path().join(".commonplace.json"))
+            .unwrap()
+            .write_all(existing_schema.as_bytes())
+            .unwrap();
+
+        // Scan should preserve the linked entry even though link.txt doesn't exist
+        let schema = scan_directory(temp.path(), &ScanOptions::default()).unwrap();
+
+        if let Some(Entry::Dir(root)) = &schema.root {
+            let entries = root.entries.as_ref().unwrap();
+
+            // source.txt should be present with preserved node_id
+            if let Some(Entry::Doc(doc)) = entries.get("source.txt") {
+                assert_eq!(doc.node_id.as_deref(), Some("shared-uuid"));
+            } else {
+                panic!("Expected source.txt to be a Doc");
+            }
+
+            // link.txt should be preserved because it shares node_id with source.txt
+            assert!(
+                entries.contains_key("link.txt"),
+                "Linked entry should be preserved even without local file"
+            );
+            if let Some(Entry::Doc(doc)) = entries.get("link.txt") {
+                assert_eq!(
+                    doc.node_id.as_deref(),
+                    Some("shared-uuid"),
+                    "Linked entry should have same node_id as source"
+                );
+            } else {
+                panic!("Expected link.txt to be a Doc");
+            }
+        } else {
+            panic!("Expected root to be a Dir");
+        }
+    }
+
+    #[test]
+    fn test_scan_does_not_preserve_unlinked_orphan_entries() {
+        // Test that entries with node_ids that don't match any local file
+        // are NOT preserved (they're not linked, just orphaned)
+        let temp = TempDir::new().unwrap();
+
+        // Create a real file
+        File::create(temp.path().join("real.txt"))
+            .unwrap()
+            .write_all(b"real content")
+            .unwrap();
+
+        // Create .commonplace.json with real file AND an orphan (different node_id)
+        let existing_schema = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "real.txt": {
+                        "type": "doc",
+                        "node_id": "real-uuid",
+                        "content_type": "text/plain"
+                    },
+                    "orphan.txt": {
+                        "type": "doc",
+                        "node_id": "orphan-uuid",
+                        "content_type": "text/plain"
+                    }
+                }
+            }
+        }"#;
+        File::create(temp.path().join(".commonplace.json"))
+            .unwrap()
+            .write_all(existing_schema.as_bytes())
+            .unwrap();
+
+        // Scan should NOT preserve the orphan entry (node_id doesn't match any local file)
+        let schema = scan_directory(temp.path(), &ScanOptions::default()).unwrap();
+
+        if let Some(Entry::Dir(root)) = &schema.root {
+            let entries = root.entries.as_ref().unwrap();
+
+            // real.txt should be present
+            assert!(entries.contains_key("real.txt"));
+
+            // orphan.txt should NOT be present (not linked to any existing file)
+            assert!(
+                !entries.contains_key("orphan.txt"),
+                "Orphan entry (no matching local file) should not be preserved"
             );
         } else {
             panic!("Expected root to be a Dir");
