@@ -133,6 +133,12 @@ impl ProcessManager {
         let mut cmd = Command::new(&config.command);
         cmd.args(&config.args);
 
+        // Inject --database for server process (from top-level config)
+        if name == "server" {
+            cmd.arg("--database");
+            cmd.arg(&self.config.database);
+        }
+
         // Set working directory if specified
         if let Some(ref cwd) = config.cwd {
             cmd.current_dir(cwd);

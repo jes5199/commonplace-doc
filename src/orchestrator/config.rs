@@ -4,6 +4,9 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestratorConfig {
+    /// Path to the redb database file. Required for persistent storage.
+    /// The orchestrator will automatically pass this to the server process.
+    pub database: PathBuf,
     #[serde(default = "default_workspace")]
     pub workspace: String,
     #[serde(default = "default_mqtt_broker")]
@@ -199,6 +202,7 @@ mod tests {
     #[test]
     fn test_parse_minimal_config() {
         let json = r#"{
+            "database": "./data.redb",
             "processes": {
                 "store": {
                     "command": "commonplace-store"
@@ -206,6 +210,7 @@ mod tests {
             }
         }"#;
         let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.database, PathBuf::from("./data.redb"));
         assert_eq!(config.mqtt_broker, "localhost:1883");
         assert_eq!(config.processes.len(), 1);
         assert_eq!(config.processes["store"].command, "commonplace-store");
@@ -216,8 +221,18 @@ mod tests {
     }
 
     #[test]
+    fn test_database_required() {
+        let json = r#"{
+            "processes": {}
+        }"#;
+        let result: Result<OrchestratorConfig, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "database field should be required");
+    }
+
+    #[test]
     fn test_parse_full_config() {
         let json = r#"{
+            "database": "./data.redb",
             "mqtt_broker": "localhost:1884",
             "processes": {
                 "store": {
@@ -245,6 +260,7 @@ mod tests {
     #[test]
     fn test_dependency_order() {
         let json = r#"{
+            "database": "./data.redb",
             "processes": {
                 "http": { "command": "http", "depends_on": ["store"] },
                 "store": { "command": "store", "depends_on": ["broker"] },
@@ -259,6 +275,7 @@ mod tests {
     #[test]
     fn test_dependency_cycle_detected() {
         let json = r#"{
+            "database": "./data.redb",
             "processes": {
                 "a": { "command": "a", "depends_on": ["b"] },
                 "b": { "command": "b", "depends_on": ["a"] }
@@ -271,6 +288,7 @@ mod tests {
     #[test]
     fn test_resolve_server_url_from_http_args() {
         let json = r#"{
+            "database": "./data.redb",
             "processes": {
                 "http": {
                     "command": "commonplace-http",
@@ -285,6 +303,7 @@ mod tests {
     #[test]
     fn test_resolve_server_url_from_explicit_field() {
         let json = r#"{
+            "database": "./data.redb",
             "http_server": "http://example.com:3000",
             "processes": {}
         }"#;
@@ -294,7 +313,7 @@ mod tests {
 
     #[test]
     fn test_resolve_server_url_default() {
-        let json = r#"{ "processes": {} }"#;
+        let json = r#"{ "database": "./data.redb", "processes": {} }"#;
         let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.resolve_server_url(), "http://localhost:3000");
     }
@@ -333,6 +352,7 @@ mod tests {
     #[test]
     fn test_managed_paths_field() {
         let json = r#"{
+            "database": "./data.redb",
             "managed_paths": ["/workspace/team-a", "/shared"],
             "processes": {}
         }"#;
@@ -343,7 +363,7 @@ mod tests {
 
     #[test]
     fn test_managed_paths_optional() {
-        let json = r#"{ "processes": {} }"#;
+        let json = r#"{ "database": "./data.redb", "processes": {} }"#;
         let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
         assert!(config.managed_paths.is_empty());
     }
@@ -351,6 +371,7 @@ mod tests {
     #[test]
     fn test_workspace_field() {
         let json = r#"{
+            "database": "./data.redb",
             "workspace": "myspace",
             "processes": {}
         }"#;
@@ -360,7 +381,7 @@ mod tests {
 
     #[test]
     fn test_workspace_default() {
-        let json = r#"{ "processes": {} }"#;
+        let json = r#"{ "database": "./data.redb", "processes": {} }"#;
         let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.workspace, "commonplace");
     }

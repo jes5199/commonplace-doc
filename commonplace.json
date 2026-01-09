@@ -1,10 +1,11 @@
 {
+  "database": "./data/commonplace.redb",
   "mqtt_broker": "localhost:1883",
   "managed_paths": ["/"],
   "processes": {
     "server": {
       "command": "/home/jes/commonplace/target/release/commonplace-server",
-      "args": ["--database", "/tmp/commonplace.redb", "--fs-root", "workspace"],
+      "args": ["--fs-root", "workspace"],
       "restart": {
         "policy": "always",
         "backoff_ms": 500,
