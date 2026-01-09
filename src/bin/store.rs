@@ -8,7 +8,7 @@ use commonplace_doc::{
     cli::StoreArgs,
     document::{ContentType, DocumentStore},
     fs::FilesystemReconciler,
-    mqtt::{topics::validate_extension, MqttConfig, MqttService},
+    mqtt::{MqttConfig, MqttService},
     store::CommitStore,
 };
 use std::sync::Arc;
@@ -29,17 +29,6 @@ async fn main() {
         .init();
 
     tracing::info!("Starting commonplace-store");
-
-    // Validate that fs-root path has a valid extension
-    // (required for MQTT topic parsing to work)
-    if let Err(e) = validate_extension(&args.fs_root) {
-        tracing::error!(
-            "Invalid fs-root path '{}': {}. Paths must have extensions like .json, .txt, etc.",
-            args.fs_root,
-            e
-        );
-        std::process::exit(1);
-    }
 
     // Create commit store (required for store binary)
     tracing::info!("Using database at: {}", args.database.display());
