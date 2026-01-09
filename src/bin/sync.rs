@@ -5,16 +5,18 @@
 //! server changes update local files.
 
 use clap::Parser;
+use commonplace_doc::mqtt::{MqttClient, MqttConfig};
 use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
 use commonplace_doc::sync::{
     acquire_sync_lock, build_replace_url, build_uuid_map_recursive, check_server_has_content,
-    detect_from_path, directory_sse_task, directory_watcher_task, encode_node_id,
-    ensure_fs_root_exists, file_watcher_task, fork_node, get_all_node_backed_dir_ids,
-    handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
-    initial_sync, is_binary_content, push_schema_to_server, scan_directory_with_contents,
-    spawn_file_sync_tasks, sse_task, subdir_sse_task, sync_schema, sync_single_file, upload_task,
-    DirEvent, FileEvent, FileSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions,
-    ShadowWriteEvent, SyncState, SCHEMA_FILENAME,
+    detect_from_path, directory_mqtt_task, directory_sse_task, directory_watcher_task,
+    encode_node_id, ensure_fs_root_exists, file_watcher_task, fork_node,
+    get_all_node_backed_dir_ids, handle_file_created, handle_file_deleted, handle_file_modified,
+    handle_schema_change, initial_sync, is_binary_content, push_schema_to_server,
+    scan_directory_with_contents, spawn_file_sync_tasks, sse_task, subdir_mqtt_task,
+    subdir_sse_task, sync_schema, sync_single_file, upload_task, DirEvent, FileEvent,
+    FileSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions, ShadowWriteEvent,
+    SyncState, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{
@@ -134,6 +136,15 @@ struct Args {
         env = "COMMONPLACE_SHADOW_DIR"
     )]
     shadow_dir: String,
+
+    /// MQTT broker URL for pub/sub (also reads from COMMONPLACE_MQTT env var)
+    /// When set, uses MQTT subscriptions instead of SSE for real-time updates.
+    #[arg(long, env = "COMMONPLACE_MQTT")]
+    mqtt_broker: Option<String>,
+
+    /// MQTT workspace name for topic namespacing (also reads from COMMONPLACE_WORKSPACE env var)
+    #[arg(long, default_value = "commonplace", env = "COMMONPLACE_WORKSPACE")]
+    workspace: String,
 }
 
 /// Discover the fs-root document ID from the server.
@@ -458,6 +469,29 @@ async fn main() -> ExitCode {
     // Create HTTP client
     let client = Client::new();
 
+    // Initialize MQTT client if broker URL is provided
+    let mqtt_client = if let Some(ref broker_url) = args.mqtt_broker {
+        info!("Initializing MQTT client for broker: {}", broker_url);
+        let mqtt_config = MqttConfig {
+            broker_url: broker_url.clone(),
+            client_id: format!("sync-{}", uuid::Uuid::new_v4()),
+            workspace: args.workspace.clone(),
+            ..Default::default()
+        };
+        match MqttClient::connect(mqtt_config).await {
+            Ok(mqtt) => {
+                info!("Connected to MQTT broker, workspace: {}", args.workspace);
+                Some(Arc::new(mqtt))
+            }
+            Err(e) => {
+                error!("Failed to connect to MQTT broker: {}", e);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
+
     // Determine the node ID to sync with
     // Priority: --node > --path > --fork-from > --use-paths discovery
     let node_id = if let Some(ref node) = args.node {
@@ -642,6 +676,8 @@ async fn main() -> ExitCode {
                 args.push_only,
                 args.pull_only,
                 args.shadow_dir,
+                mqtt_client,
+                args.workspace,
             )
             .await
             .map(|_| 0u8)
@@ -978,6 +1014,8 @@ async fn run_directory_mode(
     push_only: bool,
     pull_only: bool,
     shadow_dir: String,
+    mqtt_client: Option<Arc<MqttClient>>,
+    workspace: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mode = if push_only {
         "push-only"
@@ -1129,30 +1167,59 @@ async fn run_directory_mode(
         None
     };
 
-    // Track which subdirectories have SSE tasks (shared between startup and dynamic discovery)
+    // Track which subdirectories have tasks (shared between startup and dynamic discovery)
     let watched_subdirs: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
 
-    // Start SSE task for fs-root (skip if push-only)
-    let sse_handle = if !push_only {
-        Some(tokio::spawn(directory_sse_task(
-            client.clone(),
-            server.clone(),
-            fs_root_id.clone(),
-            directory.clone(),
-            file_states.clone(),
-            use_paths,
-            push_only,
-            pull_only,
-            #[cfg(unix)]
-            inode_tracker.clone(),
-            watched_subdirs.clone(),
-        )))
+    // Start subscription task for fs-root (skip if push-only)
+    // Use MQTT if available, otherwise fall back to SSE
+    let subscription_handle = if !push_only {
+        if let Some(ref mqtt) = mqtt_client {
+            // Spawn the MQTT event loop in a background task
+            let mqtt_for_loop = mqtt.clone();
+            tokio::spawn(async move {
+                if let Err(e) = mqtt_for_loop.run_event_loop().await {
+                    error!("MQTT event loop error: {}", e);
+                }
+            });
+
+            info!("Using MQTT for directory sync subscriptions");
+            Some(tokio::spawn(directory_mqtt_task(
+                client.clone(),
+                server.clone(),
+                fs_root_id.clone(),
+                directory.clone(),
+                file_states.clone(),
+                use_paths,
+                push_only,
+                pull_only,
+                #[cfg(unix)]
+                inode_tracker.clone(),
+                watched_subdirs.clone(),
+                mqtt.clone(),
+                workspace.clone(),
+            )))
+        } else {
+            info!("Using SSE for directory sync subscriptions");
+            Some(tokio::spawn(directory_sse_task(
+                client.clone(),
+                server.clone(),
+                fs_root_id.clone(),
+                directory.clone(),
+                file_states.clone(),
+                use_paths,
+                push_only,
+                pull_only,
+                #[cfg(unix)]
+                inode_tracker.clone(),
+                watched_subdirs.clone(),
+            )))
+        }
     } else {
-        info!("Push-only mode: skipping SSE subscription");
+        info!("Push-only mode: skipping subscription");
         None
     };
 
-    // Start SSE tasks for all node-backed subdirectories (skip if push-only)
+    // Start tasks for all node-backed subdirectories (skip if push-only)
     // This allows files created in subdirectories to propagate to other sync clients
     if !push_only {
         let node_backed_subdirs = get_all_node_backed_dir_ids(&client, &server, &fs_root_id).await;
@@ -1162,25 +1229,49 @@ async fn run_directory_mode(
         );
         let mut watched = watched_subdirs.write().await;
         for (subdir_path, subdir_node_id) in node_backed_subdirs {
-            info!(
-                "Spawning SSE task for node-backed subdir: {} ({})",
-                subdir_path, subdir_node_id
-            );
-            watched.insert(subdir_node_id.clone());
-            tokio::spawn(subdir_sse_task(
-                client.clone(),
-                server.clone(),
-                fs_root_id.clone(),
-                subdir_path,
-                subdir_node_id,
-                directory.clone(),
-                file_states.clone(),
-                use_paths,
-                push_only,
-                pull_only,
-                #[cfg(unix)]
-                inode_tracker.clone(),
-            ));
+            if let Some(ref mqtt) = mqtt_client {
+                info!(
+                    "Spawning MQTT task for node-backed subdir: {} ({})",
+                    subdir_path, subdir_node_id
+                );
+                watched.insert(subdir_node_id.clone());
+                tokio::spawn(subdir_mqtt_task(
+                    client.clone(),
+                    server.clone(),
+                    fs_root_id.clone(),
+                    subdir_path,
+                    subdir_node_id,
+                    directory.clone(),
+                    file_states.clone(),
+                    use_paths,
+                    push_only,
+                    pull_only,
+                    #[cfg(unix)]
+                    inode_tracker.clone(),
+                    mqtt.clone(),
+                    workspace.clone(),
+                ));
+            } else {
+                info!(
+                    "Spawning SSE task for node-backed subdir: {} ({})",
+                    subdir_path, subdir_node_id
+                );
+                watched.insert(subdir_node_id.clone());
+                tokio::spawn(subdir_sse_task(
+                    client.clone(),
+                    server.clone(),
+                    fs_root_id.clone(),
+                    subdir_path,
+                    subdir_node_id,
+                    directory.clone(),
+                    file_states.clone(),
+                    use_paths,
+                    push_only,
+                    pull_only,
+                    #[cfg(unix)]
+                    inode_tracker.clone(),
+                ));
+            }
         }
         drop(watched); // Release lock before continuing
     }
@@ -1312,7 +1403,7 @@ async fn run_directory_mode(
     if let Some(handle) = watcher_handle {
         handle.abort();
     }
-    if let Some(handle) = sse_handle {
+    if let Some(handle) = subscription_handle {
         handle.abort();
     }
     dir_event_handle.abort();

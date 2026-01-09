@@ -4,6 +4,7 @@
 //! with a server document, including schema traversal and UUID mapping.
 
 use crate::fs::{Entry, FsSchema};
+use crate::mqtt::{MqttClient, Topic};
 use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
 use crate::sync::state_file::{
     compute_content_hash, load_synced_directories, mark_directory_synced, unmark_directory_synced,
@@ -20,6 +21,7 @@ use crate::sync::{
 use futures::StreamExt;
 use reqwest::{Client, StatusCode};
 use reqwest_eventsource::{Error as SseError, Event as SseEvent, EventSource};
+use rumqttc::QoS;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1515,6 +1517,285 @@ pub async fn subdir_sse_task(
             subdir_path
         );
         sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// MQTT task for directory-level events (watching fs-root via MQTT).
+///
+/// This task subscribes to the fs-root document's edits topic via MQTT and handles
+/// schema change events, triggering handle_schema_change to sync new files.
+///
+/// When new node-backed subdirectories are discovered, this task dynamically
+/// spawns tasks for them to watch their schemas.
+///
+/// This is the MQTT equivalent of `directory_sse_task`.
+#[allow(clippy::too_many_arguments)]
+pub async fn directory_mqtt_task(
+    http_client: Client,
+    server: String,
+    fs_root_id: String,
+    directory: PathBuf,
+    file_states: Arc<RwLock<HashMap<String, FileSyncState>>>,
+    use_paths: bool,
+    push_only: bool,
+    pull_only: bool,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    watched_subdirs: Arc<RwLock<HashSet<String>>>,
+    mqtt_client: Arc<MqttClient>,
+    workspace: String,
+) {
+    // Subscribe to edits for the fs-root document
+    let edits_topic = Topic::edits(&workspace, &fs_root_id);
+    let topic_str = edits_topic.to_topic_string();
+
+    info!(
+        "Subscribing to MQTT edits for fs-root {} at topic: {}",
+        fs_root_id, topic_str
+    );
+
+    if let Err(e) = mqtt_client.subscribe(&topic_str, QoS::AtLeastOnce).await {
+        error!("Failed to subscribe to MQTT edits topic: {}", e);
+        return;
+    }
+
+    // Get a receiver for incoming messages
+    let mut message_rx = mqtt_client.subscribe_messages();
+
+    // Track last processed schema to prevent redundant processing
+    let mut last_schema_hash: Option<String> = None;
+
+    // Process incoming MQTT messages
+    loop {
+        match message_rx.recv().await {
+            Ok(msg) => {
+                // Check if this message is for our topic
+                if msg.topic == topic_str {
+                    debug!(
+                        "MQTT edit received for fs-root: {} bytes",
+                        msg.payload.len()
+                    );
+
+                    // An edit message means the schema has changed
+                    // Use content-based deduplication to prevent feedback loops
+                    match handle_schema_change_with_dedup(
+                        &http_client,
+                        &server,
+                        &fs_root_id,
+                        &directory,
+                        &file_states,
+                        true, // spawn_tasks: true for runtime schema changes
+                        use_paths,
+                        &mut last_schema_hash,
+                        push_only,
+                        pull_only,
+                        #[cfg(unix)]
+                        inode_tracker.clone(),
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            debug!("MQTT: Schema change processed successfully");
+                        }
+                        Ok(false) => {
+                            debug!("MQTT: Schema unchanged, skipped processing");
+                        }
+                        Err(e) => {
+                            warn!("MQTT: Failed to handle schema change: {}", e);
+                        }
+                    }
+
+                    // Check for newly discovered node-backed subdirs and spawn tasks
+                    if !push_only {
+                        let all_subdirs = crate::sync::get_all_node_backed_dir_ids(
+                            &http_client,
+                            &server,
+                            &fs_root_id,
+                        )
+                        .await;
+
+                        let mut watched = watched_subdirs.write().await;
+                        for (subdir_path, subdir_node_id) in all_subdirs {
+                            if !watched.contains(&subdir_node_id) {
+                                info!(
+                                    "Spawning MQTT task for newly discovered subdir: {} ({})",
+                                    subdir_path, subdir_node_id
+                                );
+                                watched.insert(subdir_node_id.clone());
+                                tokio::spawn(subdir_mqtt_task(
+                                    http_client.clone(),
+                                    server.clone(),
+                                    fs_root_id.clone(),
+                                    subdir_path,
+                                    subdir_node_id,
+                                    directory.clone(),
+                                    file_states.clone(),
+                                    use_paths,
+                                    push_only,
+                                    pull_only,
+                                    #[cfg(unix)]
+                                    inode_tracker.clone(),
+                                    mqtt_client.clone(),
+                                    workspace.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                warn!("MQTT message receiver lagged by {} messages", n);
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                info!("MQTT message channel closed");
+                break;
+            }
+        }
+    }
+}
+
+/// MQTT task for a node-backed subdirectory.
+///
+/// This task subscribes to a subdirectory's edits topic via MQTT and handles schema changes.
+/// When the subdirectory's schema changes, it:
+/// 1. Fetches and writes the updated schema to the local .commonplace.json file
+/// 2. Deletes local files that were removed from the server schema
+/// 3. Cleans up orphaned directories that no longer exist in the schema
+/// 4. Syncs NEW files that were added to the server schema
+///
+/// This is the MQTT equivalent of `subdir_sse_task`.
+#[allow(clippy::too_many_arguments)]
+pub async fn subdir_mqtt_task(
+    http_client: Client,
+    server: String,
+    _fs_root_id: String,
+    subdir_path: String,
+    subdir_node_id: String,
+    directory: PathBuf,
+    file_states: Arc<RwLock<HashMap<String, FileSyncState>>>,
+    use_paths: bool,
+    push_only: bool,
+    pull_only: bool,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    mqtt_client: Arc<MqttClient>,
+    workspace: String,
+) {
+    // Subscribe to edits for the subdirectory document
+    let edits_topic = Topic::edits(&workspace, &subdir_node_id);
+    let topic_str = edits_topic.to_topic_string();
+
+    info!(
+        "Subscribing to MQTT edits for subdir {} at topic: {}",
+        subdir_path, topic_str
+    );
+
+    if let Err(e) = mqtt_client.subscribe(&topic_str, QoS::AtLeastOnce).await {
+        error!(
+            "Failed to subscribe to MQTT edits topic for subdir {}: {}",
+            subdir_path, e
+        );
+        return;
+    }
+
+    // Get a receiver for incoming messages
+    let mut message_rx = mqtt_client.subscribe_messages();
+
+    // Process incoming MQTT messages
+    loop {
+        match message_rx.recv().await {
+            Ok(msg) => {
+                // Check if this message is for our topic
+                if msg.topic == topic_str {
+                    debug!(
+                        "MQTT edit received for subdir {}: {} bytes",
+                        subdir_path,
+                        msg.payload.len()
+                    );
+
+                    // Subdirectory schema changed - handle cleanup and sync new files
+                    info!(
+                        "MQTT: Subdir {} schema changed, triggering sync",
+                        subdir_path
+                    );
+                    let subdir_full_path = directory.join(&subdir_path);
+
+                    // First, cleanup deleted files and orphaned directories
+                    match handle_subdir_schema_cleanup(
+                        &http_client,
+                        &server,
+                        &subdir_node_id,
+                        &subdir_path,
+                        &subdir_full_path,
+                        &directory,
+                        &file_states,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            debug!("MQTT: Subdir {} schema cleanup completed", subdir_path);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "MQTT: Failed to handle subdir {} schema cleanup: {}",
+                                subdir_path, e
+                            );
+                        }
+                    }
+
+                    // Then, sync NEW files from server
+                    match handle_subdir_new_files(
+                        &http_client,
+                        &server,
+                        &subdir_node_id,
+                        &subdir_path,
+                        &subdir_full_path,
+                        &directory,
+                        &file_states,
+                        use_paths,
+                        push_only,
+                        pull_only,
+                        #[cfg(unix)]
+                        inode_tracker.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            debug!("MQTT: Subdir {} new files sync completed", subdir_path);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "MQTT: Failed to sync new files for subdir {}: {}",
+                                subdir_path, e
+                            );
+                        }
+                    }
+
+                    // Also create directories for any NEW node-backed subdirectories
+                    if let Err(e) = create_subdir_nested_directories(
+                        &http_client,
+                        &server,
+                        &subdir_node_id,
+                        &subdir_full_path,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "MQTT: Failed to create nested directories for subdir {}: {}",
+                            subdir_path, e
+                        );
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                warn!(
+                    "MQTT message receiver for subdir {} lagged by {} messages",
+                    subdir_path, n
+                );
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                info!("MQTT message channel closed for subdir {}", subdir_path);
+                break;
+            }
+        }
     }
 }
 
