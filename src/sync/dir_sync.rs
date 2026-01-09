@@ -20,7 +20,7 @@ use crate::sync::{
 use futures::StreamExt;
 use reqwest::{Client, StatusCode};
 use reqwest_eventsource::{Error as SseError, Event as SseEvent, EventSource};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1215,6 +1215,9 @@ pub async fn handle_schema_change(
 ///
 /// This task subscribes to the fs-root document's SSE stream and handles
 /// schema change events, triggering handle_schema_change to sync new files.
+///
+/// When new node-backed subdirectories are discovered, this task dynamically
+/// spawns `subdir_sse_task` for them to watch their schemas.
 #[allow(clippy::too_many_arguments)]
 pub async fn directory_sse_task(
     client: Client,
@@ -1226,6 +1229,7 @@ pub async fn directory_sse_task(
     push_only: bool,
     pull_only: bool,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    watched_subdirs: Arc<RwLock<HashSet<String>>>,
 ) {
     // fs-root schema subscription always uses ID-based API
     let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&fs_root_id));
@@ -1285,6 +1289,42 @@ pub async fn directory_sse_task(
                                 }
                                 Err(e) => {
                                     warn!("Failed to handle schema change: {}", e);
+                                }
+                            }
+
+                            // Check for newly discovered node-backed subdirs and spawn SSE tasks
+                            // (Done outside the match to avoid holding non-Send error across await)
+                            if !push_only {
+                                let all_subdirs = crate::sync::get_all_node_backed_dir_ids(
+                                    &client,
+                                    &server,
+                                    &fs_root_id,
+                                )
+                                .await;
+
+                                let mut watched = watched_subdirs.write().await;
+                                for (subdir_path, subdir_node_id) in all_subdirs {
+                                    if !watched.contains(&subdir_node_id) {
+                                        info!(
+                                            "Spawning SSE task for newly discovered subdir: {} ({})",
+                                            subdir_path, subdir_node_id
+                                        );
+                                        watched.insert(subdir_node_id.clone());
+                                        tokio::spawn(subdir_sse_task(
+                                            client.clone(),
+                                            server.clone(),
+                                            fs_root_id.clone(),
+                                            subdir_path,
+                                            subdir_node_id,
+                                            directory.clone(),
+                                            file_states.clone(),
+                                            use_paths,
+                                            push_only,
+                                            pull_only,
+                                            #[cfg(unix)]
+                                            inode_tracker.clone(),
+                                        ));
+                                    }
                                 }
                             }
                         }

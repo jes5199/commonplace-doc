@@ -21,7 +21,7 @@ use commonplace_doc::sync::{
     shadow_gc_task, shadow_watcher_task, shadow_write_handler_task, sse_task_with_tracker,
 };
 use reqwest::Client;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -1129,6 +1129,9 @@ async fn run_directory_mode(
         None
     };
 
+    // Track which subdirectories have SSE tasks (shared between startup and dynamic discovery)
+    let watched_subdirs: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+
     // Start SSE task for fs-root (skip if push-only)
     let sse_handle = if !push_only {
         Some(tokio::spawn(directory_sse_task(
@@ -1142,6 +1145,7 @@ async fn run_directory_mode(
             pull_only,
             #[cfg(unix)]
             inode_tracker.clone(),
+            watched_subdirs.clone(),
         )))
     } else {
         info!("Push-only mode: skipping SSE subscription");
@@ -1156,11 +1160,13 @@ async fn run_directory_mode(
             "Found {} node-backed subdirectories to watch",
             node_backed_subdirs.len()
         );
+        let mut watched = watched_subdirs.write().await;
         for (subdir_path, subdir_node_id) in node_backed_subdirs {
             info!(
                 "Spawning SSE task for node-backed subdir: {} ({})",
                 subdir_path, subdir_node_id
             );
+            watched.insert(subdir_node_id.clone());
             tokio::spawn(subdir_sse_task(
                 client.clone(),
                 server.clone(),
@@ -1176,6 +1182,7 @@ async fn run_directory_mode(
                 inode_tracker.clone(),
             ));
         }
+        drop(watched); // Release lock before continuing
     }
 
     // Start file sync tasks for each file and store handles in FileSyncState
@@ -1507,6 +1514,9 @@ async fn run_exec_mode(
         None
     };
 
+    // Track which subdirectories have SSE tasks (shared between startup and dynamic discovery)
+    let watched_subdirs: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+
     // Start SSE task for fs-root (skip if push-only)
     let sse_handle = if !push_only {
         Some(tokio::spawn(directory_sse_task(
@@ -1520,6 +1530,7 @@ async fn run_exec_mode(
             pull_only,
             #[cfg(unix)]
             inode_tracker.clone(),
+            watched_subdirs.clone(),
         )))
     } else {
         info!("Push-only mode: skipping SSE subscription");
@@ -1533,11 +1544,13 @@ async fn run_exec_mode(
             "Found {} node-backed subdirectories to watch",
             node_backed_subdirs.len()
         );
+        let mut watched = watched_subdirs.write().await;
         for (subdir_path, subdir_node_id) in node_backed_subdirs {
             info!(
                 "Spawning SSE task for node-backed subdir: {} ({})",
                 subdir_path, subdir_node_id
             );
+            watched.insert(subdir_node_id.clone());
             tokio::spawn(subdir_sse_task(
                 client.clone(),
                 server.clone(),
@@ -1553,6 +1566,7 @@ async fn run_exec_mode(
                 inode_tracker.clone(),
             ));
         }
+        drop(watched); // Release lock before continuing
     }
 
     // Start file sync tasks for each file
