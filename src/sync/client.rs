@@ -49,6 +49,8 @@ pub async fn fork_node(
 /// This function compares the new schema with the current server content
 /// and skips the update if they are semantically equivalent, preventing
 /// unnecessary SSE events that could cause feedback loops.
+///
+/// If the document doesn't exist on the server, it will be created first.
 pub async fn push_schema_to_server(
     client: &Client,
     server: &str,
@@ -62,6 +64,27 @@ pub async fn push_schema_to_server(
         let head: HeadResponse = head_resp.json().await?;
         (Some(head.content), head.state)
     } else {
+        // Document doesn't exist, create it first
+        tracing::info!("Creating document {} before pushing schema", fs_root_id);
+        let create_url = format!("{}/docs", server);
+        let create_resp = client
+            .post(&create_url)
+            .json(&serde_json::json!({
+                "type": "document",
+                "id": fs_root_id,
+                "content_type": "application/json"
+            }))
+            .send()
+            .await?;
+        if !create_resp.status().is_success() {
+            let status = create_resp.status();
+            let body = create_resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "Failed to create document {}: {} - {}",
+                fs_root_id, status, body
+            )
+            .into());
+        }
         (None, None)
     };
 

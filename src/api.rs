@@ -83,6 +83,9 @@ struct CreateDocRequest {
     /// Optional initial content for the document
     #[serde(default)]
     content: Option<String>,
+    /// Optional custom ID for the document. If not provided, a UUID is generated.
+    #[serde(default)]
+    id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -120,8 +123,20 @@ async fn create_doc(
         ContentType::from_mime(content_type_str).ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?
     };
 
-    // Create document
-    let id = state.doc_store.create_document(content_type).await;
+    // Create document - use provided ID or generate a new one
+    let id = if let Some(Json(ref req)) = body {
+        if let Some(ref custom_id) = req.id {
+            state
+                .doc_store
+                .create_document_with_id(custom_id.clone(), content_type)
+                .await;
+            custom_id.clone()
+        } else {
+            state.doc_store.create_document(content_type).await
+        }
+    } else {
+        state.doc_store.create_document(content_type).await
+    };
 
     // Set initial content if provided
     if let Some(Json(ref req)) = body {

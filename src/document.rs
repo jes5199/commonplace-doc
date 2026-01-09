@@ -75,6 +75,45 @@ impl DocumentStore {
         id
     }
 
+    /// Create a new document with a specific ID.
+    /// If a document with this ID already exists, this is a no-op.
+    pub async fn create_document_with_id(&self, id: String, content_type: ContentType) {
+        // Check if document already exists
+        {
+            let documents = self.documents.read().await;
+            if documents.contains_key(&id) {
+                return;
+            }
+        }
+
+        let ydoc = yrs::Doc::with_client_id(Self::DEFAULT_YDOC_CLIENT_ID);
+        match content_type {
+            ContentType::Text => {
+                ydoc.get_or_insert_text(Self::TEXT_ROOT_NAME);
+            }
+            ContentType::Json => {
+                ydoc.get_or_insert_map(Self::TEXT_ROOT_NAME);
+            }
+            ContentType::JsonArray | ContentType::Jsonl => {
+                ydoc.get_or_insert_array(Self::TEXT_ROOT_NAME);
+            }
+            ContentType::Xml => {
+                ydoc.get_or_insert_xml_fragment(Self::TEXT_ROOT_NAME);
+            }
+        }
+
+        let content = content_type.default_content();
+
+        let doc = Document {
+            content,
+            content_type,
+            ydoc: Some(ydoc),
+        };
+
+        let mut documents = self.documents.write().await;
+        documents.insert(id, doc);
+    }
+
     pub async fn get_document(&self, id: &str) -> Option<Document> {
         let documents = self.documents.read().await;
         documents.get(id).cloned()
