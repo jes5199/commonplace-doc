@@ -397,10 +397,8 @@ async fn resolve_or_create_path(
     let content_info = detect_from_path(local_file);
     let content_type = content_info.mime_type;
 
-    // Generate UUID locally (same as directory sync)
-    let node_id = uuid::Uuid::new_v4().to_string();
-
-    // Add entry for the new file with our generated UUID
+    // Add entry for the new file with None node_id.
+    // Server's reconciler will generate the UUID to ensure all clients get the same one.
     let entries = schema
         .root
         .entries
@@ -409,13 +407,13 @@ async fn resolve_or_create_path(
         filename.to_string(),
         SchemaEntry {
             entry_type: "doc".to_string(),
-            node_id: Some(node_id.clone()),
+            node_id: None,
             content_type: Some(content_type.to_string()),
         },
     );
 
     // Push updated schema - this triggers the server-side reconciler
-    // which creates the document with our specified UUID
+    // which creates the document and assigns a UUID
     let schema_json = serde_json::to_string_pretty(&schema)?;
     push_schema_to_server(client, server, &parent_id, &schema_json)
         .await
@@ -425,16 +423,29 @@ async fn resolve_or_create_path(
     info!("Waiting for server reconciler to create document...");
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Verify document was created
-    let doc_url = format!("{}/docs/{}/info", server, encode_node_id(&node_id));
-    let resp = client.get(&doc_url).send().await?;
+    // Fetch the updated schema to get the server-assigned UUID
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(&parent_id));
+    let resp = client.get(&head_url).send().await?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "Document '{}' was not created by reconciler. Check server logs.",
-            node_id
-        )
-        .into());
+        return Err(format!("Failed to fetch updated schema: HTTP {}", resp.status()).into());
     }
+
+    let head: HeadResp = resp.json().await?;
+    let updated_schema: Schema = serde_json::from_str(&head.content)?;
+
+    // Find the UUID assigned by the server
+    let node_id = updated_schema
+        .root
+        .entries
+        .as_ref()
+        .and_then(|e| e.get(*filename))
+        .and_then(|entry| entry.node_id.clone())
+        .ok_or_else(|| {
+            format!(
+                "Server did not assign UUID for '{}'. Check server logs.",
+                filename
+            )
+        })?;
 
     info!("Created document: {} -> {}", path, node_id);
     Ok(node_id)

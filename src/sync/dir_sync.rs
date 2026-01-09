@@ -2386,15 +2386,10 @@ pub async fn sync_schema(
     };
 
     if should_push_schema {
-        // Push schema to fs-root node
+        // Push schema to fs-root node (with None UUIDs for new entries)
         info!("Pushing filesystem schema to server...");
         push_schema_to_server(client, server, fs_root_id, &schema_json).await?;
         info!("Schema pushed successfully");
-
-        // Write the schema to local .commonplace.json file
-        if let Err(e) = write_schema_file(directory, &schema_json).await {
-            warn!("Failed to write schema file: {}", e);
-        }
 
         // Push nested schemas from local subdirectories to their server documents.
         // This restores node-backed directory contents after a server database clear.
@@ -2402,25 +2397,45 @@ pub async fn sync_schema(
             warn!("Failed to push nested schemas: {}", e);
         }
 
-        // Also fetch and write nested schemas FROM server.
-        // This handles the case where other sync clients (like sandboxes) have created
-        // directories on the server that don't exist locally yet.
-        //
-        // We retry multiple times with delays because:
-        // 1. Other sync clients may not have pushed their schemas yet
-        // 2. Nested schemas (like tmux/0) may still be empty at startup
-        // 3. The reconciler needs time to process schema changes
-        for attempt in 1..=3 {
-            if attempt > 1 {
-                // Wait between retries to give other sync clients time to push schemas
-                info!(
-                    "Waiting 3s before retry #{} of write_nested_schemas...",
-                    attempt
-                );
-                sleep(Duration::from_secs(3)).await;
-            }
+        // Give the server's reconciler a moment to generate UUIDs
+        sleep(Duration::from_millis(100)).await;
 
-            let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
+        // Fetch the schema back from server (now with server-generated UUIDs)
+        // and write to local .commonplace.json files.
+        // This ensures all sync clients get the same server-assigned UUIDs.
+        let mut final_schema_json = schema_json.clone();
+        let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
+        if let Ok(resp) = client.get(&head_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(head) = resp.json::<HeadResponse>().await {
+                    // Write server's schema (with UUIDs) to local file
+                    final_schema_json = head.content.clone();
+                    if let Err(e) = write_schema_file(directory, &head.content).await {
+                        warn!("Failed to write schema file: {}", e);
+                    }
+
+                    // Write nested schemas from server
+                    if let Ok(server_schema) = serde_json::from_str::<FsSchema>(&head.content) {
+                        info!("Writing nested schemas from server...");
+                        if let Err(e) =
+                            write_nested_schemas(client, server, directory, &server_schema).await
+                        {
+                            warn!("Failed to write nested schemas from server: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Retry fetching nested schemas to handle async directory creation by other clients
+        for attempt in 2..=3 {
+            // Wait between retries to give other sync clients time to push schemas
+            info!(
+                "Waiting 3s before retry #{} of write_nested_schemas...",
+                attempt
+            );
+            sleep(Duration::from_secs(3)).await;
+
             if let Ok(resp) = client.get(&head_url).send().await {
                 if resp.status().is_success() {
                     if let Ok(head) = resp.json::<HeadResponse>().await {
@@ -2441,7 +2456,7 @@ pub async fn sync_schema(
             }
         }
 
-        Ok(schema_json)
+        Ok(final_schema_json)
     } else {
         info!(
             "Server already has content, skipping schema push (strategy={})",

@@ -337,12 +337,9 @@ fn scan_dir_recursive(
 
         if file_type.is_dir() {
             // Check if this subdirectory has an existing node_id (already node-backed on server)
-            let node_id = if let Some(existing_node_id) = existing_node_ids.get(&relative_path) {
-                existing_node_id.clone()
-            } else {
-                // Generate a new UUID for this subdirectory
-                uuid::Uuid::new_v4().to_string()
-            };
+            // If no existing node_id, use None - the server will generate a UUID when we push.
+            // This ensures all sync clients get the same server-generated UUIDs.
+            let node_id = existing_node_ids.get(&relative_path).cloned();
 
             // Always create node-backed directory references
             // Recursively scan the subdirectory to build its schema
@@ -363,7 +360,7 @@ fn scan_dir_recursive(
                 name,
                 Entry::Dir(DirEntry {
                     entries: None,
-                    node_id: Some(node_id),
+                    node_id,
                     content_type: Some("application/json".to_string()),
                 }),
             );
@@ -387,11 +384,10 @@ fn scan_dir_recursive(
                 content_info.mime_type.clone()
             };
 
-            // Look up existing node_id for this file, or generate a new one
-            let node_id = existing_node_ids
-                .get(&relative_path)
-                .cloned()
-                .or_else(|| Some(uuid::Uuid::new_v4().to_string()));
+            // Look up existing node_id for this file.
+            // If no existing node_id, use None - the server will generate a UUID when we push.
+            // This ensures all sync clients get the same server-generated UUIDs.
+            let node_id = existing_node_ids.get(&relative_path).cloned();
 
             let doc_entry = Entry::Doc(DocEntry {
                 node_id,
