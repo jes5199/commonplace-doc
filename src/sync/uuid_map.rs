@@ -4,9 +4,10 @@
 //! fetching schemas from the server and traversing node-backed directories.
 
 use crate::fs::{Entry, FsSchema};
-use crate::sync::{encode_node_id, HeadResponse};
+use crate::sync::{encode_node_id, write_schema_file, HeadResponse};
 use reqwest::Client;
 use std::collections::HashMap;
+use std::path::Path;
 use tracing::{debug, warn};
 
 /// Collect all file paths and their node_ids from a schema entry.
@@ -89,6 +90,178 @@ pub async fn build_uuid_map_recursive_with_status(
     )
     .await;
     (uuid_map, all_succeeded)
+}
+
+/// Build UUID map AND write nested schema files to local directory.
+///
+/// This is used during initial sync to ensure all nested node-backed directories
+/// have their .commonplace.json files written locally. This is necessary for
+/// `find_owning_document` to work correctly when the uuid_map lookup fails.
+///
+/// Returns (uuid_map, all_fetches_succeeded).
+pub async fn build_uuid_map_and_write_schemas(
+    client: &Client,
+    server: &str,
+    doc_id: &str,
+    local_directory: &Path,
+) -> (HashMap<String, String>, bool) {
+    let mut uuid_map = HashMap::new();
+    let mut all_succeeded = true;
+    build_uuid_map_from_doc_and_write_schemas(
+        client,
+        server,
+        doc_id,
+        "",
+        local_directory,
+        &mut uuid_map,
+        &mut all_succeeded,
+    )
+    .await;
+    (uuid_map, all_succeeded)
+}
+
+/// Helper function to recursively build UUID map AND write schema files.
+#[async_recursion::async_recursion]
+async fn build_uuid_map_from_doc_and_write_schemas(
+    client: &Client,
+    server: &str,
+    doc_id: &str,
+    path_prefix: &str,
+    local_directory: &Path,
+    uuid_map: &mut HashMap<String, String>,
+    all_succeeded: &mut bool,
+) {
+    // Fetch the schema from this document
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(doc_id));
+    let resp = match client.get(&head_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to fetch schema for {}: {}", doc_id, e);
+            *all_succeeded = false;
+            return;
+        }
+    };
+
+    if !resp.status().is_success() {
+        warn!(
+            "Failed to fetch schema: {} (status {})",
+            doc_id,
+            resp.status()
+        );
+        *all_succeeded = false;
+        return;
+    }
+
+    let head: HeadResponse = match resp.json().await {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("Failed to parse schema response for {}: {}", doc_id, e);
+            *all_succeeded = false;
+            return;
+        }
+    };
+
+    let schema: FsSchema = match serde_json::from_str(&head.content) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Document {} failed to parse as schema ({})", doc_id, e);
+            *all_succeeded = false;
+            return;
+        }
+    };
+
+    // Write the schema file to the local directory for this path prefix
+    let schema_dir = if path_prefix.is_empty() {
+        local_directory.to_path_buf()
+    } else {
+        local_directory.join(path_prefix)
+    };
+
+    // Create directory if it doesn't exist
+    if let Err(e) = tokio::fs::create_dir_all(&schema_dir).await {
+        warn!(
+            "Failed to create directory {:?} for schema: {}",
+            schema_dir, e
+        );
+    } else {
+        // Write the schema file
+        if let Err(e) = write_schema_file(&schema_dir, &head.content).await {
+            warn!("Failed to write schema file to {:?}: {}", schema_dir, e);
+        } else {
+            debug!("Wrote schema file to {:?}", schema_dir);
+        }
+    }
+
+    // Traverse the schema and collect UUIDs
+    if let Some(ref root) = schema.root {
+        collect_paths_and_write_schemas(
+            client,
+            server,
+            root,
+            path_prefix,
+            local_directory,
+            uuid_map,
+            all_succeeded,
+        )
+        .await;
+    }
+}
+
+/// Recursively collect paths and write nested schema files.
+#[async_recursion::async_recursion]
+async fn collect_paths_and_write_schemas(
+    client: &Client,
+    server: &str,
+    entry: &Entry,
+    prefix: &str,
+    local_directory: &Path,
+    uuid_map: &mut HashMap<String, String>,
+    all_succeeded: &mut bool,
+) {
+    match entry {
+        Entry::Dir(dir) => {
+            // Node-backed directory: fetch its document, write schema, and recurse
+            if let Some(ref node_id) = dir.node_id {
+                build_uuid_map_from_doc_and_write_schemas(
+                    client,
+                    server,
+                    node_id,
+                    prefix,
+                    local_directory,
+                    uuid_map,
+                    all_succeeded,
+                )
+                .await;
+            }
+            // Directory with inline entries (root or legacy): iterate over entries
+            if let Some(ref entries) = dir.entries {
+                for (name, child) in entries {
+                    let child_path = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", prefix, name)
+                    };
+                    collect_paths_and_write_schemas(
+                        client,
+                        server,
+                        child,
+                        &child_path,
+                        local_directory,
+                        uuid_map,
+                        all_succeeded,
+                    )
+                    .await;
+                }
+            }
+        }
+        Entry::Doc(doc) => {
+            // This is a file - add it to the map if it has a node_id
+            if let Some(ref node_id) = doc.node_id {
+                debug!("Found UUID: {} -> {}", prefix, node_id);
+                uuid_map.insert(prefix.to_string(), node_id.clone());
+            }
+        }
+    }
 }
 
 /// Helper function to recursively build the UUID map from a document and its children.

@@ -10,7 +10,8 @@ use crate::sync::state_file::{
     compute_content_hash, load_synced_directories, mark_directory_synced, unmark_directory_synced,
 };
 use crate::sync::uuid_map::{
-    build_uuid_map_recursive, build_uuid_map_recursive_with_status, fetch_node_id_from_schema,
+    build_uuid_map_and_write_schemas, build_uuid_map_recursive,
+    build_uuid_map_recursive_with_status, fetch_node_id_from_schema,
 };
 use crate::sync::{
     build_head_url, delete_schema_entry, detect_from_path, encode_node_id, fork_node,
@@ -989,7 +990,9 @@ pub async fn handle_schema_change(
 
     // Collect all paths from schema (with explicit node_id if present)
     // Use async version that follows node-backed directories to get complete path->UUID map
-    let uuid_map = build_uuid_map_recursive(client, server, fs_root_id).await;
+    // AND writes nested schema files to local directory (required for find_owning_document fallback)
+    let (uuid_map, _all_succeeded) =
+        build_uuid_map_and_write_schemas(client, server, fs_root_id, directory).await;
     let schema_paths: Vec<(String, Option<String>)> = uuid_map
         .into_iter()
         .map(|(path, node_id)| (path, Some(node_id)))

@@ -72,9 +72,9 @@ pub use file_sync::{
     upload_task, upload_task_with_flock, BARRIER_RETRY_COUNT, BARRIER_RETRY_DELAY,
 };
 pub use uuid_map::{
-    build_uuid_map_from_doc, build_uuid_map_recursive, collect_node_backed_dir_ids,
-    collect_paths_from_entry, collect_paths_with_node_backed_dirs, fetch_node_id_from_schema,
-    get_all_node_backed_dir_ids,
+    build_uuid_map_and_write_schemas, build_uuid_map_from_doc, build_uuid_map_recursive,
+    collect_node_backed_dir_ids, collect_paths_from_entry, collect_paths_with_node_backed_dirs,
+    fetch_node_id_from_schema, get_all_node_backed_dir_ids,
 };
 
 pub use content_type::{
