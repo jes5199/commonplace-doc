@@ -719,99 +719,11 @@ impl DiscoveredProcessManager {
         fs_root_id: &str,
         path: &str,
     ) -> Result<String, String> {
-        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        use crate::sync::resolve_path_to_uuid_http;
 
-        if segments.is_empty() {
-            return Ok(fs_root_id.to_string());
-        }
-
-        let mut current_id = fs_root_id.to_string();
-
-        for (i, segment) in segments.iter().enumerate() {
-            let url = format!("{}/docs/{}/head", server_url, current_id);
-            let resp = client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| format!("Failed to fetch schema: {}", e))?;
-
-            if !resp.status().is_success() {
-                return Err(format!(
-                    "Failed to fetch schema for '{}': HTTP {}",
-                    segments[..=i].join("/"),
-                    resp.status()
-                ));
-            }
-
-            #[derive(Deserialize)]
-            struct HeadResponse {
-                content: String,
-            }
-
-            #[derive(Deserialize, Default)]
-            struct Schema {
-                #[serde(default)]
-                root: SchemaRoot,
-            }
-
-            #[derive(Deserialize, Default)]
-            struct SchemaRoot {
-                entries: Option<HashMap<String, SchemaEntry>>,
-            }
-
-            #[derive(Deserialize)]
-            struct SchemaEntry {
-                node_id: Option<String>,
-            }
-
-            let head: HeadResponse = resp
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-            let schema: Schema = if head.content.trim() == "{}" {
-                Schema::default()
-            } else {
-                serde_json::from_str(&head.content)
-                    .map_err(|e| format!("Failed to parse schema: {}", e))?
-            };
-
-            let entries = schema.root.entries.ok_or_else(|| {
-                format!(
-                    "Path '{}' not found: '{}' has no entries",
-                    path,
-                    if i == 0 {
-                        "fs-root".to_string()
-                    } else {
-                        segments[..i].join("/")
-                    }
-                )
-            })?;
-
-            let entry = entries.get(*segment).ok_or_else(|| {
-                format!(
-                    "Path '{}' not found: no entry '{}' in '{}'",
-                    path,
-                    segment,
-                    if i == 0 {
-                        "fs-root".to_string()
-                    } else {
-                        segments[..i].join("/")
-                    }
-                )
-            })?;
-
-            let node_id = entry.node_id.clone().ok_or_else(|| {
-                format!(
-                    "Path '{}' not found: entry '{}' has no node_id",
-                    path, segment
-                )
-            })?;
-
-            current_id = node_id;
-        }
-
-        Ok(current_id)
+        resolve_path_to_uuid_http(client, server_url, fs_root_id, path)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Resolve script paths for all evaluate processes and build a watch map.

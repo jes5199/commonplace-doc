@@ -436,3 +436,107 @@ pub async fn push_file_content(
         }
     }
 }
+
+/// Resolve a path to a UUID by traversing the fs-root schema hierarchy.
+///
+/// Fetches schemas from the server and follows node_id references for nested paths.
+/// For example, "bartleby/script.js" would:
+/// 1. Fetch fs-root schema, find bartleby's node_id
+/// 2. Fetch bartleby's schema, find script.js's node_id
+pub async fn resolve_path_to_uuid_http(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use serde::Deserialize;
+    use std::collections::HashMap;
+
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    if segments.is_empty() {
+        return Ok(fs_root_id.to_string());
+    }
+
+    let mut current_id = fs_root_id.to_string();
+
+    for (i, segment) in segments.iter().enumerate() {
+        let url = format!("{}/docs/{}/head", server, current_id);
+        let resp = client.get(&url).send().await?;
+
+        if !resp.status().is_success() {
+            return Err(format!(
+                "Failed to fetch schema for '{}': HTTP {}",
+                segments[..=i].join("/"),
+                resp.status()
+            )
+            .into());
+        }
+
+        #[derive(Deserialize)]
+        struct HeadResp {
+            content: String,
+        }
+
+        #[derive(Deserialize, Default)]
+        struct Schema {
+            #[serde(default)]
+            root: SchemaRoot,
+        }
+
+        #[derive(Deserialize, Default)]
+        struct SchemaRoot {
+            entries: Option<HashMap<String, SchemaEntry>>,
+        }
+
+        #[derive(Deserialize)]
+        struct SchemaEntry {
+            node_id: Option<String>,
+        }
+
+        let head: HeadResp = resp.json().await?;
+        let schema: Schema = if head.content.trim() == "{}" {
+            Schema::default()
+        } else {
+            serde_json::from_str(&head.content)?
+        };
+
+        let entries = schema.root.entries.ok_or_else(|| {
+            format!(
+                "Path '{}' not found: '{}' has no entries",
+                path,
+                if i == 0 {
+                    "fs-root".to_string()
+                } else {
+                    segments[..i].join("/")
+                }
+            )
+        })?;
+
+        let entry = entries.get(*segment).ok_or_else(|| {
+            let available: Vec<_> = entries.keys().collect();
+            format!(
+                "Path '{}' not found: no entry '{}' in '{}'. Available: {:?}",
+                path,
+                segment,
+                if i == 0 {
+                    "fs-root".to_string()
+                } else {
+                    segments[..i].join("/")
+                },
+                available
+            )
+        })?;
+
+        let node_id = entry.node_id.clone().ok_or_else(|| {
+            format!(
+                "Path '{}' not found: entry '{}' has no node_id",
+                path, segment
+            )
+        })?;
+
+        current_id = node_id;
+    }
+
+    Ok(current_id)
+}

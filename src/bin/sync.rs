@@ -184,7 +184,7 @@ async fn discover_fs_root(
 
 /// Resolve a path relative to fs-root to a UUID.
 ///
-/// Traverses the fs-root schema to find the document ID for the given path.
+/// Discovers the fs-root first, then traverses the schema hierarchy.
 /// For example, "bartleby" finds schema.root.entries["bartleby"].node_id
 /// For nested paths like "foo/bar", follows intermediate node_ids.
 async fn resolve_path_to_uuid(
@@ -192,98 +192,10 @@ async fn resolve_path_to_uuid(
     server: &str,
     path: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // Get the fs-root document ID
+    use commonplace_doc::sync::resolve_path_to_uuid_http;
+
     let fs_root_id = discover_fs_root(client, server).await?;
-
-    // Split path into segments
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-    if segments.is_empty() {
-        // Empty path means fs-root itself
-        return Ok(fs_root_id);
-    }
-
-    // Start traversal from fs-root
-    let mut current_id = fs_root_id;
-
-    for (i, segment) in segments.iter().enumerate() {
-        // Fetch the current document's schema
-        let url = format!("{}/docs/{}/head", server, current_id);
-        let resp = client.get(&url).send().await?;
-
-        if !resp.status().is_success() {
-            return Err(format!(
-                "Failed to fetch schema for '{}': HTTP {}",
-                segments[..=i].join("/"),
-                resp.status()
-            )
-            .into());
-        }
-
-        #[derive(serde::Deserialize)]
-        struct HeadResponse {
-            content: String,
-        }
-
-        #[derive(serde::Deserialize, Default)]
-        struct Schema {
-            #[serde(default)]
-            root: SchemaRoot,
-        }
-
-        #[derive(serde::Deserialize, Default)]
-        struct SchemaRoot {
-            entries: Option<std::collections::HashMap<String, SchemaEntry>>,
-        }
-
-        #[derive(serde::Deserialize)]
-        struct SchemaEntry {
-            node_id: Option<String>,
-        }
-
-        let head: HeadResponse = resp.json().await?;
-        // Handle empty schema "{}"
-        let schema: Schema = if head.content.trim() == "{}" {
-            Schema::default()
-        } else {
-            serde_json::from_str(&head.content)?
-        };
-
-        // Look up the segment in entries
-        let entries = schema.root.entries.ok_or_else(|| {
-            format!(
-                "Path '{}' not found: '{}' has no entries",
-                path,
-                segments[..i].join("/")
-            )
-        })?;
-
-        let entry = entries.get(*segment).ok_or_else(|| {
-            let available: Vec<_> = entries.keys().collect();
-            format!(
-                "Path '{}' not found: no entry '{}' in '{}'. Available: {:?}",
-                path,
-                segment,
-                if i == 0 {
-                    "fs-root".to_string()
-                } else {
-                    segments[..i].join("/")
-                },
-                available
-            )
-        })?;
-
-        let node_id = entry.node_id.clone().ok_or_else(|| {
-            format!(
-                "Path '{}' not found: entry '{}' has no node_id",
-                path, segment
-            )
-        })?;
-
-        current_id = node_id;
-    }
-
-    Ok(current_id)
+    resolve_path_to_uuid_http(client, server, &fs_root_id, path).await
 }
 
 /// Resolve a path to UUID, or create the document if it doesn't exist.
