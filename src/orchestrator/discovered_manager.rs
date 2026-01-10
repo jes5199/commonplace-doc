@@ -5,19 +5,15 @@
 //! see the `discovery` module.
 
 use super::discovery::{DiscoveredProcess, ProcessesConfig};
+use super::spawn::spawn_managed_process;
 use super::status::{OrchestratorStatus, ProcessStatus};
 use futures::StreamExt;
 use reqwest::Client;
 use reqwest_eventsource::{Event as SseEvent, EventSource};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-#[cfg(unix)]
-#[allow(unused_imports)]
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 /// URL-encode a path for use in `/files/*` endpoints.
@@ -362,55 +358,7 @@ impl DiscoveredProcessManager {
         cmd.env("COMMONPLACE_SERVER", &self.server_url);
         cmd.env("COMMONPLACE_INITIAL_SYNC", "server");
 
-        // Capture stdout/stderr
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        // Enable kill_on_drop for extra safety when handle is dropped
-        cmd.kill_on_drop(true);
-
-        // Set up process group on Unix (works on macOS and Linux)
-        // Also set death signal on Linux (prctl is Linux-specific)
-        #[cfg(unix)]
-        unsafe {
-            cmd.pre_exec(|| {
-                // Put child in its own process group so we can kill all descendants
-                libc::setpgid(0, 0);
-                // Request SIGTERM if parent dies (Linux-only, covers SIGKILL of parent)
-                #[cfg(target_os = "linux")]
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-                Ok(())
-            });
-        }
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn {}: {}", name, e))?;
-
-        // Spawn tasks to read stdout/stderr with prefix
-        let name_clone = name.to_string();
-        if let Some(stdout) = child.stdout.take() {
-            let name = name_clone.clone();
-            tokio::spawn(async move {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    println!("[{}] {}", name, line);
-                }
-            });
-        }
-
-        if let Some(stderr) = child.stderr.take() {
-            let name = name_clone;
-            tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    eprintln!("[{}] {}", name, line);
-                }
-            });
-        }
-
+        let child = spawn_managed_process(cmd, name)?;
         process.handle = Some(child);
         process.state = DiscoveredProcessState::Running;
         process.last_start = Some(Instant::now());

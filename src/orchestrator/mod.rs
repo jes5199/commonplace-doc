@@ -2,6 +2,7 @@ mod config;
 mod discovered_manager;
 mod discovery;
 mod manager;
+mod spawn;
 mod status;
 
 pub use config::{OrchestratorConfig, ProcessConfig, RestartMode, RestartPolicy};
