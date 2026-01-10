@@ -14,9 +14,9 @@ use crate::sync::uuid_map::{
     build_uuid_map_recursive_with_status,
 };
 use crate::sync::{
-    build_head_url, detect_from_path, encode_node_id, is_allowed_extension, is_binary_content,
-    looks_like_base64_binary, push_schema_to_server, spawn_file_sync_tasks, FileSyncState,
-    HeadResponse, SyncState,
+    ancestry::determine_sync_direction, build_head_url, detect_from_path, encode_node_id,
+    is_allowed_extension, is_binary_content, looks_like_base64_binary, push_schema_to_server,
+    spawn_file_sync_tasks, FileSyncState, HeadResponse, SyncState,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -1124,6 +1124,7 @@ pub async fn handle_schema_change_with_dedup(
     spawn_tasks: bool,
     use_paths: bool,
     last_schema_hash: &mut Option<String>,
+    last_schema_cid: &mut Option<String>,
     push_only: bool,
     pull_only: bool,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
@@ -1139,6 +1140,34 @@ pub async fn handle_schema_change_with_dedup(
 
     let head: HeadResponse = resp.json().await?;
     if head.content.is_empty() {
+        return Ok(false);
+    }
+
+    // Use CRDT ancestry to determine if we should apply server schema.
+    // Only pull if server is ahead of us (our CID is ancestor of server's CID).
+    let server_cid = head.cid.as_deref();
+    let direction = match determine_sync_direction(
+        client,
+        server,
+        fs_root_id,
+        last_schema_cid.as_deref(),
+        server_cid,
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("Ancestry check failed for schema sync: {}", e);
+            // On error, fall through to content-based checks as fallback
+            crate::sync::ancestry::SyncDirection::Pull
+        }
+    };
+
+    if !direction.should_pull() {
+        debug!(
+            "Ancestry check for schema: {:?}, skipping server schema",
+            direction
+        );
         return Ok(false);
     }
 
@@ -1170,8 +1199,9 @@ pub async fn handle_schema_change_with_dedup(
     )
     .await?;
 
-    // Update last hash only after successful processing
+    // Update last hash and CID only after successful processing
     *last_schema_hash = Some(current_hash);
+    *last_schema_cid = head.cid.clone();
 
     Ok(true)
 }

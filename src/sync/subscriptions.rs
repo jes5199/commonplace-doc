@@ -47,6 +47,8 @@ pub async fn directory_sse_task(
 
     // Track last processed schema to prevent redundant processing
     let mut last_schema_hash: Option<String> = None;
+    // Track last applied schema CID for ancestry checking
+    let mut last_schema_cid: Option<String> = None;
 
     'reconnect: loop {
         info!("Connecting to fs-root SSE: {}", sse_url);
@@ -75,7 +77,7 @@ pub async fn directory_sse_task(
                         }
                         "edit" => {
                             // Schema changed on server, sync new files to local
-                            // Use content-based deduplication to prevent feedback loops
+                            // Use content-based deduplication and ancestry checking
                             match handle_schema_change_with_dedup(
                                 &client,
                                 &server,
@@ -85,6 +87,7 @@ pub async fn directory_sse_task(
                                 true, // spawn_tasks: true for runtime schema changes
                                 use_paths,
                                 &mut last_schema_hash,
+                                &mut last_schema_cid,
                                 push_only,
                                 pull_only,
                                 #[cfg(unix)]
@@ -461,6 +464,8 @@ pub async fn directory_mqtt_task(
 
     // Track last processed schema to prevent redundant processing
     let mut last_schema_hash: Option<String> = None;
+    // Track last applied schema CID for ancestry checking
+    let mut last_schema_cid: Option<String> = None;
 
     // Process incoming MQTT messages
     loop {
@@ -474,7 +479,7 @@ pub async fn directory_mqtt_task(
                     );
 
                     // An edit message means the schema has changed
-                    // Use content-based deduplication to prevent feedback loops
+                    // Use content-based deduplication and ancestry checking
                     match handle_schema_change_with_dedup(
                         &http_client,
                         &server,
@@ -484,6 +489,7 @@ pub async fn directory_mqtt_task(
                         true, // spawn_tasks: true for runtime schema changes
                         use_paths,
                         &mut last_schema_hash,
+                        &mut last_schema_cid,
                         push_only,
                         pull_only,
                         #[cfg(unix)]
