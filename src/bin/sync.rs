@@ -1020,8 +1020,10 @@ async fn run_directory_mode(
         info!("Server files pulled to local directory");
     }
 
-    // Synchronize schema between local and server
-    sync_schema(
+    // Synchronize schema between local and server.
+    // Capture the CID from initial sync to prevent subscription tasks from
+    // pulling stale server content that predates our push.
+    let (_schema_json, initial_schema_cid) = sync_schema(
         &client,
         &server,
         &fs_root_id,
@@ -1029,25 +1031,6 @@ async fn run_directory_mode(
         &options,
         &initial_sync_strategy,
         server_has_content,
-    )
-    .await?;
-
-    // Create local files for any schema entries that don't exist locally.
-    // This handles commonplace-link entries where the linked target exists but the
-    // link file needs to be created locally.
-    handle_schema_change(
-        &client,
-        &server,
-        &fs_root_id,
-        &directory,
-        &file_states,
-        false, // Don't spawn tasks - main loop will do that
-        use_paths,
-        push_only,
-        pull_only,
-        #[cfg(unix)]
-        inode_tracker.clone(),
-        Some(&written_schemas),
     )
     .await?;
 
@@ -1099,6 +1082,26 @@ async fn run_directory_mode(
 
     info!("Initial sync complete: {} files synced", files.len());
 
+    // Create local files for any schema entries that don't exist locally.
+    // This handles commonplace-link entries where the linked target exists but the
+    // link file needs to be created locally. We do this AFTER sync_single_file
+    // so that file_states is populated and we correctly identify truly new files.
+    handle_schema_change(
+        &client,
+        &server,
+        &fs_root_id,
+        &directory,
+        &file_states,
+        false, // Don't spawn tasks - main loop will do that
+        use_paths,
+        push_only,
+        pull_only,
+        #[cfg(unix)]
+        inode_tracker.clone(),
+        Some(&written_schemas),
+    )
+    .await?;
+
     // Start directory watcher (skip if pull-only)
     let (dir_tx, mut dir_rx) = mpsc::channel::<DirEvent>(100);
     let watcher_handle = if !pull_only {
@@ -1147,6 +1150,7 @@ async fn run_directory_mode(
                 mqtt.clone(),
                 workspace.clone(),
                 Some(written_schemas.clone()),
+                initial_schema_cid.clone(),
             )))
         } else {
             info!("Using SSE for directory sync subscriptions");
@@ -1163,6 +1167,7 @@ async fn run_directory_mode(
                 inode_tracker.clone(),
                 watched_subdirs.clone(),
                 Some(written_schemas.clone()),
+                initial_schema_cid.clone(),
             )))
         }
     } else {
@@ -1507,8 +1512,10 @@ async fn run_exec_mode(
         info!("Server files pulled to local directory");
     }
 
-    // Synchronize schema between local and server
-    sync_schema(
+    // Synchronize schema between local and server.
+    // Capture the CID from initial sync to prevent subscription tasks from
+    // pulling stale server content that predates our push.
+    let (_schema_json, initial_schema_cid) = sync_schema(
         &client,
         &server,
         &fs_root_id,
@@ -1602,6 +1609,7 @@ async fn run_exec_mode(
             inode_tracker.clone(),
             watched_subdirs.clone(),
             Some(written_schemas.clone()),
+            initial_schema_cid.clone(),
         )))
     } else {
         info!("Push-only mode: skipping SSE subscription");

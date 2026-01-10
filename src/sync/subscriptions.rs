@@ -164,14 +164,16 @@ pub async fn directory_sse_task(
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     watched_subdirs: Arc<RwLock<HashSet<String>>>,
     written_schemas: Option<crate::sync::WrittenSchemas>,
+    initial_schema_cid: Option<String>,
 ) {
     // fs-root schema subscription always uses ID-based API
     let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&fs_root_id));
 
     // Track last processed schema to prevent redundant processing
     let mut last_schema_hash: Option<String> = None;
-    // Track last applied schema CID for ancestry checking
-    let mut last_schema_cid: Option<String> = None;
+    // Track last applied schema CID for ancestry checking.
+    // Initialize with the CID from initial sync to prevent pulling stale server content.
+    let mut last_schema_cid: Option<String> = initial_schema_cid;
 
     'reconnect: loop {
         info!("Connecting to fs-root SSE: {}", sse_url);
@@ -501,6 +503,7 @@ pub async fn directory_mqtt_task(
     mqtt_client: Arc<MqttClient>,
     workspace: String,
     written_schemas: Option<crate::sync::WrittenSchemas>,
+    initial_schema_cid: Option<String>,
 ) {
     // Subscribe to edits for the fs-root document
     let edits_topic = Topic::edits(&workspace, &fs_root_id);
@@ -521,8 +524,9 @@ pub async fn directory_mqtt_task(
 
     // Track last processed schema to prevent redundant processing
     let mut last_schema_hash: Option<String> = None;
-    // Track last applied schema CID for ancestry checking
-    let mut last_schema_cid: Option<String> = None;
+    // Track last applied schema CID for ancestry checking.
+    // Initialize with the CID from initial sync to prevent pulling stale server content.
+    let mut last_schema_cid: Option<String> = initial_schema_cid;
 
     // Process incoming MQTT messages
     loop {

@@ -1182,6 +1182,9 @@ pub async fn ensure_fs_root_exists(
 /// - "skip": Only push if server is empty
 ///
 /// Returns the schema JSON that was pushed or fetched.
+/// Returns (schema_json, initial_cid) where initial_cid is the CID of the schema
+/// after initial sync. This CID should be passed to subscription tasks to prevent
+/// them from pulling stale server content that predates our push.
 pub async fn sync_schema(
     client: &Client,
     server: &str,
@@ -1190,7 +1193,7 @@ pub async fn sync_schema(
     options: &ScanOptions,
     initial_sync_strategy: &str,
     server_has_content: bool,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
     // Scan directory and generate FS schema
     info!("Scanning directory...");
     let schema = scan_directory(directory, options).map_err(|e| format!("Scan error: {}", e))?;
@@ -1227,12 +1230,14 @@ pub async fn sync_schema(
         // and write to local .commonplace.json files.
         // This ensures all sync clients get the same server-assigned UUIDs.
         let mut final_schema_json = schema_json.clone();
+        let mut final_cid: Option<String> = None;
         let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
         if let Ok(resp) = client.get(&head_url).send().await {
             if resp.status().is_success() {
                 if let Ok(head) = resp.json::<HeadResponse>().await {
                     // Write server's schema (with UUIDs) to local file
                     final_schema_json = head.content.clone();
+                    final_cid = head.cid.clone();
                     if let Err(e) = write_schema_file(directory, &head.content, None).await {
                         warn!("Failed to write schema file: {}", e);
                     }
@@ -1263,6 +1268,8 @@ pub async fn sync_schema(
             if let Ok(resp) = client.get(&head_url).send().await {
                 if resp.status().is_success() {
                     if let Ok(head) = resp.json::<HeadResponse>().await {
+                        // Update final_cid with the latest CID from retry
+                        final_cid = head.cid.clone();
                         if let Ok(server_schema) = serde_json::from_str::<FsSchema>(&head.content) {
                             info!(
                                 "Writing nested schemas from server (attempt {})...",
@@ -1285,7 +1292,7 @@ pub async fn sync_schema(
             }
         }
 
-        Ok(final_schema_json)
+        Ok((final_schema_json, final_cid))
     } else {
         info!(
             "Server already has content, skipping schema push (strategy={})",
@@ -1328,11 +1335,11 @@ pub async fn sync_schema(
                         warn!("Failed to write nested schemas: {}", e);
                     }
 
-                    return Ok(head.content);
+                    return Ok((head.content, head.cid));
                 }
             }
         }
-        Ok(schema_json)
+        Ok((schema_json, None))
     }
 }
 
