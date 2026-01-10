@@ -14,10 +14,10 @@ use commonplace_doc::sync::{
     encode_node_id, ensure_fs_root_exists, file_watcher_task, fork_node,
     get_all_node_backed_dir_ids, handle_file_created, handle_file_deleted, handle_file_modified,
     handle_schema_change, handle_schema_modified, initial_sync, is_binary_content,
-    push_schema_to_server, scan_directory_with_contents, spawn_file_sync_tasks, sse_task,
-    subdir_mqtt_task, subdir_sse_task, sync_schema, sync_single_file, upload_task, DirEvent,
-    FileEvent, FileSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions, SyncState,
-    SCHEMA_FILENAME,
+    push_schema_to_server, scan_directory_with_contents, spawn_file_sync_tasks_with_flock,
+    sse_task, subdir_mqtt_task, subdir_sse_task, sync_schema, sync_single_file, upload_task,
+    DirEvent, FileEvent, FileSyncState, FlockSyncState, InodeKey, InodeTracker, ReplaceResponse,
+    ScanOptions, SyncState, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -1116,6 +1116,9 @@ async fn run_directory_mode(
     // Track which subdirectories have tasks (shared between startup and dynamic discovery)
     let watched_subdirs: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
 
+    // Create shared flock state for ancestry checking
+    let flock_state = FlockSyncState::new();
+
     // Start subscription task for fs-root (skip if push-only)
     // Use MQTT if available, otherwise fall back to SSE
     let subscription_handle = if !push_only {
@@ -1232,8 +1235,15 @@ async fn run_directory_mode(
         for (relative_path, file_state) in states.iter_mut() {
             let file_path = directory.join(relative_path);
 
+            // Parse doc_id from identifier if using UUID-based API
+            let doc_id = if !file_state.use_paths {
+                uuid::Uuid::parse_str(&file_state.identifier).ok()
+            } else {
+                None
+            };
+
             // Spawn sync tasks and store handles in FileSyncState for cleanup on deletion
-            file_state.task_handles = spawn_file_sync_tasks(
+            file_state.task_handles = spawn_file_sync_tasks_with_flock(
                 client.clone(),
                 server.clone(),
                 file_state.identifier.clone(),
@@ -1243,6 +1253,8 @@ async fn run_directory_mode(
                 push_only,
                 pull_only,
                 false, // force_push: directory mode doesn't support force-push
+                flock_state.clone(),
+                doc_id,
                 #[cfg(unix)]
                 inode_tracker.clone(),
             );
@@ -1572,6 +1584,9 @@ async fn run_exec_mode(
     // Track which subdirectories have SSE tasks (shared between startup and dynamic discovery)
     let watched_subdirs: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
 
+    // Create shared flock state for ancestry checking
+    let flock_state = FlockSyncState::new();
+
     // Start SSE task for fs-root (skip if push-only)
     let sse_handle = if !push_only {
         Some(tokio::spawn(directory_sse_task(
@@ -1631,7 +1646,15 @@ async fn run_exec_mode(
         let mut states = file_states.write().await;
         for (relative_path, file_state) in states.iter_mut() {
             let file_path = directory.join(relative_path);
-            file_state.task_handles = spawn_file_sync_tasks(
+
+            // Parse doc_id from identifier if using UUID-based API
+            let doc_id = if !file_state.use_paths {
+                uuid::Uuid::parse_str(&file_state.identifier).ok()
+            } else {
+                None
+            };
+
+            file_state.task_handles = spawn_file_sync_tasks_with_flock(
                 client.clone(),
                 server.clone(),
                 file_state.identifier.clone(),
@@ -1641,6 +1664,8 @@ async fn run_exec_mode(
                 push_only,
                 pull_only,
                 false, // force_push: sandbox mode doesn't support force-push
+                flock_state.clone(),
+                doc_id,
                 #[cfg(unix)]
                 inode_tracker.clone(),
             );
