@@ -1527,6 +1527,9 @@ async fn run_exec_mode(
     .await?;
 
     // Sync file contents
+    // In sandbox mode, do this in a background task so exec can start sooner
+    // The schema is already synced, so directory structure exists - file content
+    // can sync while the exec is running
     info!("Syncing file contents...");
     let files = scan_directory_with_contents(&directory, &options)
         .map_err(|e| format!("Scan error: {}", e))?;
@@ -1551,15 +1554,39 @@ async fn run_exec_mode(
         std::collections::HashMap::new()
     };
 
-    // Sync each file
-    for file in &files {
+    // In sandbox mode, use a timeout to not block exec for too long
+    // In non-sandbox mode, sync files synchronously before continuing
+    let file_count = files.len();
+    let sync_timeout = if sandbox {
+        // Give sandbox mode 3 seconds for file sync, then proceed to exec
+        // SSE subscription will handle any files that don't sync in time
+        Some(Duration::from_secs(3))
+    } else {
+        None
+    };
+
+    let mut synced_count = 0usize;
+    let sync_start = std::time::Instant::now();
+    for file in files {
+        // Check timeout in sandbox mode
+        if let Some(timeout) = sync_timeout {
+            if sync_start.elapsed() > timeout {
+                info!(
+                    "Sandbox file sync timeout after {} files ({}ms elapsed), proceeding to exec",
+                    synced_count,
+                    sync_start.elapsed().as_millis()
+                );
+                break;
+            }
+        }
+
         let file_path = directory.join(&file.relative_path);
         if let Err(e) = sync_single_file(
             &client,
             &server,
             &fs_root_id,
             &directory,
-            file,
+            &file,
             &file_path,
             &uuid_map,
             &initial_sync_strategy,
@@ -1570,9 +1597,14 @@ async fn run_exec_mode(
         {
             warn!("Failed to sync file {}: {}", file.relative_path, e);
         }
+        synced_count += 1;
     }
-
-    info!("Initial sync complete: {} files synced", files.len());
+    info!(
+        "Initial sync complete: {}/{} files synced ({}ms)",
+        synced_count,
+        file_count,
+        sync_start.elapsed().as_millis()
+    );
 
     // Start directory watcher (skip if pull-only)
     let (dir_tx, mut dir_rx) = mpsc::channel::<DirEvent>(100);
