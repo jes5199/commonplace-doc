@@ -16,13 +16,11 @@ use commonplace_doc::sync::{
     handle_schema_change, handle_schema_modified, initial_sync, is_binary_content,
     push_schema_to_server, scan_directory_with_contents, spawn_file_sync_tasks, sse_task,
     subdir_mqtt_task, subdir_sse_task, sync_schema, sync_single_file, upload_task, DirEvent,
-    FileEvent, FileSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions,
-    ShadowWriteEvent, SyncState, SCHEMA_FILENAME,
+    FileEvent, FileSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions, SyncState,
+    SCHEMA_FILENAME,
 };
 #[cfg(unix)]
-use commonplace_doc::sync::{
-    shadow_gc_task, shadow_watcher_task, shadow_write_handler_task, sse_task_with_tracker,
-};
+use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -837,23 +835,13 @@ async fn run_file_mode(
                 t.shadow_dir.clone()
             };
 
-            // Create channel for shadow write events
-            let (shadow_tx, shadow_rx) = mpsc::channel::<ShadowWriteEvent>(100);
-
-            // Start shadow watcher
-            let watcher = tokio::spawn(shadow_watcher_task(shadow_path, shadow_tx));
-
-            // Start shadow write handler
-            let handler = tokio::spawn(shadow_write_handler_task(
+            let (watcher, handler, gc) = spawn_shadow_tasks(
+                shadow_path,
                 client.clone(),
                 server.clone(),
-                shadow_rx,
                 tracker.clone(),
                 false, // use_paths: file mode uses ID-based API
-            ));
-
-            // Start periodic shadow GC task
-            let gc = tokio::spawn(shadow_gc_task(tracker.clone()));
+            );
 
             (Some(watcher), Some(handler), Some(gc))
         } else {
@@ -1270,23 +1258,13 @@ async fn run_directory_mode(
                 t.shadow_dir.clone()
             };
 
-            // Create channel for shadow write events
-            let (shadow_tx, shadow_rx) = mpsc::channel::<ShadowWriteEvent>(100);
-
-            // Start shadow watcher
-            let watcher = tokio::spawn(shadow_watcher_task(shadow_path, shadow_tx));
-
-            // Start shadow write handler
-            let handler = tokio::spawn(shadow_write_handler_task(
+            let (watcher, handler, gc) = spawn_shadow_tasks(
+                shadow_path,
                 client.clone(),
                 server.clone(),
-                shadow_rx,
                 tracker.clone(),
                 use_paths,
-            ));
-
-            // Start periodic shadow GC task
-            let gc = tokio::spawn(shadow_gc_task(tracker.clone()));
+            );
 
             (Some(watcher), Some(handler), Some(gc))
         } else {
@@ -1678,23 +1656,13 @@ async fn run_exec_mode(
                 t.shadow_dir.clone()
             };
 
-            // Create channel for shadow write events
-            let (shadow_tx, shadow_rx) = mpsc::channel::<ShadowWriteEvent>(100);
-
-            // Start shadow watcher
-            let watcher = tokio::spawn(shadow_watcher_task(shadow_path, shadow_tx));
-
-            // Start shadow write handler
-            let handler = tokio::spawn(shadow_write_handler_task(
+            let (watcher, handler, gc) = spawn_shadow_tasks(
+                shadow_path,
                 client.clone(),
                 server.clone(),
-                shadow_rx,
                 tracker.clone(),
                 use_paths,
-            ));
-
-            // Start periodic shadow GC task
-            let gc = tokio::spawn(shadow_gc_task(tracker.clone()));
+            );
 
             (Some(watcher), Some(handler), Some(gc))
         } else {

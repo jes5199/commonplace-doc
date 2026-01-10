@@ -132,7 +132,7 @@ pub use urls::{
 };
 pub use watcher::{directory_watcher_task, file_watcher_task, ShadowWriteEvent};
 #[cfg(unix)]
-pub use watcher::{shadow_gc_task, shadow_watcher_task, SHADOW_GC_INTERVAL};
+pub use watcher::{shadow_gc_task, shadow_watcher_task, spawn_shadow_tasks, SHADOW_GC_INTERVAL};
 pub use yjs::{
     base64_decode, base64_encode, create_yjs_json_delete_key, create_yjs_json_merge,
     create_yjs_json_update, create_yjs_jsonl_update, create_yjs_structured_update,
