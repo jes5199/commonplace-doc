@@ -39,7 +39,16 @@ pub const SCHEMA_FILENAME: &str = ".commonplace.json";
 /// This function compares the new schema with the existing local file
 /// and skips the write if they are semantically equivalent, preventing
 /// unnecessary file system events that could cause feedback loops.
-pub async fn write_schema_file(directory: &Path, schema_json: &str) -> Result<(), std::io::Error> {
+///
+/// If `written_schemas` is provided, the content is recorded for echo detection
+/// by the directory watcher. This allows the watcher to distinguish between
+/// schema files we wrote (which should be ignored) and user edits (which should
+/// be pushed to the server).
+pub async fn write_schema_file(
+    directory: &Path,
+    schema_json: &str,
+    written_schemas: Option<&crate::sync::WrittenSchemas>,
+) -> Result<(), std::io::Error> {
     let schema_path = directory.join(SCHEMA_FILENAME);
 
     // Check if existing schema is the same (prevents feedback loops)
@@ -54,6 +63,12 @@ pub async fn write_schema_file(directory: &Path, schema_json: &str) -> Result<()
                         "Schema unchanged, skipping write to {}",
                         schema_path.display()
                     );
+                    // Still record in written_schemas even if we skip the write,
+                    // in case the file was modified externally to match what we have
+                    if let Some(ws) = written_schemas {
+                        let canonical = schema_path.canonicalize().unwrap_or(schema_path.clone());
+                        ws.write().await.insert(canonical, schema_json.to_string());
+                    }
                     return Ok(());
                 }
             }
@@ -62,6 +77,13 @@ pub async fn write_schema_file(directory: &Path, schema_json: &str) -> Result<()
 
     tokio::fs::write(&schema_path, schema_json).await?;
     info!("Wrote schema to {}", schema_path.display());
+
+    // Record what we wrote for echo detection
+    if let Some(ws) = written_schemas {
+        let canonical = schema_path.canonicalize().unwrap_or(schema_path.clone());
+        ws.write().await.insert(canonical, schema_json.to_string());
+    }
+
     Ok(())
 }
 
@@ -176,7 +198,7 @@ pub async fn handle_subdir_schema_cleanup(
     }
 
     // Only write valid schema to local .commonplace.json file
-    if let Err(e) = write_schema_file(subdir_directory, &head.content).await {
+    if let Err(e) = write_schema_file(subdir_directory, &head.content, None).await {
         warn!("Failed to write subdir schema file: {}", e);
     }
 
@@ -574,6 +596,7 @@ pub async fn write_nested_schemas(
     server: &str,
     directory: &Path,
     schema: &FsSchema,
+    written_schemas: Option<&crate::sync::WrittenSchemas>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref root) = schema.root {
         // Track processed node_ids with their content hashes to prevent redundant fetches
@@ -585,6 +608,7 @@ pub async fn write_nested_schemas(
             root,
             directory,
             &mut processed_hashes,
+            written_schemas,
         )
         .await?;
     }
@@ -603,6 +627,7 @@ async fn write_nested_schemas_recursive(
     entry: &Entry,
     current_dir: &Path,
     processed_hashes: &mut HashMap<String, String>,
+    written_schemas: Option<&crate::sync::WrittenSchemas>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         "write_nested_schemas_recursive: current_dir={:?}, entry_type={:?}",
@@ -699,6 +724,7 @@ async fn write_nested_schemas_recursive(
                                                             if let Err(e) = write_schema_file(
                                                                 &subdir_path,
                                                                 &head.content,
+                                                                written_schemas,
                                                             )
                                                             .await
                                                             {
@@ -722,6 +748,7 @@ async fn write_nested_schemas_recursive(
                                                                 sub_root,
                                                                 &subdir_path,
                                                                 processed_hashes,
+                                                                written_schemas,
                                                             )
                                                             .await?;
                                                         } else {
@@ -937,6 +964,9 @@ async fn push_nested_schemas_recursive(
 /// When the server's fs-root schema changes (e.g., new files added by another client),
 /// this function fetches the new schema, creates any missing local files, and optionally
 /// spawns sync tasks for them.
+///
+/// If `written_schemas` is provided, written schema content is recorded for
+/// echo detection by the directory watcher.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_schema_change(
     client: &Client,
@@ -949,6 +979,7 @@ pub async fn handle_schema_change(
     push_only: bool,
     pull_only: bool,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    written_schemas: Option<&crate::sync::WrittenSchemas>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Fetch current schema from server (fs-root schema always uses ID-based API)
     let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
@@ -984,7 +1015,7 @@ pub async fn handle_schema_change(
     }
 
     // Only write valid schema to local .commonplace.json file
-    if let Err(e) = write_schema_file(directory, &head.content).await {
+    if let Err(e) = write_schema_file(directory, &head.content, written_schemas).await {
         warn!("Failed to write schema file: {}", e);
     }
 
@@ -992,7 +1023,8 @@ pub async fn handle_schema_change(
     // Use async version that follows node-backed directories to get complete path->UUID map
     // AND writes nested schema files to local directory (required for find_owning_document fallback)
     let (uuid_map, _all_succeeded) =
-        build_uuid_map_and_write_schemas(client, server, fs_root_id, directory).await;
+        build_uuid_map_and_write_schemas(client, server, fs_root_id, directory, written_schemas)
+            .await;
     let schema_paths: Vec<(String, Option<String>)> = uuid_map
         .into_iter()
         .map(|(path, node_id)| (path, Some(node_id)))
@@ -1209,7 +1241,8 @@ pub async fn handle_schema_change(
     // Write nested schemas for node-backed directories to local subdirectories.
     // This persists subdirectory schemas so they survive server restarts.
     // NOTE: This must be called AFTER the file sync loop above which creates directories.
-    if let Err(e) = write_nested_schemas(client, server, directory, &schema).await {
+    if let Err(e) = write_nested_schemas(client, server, directory, &schema, written_schemas).await
+    {
         warn!("Failed to write nested schemas: {}", e);
     }
 
@@ -1235,6 +1268,7 @@ pub async fn directory_sse_task(
     pull_only: bool,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     watched_subdirs: Arc<RwLock<HashSet<String>>>,
+    written_schemas: Option<crate::sync::WrittenSchemas>,
 ) {
     // fs-root schema subscription always uses ID-based API
     let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&fs_root_id));
@@ -1283,6 +1317,7 @@ pub async fn directory_sse_task(
                                 pull_only,
                                 #[cfg(unix)]
                                 inode_tracker.clone(),
+                                written_schemas.as_ref(),
                             )
                             .await
                             {
@@ -1633,6 +1668,7 @@ pub async fn directory_mqtt_task(
     watched_subdirs: Arc<RwLock<HashSet<String>>>,
     mqtt_client: Arc<MqttClient>,
     workspace: String,
+    written_schemas: Option<crate::sync::WrittenSchemas>,
 ) {
     // Subscribe to edits for the fs-root document
     let edits_topic = Topic::edits(&workspace, &fs_root_id);
@@ -1680,6 +1716,7 @@ pub async fn directory_mqtt_task(
                         pull_only,
                         #[cfg(unix)]
                         inode_tracker.clone(),
+                        written_schemas.as_ref(),
                     )
                     .await
                     {
@@ -1996,6 +2033,7 @@ async fn handle_schema_change_with_dedup(
     push_only: bool,
     pull_only: bool,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    written_schemas: Option<&crate::sync::WrittenSchemas>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     // Fetch current schema from server
     let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
@@ -2034,6 +2072,7 @@ async fn handle_schema_change_with_dedup(
         pull_only,
         #[cfg(unix)]
         inode_tracker,
+        written_schemas,
     )
     .await?;
 
@@ -2588,7 +2627,7 @@ pub async fn sync_schema(
                 if let Ok(head) = resp.json::<HeadResponse>().await {
                     // Write server's schema (with UUIDs) to local file
                     final_schema_json = head.content.clone();
-                    if let Err(e) = write_schema_file(directory, &head.content).await {
+                    if let Err(e) = write_schema_file(directory, &head.content, None).await {
                         warn!("Failed to write schema file: {}", e);
                     }
 
@@ -2596,7 +2635,8 @@ pub async fn sync_schema(
                     if let Ok(server_schema) = serde_json::from_str::<FsSchema>(&head.content) {
                         info!("Writing nested schemas from server...");
                         if let Err(e) =
-                            write_nested_schemas(client, server, directory, &server_schema).await
+                            write_nested_schemas(client, server, directory, &server_schema, None)
+                                .await
                         {
                             warn!("Failed to write nested schemas from server: {}", e);
                         }
@@ -2622,9 +2662,14 @@ pub async fn sync_schema(
                                 "Writing nested schemas from server (attempt {})...",
                                 attempt
                             );
-                            if let Err(e) =
-                                write_nested_schemas(client, server, directory, &server_schema)
-                                    .await
+                            if let Err(e) = write_nested_schemas(
+                                client,
+                                server,
+                                directory,
+                                &server_schema,
+                                None,
+                            )
+                            .await
                             {
                                 warn!("Failed to write nested schemas from server: {}", e);
                             }
@@ -2664,7 +2709,7 @@ pub async fn sync_schema(
                         );
                     } else {
                         // No local schema exists, write server's schema
-                        if let Err(e) = write_schema_file(directory, &head.content).await {
+                        if let Err(e) = write_schema_file(directory, &head.content, None).await {
                             warn!("Failed to write schema file: {}", e);
                         }
                     }
@@ -2672,7 +2717,7 @@ pub async fn sync_schema(
                     // Write nested schemas for node-backed directories to local subdirectories.
                     // This persists subdirectory schemas so they survive server restarts.
                     if let Err(e) =
-                        write_nested_schemas(client, server, directory, &server_schema).await
+                        write_nested_schemas(client, server, directory, &server_schema, None).await
                     {
                         warn!("Failed to write nested schemas: {}", e);
                     }
@@ -2778,4 +2823,117 @@ pub async fn handle_file_deleted(
     if let Err(e) = delete_schema_entry(client, server, fs_root_id, &relative_path).await {
         warn!("Failed to delete schema entry {}: {}", relative_path, e);
     }
+}
+
+/// Handle a user edit to a .commonplace.json schema file.
+///
+/// When the user edits a schema file locally (e.g., to change a node_id for linking),
+/// this function pushes the changes to the server.
+///
+/// # Arguments
+/// * `client` - HTTP client
+/// * `server` - Server URL
+/// * `fs_root_id` - The root document ID for this sync directory
+/// * `base_directory` - The base sync directory path
+/// * `schema_path` - Path to the modified .commonplace.json file
+/// * `content` - New content of the schema file
+pub async fn handle_schema_modified(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    base_directory: &Path,
+    schema_path: &Path,
+    content: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate the schema content
+    let _schema: FsSchema =
+        serde_json::from_str(content).map_err(|e| format!("Invalid schema JSON: {}", e))?;
+
+    // Determine which document owns this schema
+    // If schema_path is in base_directory (root schema), push to fs_root_id
+    // If schema_path is in a subdirectory, find the node_id from parent schema
+
+    let schema_dir = schema_path
+        .parent()
+        .ok_or("Schema file has no parent directory")?;
+
+    // Check if this is the root schema
+    if schema_dir == base_directory {
+        info!("Pushing root schema to server (fs_root_id: {})", fs_root_id);
+        push_schema_to_server(client, server, fs_root_id, content).await?;
+        return Ok(());
+    }
+
+    // This is a nested schema - find the owning document
+    // Get the relative path from base_directory to schema_dir
+    let relative_dir = schema_dir.strip_prefix(base_directory).map_err(|_| {
+        format!(
+            "Schema path {} is not under base directory {}",
+            schema_path.display(),
+            base_directory.display()
+        )
+    })?;
+
+    // Find the node_id for this directory by reading parent schemas
+    // Start from base_directory and walk down
+    let mut current_dir = base_directory.to_path_buf();
+    let mut current_node_id = fs_root_id.to_string();
+
+    for component in relative_dir.iter() {
+        let component_str = component.to_string_lossy();
+
+        // Read the schema at current_dir
+        let parent_schema_path = current_dir.join(SCHEMA_FILENAME);
+        let parent_schema_content = tokio::fs::read_to_string(&parent_schema_path)
+            .await
+            .map_err(|e| {
+                format!(
+                    "Failed to read parent schema {}: {}",
+                    parent_schema_path.display(),
+                    e
+                )
+            })?;
+
+        let parent_schema: FsSchema = serde_json::from_str(&parent_schema_content)
+            .map_err(|e| format!("Invalid parent schema: {}", e))?;
+
+        // Find the entry for this component
+        let entry = parent_schema
+            .root
+            .as_ref()
+            .and_then(|root| {
+                if let Entry::Dir(dir) = root {
+                    dir.entries.as_ref()?.get(component_str.as_ref())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| format!("Directory {} not found in parent schema", component_str))?;
+
+        // Get the node_id if this is a node-backed directory
+        if let Entry::Dir(dir) = entry {
+            if let Some(ref node_id) = dir.node_id {
+                current_node_id = node_id.clone();
+            } else {
+                return Err(format!(
+                    "Directory {} is not node-backed (no node_id)",
+                    component_str
+                )
+                .into());
+            }
+        } else {
+            return Err(format!("{} is not a directory", component_str).into());
+        }
+
+        current_dir = current_dir.join(component);
+    }
+
+    info!(
+        "Pushing nested schema {} to server (node_id: {})",
+        schema_path.display(),
+        current_node_id
+    );
+    push_schema_to_server(client, server, &current_node_id, content).await?;
+
+    Ok(())
 }

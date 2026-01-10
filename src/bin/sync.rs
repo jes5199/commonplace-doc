@@ -12,11 +12,11 @@ use commonplace_doc::sync::{
     detect_from_path, directory_mqtt_task, directory_sse_task, directory_watcher_task,
     encode_node_id, ensure_fs_root_exists, file_watcher_task, fork_node,
     get_all_node_backed_dir_ids, handle_file_created, handle_file_deleted, handle_file_modified,
-    handle_schema_change, initial_sync, is_binary_content, push_schema_to_server,
-    scan_directory_with_contents, spawn_file_sync_tasks, sse_task, subdir_mqtt_task,
-    subdir_sse_task, sync_schema, sync_single_file, upload_task, DirEvent, FileEvent,
-    FileSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions, ShadowWriteEvent,
-    SyncState, SCHEMA_FILENAME,
+    handle_schema_change, handle_schema_modified, initial_sync, is_binary_content,
+    push_schema_to_server, scan_directory_with_contents, spawn_file_sync_tasks, sse_task,
+    subdir_mqtt_task, subdir_sse_task, sync_schema, sync_single_file, upload_task, DirEvent,
+    FileEvent, FileSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions,
+    ShadowWriteEvent, SyncState, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{
@@ -1085,6 +1085,11 @@ async fn run_directory_mode(
     let file_states: Arc<RwLock<HashMap<String, FileSyncState>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
+    // Create written_schemas tracker for user schema edit detection
+    // This must be created before any handle_schema_change calls so we can track what we write
+    let written_schemas: commonplace_doc::sync::WrittenSchemas =
+        Arc::new(RwLock::new(std::collections::HashMap::new()));
+
     if initial_sync_strategy == "server" && server_has_content {
         info!("Pulling server schema first (initial-sync=server)...");
         // Don't spawn tasks here - the main loop will spawn them for all files
@@ -1100,6 +1105,7 @@ async fn run_directory_mode(
             pull_only,
             #[cfg(unix)]
             inode_tracker.clone(),
+            Some(&written_schemas),
         )
         .await?;
         info!("Server files pulled to local directory");
@@ -1132,6 +1138,7 @@ async fn run_directory_mode(
         pull_only,
         #[cfg(unix)]
         inode_tracker.clone(),
+        Some(&written_schemas),
     )
     .await?;
 
@@ -1190,6 +1197,7 @@ async fn run_directory_mode(
             directory.clone(),
             dir_tx,
             options.clone(),
+            Some(written_schemas.clone()),
         )))
     } else {
         info!("Pull-only mode: skipping directory watcher");
@@ -1226,6 +1234,7 @@ async fn run_directory_mode(
                 watched_subdirs.clone(),
                 mqtt.clone(),
                 workspace.clone(),
+                Some(written_schemas.clone()),
             )))
         } else {
             info!("Using SSE for directory sync subscriptions");
@@ -1241,6 +1250,7 @@ async fn run_directory_mode(
                 #[cfg(unix)]
                 inode_tracker.clone(),
                 watched_subdirs.clone(),
+                Some(written_schemas.clone()),
             )))
         }
     } else {
@@ -1421,6 +1431,22 @@ async fn run_directory_mode(
                         )
                         .await;
                     }
+                    DirEvent::SchemaModified(path, content) => {
+                        info!("User edited schema file: {}", path.display());
+                        // Find the owning document for this schema and push to server
+                        if let Err(e) = handle_schema_modified(
+                            &client,
+                            &server,
+                            &fs_root_id,
+                            &directory,
+                            &path,
+                            &content,
+                        )
+                        .await
+                        {
+                            warn!("Failed to push schema change: {}", e);
+                        }
+                    }
                 }
             }
         }
@@ -1544,6 +1570,11 @@ async fn run_exec_mode(
     let file_states: Arc<RwLock<HashMap<String, FileSyncState>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
+    // Create written_schemas tracker for user schema edit detection
+    // This must be created before any handle_schema_change calls so we can track what we write
+    let written_schemas: commonplace_doc::sync::WrittenSchemas =
+        Arc::new(RwLock::new(std::collections::HashMap::new()));
+
     if initial_sync_strategy == "server" && server_has_content {
         info!("Pulling server schema first (initial-sync=server)...");
         handle_schema_change(
@@ -1558,6 +1589,7 @@ async fn run_exec_mode(
             pull_only,
             #[cfg(unix)]
             inode_tracker.clone(),
+            Some(&written_schemas),
         )
         .await?;
         info!("Server files pulled to local directory");
@@ -1630,6 +1662,7 @@ async fn run_exec_mode(
             directory.clone(),
             dir_tx,
             options.clone(),
+            Some(written_schemas.clone()),
         )))
     } else {
         info!("Pull-only mode: skipping directory watcher");
@@ -1653,6 +1686,7 @@ async fn run_exec_mode(
             #[cfg(unix)]
             inode_tracker.clone(),
             watched_subdirs.clone(),
+            Some(written_schemas.clone()),
         )))
     } else {
         info!("Push-only mode: skipping SSE subscription");
@@ -1803,6 +1837,22 @@ async fn run_exec_mode(
                             &file_states,
                         )
                         .await;
+                    }
+                    DirEvent::SchemaModified(path, content) => {
+                        info!("User edited schema file: {}", path.display());
+                        // Find the owning document for this schema and push to server
+                        if let Err(e) = handle_schema_modified(
+                            &client,
+                            &server,
+                            &fs_root_id,
+                            &directory,
+                            &path,
+                            &content,
+                        )
+                        .await
+                        {
+                            warn!("Failed to push schema change: {}", e);
+                        }
                     }
                 }
             }

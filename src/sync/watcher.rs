@@ -293,10 +293,16 @@ pub async fn file_watcher_task(file_path: PathBuf, tx: mpsc::Sender<FileEvent>) 
 /// - Debounces events with a 500ms delay
 /// - Logs errors but continues watching on watcher errors
 /// - Exits when the receiver is dropped
+///
+/// If `written_schemas` is provided, the watcher will detect user edits to
+/// `.commonplace.json` files (changes that differ from what the sync client wrote)
+/// and emit `DirEvent::SchemaModified` events for them. Without this parameter,
+/// schema file changes are ignored entirely.
 pub async fn directory_watcher_task(
     directory: PathBuf,
     tx: mpsc::Sender<DirEvent>,
     options: ScanOptions,
+    written_schemas: Option<crate::sync::WrittenSchemas>,
 ) {
     let (notify_tx, mut notify_rx) = mpsc::channel::<Result<Event, notify::Error>>(100);
 
@@ -330,14 +336,57 @@ pub async fn directory_watcher_task(
                 match res {
                     Ok(event) => {
                         for path in event.paths {
-                            // Skip .commonplace.json files to prevent feedback loops
-                            // These files are managed by the sync client itself
                             if let Some(name) = path.file_name() {
                                 let name_str = name.to_string_lossy();
+
+                                // Handle .commonplace.json files specially
                                 if name_str == ".commonplace.json" {
+                                    // If we have written_schemas tracking, check for user edits
+                                    if let Some(ref ws) = written_schemas {
+                                        // Read the file content
+                                        if let Ok(content) = std::fs::read_to_string(&path) {
+                                            let canonical = path.canonicalize().unwrap_or(path.clone());
+                                            let ws_guard = ws.blocking_read();
+                                            let is_our_write = if let Some(last_written) = ws_guard.get(&canonical) {
+                                                // Compare as JSON to ignore whitespace differences
+                                                if let (Ok(last_json), Ok(new_json)) = (
+                                                    serde_json::from_str::<serde_json::Value>(last_written),
+                                                    serde_json::from_str::<serde_json::Value>(&content),
+                                                ) {
+                                                    last_json == new_json
+                                                } else {
+                                                    // If JSON parsing fails, compare raw strings
+                                                    last_written == &content
+                                                }
+                                            } else {
+                                                // Not in our tracking map - could be initial load or user edit
+                                                // Treat as user edit to be safe
+                                                false
+                                            };
+                                            drop(ws_guard);
+
+                                            if is_our_write {
+                                                debug!("Skipping schema file event (our write): {}", path.display());
+                                                continue;
+                                            } else {
+                                                info!("Detected user edit to schema file: {}", path.display());
+                                                // Queue SchemaModified event (will be sent after debounce)
+                                                pending_events.insert(
+                                                    path.clone(),
+                                                    DirEvent::SchemaModified(path.clone(), content),
+                                                );
+                                                if debounce_timer.is_none() {
+                                                    debounce_timer = Some(tokio::time::Instant::now() + debounce_duration);
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    // No written_schemas tracking - skip entirely (old behavior)
                                     debug!("Skipping schema file event: {}", path.display());
                                     continue;
                                 }
+
                                 // Skip hidden files if not configured
                                 if !options.include_hidden && name_str.starts_with('.') {
                                     continue;
@@ -850,7 +899,7 @@ mod tests {
         // Start the watcher task
         let dir_clone = temp_dir.path().to_path_buf();
         let watcher_handle = tokio::spawn(async move {
-            directory_watcher_task(dir_clone, tx, options).await;
+            directory_watcher_task(dir_clone, tx, options, None).await;
         });
 
         // Give the watcher time to start
@@ -887,6 +936,9 @@ mod tests {
                     path.display()
                 );
             }
+            Ok(Some(DirEvent::SchemaModified(path, _))) => {
+                panic!("Unexpected SchemaModified event for {}", path.display());
+            }
             Ok(None) => panic!("Channel closed without receiving event"),
             Err(_) => panic!("Timeout waiting for directory event"),
         }
@@ -906,7 +958,7 @@ mod tests {
         // Start the watcher task
         let dir_clone = temp_dir.path().to_path_buf();
         let watcher_handle = tokio::spawn(async move {
-            directory_watcher_task(dir_clone, tx, options).await;
+            directory_watcher_task(dir_clone, tx, options, None).await;
         });
 
         // Give the watcher time to start
@@ -939,6 +991,7 @@ mod tests {
                 // Should only receive event for normal.txt
                 let path = match &event {
                     DirEvent::Created(p) | DirEvent::Modified(p) | DirEvent::Deleted(p) => p,
+                    DirEvent::SchemaModified(p, _) => p,
                 };
                 let name = path.file_name().unwrap().to_str().unwrap();
                 assert_eq!(

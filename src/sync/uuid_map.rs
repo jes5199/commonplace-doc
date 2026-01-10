@@ -4,7 +4,7 @@
 //! fetching schemas from the server and traversing node-backed directories.
 
 use crate::fs::{Entry, FsSchema};
-use crate::sync::{encode_node_id, write_schema_file, HeadResponse};
+use crate::sync::{encode_node_id, write_schema_file, HeadResponse, WrittenSchemas};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::path::Path;
@@ -98,12 +98,16 @@ pub async fn build_uuid_map_recursive_with_status(
 /// have their .commonplace.json files written locally. This is necessary for
 /// `find_owning_document` to work correctly when the uuid_map lookup fails.
 ///
+/// If `written_schemas` is provided, written schema content is recorded for
+/// echo detection by the directory watcher.
+///
 /// Returns (uuid_map, all_fetches_succeeded).
 pub async fn build_uuid_map_and_write_schemas(
     client: &Client,
     server: &str,
     doc_id: &str,
     local_directory: &Path,
+    written_schemas: Option<&WrittenSchemas>,
 ) -> (HashMap<String, String>, bool) {
     let mut uuid_map = HashMap::new();
     let mut all_succeeded = true;
@@ -115,6 +119,7 @@ pub async fn build_uuid_map_and_write_schemas(
         local_directory,
         &mut uuid_map,
         &mut all_succeeded,
+        written_schemas,
     )
     .await;
     (uuid_map, all_succeeded)
@@ -130,6 +135,7 @@ async fn build_uuid_map_from_doc_and_write_schemas(
     local_directory: &Path,
     uuid_map: &mut HashMap<String, String>,
     all_succeeded: &mut bool,
+    written_schemas: Option<&WrittenSchemas>,
 ) {
     // Fetch the schema from this document
     let head_url = format!("{}/docs/{}/head", server, encode_node_id(doc_id));
@@ -185,7 +191,7 @@ async fn build_uuid_map_from_doc_and_write_schemas(
         );
     } else {
         // Write the schema file
-        if let Err(e) = write_schema_file(&schema_dir, &head.content).await {
+        if let Err(e) = write_schema_file(&schema_dir, &head.content, written_schemas).await {
             warn!("Failed to write schema file to {:?}: {}", schema_dir, e);
         } else {
             debug!("Wrote schema file to {:?}", schema_dir);
@@ -202,6 +208,7 @@ async fn build_uuid_map_from_doc_and_write_schemas(
             local_directory,
             uuid_map,
             all_succeeded,
+            written_schemas,
         )
         .await;
     }
@@ -217,6 +224,7 @@ async fn collect_paths_and_write_schemas(
     local_directory: &Path,
     uuid_map: &mut HashMap<String, String>,
     all_succeeded: &mut bool,
+    written_schemas: Option<&WrittenSchemas>,
 ) {
     match entry {
         Entry::Dir(dir) => {
@@ -230,6 +238,7 @@ async fn collect_paths_and_write_schemas(
                     local_directory,
                     uuid_map,
                     all_succeeded,
+                    written_schemas,
                 )
                 .await;
             }
@@ -249,6 +258,7 @@ async fn collect_paths_and_write_schemas(
                         local_directory,
                         uuid_map,
                         all_succeeded,
+                        written_schemas,
                     )
                     .await;
                 }
