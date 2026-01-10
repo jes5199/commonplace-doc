@@ -304,13 +304,15 @@ async fn get_doc_head(
     }))
 }
 
+/// Request for POST /docs/{id}/edit endpoint.
+/// Shared with files.rs for /files/*path/edit.
 #[derive(Deserialize)]
-struct DocEditRequest {
-    update: String,
+pub struct DocEditRequest {
+    pub update: String,
     #[serde(default)]
-    author: Option<String>,
+    pub author: Option<String>,
     #[serde(default)]
-    message: Option<String>,
+    pub message: Option<String>,
 }
 
 /// Response for POST /docs/{id}/edit endpoint.
@@ -333,11 +335,13 @@ async fn edit_doc(
     Ok(Json(DocEditResponse { cid: result.cid }))
 }
 
+/// Query params for POST /docs/{id}/replace endpoint.
+/// Shared with files.rs for /files/*path/replace.
 #[derive(Deserialize)]
-struct ReplaceParams {
-    parent_cid: Option<String>,
+pub struct ReplaceParams {
+    pub parent_cid: Option<String>,
     #[serde(default)]
-    author: Option<String>,
+    pub author: Option<String>,
 }
 
 /// Response for POST /docs/{id}/replace endpoint.

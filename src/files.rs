@@ -11,10 +11,12 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use serde::Deserialize;
 use std::sync::Arc;
 
-use crate::api::{DocEditResponse, DocHeadResponse, ReplaceResponse, ReplaceSummary};
+use crate::api::{
+    DocEditRequest, DocEditResponse, DocHeadResponse, ReplaceParams, ReplaceResponse,
+    ReplaceSummary,
+};
 use crate::content_type::ContentType;
 use crate::document::DocumentStore;
 use crate::events::CommitBroadcaster;
@@ -218,26 +220,6 @@ async fn resolve_path(state: &FileApiState, path: &str) -> Result<String, PathRe
     }
 
     Err(PathResolveError::PathNotFound)
-}
-
-// ============================================================================
-// Request types (files-specific)
-// ============================================================================
-
-#[derive(Deserialize)]
-struct DocEditRequest {
-    update: String,
-    #[serde(default)]
-    author: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ReplaceParams {
-    parent_cid: Option<String>,
-    #[serde(default)]
-    author: Option<String>,
 }
 
 // ============================================================================
