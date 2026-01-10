@@ -126,6 +126,42 @@ impl Default for OrchestratorStatus {
     }
 }
 
+/// Build a ProcessStatus entry from process information.
+///
+/// This helper encapsulates the common logic of getting CWD from config or /proc,
+/// reducing duplication between ProcessManager and DiscoveredProcessManager.
+///
+/// # Arguments
+/// * `name` - Process name
+/// * `pid` - Process ID (if running)
+/// * `config_cwd` - CWD from process config (preferred if present)
+/// * `state` - Process state as string (caller maps their state enum)
+/// * `document_path` - Document path for discovered processes (None for base processes)
+/// * `source_path` - Source path for discovered processes (None for base processes)
+pub fn build_process_status(
+    name: String,
+    pid: Option<u32>,
+    config_cwd: Option<&std::path::Path>,
+    state: &str,
+    document_path: Option<String>,
+    source_path: Option<String>,
+) -> ProcessStatus {
+    // Try to get CWD from config first, otherwise read from /proc/<pid>/cwd
+    // For sandbox processes, this finds the deepest child's CWD
+    let cwd = config_cwd
+        .map(|p| p.to_string_lossy().to_string())
+        .or_else(|| pid.and_then(get_process_cwd));
+
+    ProcessStatus {
+        name,
+        pid,
+        cwd,
+        state: state.to_string(),
+        document_path,
+        source_path,
+    }
+}
+
 /// Get the working directory for a process, following the process tree to find
 /// the deepest child's CWD. This is needed for sandbox processes where the
 /// actual sandboxed process runs in a temp directory.

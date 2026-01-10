@@ -6,7 +6,7 @@
 
 use super::discovery::{DiscoveredProcess, ProcessesConfig};
 use super::spawn::spawn_managed_process;
-use super::status::{OrchestratorStatus, ProcessStatus};
+use super::status::OrchestratorStatus;
 use futures::StreamExt;
 use reqwest::Client;
 use reqwest_eventsource::{Event as SseEvent, EventSource};
@@ -121,15 +121,6 @@ impl DiscoveredProcessManager {
         for (name, process) in &self.processes {
             let pid = process.handle.as_ref().and_then(|h| h.id());
 
-            // Try to get CWD from config first, otherwise read from /proc/<pid>/cwd
-            // For sandbox processes, this finds the deepest child's CWD
-            let cwd = process
-                .config
-                .cwd
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string())
-                .or_else(|| pid.and_then(super::status::get_process_cwd));
-
             let state = match process.state {
                 DiscoveredProcessState::Stopped => "Stopped",
                 DiscoveredProcessState::Starting => "Starting",
@@ -137,14 +128,14 @@ impl DiscoveredProcessManager {
                 DiscoveredProcessState::Failed => "Failed",
             };
 
-            status.processes.push(ProcessStatus {
-                name: name.clone(),
+            status.processes.push(super::status::build_process_status(
+                name.clone(),
                 pid,
-                cwd,
-                state: state.to_string(),
-                document_path: Some(process.document_path.clone()),
-                source_path: Some(process.source_path.clone()),
-            });
+                process.config.cwd.as_deref(),
+                state,
+                Some(process.document_path.clone()),
+                Some(process.source_path.clone()),
+            ));
         }
 
         // Merge with existing status (preserving base processes) and write

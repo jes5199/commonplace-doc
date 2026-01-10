@@ -1,5 +1,5 @@
 use super::spawn::spawn_managed_process;
-use super::status::{OrchestratorStatus, ProcessStatus};
+use super::status::OrchestratorStatus;
 use super::{OrchestratorConfig, ProcessConfig, RestartMode};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -76,15 +76,6 @@ impl ProcessManager {
         for (name, process) in &self.processes {
             let pid = process.handle.as_ref().and_then(|h| h.id());
 
-            // Try to get CWD from config first, otherwise read from /proc/<pid>/cwd
-            // For sandbox processes, this finds the deepest child's CWD
-            let cwd = process
-                .config
-                .cwd
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string())
-                .or_else(|| pid.and_then(super::status::get_process_cwd));
-
             let state = match process.state {
                 ProcessState::Stopped => "Stopped",
                 ProcessState::Starting => "Starting",
@@ -92,14 +83,14 @@ impl ProcessManager {
                 ProcessState::Failed => "Failed",
             };
 
-            status.processes.push(ProcessStatus {
-                name: name.clone(),
+            status.processes.push(super::status::build_process_status(
+                name.clone(),
                 pid,
-                cwd,
-                state: state.to_string(),
-                document_path: None,
-                source_path: None,
-            });
+                process.config.cwd.as_deref(),
+                state,
+                None,
+                None,
+            ));
         }
 
         // Merge with existing status (preserving discovered processes) and write
