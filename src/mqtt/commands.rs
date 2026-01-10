@@ -40,6 +40,17 @@ impl CommandsHandler {
         }
     }
 
+    /// Publish a response to the {workspace}/responses topic.
+    async fn publish_response<T: serde::Serialize>(&self, response: &T) -> Result<(), MqttError> {
+        let payload =
+            serde_json::to_vec(response).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+
+        let response_topic = format!("{}/responses", self.workspace);
+        self.client
+            .publish(&response_topic, &payload, QoS::AtLeastOnce)
+            .await
+    }
+
     /// Subscribe to commands for a path.
     /// Uses wildcard: `{workspace}/{path}/commands/#`
     pub async fn subscribe_commands(&self, path: &str) -> Result<(), MqttError> {
@@ -151,16 +162,7 @@ impl CommandsHandler {
             }
         };
 
-        // Publish response to {workspace}/responses
-        let payload =
-            serde_json::to_vec(&response).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
-
-        let response_topic = format!("{}/responses", self.workspace);
-        self.client
-            .publish(&response_topic, &payload, QoS::AtLeastOnce)
-            .await?;
-
-        Ok(())
+        self.publish_response(&response).await
     }
 
     /// Handle delete-document command.
@@ -177,7 +179,7 @@ impl CommandsHandler {
         let deleted = self.document_store.delete_document(&request.id).await;
 
         let response = DeleteDocumentResponse {
-            req: request.req,
+            req: request.req.clone(),
             deleted,
             error: if deleted {
                 None
@@ -186,21 +188,12 @@ impl CommandsHandler {
             },
         };
 
-        // Publish response to {workspace}/responses
-        let payload =
-            serde_json::to_vec(&response).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
-
-        let response_topic = format!("{}/responses", self.workspace);
-        self.client
-            .publish(&response_topic, &payload, QoS::AtLeastOnce)
-            .await?;
-
         debug!(
-            "Delete-document response: deleted={} for id={}",
-            deleted, response.req
+            "Delete-document response: deleted={} for req={}",
+            deleted, request.req
         );
 
-        Ok(())
+        self.publish_response(&response).await
     }
 
     /// Handle get-content command.
@@ -216,31 +209,22 @@ impl CommandsHandler {
 
         let response = match self.document_store.get_document(&request.id).await {
             Some(doc) => GetContentResponse {
-                req: request.req,
+                req: request.req.clone(),
                 content: Some(doc.content.clone()),
                 content_type: Some(doc.content_type.to_mime().to_string()),
                 error: None,
             },
             None => GetContentResponse {
-                req: request.req,
+                req: request.req.clone(),
                 content: None,
                 content_type: None,
                 error: Some(format!("Document '{}' not found", request.id)),
             },
         };
 
-        // Publish response to {workspace}/responses
-        let payload =
-            serde_json::to_vec(&response).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+        debug!("Get-content response for req={}", request.req);
 
-        let response_topic = format!("{}/responses", self.workspace);
-        self.client
-            .publish(&response_topic, &payload, QoS::AtLeastOnce)
-            .await?;
-
-        debug!("Get-content response for id={}", response.req);
-
-        Ok(())
+        self.publish_response(&response).await
     }
 
     /// Handle get-info command.
@@ -256,31 +240,22 @@ impl CommandsHandler {
 
         let response = match self.document_store.get_document(&request.id).await {
             Some(doc) => GetInfoResponse {
-                req: request.req,
+                req: request.req.clone(),
                 id: Some(request.id.clone()),
                 content_type: Some(doc.content_type.to_mime().to_string()),
                 error: None,
             },
             None => GetInfoResponse {
-                req: request.req,
+                req: request.req.clone(),
                 id: None,
                 content_type: None,
                 error: Some(format!("Document '{}' not found", request.id)),
             },
         };
 
-        // Publish response to {workspace}/responses
-        let payload =
-            serde_json::to_vec(&response).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+        debug!("Get-info response for req={}", request.req);
 
-        let response_topic = format!("{}/responses", self.workspace);
-        self.client
-            .publish(&response_topic, &payload, QoS::AtLeastOnce)
-            .await?;
-
-        debug!("Get-info response for id={}", response.req);
-
-        Ok(())
+        self.publish_response(&response).await
     }
 
     /// Check if commands are subscribed for a path.
