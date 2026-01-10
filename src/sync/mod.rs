@@ -97,8 +97,8 @@ pub use content_type::{
     ContentTypeInfo,
 };
 pub use directory::{
-    scan_directory, scan_directory_with_contents, schema_to_json, ScanError, ScanOptions,
-    ScannedFile,
+    scan_directory, scan_directory_to_json, scan_directory_with_contents, schema_to_json,
+    ScanError, ScanOptions, ScannedFile,
 };
 #[cfg(unix)]
 pub use flock::{

@@ -4,7 +4,7 @@
 //! during directory synchronization.
 
 use crate::fs::{Entry, FsSchema};
-use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
+use crate::sync::directory::{scan_directory_to_json, ScanOptions};
 use crate::sync::schema_io::SCHEMA_FILENAME;
 use crate::sync::state_file::compute_content_hash;
 use crate::sync::uuid_map::fetch_node_id_from_schema;
@@ -299,18 +299,12 @@ pub async fn handle_file_created(
                     );
                     // Update schema to point to forked node
                     // Use the owning document's directory and ID
-                    if let Ok(schema) = scan_directory(&owning_doc.directory, options) {
-                        if let Ok(json) = schema_to_json(&schema) {
-                            if let Err(e) = push_schema_to_server(
-                                client,
-                                server,
-                                &owning_doc.document_id,
-                                &json,
-                            )
-                            .await
-                            {
-                                warn!("Failed to push updated schema: {}", e);
-                            }
+                    if let Ok(json) = scan_directory_to_json(&owning_doc.directory, options) {
+                        if let Err(e) =
+                            push_schema_to_server(client, server, &owning_doc.document_id, &json)
+                                .await
+                        {
+                            warn!("Failed to push updated schema: {}", e);
                         }
                     }
                     // Use the forked ID as the identifier
@@ -333,13 +327,11 @@ pub async fn handle_file_created(
         if !forked_successfully {
             // Push updated schema FIRST so server reconciler creates the node
             // Use the owning document's directory and ID
-            if let Ok(schema) = scan_directory(&owning_doc.directory, options) {
-                if let Ok(json) = schema_to_json(&schema) {
-                    if let Err(e) =
-                        push_schema_to_server(client, server, &owning_doc.document_id, &json).await
-                    {
-                        warn!("Failed to push updated schema: {}", e);
-                    }
+            if let Ok(json) = scan_directory_to_json(&owning_doc.directory, options) {
+                if let Err(e) =
+                    push_schema_to_server(client, server, &owning_doc.document_id, &json).await
+                {
+                    warn!("Failed to push updated schema: {}", e);
                 }
             }
 
@@ -467,13 +459,10 @@ pub async fn handle_file_modified(
     // Modified files are handled by per-file watchers
     // Just update schema in case metadata changed
     // Use the owning document's directory and ID
-    if let Ok(schema) = scan_directory(&owning_doc.directory, options) {
-        if let Ok(json) = schema_to_json(&schema) {
-            if let Err(e) =
-                push_schema_to_server(client, server, &owning_doc.document_id, &json).await
-            {
-                warn!("Failed to push updated schema: {}", e);
-            }
+    if let Ok(json) = scan_directory_to_json(&owning_doc.directory, options) {
+        if let Err(e) = push_schema_to_server(client, server, &owning_doc.document_id, &json).await
+        {
+            warn!("Failed to push updated schema: {}", e);
         }
     }
 }

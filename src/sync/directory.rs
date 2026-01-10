@@ -676,6 +676,14 @@ pub fn schema_to_json(schema: &FsSchema) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(schema)
 }
 
+/// Scan a directory and return the schema as a JSON string.
+///
+/// This is a convenience function that combines `scan_directory` and `schema_to_json`.
+pub fn scan_directory_to_json(path: &Path, options: &ScanOptions) -> Result<String, ScanError> {
+    let schema = scan_directory(path, options)?;
+    schema_to_json(&schema).map_err(|e| ScanError::Serialization(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

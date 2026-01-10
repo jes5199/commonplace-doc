@@ -2,7 +2,7 @@
 //!
 //! This module contains functions for syncing a single file with a server document.
 
-use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
+use crate::sync::directory::{scan_directory_to_json, ScanOptions};
 use crate::sync::file_events::find_owning_document;
 use crate::sync::state_file::compute_content_hash;
 use crate::sync::uuid_map::fetch_node_id_from_schema;
@@ -1040,36 +1040,34 @@ pub async fn sync_single_file(
                 include_hidden: false,
                 ignore_patterns: vec![],
             };
-            if let Ok(schema) = scan_directory(&owning.directory, &options) {
-                if let Ok(json) = schema_to_json(&schema) {
-                    info!(
-                        "Pushing subdirectory schema for {} (document {})",
-                        owning.directory.display(),
-                        owning.document_id
-                    );
-                    if let Err(e) =
-                        push_schema_to_server(client, server, &owning.document_id, &json).await
-                    {
-                        warn!("Failed to push subdirectory schema: {}", e);
-                    } else {
-                        // Wait for server to reconcile and create the document
-                        sleep(Duration::from_millis(200)).await;
+            if let Ok(json) = scan_directory_to_json(&owning.directory, &options) {
+                info!(
+                    "Pushing subdirectory schema for {} (document {})",
+                    owning.directory.display(),
+                    owning.document_id
+                );
+                if let Err(e) =
+                    push_schema_to_server(client, server, &owning.document_id, &json).await
+                {
+                    warn!("Failed to push subdirectory schema: {}", e);
+                } else {
+                    // Wait for server to reconcile and create the document
+                    sleep(Duration::from_millis(200)).await;
 
-                        // Fetch the UUID assigned by the reconciler
-                        if let Some(uuid) = fetch_node_id_from_schema(
-                            client,
-                            server,
-                            &owning.document_id,
-                            &owning.relative_path,
-                        )
-                        .await
-                        {
-                            info!(
-                                "Resolved UUID for {}: {} -> {}",
-                                owning.relative_path, derived, uuid
-                            );
-                            final_identifier = uuid;
-                        }
+                    // Fetch the UUID assigned by the reconciler
+                    if let Some(uuid) = fetch_node_id_from_schema(
+                        client,
+                        server,
+                        &owning.document_id,
+                        &owning.relative_path,
+                    )
+                    .await
+                    {
+                        info!(
+                            "Resolved UUID for {}: {} -> {}",
+                            owning.relative_path, derived, uuid
+                        );
+                        final_identifier = uuid;
                     }
                 }
             }
