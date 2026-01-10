@@ -10,9 +10,9 @@ use crate::sync::{
     flock_state::PathState,
 };
 use crate::sync::{
-    ancestry::determine_sync_direction, build_head_url, build_sse_url, detect_from_path,
+    ancestry::determine_sync_direction, build_sse_url, detect_from_path, fetch_head,
     is_binary_content, looks_like_base64_binary, process_pending_inbound_after_confirm,
-    EditEventData, FlockSyncState, HeadResponse, PendingWrite, SyncState,
+    EditEventData, FlockSyncState, PendingWrite, SyncState,
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -502,24 +502,14 @@ pub async fn handle_server_edit_with_flock(
     let content_info = detect_from_path(file_path);
 
     // Fetch new content from server first
-    let head_url = build_head_url(server, identifier, use_paths);
-    let resp = match client.get(&head_url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to fetch HEAD: {}", e);
+    let head = match fetch_head(client, server, identifier, use_paths).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            error!("HEAD not found (404)");
             return;
         }
-    };
-
-    if !resp.status().is_success() {
-        error!("Failed to fetch HEAD: {}", resp.status());
-        return;
-    }
-
-    let head: HeadResponse = match resp.json().await {
-        Ok(h) => h,
         Err(e) => {
-            error!("Failed to parse HEAD response: {}", e);
+            error!("Failed to fetch HEAD: {:?}", e);
             return;
         }
     };
@@ -709,24 +699,14 @@ pub async fn refresh_from_head(
     debug!("Refreshing from HEAD due to skipped server edit");
 
     // Fetch HEAD
-    let head_url = build_head_url(server, identifier, use_paths);
-    let resp = match client.get(&head_url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to fetch HEAD for refresh: {}", e);
+    let head = match fetch_head(client, server, identifier, use_paths).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            error!("HEAD not found for refresh (404)");
             return false;
         }
-    };
-
-    if !resp.status().is_success() {
-        error!("HEAD fetch failed for refresh: {}", resp.status());
-        return false;
-    }
-
-    let head: HeadResponse = match resp.json().await {
-        Ok(h) => h,
         Err(e) => {
-            error!("Failed to parse HEAD response for refresh: {}", e);
+            error!("Failed to fetch HEAD for refresh: {:?}", e);
             return false;
         }
     };
@@ -878,24 +858,14 @@ pub async fn handle_server_edit(
     let content_info = detect_from_path(file_path);
 
     // Fetch new content from server first
-    let head_url = build_head_url(server, identifier, use_paths);
-    let resp = match client.get(&head_url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to fetch HEAD: {}", e);
+    let head = match fetch_head(client, server, identifier, use_paths).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            error!("HEAD not found (404)");
             return;
         }
-    };
-
-    if !resp.status().is_success() {
-        error!("Failed to fetch HEAD: {}", resp.status());
-        return;
-    }
-
-    let head: HeadResponse = match resp.json().await {
-        Ok(h) => h,
         Err(e) => {
-            error!("Failed to parse HEAD response: {}", e);
+            error!("Failed to fetch HEAD: {:?}", e);
             return;
         }
     };
@@ -1109,24 +1079,14 @@ pub async fn handle_server_edit_with_tracker(
     let content_info = detect_from_path(file_path);
 
     // Fetch new content from server first
-    let head_url = build_head_url(server, identifier, use_paths);
-    let resp = match client.get(&head_url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to fetch HEAD: {}", e);
+    let head = match fetch_head(client, server, identifier, use_paths).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            error!("HEAD not found (404)");
             return;
         }
-    };
-
-    if !resp.status().is_success() {
-        error!("Failed to fetch HEAD: {}", resp.status());
-        return;
-    }
-
-    let head: HeadResponse = match resp.json().await {
-        Ok(h) => h,
         Err(e) => {
-            error!("Failed to parse HEAD response: {}", e);
+            error!("Failed to fetch HEAD: {:?}", e);
             return;
         }
     };
