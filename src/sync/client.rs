@@ -15,6 +15,62 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
+/// Error from fetching HEAD
+#[derive(Debug)]
+pub enum FetchHeadError {
+    /// HTTP request failed
+    Request(reqwest::Error),
+    /// JSON parsing failed
+    Parse(reqwest::Error),
+    /// Server returned error status (not 404)
+    Status(reqwest::StatusCode, String),
+}
+
+impl std::fmt::Display for FetchHeadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(e) => write!(f, "HEAD request failed: {}", e),
+            Self::Parse(e) => write!(f, "Failed to parse HEAD response: {}", e),
+            Self::Status(code, body) => write!(f, "HEAD failed with {}: {}", code, body),
+        }
+    }
+}
+
+impl std::error::Error for FetchHeadError {}
+
+/// Fetch HEAD for a document.
+///
+/// Returns:
+/// - `Ok(Some(head))` if the document exists and HEAD was fetched successfully
+/// - `Ok(None)` if the document doesn't exist (404)
+/// - `Err(_)` if there was a network error or parse error
+pub async fn fetch_head(
+    client: &Client,
+    server: &str,
+    identifier: &str,
+    use_paths: bool,
+) -> Result<Option<HeadResponse>, FetchHeadError> {
+    let head_url = build_head_url(server, identifier, use_paths);
+    let resp = client
+        .get(&head_url)
+        .send()
+        .await
+        .map_err(FetchHeadError::Request)?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(FetchHeadError::Status(status, body));
+    }
+
+    let head = resp.json().await.map_err(FetchHeadError::Parse)?;
+    Ok(Some(head))
+}
+
 /// Fork a node on the server, optionally at a specific commit.
 pub async fn fork_node(
     client: &Client,
