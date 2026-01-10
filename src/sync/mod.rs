@@ -20,6 +20,7 @@ pub mod schema_io;
 pub mod sse;
 pub mod state;
 pub mod state_file;
+pub mod subscriptions;
 pub mod types;
 pub mod urls;
 pub mod uuid_map;
@@ -64,9 +65,8 @@ pub use client::{
     push_jsonl_content, push_schema_to_server,
 };
 pub use dir_sync::{
-    check_server_has_content, directory_mqtt_task, directory_sse_task, ensure_fs_root_exists,
-    handle_schema_change, handle_schema_modified, push_nested_schemas, spawn_subdir_mqtt_task,
-    spawn_subdir_sse_task, subdir_mqtt_task, subdir_sse_task, sync_schema,
+    check_server_has_content, ensure_fs_root_exists, handle_schema_change, handle_schema_modified,
+    push_nested_schemas, sync_schema,
 };
 pub use file_events::{
     find_owning_document, handle_file_created, handle_file_deleted, handle_file_modified,
@@ -77,6 +77,10 @@ pub use file_sync::{
     upload_task, upload_task_with_flock, BARRIER_RETRY_COUNT, BARRIER_RETRY_DELAY,
 };
 pub use schema_io::{write_nested_schemas, write_schema_file, SCHEMA_FILENAME};
+pub use subscriptions::{
+    directory_mqtt_task, directory_sse_task, spawn_subdir_mqtt_task, spawn_subdir_sse_task,
+    subdir_mqtt_task, subdir_sse_task,
+};
 pub use uuid_map::{
     build_uuid_map_and_write_schemas, build_uuid_map_from_doc, build_uuid_map_recursive,
     collect_node_backed_dir_ids, collect_paths_from_entry, collect_paths_with_node_backed_dirs,
