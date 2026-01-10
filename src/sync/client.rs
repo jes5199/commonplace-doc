@@ -339,6 +339,7 @@ pub async fn push_jsonl_content(
 ///
 /// This helper handles the common pattern of detecting content type and calling
 /// the right push function (JSON, JSONL, or text/binary).
+#[allow(clippy::too_many_arguments)]
 pub async fn push_content_by_type(
     client: &Client,
     server: &str,

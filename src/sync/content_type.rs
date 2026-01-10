@@ -71,6 +71,8 @@ const TEXT_EXTENSIONS: &[(&str, &str)] = &[
     ("dockerfile", "text/x-dockerfile"),
     ("makefile", "text/x-makefile"),
     ("cmake", "text/x-cmake"),
+    // Binary-looking but synced as text
+    ("bin", "text/plain"),
 ];
 
 /// Known binary file extensions.
@@ -82,7 +84,7 @@ const BINARY_EXTENSIONS: &[&str] = &[
     "zip", "tar", "gz", "bz2", "xz", "7z", "rar", // Documents
     "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp",
     // Executables
-    "exe", "dll", "so", "dylib", "bin", "app", // Other binary
+    "exe", "dll", "so", "dylib", "app", // Other binary
     "wasm", "class", "pyc", "pyo", "o", "a", "lib", // Fonts
     "ttf", "otf", "woff", "woff2", "eot", // Database
     "db", "sqlite", "sqlite3",

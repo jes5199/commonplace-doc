@@ -226,22 +226,27 @@ pub fn validate_workspace_name(name: &str) -> Result<(), MqttError> {
 }
 
 /// Get the content type for a path based on its extension.
+///
+/// Uses the shared content type detection from the sync module.
 pub fn content_type_for_path(path: &str) -> Result<ContentType, MqttError> {
-    let ext = path
-        .rsplit('.')
-        .next()
-        .map(|s| s.to_lowercase())
-        .ok_or_else(|| MqttError::InvalidTopic(format!("Path has no extension: {}", path)))?;
+    use crate::sync::detect_from_path;
+    use std::path::Path;
 
-    match ext.as_str() {
-        "json" => Ok(ContentType::Json),
-        "txt" | "bin" | "md" => Ok(ContentType::Text),
-        "xml" | "xhtml" => Ok(ContentType::Xml),
-        _ => Err(MqttError::InvalidTopic(format!(
-            "Unknown extension: {}",
-            ext
-        ))),
+    let content_info = detect_from_path(Path::new(path));
+
+    if content_info.is_binary {
+        return Err(MqttError::InvalidTopic(format!(
+            "Binary content type not supported: {}",
+            content_info.mime_type
+        )));
     }
+
+    ContentType::from_mime(&content_info.mime_type).ok_or_else(|| {
+        MqttError::InvalidTopic(format!(
+            "Unsupported content type for path '{}': {}",
+            path, content_info.mime_type
+        ))
+    })
 }
 
 #[cfg(test)]

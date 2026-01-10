@@ -30,20 +30,16 @@ fn load_existing_node_ids_recursive(
 
     let mut result = HashMap::new();
 
-    match fs::read_to_string(&schema_path) {
-        Ok(content) => match serde_json::from_str::<FsSchema>(&content) {
-            Ok(schema) => {
-                if let Some(ref root_entry) = schema.root {
-                    // Extract node_ids from this schema level
-                    result.extend(extract_node_ids_with_prefix(root_entry, prefix));
+    if let Ok(content) = fs::read_to_string(&schema_path) {
+        if let Ok(schema) = serde_json::from_str::<FsSchema>(&content) {
+            if let Some(ref root_entry) = schema.root {
+                // Extract node_ids from this schema level
+                result.extend(extract_node_ids_with_prefix(root_entry, prefix));
 
-                    // For node-backed directories, recursively load from their .commonplace.json
-                    load_nested_node_ids(root_entry, current, prefix, &mut result);
-                }
+                // For node-backed directories, recursively load from their .commonplace.json
+                load_nested_node_ids(root_entry, current, prefix, &mut result);
             }
-            Err(_) => {}
-        },
-        Err(_) => {}
+        }
     }
 
     result

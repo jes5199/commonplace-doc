@@ -618,22 +618,20 @@ pub async fn create_subdir_nested_directories(
 
     let schema: FsSchema = serde_json::from_str(&head.content)?;
 
-    if let Some(ref root) = schema.root {
-        if let Entry::Dir(dir) = root {
-            if let Some(ref entries) = dir.entries {
-                for (name, child_entry) in entries {
-                    if let Entry::Dir(child_dir) = child_entry {
-                        if child_dir.node_id.is_some() {
-                            // This is a node-backed directory - create it if it doesn't exist
-                            let child_path = subdir_directory.join(name);
-                            if !child_path.exists() {
-                                info!(
-                                    "Creating directory for node-backed subdirectory: {:?}",
-                                    child_path
-                                );
-                                if let Err(e) = tokio::fs::create_dir_all(&child_path).await {
-                                    warn!("Failed to create directory {:?}: {}", child_path, e);
-                                }
+    if let Some(Entry::Dir(dir)) = schema.root.as_ref() {
+        if let Some(ref entries) = dir.entries {
+            for (name, child_entry) in entries {
+                if let Entry::Dir(child_dir) = child_entry {
+                    if child_dir.node_id.is_some() {
+                        // This is a node-backed directory - create it if it doesn't exist
+                        let child_path = subdir_directory.join(name);
+                        if !child_path.exists() {
+                            info!(
+                                "Creating directory for node-backed subdirectory: {:?}",
+                                child_path
+                            );
+                            if let Err(e) = tokio::fs::create_dir_all(&child_path).await {
+                                warn!("Failed to create directory {:?}: {}", child_path, e);
                             }
                         }
                     }

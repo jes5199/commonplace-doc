@@ -53,7 +53,7 @@ impl ContentType {
             "application/x-ndjson" | "application/jsonl" | "application/x-jsonlines" => {
                 Some(ContentType::Jsonl)
             }
-            "application/xml" | "text/xml" => Some(ContentType::Xml),
+            "application/xml" | "text/xml" | "application/xhtml+xml" => Some(ContentType::Xml),
             // Handle all text/* types as Text (text/plain, text/typescript, text/x-rust, etc.)
             _ if base.starts_with("text/") => Some(ContentType::Text),
             _ => None,

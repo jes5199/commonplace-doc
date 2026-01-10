@@ -126,6 +126,7 @@ pub async fn build_uuid_map_and_write_schemas(
 }
 
 /// Helper function to recursively build UUID map AND write schema files.
+#[allow(clippy::too_many_arguments)]
 #[async_recursion::async_recursion]
 async fn build_uuid_map_from_doc_and_write_schemas(
     client: &Client,
@@ -215,6 +216,7 @@ async fn build_uuid_map_from_doc_and_write_schemas(
 }
 
 /// Recursively collect paths and write nested schema files.
+#[allow(clippy::too_many_arguments)]
 #[async_recursion::async_recursion]
 async fn collect_paths_and_write_schemas(
     client: &Client,
