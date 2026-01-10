@@ -6,8 +6,7 @@
 use crate::sync::{
     build_edit_url, build_fork_url, build_head_url, build_replace_url, create_yjs_json_delete_key,
     create_yjs_json_merge, create_yjs_json_update, create_yjs_jsonl_update, create_yjs_text_update,
-    encode_node_id, EditRequest, EditResponse, ForkResponse, HeadResponse, ReplaceResponse,
-    SyncState,
+    EditRequest, EditResponse, ForkResponse, HeadResponse, ReplaceResponse, SyncState,
 };
 use reqwest::Client;
 use std::sync::Arc;
@@ -57,15 +56,18 @@ pub async fn push_schema_to_server(
     fs_root_id: &str,
     schema_json: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // First fetch current server content and state to detect deletions
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
+    // Use shared URL builders (schemas always use ID-based URLs, not paths)
+    let head_url = build_head_url(server, fs_root_id, false);
+    let edit_url = build_edit_url(server, fs_root_id, false);
+
+    // First fetch current server content and state
     let head_resp = client.get(&head_url).send().await?;
     let (old_content, base_state) = if head_resp.status().is_success() {
         let head: HeadResponse = head_resp.json().await?;
         (Some(head.content), head.state)
     } else {
         // Document doesn't exist, create it first
-        tracing::info!("Creating document {} before pushing schema", fs_root_id);
+        info!("Creating document {} before pushing schema", fs_root_id);
         let create_url = format!("{}/docs", server);
         let create_resp = client
             .post(&create_url)
@@ -89,23 +91,14 @@ pub async fn push_schema_to_server(
     };
 
     // Skip update if schema hasn't changed (prevents feedback loops)
-    // Compare as parsed JSON to ignore whitespace/formatting differences
-    if let Some(ref old) = old_content {
-        let old_parsed: Result<serde_json::Value, _> = serde_json::from_str(old);
-        let new_parsed: Result<serde_json::Value, _> = serde_json::from_str(schema_json);
-        if let (Ok(old_json), Ok(new_json)) = (old_parsed, new_parsed) {
-            if old_json == new_json {
-                tracing::debug!("Schema unchanged, skipping push to server");
-                return Ok(());
-            }
-        }
+    if json_content_equal(old_content.as_deref(), schema_json) {
+        debug!("Schema unchanged, skipping push to server");
+        return Ok(());
     }
 
     // Create an additive merge (don't remove entries that other sync clients may have added)
-    // This allows multiple sync clients to each contribute their own schema entries
     let update = create_yjs_json_merge(schema_json, base_state.as_deref())
         .map_err(|e| format!("Failed to create JSON update: {}", e))?;
-    let edit_url = format!("{}/docs/{}/edit", server, encode_node_id(fs_root_id));
     let edit_req = EditRequest {
         update,
         author: Some("sync-client".to_string()),
@@ -122,6 +115,18 @@ pub async fn push_schema_to_server(
     Ok(())
 }
 
+/// Check if two JSON strings are semantically equal (ignoring whitespace/formatting).
+fn json_content_equal(old: Option<&str>, new: &str) -> bool {
+    if let Some(old) = old {
+        let old_parsed: Result<serde_json::Value, _> = serde_json::from_str(old);
+        let new_parsed: Result<serde_json::Value, _> = serde_json::from_str(new);
+        if let (Ok(old_json), Ok(new_json)) = (old_parsed, new_parsed) {
+            return old_json == new_json;
+        }
+    }
+    false
+}
+
 /// Delete a specific entry from a schema on the server.
 ///
 /// This function removes a single entry without affecting other entries,
@@ -132,8 +137,11 @@ pub async fn delete_schema_entry(
     fs_root_id: &str,
     entry_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Use shared URL builders (schemas always use ID-based URLs, not paths)
+    let head_url = build_head_url(server, fs_root_id, false);
+    let edit_url = build_edit_url(server, fs_root_id, false);
+
     // Fetch current server state
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
     let head_resp = client.get(&head_url).send().await?;
     let base_state = if head_resp.status().is_success() {
         let head: HeadResponse = head_resp.json().await?;
@@ -147,7 +155,6 @@ pub async fn delete_schema_entry(
     let update = create_yjs_json_delete_key(&key_path, base_state.as_deref())
         .map_err(|e| format!("Failed to create delete update: {}", e))?;
 
-    let edit_url = format!("{}/docs/{}/edit", server, encode_node_id(fs_root_id));
     let edit_req = EditRequest {
         update,
         author: Some("sync-client".to_string()),
@@ -224,15 +231,9 @@ async fn push_json_content_impl(
         };
 
         // Skip update if content hasn't changed (prevents feedback loops)
-        if let Some(ref old) = old_content {
-            let old_parsed: Result<serde_json::Value, _> = serde_json::from_str(old);
-            let new_parsed: Result<serde_json::Value, _> = serde_json::from_str(content);
-            if let (Ok(old_json), Ok(new_json)) = (old_parsed, new_parsed) {
-                if old_json == new_json {
-                    debug!("JSON content unchanged, skipping push");
-                    return Ok(());
-                }
-            }
+        if json_content_equal(old_content.as_deref(), content) {
+            debug!("JSON content unchanged, skipping push");
+            return Ok(());
         }
 
         let update = if merge {
