@@ -277,12 +277,14 @@ struct DocHeadParams {
     at_commit: Option<String>,
 }
 
+/// Response for GET /docs/{id}/head endpoint.
+/// Shared with files.rs for /files/*path/head.
 #[derive(Serialize)]
-struct DocHeadResponse {
-    cid: Option<String>,
-    content: String,
+pub struct DocHeadResponse {
+    pub cid: Option<String>,
+    pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    state: Option<String>,
+    pub state: Option<String>,
 }
 
 async fn get_doc_head(
@@ -311,9 +313,11 @@ struct DocEditRequest {
     message: Option<String>,
 }
 
+/// Response for POST /docs/{id}/edit endpoint.
+/// Shared with files.rs for /files/*path/edit.
 #[derive(Serialize)]
-struct DocEditResponse {
-    cid: String,
+pub struct DocEditResponse {
+    pub cid: String,
 }
 
 async fn edit_doc(
@@ -336,18 +340,21 @@ struct ReplaceParams {
     author: Option<String>,
 }
 
+/// Response for POST /docs/{id}/replace endpoint.
+/// Shared with files.rs for /files/*path/replace.
 #[derive(Serialize)]
-struct ReplaceResponse {
-    cid: String,
-    edit_cid: String,
-    summary: ReplaceSummary,
+pub struct ReplaceResponse {
+    pub cid: String,
+    pub edit_cid: String,
+    pub summary: ReplaceSummary,
 }
 
+/// Summary of a replace operation.
 #[derive(Serialize)]
-struct ReplaceSummary {
-    chars_inserted: usize,
-    chars_deleted: usize,
-    operations: usize,
+pub struct ReplaceSummary {
+    pub chars_inserted: usize,
+    pub chars_deleted: usize,
+    pub operations: usize,
 }
 
 async fn replace_doc(

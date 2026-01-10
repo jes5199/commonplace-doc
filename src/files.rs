@@ -11,9 +11,10 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::Arc;
 
+use crate::api::{DocEditResponse, DocHeadResponse, ReplaceResponse, ReplaceSummary};
 use crate::content_type::ContentType;
 use crate::document::DocumentStore;
 use crate::events::CommitBroadcaster;
@@ -220,16 +221,8 @@ async fn resolve_path(state: &FileApiState, path: &str) -> Result<String, PathRe
 }
 
 // ============================================================================
-// Response types (shared with api.rs)
+// Request types (files-specific)
 // ============================================================================
-
-#[derive(Serialize)]
-struct DocHeadResponse {
-    cid: Option<String>,
-    content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    state: Option<String>,
-}
 
 #[derive(Deserialize)]
 struct DocEditRequest {
@@ -240,30 +233,11 @@ struct DocEditRequest {
     message: Option<String>,
 }
 
-#[derive(Serialize)]
-struct DocEditResponse {
-    cid: String,
-}
-
 #[derive(Deserialize)]
 struct ReplaceParams {
     parent_cid: Option<String>,
     #[serde(default)]
     author: Option<String>,
-}
-
-#[derive(Serialize)]
-struct ReplaceResponse {
-    cid: String,
-    edit_cid: String,
-    summary: ReplaceSummary,
-}
-
-#[derive(Serialize)]
-struct ReplaceSummary {
-    chars_inserted: usize,
-    chars_deleted: usize,
-    operations: usize,
 }
 
 // ============================================================================
