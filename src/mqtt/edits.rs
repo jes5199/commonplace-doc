@@ -179,8 +179,8 @@ impl EditsHandler {
             .await;
 
         // Decode the base64 update and apply it to the document
-        let update_bytes = crate::b64::decode(&commit.update)
-            .map_err(|e| MqttError::InvalidMessage(format!("Invalid base64 update: {}", e)))?;
+        let update_bytes = crate::b64::decode_with_context(&commit.update, "update")
+            .map_err(MqttError::InvalidMessage)?;
 
         self.document_store
             .apply_yjs_update(&document_id, &update_bytes)

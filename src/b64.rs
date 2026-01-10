@@ -127,6 +127,15 @@ pub fn decode(input: &str) -> Result<Vec<u8>, DecodeError> {
     Ok(out)
 }
 
+/// Decode base64 and return a user-friendly error message.
+///
+/// This helper provides consistent error messaging for base64 decoding
+/// across HTTP and MQTT handlers. Callers can map the error String
+/// to their specific error type.
+pub fn decode_with_context(input: &str, context: &str) -> Result<Vec<u8>, String> {
+    decode(input).map_err(|e| format!("Invalid base64 {}: {}", context, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -261,8 +261,8 @@ impl DocumentService {
         // Verify document exists
         self.get_document(id).await?;
 
-        let update_bytes = b64::decode(update_b64)
-            .map_err(|_| ServiceError::InvalidInput("Invalid base64".to_string()))?;
+        let update_bytes =
+            b64::decode_with_context(update_b64, "update").map_err(ServiceError::InvalidInput)?;
 
         // Get current head
         let current_head = commit_store
@@ -371,8 +371,8 @@ impl DocumentService {
             author
         };
 
-        let update_bytes = b64::decode(update_b64)
-            .map_err(|_| ServiceError::InvalidInput("Invalid base64".to_string()))?;
+        let update_bytes =
+            b64::decode_with_context(update_b64, "update").map_err(ServiceError::InvalidInput)?;
 
         let current_head = commit_store
             .get_document_head(id)
