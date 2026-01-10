@@ -24,6 +24,20 @@ use std::sync::Arc;
 use super::HttpGateway;
 use crate::mqtt::{messages::EditMessage, topics::Topic};
 
+// ============================================================================
+// Error helpers
+// ============================================================================
+
+/// Convert an error to a BAD_REQUEST response tuple.
+fn bad_request<E: ToString>(e: E) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, e.to_string())
+}
+
+/// Convert an error to an INTERNAL_SERVER_ERROR response tuple.
+fn internal_error<E: ToString>(e: E) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
 /// Create the HTTP gateway router
 pub fn router(gateway: Arc<HttpGateway>) -> Router {
     Router::new()
@@ -94,14 +108,13 @@ async fn send_edit(
     let topic = Topic::edits(&gateway.workspace, &id);
 
     // Serialize and publish
-    let payload =
-        serde_json::to_vec(&edit_msg).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let payload = serde_json::to_vec(&edit_msg).map_err(bad_request)?;
 
     gateway
         .client
         .publish(&topic.to_topic_string(), &payload, QoS::AtLeastOnce)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     Ok(Json(SendEditResponse {
         status: "published".to_string(),
@@ -118,14 +131,13 @@ async fn send_event(
     let topic = Topic::events(&gateway.workspace, &id, &req.event_type);
 
     // Serialize and publish
-    let payload =
-        serde_json::to_vec(&req.payload).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let payload = serde_json::to_vec(&req.payload).map_err(bad_request)?;
 
     gateway
         .client
         .publish(&topic.to_topic_string(), &payload, QoS::AtMostOnce)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
