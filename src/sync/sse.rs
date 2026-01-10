@@ -32,6 +32,25 @@ use uuid::Uuid;
 /// Timeout for pending write barrier (30 seconds)
 pub const PENDING_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Context for different SSE task variants.
+///
+/// This enum allows the shared SSE loop to dispatch to different edit handlers
+/// based on the task type (basic, flock-aware, or with inode tracking).
+pub enum SseContext {
+    /// Basic SSE task - no special handling
+    Basic,
+    /// Flock-aware SSE task with ancestry checking
+    WithFlock {
+        flock_state: FlockSyncState,
+        doc_id: Option<Uuid>,
+    },
+    /// SSE task with inode tracking for shadow hardlinks (Unix only)
+    #[cfg(unix)]
+    WithTracker {
+        inode_tracker: Arc<RwLock<crate::sync::InodeTracker>>,
+    },
+}
+
 /// Error type for inbound write operations
 #[derive(Debug, Error)]
 pub enum InboundWriteError {
@@ -266,126 +285,31 @@ pub async fn write_inbound_with_checks_atomic(
     Ok(InboundWriteResult::Written)
 }
 
-/// Task that subscribes to SSE and handles server changes for a single file.
+/// Shared SSE connection and event loop.
 ///
-/// This maintains a persistent connection to the server's SSE endpoint,
-/// automatically reconnecting on disconnection. When edit events arrive,
-/// it fetches the new content and updates the local file.
-pub async fn sse_task(
-    client: Client,
-    server: String,
-    identifier: String,
-    file_path: PathBuf,
-    state: Arc<RwLock<SyncState>>,
-    use_paths: bool,
-) {
-    let sse_url = build_sse_url(&server, &identifier, use_paths);
-
-    'reconnect: loop {
-        info!("Connecting to SSE: {}", sse_url);
-
-        let request_builder = client.get(&sse_url);
-
-        let mut es = match EventSource::new(request_builder) {
-            Ok(es) => es,
-            Err(e) => {
-                error!("Failed to create EventSource: {}", e);
-                sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-        };
-
-        while let Some(event) = es.next().await {
-            match event {
-                Ok(SseEvent::Open) => {
-                    info!("SSE connection opened");
-                }
-                Ok(SseEvent::Message(msg)) => {
-                    debug!("SSE event: {} - {}", msg.event, msg.data);
-
-                    match msg.event.as_str() {
-                        "connected" => {
-                            info!("SSE connected to node");
-                        }
-                        "edit" => {
-                            // Parse edit event
-                            match serde_json::from_str::<EditEventData>(&msg.data) {
-                                Ok(edit) => {
-                                    handle_server_edit(
-                                        &client,
-                                        &server,
-                                        &identifier,
-                                        &file_path,
-                                        &state,
-                                        &edit,
-                                        use_paths,
-                                    )
-                                    .await;
-                                }
-                                Err(e) => {
-                                    warn!("Failed to parse edit event: {}", e);
-                                }
-                            }
-                        }
-                        "closed" => {
-                            warn!("SSE: Target node shut down");
-                            break;
-                        }
-                        "warning" => {
-                            warn!("SSE warning: {}", msg.data);
-                        }
-                        _ => {
-                            debug!("Unknown SSE event type: {}", msg.event);
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Handle 404 gracefully - document may not exist yet
-                    if let SseError::InvalidStatusCode(status, _) = &e {
-                        if *status == StatusCode::NOT_FOUND {
-                            debug!("SSE: Document not found (404), retrying in 1s...");
-                            sleep(Duration::from_secs(1)).await;
-                            continue 'reconnect; // Skip outer 5s sleep
-                        }
-                    }
-                    error!("SSE error: {}", e);
-                    break;
-                }
-            }
-        }
-
-        debug!("SSE connection closed, reconnecting in 5s...");
-        sleep(Duration::from_secs(5)).await;
-    }
-}
-
-/// Task that subscribes to SSE and handles server changes with flock-aware tracking.
-///
-/// This is an enhanced version of `sse_task` that uses `FlockSyncState` for tracking
-/// pending outbound commits. When an edit event arrives, it verifies that any pending
-/// uploads are ancestors of the incoming commit before writing to the local file.
-///
-/// This prevents the race condition where:
-/// 1. Local edit is uploaded
-/// 2. SSE receives an older commit that doesn't include our upload
-/// 3. Writing that older commit would overwrite our local changes
-///
-/// The doc_id parameter is needed for ancestry checking via the server API.
+/// This function implements the core SSE connect/reconnect/event-dispatch logic
+/// shared by all SSE task variants. The `context` parameter determines which
+/// edit handler is called when an edit event is received.
 #[allow(clippy::too_many_arguments)]
-pub async fn sse_task_with_flock(
-    client: Client,
-    server: String,
-    identifier: String,
-    file_path: PathBuf,
-    state: Arc<RwLock<SyncState>>,
+pub async fn run_sse_loop(
+    client: &Client,
+    server: &str,
+    identifier: &str,
+    file_path: &PathBuf,
+    state: &Arc<RwLock<SyncState>>,
     use_paths: bool,
-    flock_state: FlockSyncState,
-    doc_id: Option<Uuid>,
+    context: &SseContext,
 ) {
-    let sse_url = build_sse_url(&server, &identifier, use_paths);
+    let sse_url = build_sse_url(server, identifier, use_paths);
+    let log_context = match context {
+        SseContext::Basic => "",
+        SseContext::WithFlock { .. } => " (flock-aware)",
+        #[cfg(unix)]
+        SseContext::WithTracker { .. } => " (with inode tracking)",
+    };
 
     'reconnect: loop {
-        info!("Connecting to SSE (flock-aware): {}", sse_url);
+        info!("Connecting to SSE{}: {}", log_context, sse_url);
 
         let request_builder = client.get(&sse_url);
 
@@ -414,18 +338,47 @@ pub async fn sse_task_with_flock(
                             // Parse edit event
                             match serde_json::from_str::<EditEventData>(&msg.data) {
                                 Ok(edit) => {
-                                    handle_server_edit_with_flock(
-                                        &client,
-                                        &server,
-                                        &identifier,
-                                        &file_path,
-                                        &state,
-                                        &edit,
-                                        use_paths,
-                                        &flock_state,
-                                        doc_id.as_ref(),
-                                    )
-                                    .await;
+                                    // Dispatch to appropriate handler based on context
+                                    match context {
+                                        SseContext::Basic => {
+                                            handle_server_edit(
+                                                client, server, identifier, file_path, state,
+                                                &edit, use_paths,
+                                            )
+                                            .await;
+                                        }
+                                        SseContext::WithFlock {
+                                            flock_state,
+                                            doc_id,
+                                        } => {
+                                            handle_server_edit_with_flock(
+                                                client,
+                                                server,
+                                                identifier,
+                                                file_path,
+                                                state,
+                                                &edit,
+                                                use_paths,
+                                                flock_state,
+                                                doc_id.as_ref(),
+                                            )
+                                            .await;
+                                        }
+                                        #[cfg(unix)]
+                                        SseContext::WithTracker { inode_tracker } => {
+                                            handle_server_edit_with_tracker(
+                                                client,
+                                                server,
+                                                identifier,
+                                                file_path,
+                                                state,
+                                                &edit,
+                                                use_paths,
+                                                inode_tracker,
+                                            )
+                                            .await;
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     warn!("Failed to parse edit event: {}", e);
@@ -462,6 +415,70 @@ pub async fn sse_task_with_flock(
         debug!("SSE connection closed, reconnecting in 5s...");
         sleep(Duration::from_secs(5)).await;
     }
+}
+
+/// Task that subscribes to SSE and handles server changes for a single file.
+///
+/// This maintains a persistent connection to the server's SSE endpoint,
+/// automatically reconnecting on disconnection. When edit events arrive,
+/// it fetches the new content and updates the local file.
+pub async fn sse_task(
+    client: Client,
+    server: String,
+    identifier: String,
+    file_path: PathBuf,
+    state: Arc<RwLock<SyncState>>,
+    use_paths: bool,
+) {
+    run_sse_loop(
+        &client,
+        &server,
+        &identifier,
+        &file_path,
+        &state,
+        use_paths,
+        &SseContext::Basic,
+    )
+    .await;
+}
+
+/// Task that subscribes to SSE and handles server changes with flock-aware tracking.
+///
+/// This is an enhanced version of `sse_task` that uses `FlockSyncState` for tracking
+/// pending outbound commits. When an edit event arrives, it verifies that any pending
+/// uploads are ancestors of the incoming commit before writing to the local file.
+///
+/// This prevents the race condition where:
+/// 1. Local edit is uploaded
+/// 2. SSE receives an older commit that doesn't include our upload
+/// 3. Writing that older commit would overwrite our local changes
+///
+/// The doc_id parameter is needed for ancestry checking via the server API.
+#[allow(clippy::too_many_arguments)]
+pub async fn sse_task_with_flock(
+    client: Client,
+    server: String,
+    identifier: String,
+    file_path: PathBuf,
+    state: Arc<RwLock<SyncState>>,
+    use_paths: bool,
+    flock_state: FlockSyncState,
+    doc_id: Option<Uuid>,
+) {
+    let context = SseContext::WithFlock {
+        flock_state,
+        doc_id,
+    };
+    run_sse_loop(
+        &client,
+        &server,
+        &identifier,
+        &file_path,
+        &state,
+        use_paths,
+        &context,
+    )
+    .await;
 }
 
 /// Handle a server edit event with flock-aware ancestry checking.
@@ -1060,85 +1077,17 @@ pub async fn sse_task_with_tracker(
     use_paths: bool,
     inode_tracker: Arc<tokio::sync::RwLock<crate::sync::InodeTracker>>,
 ) {
-    let sse_url = build_sse_url(&server, &identifier, use_paths);
-
-    'reconnect: loop {
-        info!("Connecting to SSE (with inode tracking): {}", sse_url);
-
-        let request_builder = client.get(&sse_url);
-
-        let mut es = match EventSource::new(request_builder) {
-            Ok(es) => es,
-            Err(e) => {
-                error!("Failed to create EventSource: {}", e);
-                sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-        };
-
-        while let Some(event) = es.next().await {
-            match event {
-                Ok(SseEvent::Open) => {
-                    info!("SSE connection opened");
-                }
-                Ok(SseEvent::Message(msg)) => {
-                    debug!("SSE event: {} - {}", msg.event, msg.data);
-
-                    match msg.event.as_str() {
-                        "connected" => {
-                            info!("SSE connected to node");
-                        }
-                        "edit" => {
-                            // Parse edit event
-                            match serde_json::from_str::<EditEventData>(&msg.data) {
-                                Ok(edit) => {
-                                    handle_server_edit_with_tracker(
-                                        &client,
-                                        &server,
-                                        &identifier,
-                                        &file_path,
-                                        &state,
-                                        &edit,
-                                        use_paths,
-                                        &inode_tracker,
-                                    )
-                                    .await;
-                                }
-                                Err(e) => {
-                                    warn!("Failed to parse edit event: {}", e);
-                                }
-                            }
-                        }
-                        "closed" => {
-                            warn!("SSE: Target node shut down");
-                            break;
-                        }
-                        "warning" => {
-                            warn!("SSE warning: {}", msg.data);
-                        }
-                        _ => {
-                            debug!("Unknown SSE event type: {}", msg.event);
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Handle 404 gracefully - document may not exist yet
-                    if let SseError::InvalidStatusCode(status, _) = &e {
-                        if *status == StatusCode::NOT_FOUND {
-                            debug!("SSE: Document not found (404), retrying in 1s...");
-                            sleep(Duration::from_secs(1)).await;
-                            continue 'reconnect; // Skip outer 5s sleep
-                        }
-                    }
-                    error!("SSE error: {}", e);
-                    break;
-                }
-            }
-        }
-
-        debug!("SSE connection closed, reconnecting in 5s...");
-        sleep(Duration::from_secs(5)).await;
-    }
+    let context = SseContext::WithTracker { inode_tracker };
+    run_sse_loop(
+        &client,
+        &server,
+        &identifier,
+        &file_path,
+        &state,
+        use_paths,
+        &context,
+    )
+    .await;
 }
 
 /// Handle a server edit event with inode tracking.
