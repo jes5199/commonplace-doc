@@ -13,6 +13,91 @@ use tracing::{debug, info, warn};
 /// Schema filename constant.
 pub const SCHEMA_FILENAME: &str = ".commonplace.json";
 
+/// Result of fetching and validating a schema from the server.
+pub struct FetchedSchema {
+    /// The parsed schema.
+    pub schema: FsSchema,
+    /// The raw JSON content from the server.
+    pub content: String,
+    /// The commit ID from the HEAD response (if any).
+    pub cid: Option<String>,
+}
+
+/// Fetch a schema from the server, parse it, and optionally validate it.
+///
+/// Returns `None` if:
+/// - The fetch fails
+/// - The content is empty
+/// - Parsing fails
+/// - `require_valid_root` is true and schema doesn't have a valid root
+///
+/// A valid root is a directory with either entries or a node_id.
+pub async fn fetch_and_validate_schema(
+    client: &Client,
+    server: &str,
+    node_id: &str,
+    require_valid_root: bool,
+) -> Option<FetchedSchema> {
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
+    let resp = match client.get(&head_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to fetch schema for {}: {}", node_id, e);
+            return None;
+        }
+    };
+
+    if !resp.status().is_success() {
+        warn!(
+            "Failed to fetch schema HEAD for {}: status {}",
+            node_id,
+            resp.status()
+        );
+        return None;
+    }
+
+    let head: HeadResponse = match resp.json().await {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("Failed to parse HEAD response for {}: {}", node_id, e);
+            return None;
+        }
+    };
+
+    if head.content.is_empty() {
+        debug!("Schema content is empty for {}", node_id);
+        return None;
+    }
+
+    let schema: FsSchema = match serde_json::from_str(&head.content) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to parse schema for {}: {}", node_id, e);
+            return None;
+        }
+    };
+
+    if require_valid_root {
+        let has_valid_root = match &schema.root {
+            Some(Entry::Dir(dir)) => dir.entries.is_some() || dir.node_id.is_some(),
+            _ => false,
+        };
+        if !has_valid_root {
+            warn!(
+                "Schema for {} has no valid root (missing entries or node_id)",
+                node_id
+            );
+            return None;
+        }
+    }
+
+    Some(FetchedSchema {
+        schema,
+        content: head.content,
+        cid: head.cid,
+    })
+}
+
 /// Write a schema file to disk with deduplication.
 ///
 /// Compares the new schema with the existing file (if any) as parsed JSON

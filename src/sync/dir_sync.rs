@@ -5,7 +5,9 @@
 
 use crate::fs::{Entry, FsSchema};
 use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
-use crate::sync::schema_io::{write_nested_schemas, write_schema_file, SCHEMA_FILENAME};
+use crate::sync::schema_io::{
+    fetch_and_validate_schema, write_nested_schemas, write_schema_file, SCHEMA_FILENAME,
+};
 use crate::sync::state_file::{
     compute_content_hash, load_synced_directories, mark_directory_synced, unmark_directory_synced,
 };
@@ -211,40 +213,15 @@ pub async fn handle_subdir_schema_cleanup(
     root_directory: &Path,
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Fetch current schema from server
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(subdir_node_id));
-    let resp = client.get(&head_url).send().await?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Failed to fetch subdir HEAD: {}", resp.status()).into());
-    }
-
-    let head: HeadResponse = resp.json().await?;
-    if head.content.is_empty() {
-        return Ok(());
-    }
-
-    // Parse and validate schema BEFORE writing to disk
-    let schema: FsSchema = match serde_json::from_str(&head.content) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Failed to parse subdir schema: {}", e);
-            return Ok(());
-        }
+    // Fetch, parse, and validate schema from server
+    let fetched = match fetch_and_validate_schema(client, server, subdir_node_id, true).await {
+        Some(f) => f,
+        None => return Ok(()), // Logged inside fetch_and_validate_schema
     };
+    let schema = fetched.schema;
 
-    // Validate that schema has a populated root with entries
-    let has_valid_root = match &schema.root {
-        Some(Entry::Dir(dir)) => dir.entries.is_some() || dir.node_id.is_some(),
-        _ => false,
-    };
-    if !has_valid_root {
-        warn!("Server returned subdir schema without valid root, not overwriting local schema");
-        return Ok(());
-    }
-
-    // Only write valid schema to local .commonplace.json file
-    if let Err(e) = write_schema_file(subdir_directory, &head.content, None).await {
+    // Write valid schema to local .commonplace.json file
+    if let Err(e) = write_schema_file(subdir_directory, &fetched.content, None).await {
         warn!("Failed to write subdir schema file: {}", e);
     }
 
@@ -374,27 +351,13 @@ pub async fn handle_subdir_new_files(
         return Ok(());
     }
 
-    // Fetch current schema from server
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(subdir_node_id));
-    let resp = client.get(&head_url).send().await?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Failed to fetch subdir HEAD: {}", resp.status()).into());
+    // Fetch and parse schema from server (validation only, no root check needed)
+    if fetch_and_validate_schema(client, server, subdir_node_id, false)
+        .await
+        .is_none()
+    {
+        return Ok(()); // Logged inside fetch_and_validate_schema
     }
-
-    let head: HeadResponse = resp.json().await?;
-    if head.content.is_empty() {
-        return Ok(());
-    }
-
-    // Parse and validate schema (early return if invalid)
-    let _schema: FsSchema = match serde_json::from_str(&head.content) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Failed to parse subdir schema: {}", e);
-            return Ok(());
-        }
-    };
 
     // Build UUID map for the subdirectory
     let subdir_uuid_map = build_uuid_map_recursive(client, server, subdir_node_id).await;
@@ -832,41 +795,15 @@ pub async fn handle_schema_change(
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Fetch current schema from server (fs-root schema always uses ID-based API)
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
-    let resp = client.get(&head_url).send().await?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Failed to fetch fs-root HEAD: {}", resp.status()).into());
-    }
-
-    let head: HeadResponse = resp.json().await?;
-    if head.content.is_empty() {
-        return Ok(());
-    }
-
-    // Parse and validate schema BEFORE writing to disk
-    // This prevents corrupting the local schema file with invalid/empty server content
-    let schema: FsSchema = match serde_json::from_str(&head.content) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Failed to parse fs-root schema: {}", e);
-            return Ok(());
-        }
+    // Fetch, parse, and validate schema from server
+    let fetched = match fetch_and_validate_schema(client, server, fs_root_id, true).await {
+        Some(f) => f,
+        None => return Ok(()), // Logged inside fetch_and_validate_schema
     };
+    let schema = fetched.schema;
 
-    // Validate that schema has a populated root with entries - don't overwrite with empty/minimal schemas
-    let has_valid_root = match &schema.root {
-        Some(Entry::Dir(dir)) => dir.entries.is_some() || dir.node_id.is_some(),
-        _ => false,
-    };
-    if !has_valid_root {
-        warn!("Server returned schema without valid root (missing entries or node_id), not overwriting local schema");
-        return Ok(());
-    }
-
-    // Only write valid schema to local .commonplace.json file
-    if let Err(e) = write_schema_file(directory, &head.content, written_schemas).await {
+    // Write valid schema to local .commonplace.json file
+    if let Err(e) = write_schema_file(directory, &fetched.content, written_schemas).await {
         warn!("Failed to write schema file: {}", e);
     }
 

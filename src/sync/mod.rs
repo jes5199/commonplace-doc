@@ -76,7 +76,10 @@ pub use file_sync::{
     initial_sync, spawn_file_sync_tasks, spawn_file_sync_tasks_with_flock, sync_single_file,
     upload_task, upload_task_with_flock, BARRIER_RETRY_COUNT, BARRIER_RETRY_DELAY,
 };
-pub use schema_io::{write_nested_schemas, write_schema_file, SCHEMA_FILENAME};
+pub use schema_io::{
+    fetch_and_validate_schema, write_nested_schemas, write_schema_file, FetchedSchema,
+    SCHEMA_FILENAME,
+};
 pub use subscriptions::{
     directory_mqtt_task, directory_sse_task, spawn_subdir_mqtt_task, spawn_subdir_sse_task,
     subdir_mqtt_task, subdir_sse_task,
