@@ -9,6 +9,7 @@ use clap::Parser;
 use commonplace_doc::cli::{fetch_changes, fetch_head, ReplayArgs};
 use commonplace_doc::fs::{Entry, FsSchema};
 use commonplace_doc::sync::SCHEMA_FILENAME;
+use commonplace_doc::workspace::format_timestamp;
 use reqwest::Client;
 use serde::Serialize;
 use std::fs;
@@ -280,11 +281,4 @@ fn resolve_uuid(
             .ok_or_else(|| format!("File {} has no UUID assigned", filename).into()),
         Entry::Dir(_) => Err(format!("{} is a directory, not a file", filename).into()),
     }
-}
-
-fn format_timestamp(ts: u64) -> String {
-    use std::time::{Duration, UNIX_EPOCH};
-    let time = UNIX_EPOCH + Duration::from_millis(ts);
-    let datetime: chrono::DateTime<chrono::Local> = time.into();
-    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
 }
