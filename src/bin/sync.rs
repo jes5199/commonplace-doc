@@ -106,6 +106,12 @@ struct Args {
     #[arg(long, conflicts_with = "directory", requires = "exec")]
     sandbox: bool,
 
+    /// Process name for log file naming in sandbox mode.
+    /// Log files will be named __<name>.stdout.txt and __<name>.stderr.txt
+    /// If not specified, defaults to extracting from the exec command.
+    #[arg(long)]
+    name: Option<String>,
+
     /// Push-only mode: watch local files and push changes to server.
     /// Ignores server-side updates (no SSE subscription).
     /// Use case: source-of-truth files like .beads/issues.jsonl
@@ -625,6 +631,7 @@ async fn main() -> ExitCode {
             args.push_only,
             args.pull_only,
             args.shadow_dir,
+            args.name,
         )
         .await;
 
@@ -672,6 +679,7 @@ async fn main() -> ExitCode {
                 args.push_only,
                 args.pull_only,
                 args.shadow_dir,
+                args.name,
             )
             .await
         } else {
@@ -1509,6 +1517,7 @@ async fn run_exec_mode(
     push_only: bool,
     pull_only: bool,
     shadow_dir: String,
+    process_name: Option<String>,
 ) -> Result<u8, Box<dyn std::error::Error>> {
     let mode = if push_only {
         "push-only"
@@ -1888,7 +1897,9 @@ async fn run_exec_mode(
     // For non-sandbox mode, inherit stdout/stderr for interactive programs
     if sandbox {
         cmd.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            // Force unbuffered output for Python processes (and similar)
+            .env("PYTHONUNBUFFERED", "1");
     } else {
         cmd.stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit());
@@ -1929,12 +1940,14 @@ async fn run_exec_mode(
         .map_err(|e| format!("Failed to spawn command '{}': {}", program, e))?;
 
     // In sandbox mode, spawn tasks to log stdout/stderr to files
-    // Extract a simple name from the program for the log filename
-    let exec_name = std::path::Path::new(&program)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("exec")
-        .to_string();
+    // Use provided process_name if available, otherwise extract from program path
+    let exec_name = process_name.unwrap_or_else(|| {
+        std::path::Path::new(&program)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("exec")
+            .to_string()
+    });
 
     if sandbox {
         use tokio::fs::OpenOptions;

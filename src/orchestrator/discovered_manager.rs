@@ -243,7 +243,7 @@ impl DiscoveredProcessManager {
                 .unwrap_or_else(|| PathBuf::from("commonplace-sync"));
 
             let mut cmd = Command::new(&sync_path);
-            cmd.args(["--sandbox", "--exec", exec_cmd]);
+            cmd.args(["--sandbox", "--name", name, "--exec", exec_cmd]);
 
             // Set cwd if specified, otherwise use current directory
             if let Some(ref cwd) = config.cwd {
