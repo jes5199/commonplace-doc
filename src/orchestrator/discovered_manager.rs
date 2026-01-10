@@ -8,6 +8,7 @@ use super::discovery::{DiscoveredProcess, ProcessesConfig};
 use super::process_utils::stop_process_gracefully;
 use super::spawn::spawn_managed_process;
 use super::status::OrchestratorStatus;
+use crate::sync::encode_path;
 use futures::StreamExt;
 use reqwest::Client;
 use reqwest_eventsource::{Event as SseEvent, EventSource};
@@ -16,15 +17,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
-
-/// URL-encode a path for use in `/files/*` endpoints.
-/// Each path segment is encoded individually to preserve the `/` separators.
-fn encode_url_path(path: &str) -> String {
-    path.split('/')
-        .map(|segment| urlencoding::encode(segment).into_owned())
-        .collect::<Vec<_>>()
-        .join("/")
-}
 
 /// State of a managed discovered process.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -274,7 +266,7 @@ impl DiscoveredProcessManager {
             let full_path = format!("{}/{}", document_path, script);
             // Strip leading slash to avoid double-slash in URL
             let full_path = full_path.trim_start_matches('/');
-            let script_url = format!("{}/files/{}", server, encode_url_path(full_path));
+            let script_url = format!("{}/files/{}", server, encode_path(full_path));
 
             // Generate a unique client ID for this process instance
             let client_id = format!("{}-{}", name, &uuid::Uuid::new_v4().to_string()[..8]);
