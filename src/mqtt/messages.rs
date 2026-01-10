@@ -98,6 +98,18 @@ pub enum SyncMessage {
         depth: Option<u32>,
     },
 
+    /// Check if one commit is an ancestor of another
+    /// { "type": "is_ancestor", "req": "...", "ancestor": "abc123", "descendant": "def456" }
+    #[serde(rename = "is_ancestor")]
+    IsAncestor {
+        /// Request ID for correlation
+        req: String,
+        /// The potential ancestor commit ID
+        ancestor: String,
+        /// The potential descendant commit ID
+        descendant: String,
+    },
+
     // ========== Responses (from doc store) ==========
     /// Commit data
     Commit {
@@ -124,6 +136,16 @@ pub enum SyncMessage {
         req: String,
         /// List of commit IDs that were sent
         commits: Vec<String>,
+    },
+
+    /// Response to IsAncestor request
+    /// { "type": "is_ancestor_response", "req": "...", "result": true }
+    #[serde(rename = "is_ancestor_response")]
+    IsAncestorResponse {
+        /// Request ID for correlation
+        req: String,
+        /// True if ancestor is an ancestor of descendant
+        result: bool,
     },
 
     /// Error response
@@ -284,8 +306,10 @@ impl SyncMessage {
             SyncMessage::Get { req, .. } => req,
             SyncMessage::Pull { req, .. } => req,
             SyncMessage::Ancestors { req, .. } => req,
+            SyncMessage::IsAncestor { req, .. } => req,
             SyncMessage::Commit { req, .. } => req,
             SyncMessage::Done { req, .. } => req,
+            SyncMessage::IsAncestorResponse { req, .. } => req,
             SyncMessage::Error { req, .. } => req,
         }
     }
@@ -298,6 +322,7 @@ impl SyncMessage {
                 | SyncMessage::Get { .. }
                 | SyncMessage::Pull { .. }
                 | SyncMessage::Ancestors { .. }
+                | SyncMessage::IsAncestor { .. }
         )
     }
 
@@ -308,6 +333,7 @@ impl SyncMessage {
             SyncMessage::HeadResponse { .. }
                 | SyncMessage::Commit { .. }
                 | SyncMessage::Done { .. }
+                | SyncMessage::IsAncestorResponse { .. }
                 | SyncMessage::Error { .. }
         )
     }

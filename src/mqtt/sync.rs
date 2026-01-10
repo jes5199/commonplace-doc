@@ -130,9 +130,18 @@ impl SyncHandler {
                 self.handle_ancestors(&topic.path, client_id, &req, &commit, depth)
                     .await
             }
+            SyncMessage::IsAncestor {
+                req,
+                ancestor,
+                descendant,
+            } => {
+                self.handle_is_ancestor(&topic.path, client_id, &req, &ancestor, &descendant)
+                    .await
+            }
             SyncMessage::HeadResponse { .. }
             | SyncMessage::Commit { .. }
             | SyncMessage::Done { .. }
+            | SyncMessage::IsAncestorResponse { .. }
             | SyncMessage::Error { .. } => {
                 // Response messages shouldn't be received by the doc store
                 warn!("Received unexpected sync response message: {:?}", message);
@@ -354,6 +363,41 @@ impl SyncHandler {
         };
 
         self.send_response(path, client_id, &done).await
+    }
+
+    /// Handle an IS_ANCESTOR request - check if one commit is an ancestor of another.
+    async fn handle_is_ancestor(
+        &self,
+        path: &str,
+        client_id: &str,
+        req: &str,
+        ancestor: &str,
+        descendant: &str,
+    ) -> Result<(), MqttError> {
+        let store = self
+            .commit_store
+            .as_ref()
+            .ok_or_else(|| MqttError::Node("Commit store not initialized".to_string()))?;
+
+        // Check ancestry relationship
+        let result = match store.is_ancestor(ancestor, descendant).await {
+            Ok(is_ancestor) => is_ancestor,
+            Err(e) => {
+                // Send error response
+                let error = SyncMessage::Error {
+                    req: req.to_string(),
+                    message: format!("Ancestry check failed: {}", e),
+                };
+                return self.send_response(path, client_id, &error).await;
+            }
+        };
+
+        let response = SyncMessage::IsAncestorResponse {
+            req: req.to_string(),
+            result,
+        };
+
+        self.send_response(path, client_id, &response).await
     }
 
     /// Send a response to a client.
