@@ -2,6 +2,7 @@ mod config;
 mod discovered_manager;
 mod discovery;
 mod manager;
+mod process_utils;
 mod spawn;
 mod status;
 

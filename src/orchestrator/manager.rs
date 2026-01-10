@@ -1,3 +1,4 @@
+use super::process_utils::stop_process_gracefully;
 use super::spawn::spawn_managed_process;
 use super::status::OrchestratorStatus;
 use super::{OrchestratorConfig, ProcessConfig, RestartMode};
@@ -383,36 +384,8 @@ impl ProcessManager {
             if let Some(ref mut child) = process.handle {
                 tracing::info!("[orchestrator] Stopping '{}'", name);
 
-                #[cfg(unix)]
-                {
-                    if let Some(pid) = child.id() {
-                        tracing::debug!("[orchestrator] Sending SIGTERM to process group {}", pid);
-                        unsafe {
-                            libc::killpg(pid as i32, libc::SIGTERM);
-                        }
-                    }
-                }
-
-                let timeout = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-
-                match timeout {
-                    Ok(Ok(_)) => {
-                        tracing::info!("[orchestrator] '{}' stopped gracefully", name);
-                    }
-                    _ => {
-                        tracing::warn!(
-                            "[orchestrator] '{}' didn't stop gracefully, force killing",
-                            name
-                        );
-                        #[cfg(unix)]
-                        if let Some(pid) = child.id() {
-                            unsafe {
-                                libc::killpg(pid as i32, libc::SIGKILL);
-                            }
-                        }
-                        let _ = child.kill().await;
-                    }
-                }
+                stop_process_gracefully(child, name, "[orchestrator]", Duration::from_secs(5))
+                    .await;
 
                 process.handle = None;
                 process.state = ProcessState::Stopped;
@@ -541,48 +514,10 @@ impl ProcessManager {
                 if let Some(ref mut child) = process.handle {
                     tracing::info!("[orchestrator] Stopping '{}'", name);
 
-                    #[cfg(unix)]
-                    {
-                        if let Some(pid) = child.id() {
-                            // Kill the entire process group (negative pid)
-                            // This ensures all descendants are terminated
-                            tracing::debug!(
-                                "[orchestrator] Sending SIGTERM to process group {}",
-                                pid
-                            );
-                            unsafe {
-                                libc::killpg(pid as i32, libc::SIGTERM);
-                            }
-                        }
-                    }
-
                     // Give processes 10 seconds to shutdown gracefully
                     // This allows sync to properly terminate its exec child
-                    let timeout = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
-
-                    match timeout {
-                        Ok(Ok(_)) => {
-                            tracing::info!("[orchestrator] '{}' stopped gracefully", name);
-                        }
-                        _ => {
-                            tracing::warn!(
-                                "[orchestrator] '{}' didn't stop gracefully after 10s, force killing process group",
-                                name
-                            );
-                            // Force kill the entire process group
-                            #[cfg(unix)]
-                            if let Some(pid) = child.id() {
-                                tracing::debug!(
-                                    "[orchestrator] Sending SIGKILL to process group {}",
-                                    pid
-                                );
-                                unsafe {
-                                    libc::killpg(pid as i32, libc::SIGKILL);
-                                }
-                            }
-                            let _ = child.kill().await;
-                        }
-                    }
+                    stop_process_gracefully(child, name, "[orchestrator]", Duration::from_secs(10))
+                        .await;
 
                     process.handle = None;
                     process.state = ProcessState::Stopped;

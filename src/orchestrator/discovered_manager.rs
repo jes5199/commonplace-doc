@@ -5,6 +5,7 @@
 //! see the `discovery` module.
 
 use super::discovery::{DiscoveredProcess, ProcessesConfig};
+use super::process_utils::stop_process_gracefully;
 use super::spawn::spawn_managed_process;
 use super::status::OrchestratorStatus;
 use futures::StreamExt;
@@ -177,28 +178,7 @@ impl DiscoveredProcessManager {
         if let Some(mut process) = self.processes.remove(name) {
             // Stop the process if it's running
             if let Some(ref mut child) = process.handle {
-                #[cfg(unix)]
-                {
-                    if let Some(pid) = child.id() {
-                        // Kill the entire process group
-                        unsafe {
-                            libc::killpg(pid as i32, libc::SIGTERM);
-                        }
-                    }
-                }
-
-                let timeout = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-
-                if timeout.is_err() {
-                    // Force kill the entire process group
-                    #[cfg(unix)]
-                    if let Some(pid) = child.id() {
-                        unsafe {
-                            libc::killpg(pid as i32, libc::SIGKILL);
-                        }
-                    }
-                    let _ = child.kill().await;
-                }
+                stop_process_gracefully(child, name, "[discovery]", Duration::from_secs(5)).await;
             }
             // Update status after removing process
             self.write_status();
@@ -890,28 +870,7 @@ impl DiscoveredProcessManager {
             // Stop the process if running
             if let Some(ref mut child) = process.handle {
                 tracing::info!("[discovery] Stopping process '{}' for restart", name);
-
-                #[cfg(unix)]
-                {
-                    if let Some(pid) = child.id() {
-                        unsafe {
-                            libc::killpg(pid as i32, libc::SIGTERM);
-                        }
-                    }
-                }
-
-                let timeout = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-
-                if timeout.is_err() {
-                    #[cfg(unix)]
-                    if let Some(pid) = child.id() {
-                        unsafe {
-                            libc::killpg(pid as i32, libc::SIGKILL);
-                        }
-                    }
-                    let _ = child.kill().await;
-                }
-
+                stop_process_gracefully(child, name, "[discovery]", Duration::from_secs(5)).await;
                 process.handle = None;
             }
 
@@ -1425,45 +1384,10 @@ impl DiscoveredProcessManager {
                 if let Some(ref mut child) = process.handle {
                     tracing::info!("[discovery] Stopping '{}'", name);
 
-                    #[cfg(unix)]
-                    {
-                        if let Some(pid) = child.id() {
-                            // Kill the entire process group (negative pid)
-                            // This ensures all descendants are terminated
-                            tracing::debug!("[discovery] Sending SIGTERM to process group {}", pid);
-                            unsafe {
-                                libc::killpg(pid as i32, libc::SIGTERM);
-                            }
-                        }
-                    }
-
                     // Give processes 10 seconds to shutdown gracefully
                     // This allows sync to properly terminate its exec child
-                    let timeout = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
-
-                    match timeout {
-                        Ok(Ok(_)) => {
-                            tracing::info!("[discovery] '{}' stopped gracefully", name);
-                        }
-                        _ => {
-                            tracing::warn!(
-                                "[discovery] '{}' didn't stop gracefully after 10s, force killing process group",
-                                name
-                            );
-                            // Force kill the entire process group
-                            #[cfg(unix)]
-                            if let Some(pid) = child.id() {
-                                tracing::debug!(
-                                    "[discovery] Sending SIGKILL to process group {}",
-                                    pid
-                                );
-                                unsafe {
-                                    libc::killpg(pid as i32, libc::SIGKILL);
-                                }
-                            }
-                            let _ = child.kill().await;
-                        }
-                    }
+                    stop_process_gracefully(child, &name, "[discovery]", Duration::from_secs(10))
+                        .await;
 
                     process.handle = None;
                     process.state = DiscoveredProcessState::Stopped;
