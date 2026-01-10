@@ -1,4 +1,5 @@
 use clap::Parser;
+use serde::Deserialize;
 use std::path::PathBuf;
 
 /// CLI arguments for the combined server (legacy, for backwards compatibility)
@@ -329,4 +330,12 @@ pub struct SignalArgs {
     /// Output in JSON format
     #[clap(long)]
     pub json: bool,
+}
+
+/// Response from /docs/:id/head or /files/*path/head endpoints.
+/// Shared by CLI binaries that fetch document HEAD.
+#[derive(Deserialize)]
+pub struct HeadResponse {
+    pub cid: Option<String>,
+    pub content: Option<String>,
 }

@@ -6,7 +6,7 @@
 //!   commonplace-show --stat path/to/file.txt        # Show with change stats
 
 use clap::Parser;
-use commonplace_doc::cli::ShowArgs;
+use commonplace_doc::cli::{HeadResponse, ShowArgs};
 use commonplace_doc::workspace::{format_timestamp, resolve_path_to_uuid};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -24,12 +24,6 @@ struct CommitChange {
 #[derive(Deserialize)]
 struct ChangesResponse {
     changes: Vec<CommitChange>,
-}
-
-#[derive(Deserialize)]
-struct HeadResponse {
-    cid: Option<String>,
-    content: Option<String>,
 }
 
 #[derive(Serialize)]

@@ -6,7 +6,7 @@
 //!   commonplace-replay path/to/file.txt --at <cid>   # Show content at commit
 
 use clap::Parser;
-use commonplace_doc::cli::ReplayArgs;
+use commonplace_doc::cli::{HeadResponse, ReplayArgs};
 use commonplace_doc::fs::{Entry, FsSchema};
 use commonplace_doc::sync::SCHEMA_FILENAME;
 use reqwest::Client;
@@ -27,12 +27,6 @@ struct CommitChange {
 #[derive(Deserialize)]
 struct ChangesResponse {
     changes: Vec<CommitChange>,
-}
-
-#[derive(Deserialize)]
-struct HeadResponse {
-    cid: Option<String>,
-    content: Option<String>,
 }
 
 #[derive(Serialize)]
