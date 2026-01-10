@@ -37,6 +37,24 @@ fn ensure_trailing_newline(content: &str) -> String {
     }
 }
 
+/// Check if content equals the default for its content type.
+///
+/// This is used to detect newly created documents that haven't been edited yet.
+/// Default content indicates the document was created by the reconciler but not
+/// yet populated with real content - local content should take precedence.
+fn is_default_content(content: &str, mime_type: &str) -> bool {
+    let trimmed = content.trim();
+    match mime_type {
+        "application/json" => trimmed == "{}" || trimmed.is_empty(),
+        "application/x-ndjson" => trimmed.is_empty(),
+        "text/plain" => trimmed.is_empty(),
+        "application/xml" => {
+            trimmed.is_empty() || trimmed == r#"<?xml version="1.0" encoding="UTF-8"?><root/>"#
+        }
+        _ => trimmed.is_empty(),
+    }
+}
+
 /// Task that handles file changes and uploads to server
 #[allow(clippy::too_many_arguments)]
 pub async fn upload_task(
@@ -1130,22 +1148,142 @@ pub async fn sync_single_file(
                     .await?;
                 }
             } else {
-                // Server has content
+                // Server has content - use CRDT ancestry to determine sync direction
                 if initial_sync_strategy == "server" {
-                    // Pull server content to local
-                    if file.is_binary {
-                        if let Ok(decoded) = STANDARD.decode(&head.content) {
-                            tokio::fs::write(file_path, &decoded).await?;
+                    // Check if server has only default content (e.g., {} for JSON)
+                    // Default content indicates newly created doc that should be overwritten
+                    let server_has_default = is_default_content(&head.content, &file.content_type);
+
+                    // Get local CID from state (if we've synced before)
+                    let local_cid = {
+                        let s = state.read().await;
+                        s.last_written_cid.clone()
+                    };
+
+                    // Determine sync direction using CRDT ancestry
+                    let should_push = if server_has_default {
+                        // Server has default content - always push local
+                        info!(
+                            "Server has default content for {}, pushing local",
+                            file.relative_path
+                        );
+                        true
+                    } else if local_cid.is_none() {
+                        // No local CID - first sync, trust server unless content differs
+                        if file.content != head.content {
+                            // Local has different content but no CID - push local
+                            // (This handles the case where local was edited offline before first sync)
+                            info!(
+                                "Local has different content but no CID for {}, pushing local",
+                                file.relative_path
+                            );
+                            true
+                        } else {
+                            false
                         }
                     } else {
-                        // Ensure text files end with a trailing newline
-                        let content_with_newline = ensure_trailing_newline(&head.content);
-                        tokio::fs::write(file_path, content_with_newline).await?;
+                        // Both have CIDs - use ancestry check
+                        match crate::sync::determine_sync_direction(
+                            client,
+                            server,
+                            &identifier,
+                            local_cid.as_deref(),
+                            head.cid.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(crate::sync::SyncDirection::Push) => {
+                                info!("Ancestry check: local is ahead for {}", file.relative_path);
+                                true
+                            }
+                            Ok(crate::sync::SyncDirection::Pull) => {
+                                info!("Ancestry check: server is ahead for {}", file.relative_path);
+                                false
+                            }
+                            Ok(crate::sync::SyncDirection::InSync) => {
+                                // Already in sync, but check content anyway
+                                if file.content != head.content {
+                                    info!(
+                                        "CIDs match but content differs for {}, pushing local",
+                                        file.relative_path
+                                    );
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            Ok(crate::sync::SyncDirection::Diverged) => {
+                                // Diverged - prefer local content (merge not implemented yet)
+                                warn!(
+                                    "Diverged history for {}, preferring local content",
+                                    file.relative_path
+                                );
+                                true
+                            }
+                            Err(e) => {
+                                // Ancestry check failed - prefer local to avoid data loss
+                                warn!(
+                                    "Ancestry check failed for {}: {}, preferring local",
+                                    file.relative_path, e
+                                );
+                                true
+                            }
+                        }
+                    };
+
+                    if should_push {
+                        // Push local content to server
+                        let is_json =
+                            !file.is_binary && file.content_type.starts_with("application/json");
+                        let is_jsonl =
+                            !file.is_binary && file.content_type == "application/x-ndjson";
+                        if is_json {
+                            crate::sync::push_json_content(
+                                client,
+                                server,
+                                &identifier,
+                                &file.content,
+                                &state,
+                                use_paths,
+                            )
+                            .await?;
+                        } else if is_jsonl {
+                            crate::sync::push_jsonl_content(
+                                client,
+                                server,
+                                &identifier,
+                                &file.content,
+                                &state,
+                                use_paths,
+                            )
+                            .await?;
+                        } else {
+                            crate::sync::push_file_content(
+                                client,
+                                server,
+                                &identifier,
+                                &file.content,
+                                &state,
+                                use_paths,
+                            )
+                            .await?;
+                        }
+                    } else {
+                        // Pull server content to local
+                        if file.is_binary {
+                            if let Ok(decoded) = STANDARD.decode(&head.content) {
+                                tokio::fs::write(file_path, &decoded).await?;
+                            }
+                        } else {
+                            // Ensure text files end with a trailing newline
+                            let content_with_newline = ensure_trailing_newline(&head.content);
+                            tokio::fs::write(file_path, content_with_newline).await?;
+                        }
+                        // Seed SyncState with server content after pull
+                        let mut s = state.write().await;
+                        s.last_written_cid = head.cid.clone();
+                        s.last_written_content = head.content.clone();
                     }
-                    // Seed SyncState with server content after pull
-                    let mut s = state.write().await;
-                    s.last_written_cid = head.cid.clone();
-                    s.last_written_content = head.content.clone();
                 } else if initial_sync_strategy == "skip" && file.content != head.content {
                     // Offline edits detected - push local changes to server
                     // Note: push_json_content/push_file_content update state with new CID internally

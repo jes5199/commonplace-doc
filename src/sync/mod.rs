@@ -78,6 +78,8 @@ pub use uuid_map::{
     fetch_node_id_from_schema, get_all_node_backed_dir_ids,
 };
 
+pub use ancestry::{determine_sync_direction, is_ancestor, SyncDirection};
+
 pub use content_type::{
     detect_from_path, is_allowed_extension, is_binary_content, looks_like_base64_binary,
     ContentTypeInfo,
