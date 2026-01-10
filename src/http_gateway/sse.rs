@@ -40,8 +40,8 @@ async fn subscribe_to_doc(
     // Create a channel for SSE events
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(100);
 
-    // Subscribe to the MQTT edits topic (new format: workspace/port/path)
-    let edits_topic = format!("{}/edits/{}", gateway.workspace, id);
+    // Subscribe to the MQTT edits topic
+    let edits_topic = crate::mqtt::topics::Topic::edits(&gateway.workspace, &id).to_topic_string();
 
     let gateway_clone = gateway.clone();
     let edits_topic_clone = edits_topic.clone();
