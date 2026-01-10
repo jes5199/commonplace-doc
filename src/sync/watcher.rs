@@ -21,6 +21,39 @@ pub const FILE_DEBOUNCE_MS: u64 = 100;
 /// Default debounce duration for directory watcher (500ms)
 pub const DIR_DEBOUNCE_MS: u64 = 500;
 
+/// Create a notify watcher with a channel for receiving events.
+///
+/// This helper encapsulates the common watcher setup pattern:
+/// - Creates an mpsc channel for events
+/// - Creates a RecommendedWatcher with the callback wired to the channel
+/// - Configures the poll interval
+///
+/// Returns the watcher and receiver, or None if watcher creation failed.
+fn create_watcher(
+    poll_interval_ms: u64,
+    watcher_name: &str,
+) -> Option<(
+    RecommendedWatcher,
+    mpsc::Receiver<Result<Event, notify::Error>>,
+)> {
+    let (notify_tx, notify_rx) = mpsc::channel::<Result<Event, notify::Error>>(100);
+
+    let watcher = match RecommendedWatcher::new(
+        move |res| {
+            let _ = notify_tx.blocking_send(res);
+        },
+        Config::default().with_poll_interval(Duration::from_millis(poll_interval_ms)),
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            error!("Failed to create {} watcher: {}", watcher_name, e);
+            return None;
+        }
+    };
+
+    Some((watcher, notify_rx))
+}
+
 /// Check if a filename matches common temp file patterns used by atomic writes.
 ///
 /// Many applications write to a temp file first, then rename to the target.
@@ -103,21 +136,10 @@ pub async fn file_watcher_task(file_path: PathBuf, tx: mpsc::Sender<FileEvent>) 
         }
     };
 
-    // Create a channel for notify events
-    let (notify_tx, mut notify_rx) = mpsc::channel::<Result<Event, notify::Error>>(100);
-
-    // Create watcher
-    let mut watcher = match RecommendedWatcher::new(
-        move |res| {
-            let _ = notify_tx.blocking_send(res);
-        },
-        Config::default().with_poll_interval(Duration::from_millis(FILE_DEBOUNCE_MS)),
-    ) {
-        Ok(w) => w,
-        Err(e) => {
-            error!("Failed to create file watcher: {}", e);
-            return;
-        }
+    // Create watcher with channel
+    let (mut watcher, mut notify_rx) = match create_watcher(FILE_DEBOUNCE_MS, "file") {
+        Some(w) => w,
+        None => return,
     };
 
     // Watch the parent directory (non-recursive) to catch atomic renames
@@ -304,19 +326,10 @@ pub async fn directory_watcher_task(
     options: ScanOptions,
     written_schemas: Option<crate::sync::WrittenSchemas>,
 ) {
-    let (notify_tx, mut notify_rx) = mpsc::channel::<Result<Event, notify::Error>>(100);
-
-    let mut watcher = match RecommendedWatcher::new(
-        move |res| {
-            let _ = notify_tx.blocking_send(res);
-        },
-        Config::default().with_poll_interval(Duration::from_millis(DIR_DEBOUNCE_MS)),
-    ) {
-        Ok(w) => w,
-        Err(e) => {
-            error!("Failed to create directory watcher: {}", e);
-            return;
-        }
+    // Create watcher with channel
+    let (mut watcher, mut notify_rx) = match create_watcher(DIR_DEBOUNCE_MS, "directory") {
+        Some(w) => w,
+        None => return,
     };
 
     if let Err(e) = watcher.watch(&directory, RecursiveMode::Recursive) {
@@ -540,19 +553,10 @@ pub async fn shadow_watcher_task(shadow_dir: PathBuf, tx: mpsc::Sender<ShadowWri
         return;
     }
 
-    let (notify_tx, mut notify_rx) = mpsc::channel::<Result<Event, notify::Error>>(100);
-
-    let mut watcher = match RecommendedWatcher::new(
-        move |res| {
-            let _ = notify_tx.blocking_send(res);
-        },
-        Config::default().with_poll_interval(Duration::from_millis(FILE_DEBOUNCE_MS)),
-    ) {
-        Ok(w) => w,
-        Err(e) => {
-            error!("Failed to create shadow watcher: {}", e);
-            return;
-        }
+    // Create watcher with channel
+    let (mut watcher, mut notify_rx) = match create_watcher(FILE_DEBOUNCE_MS, "shadow") {
+        Some(w) => w,
+        None => return,
     };
 
     // Watch shadow directory non-recursively
