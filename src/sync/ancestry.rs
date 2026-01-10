@@ -23,6 +23,13 @@ pub enum SyncDirection {
     Diverged,
 }
 
+impl SyncDirection {
+    /// Returns true if server content should be applied (server is ahead or in sync).
+    pub fn should_pull(&self) -> bool {
+        matches!(self, SyncDirection::Pull | SyncDirection::InSync)
+    }
+}
+
 /// Check if `ancestor` is an ancestor of `descendant` in the commit DAG.
 ///
 /// Returns Ok(true) if ancestor is in the history of descendant.

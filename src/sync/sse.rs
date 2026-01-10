@@ -10,10 +10,9 @@ use crate::sync::{
     flock_state::PathState,
 };
 use crate::sync::{
-    ancestry::{determine_sync_direction, SyncDirection},
-    build_head_url, build_sse_url, detect_from_path, is_binary_content, looks_like_base64_binary,
-    process_pending_inbound_after_confirm, EditEventData, FlockSyncState, HeadResponse,
-    PendingWrite, SyncState,
+    ancestry::determine_sync_direction, build_head_url, build_sse_url, detect_from_path,
+    is_binary_content, looks_like_base64_binary, process_pending_inbound_after_confirm,
+    EditEventData, FlockSyncState, HeadResponse, PendingWrite, SyncState,
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -738,21 +737,9 @@ pub async fn refresh_from_head(
         }
     };
 
-    match direction {
-        SyncDirection::Pull | SyncDirection::InSync => {
-            // Server is ahead or we're in sync - proceed with refresh
-            debug!("Ancestry check for refresh: {:?}, proceeding", direction);
-        }
-        SyncDirection::Push => {
-            // We're ahead of server - don't refresh, our content should be pushed
-            debug!("Ancestry check for refresh: Push (local ahead), skipping");
-            return false;
-        }
-        SyncDirection::Diverged => {
-            // Diverged state - skip for now
-            warn!("Ancestry check for refresh: Diverged, skipping");
-            return false;
-        }
+    if !direction.should_pull() {
+        debug!("Ancestry check for refresh: {:?}, skipping", direction);
+        return false;
     }
 
     // Read current local file to check for pending changes
@@ -920,27 +907,10 @@ pub async fn handle_server_edit(
         }
     };
 
-    match direction {
-        SyncDirection::Pull | SyncDirection::InSync => {
-            // Server is ahead or we're in sync - proceed with write
-            debug!(
-                "Ancestry check: {:?}, proceeding with server edit",
-                direction
-            );
-        }
-        SyncDirection::Push => {
-            // We're ahead of server - skip, our content should be pushed instead
-            debug!("Ancestry check: Push (local ahead), skipping server edit");
-            state.write().await.needs_head_refresh = true;
-            return;
-        }
-        SyncDirection::Diverged => {
-            // Diverged state - skip for now, let merge handle it
-            // TODO: Implement proper merge for diverged state
-            warn!("Ancestry check: Diverged, skipping server edit (needs merge)");
-            state.write().await.needs_head_refresh = true;
-            return;
-        }
+    if !direction.should_pull() {
+        debug!("Ancestry check: {:?}, skipping server edit", direction);
+        state.write().await.needs_head_refresh = true;
+        return;
     }
 
     // Acquire write lock and set up barrier atomically
@@ -1236,26 +1206,10 @@ pub async fn handle_server_edit_with_tracker(
         }
     };
 
-    match direction {
-        SyncDirection::Pull | SyncDirection::InSync => {
-            // Server is ahead or we're in sync - proceed with write
-            debug!(
-                "Ancestry check: {:?}, proceeding with server edit",
-                direction
-            );
-        }
-        SyncDirection::Push => {
-            // We're ahead of server - skip, our content should be pushed instead
-            debug!("Ancestry check: Push (local ahead), skipping server edit");
-            state.write().await.needs_head_refresh = true;
-            return;
-        }
-        SyncDirection::Diverged => {
-            // Diverged state - skip for now, let merge handle it
-            warn!("Ancestry check: Diverged, skipping server edit (needs merge)");
-            state.write().await.needs_head_refresh = true;
-            return;
-        }
+    if !direction.should_pull() {
+        debug!("Ancestry check: {:?}, skipping server edit", direction);
+        state.write().await.needs_head_refresh = true;
+        return;
     }
 
     // Acquire write lock and set up barrier atomically
