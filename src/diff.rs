@@ -71,7 +71,9 @@ pub struct DiffResult {
 /// # Returns
 /// A `DiffResult` containing the Yjs update and statistics
 pub fn compute_diff_update(old_content: &str, new_content: &str) -> Result<DiffResult, DiffError> {
-    // Create base doc with old content (client ID 1)
+    // Create base doc with old content
+    // Use fixed client_id for base_doc - this establishes initial state with
+    // predictable character IDs. Only the target_doc needs a unique ID.
     let base_doc = Doc::with_client_id(1);
     let base_text = base_doc.get_or_insert_text(TEXT_ROOT_NAME);
     {
@@ -79,8 +81,10 @@ pub fn compute_diff_update(old_content: &str, new_content: &str) -> Result<DiffR
         base_text.push(&mut txn, old_content);
     }
 
-    // Create target doc (client ID 2) and sync to base state
-    let target_doc = Doc::with_client_id(2);
+    // Create target doc and sync to base state
+    // CRITICAL: Must use unique client ID (Doc::new()) to avoid conflicts
+    // when multiple concurrent replace requests hit the server
+    let target_doc = Doc::new();
     let target_text = target_doc.get_or_insert_text(TEXT_ROOT_NAME);
 
     // Sync target_doc to match base_doc state
@@ -140,7 +144,9 @@ pub fn compute_diff_update_with_base(
     new_content: &str,
 ) -> Result<DiffResult, DiffError> {
     // Create target doc and sync to actual base state
-    let target_doc = Doc::with_client_id(2);
+    // CRITICAL: Must use unique client ID (Doc::new()) to avoid CRDT corruption
+    // when concurrent replace requests generate updates from the same base state
+    let target_doc = Doc::new();
     let target_text = target_doc.get_or_insert_text(TEXT_ROOT_NAME);
 
     // Apply the actual base state from parent commits
@@ -230,7 +236,9 @@ pub fn compute_xml_diff_update(
     let old_inner = strip_xml_wrapper(old_content);
     let new_inner = strip_xml_wrapper(new_content);
 
-    // Create base doc with old content (client ID 1)
+    // Create base doc with old content
+    // Use fixed client_id for base_doc - this establishes initial state with
+    // predictable character IDs. Only the target_doc needs a unique ID.
     let base_doc = Doc::with_client_id(1);
     let base_fragment = base_doc.get_or_insert_xml_fragment(TEXT_ROOT_NAME);
     {
@@ -240,8 +248,9 @@ pub fn compute_xml_diff_update(
         }
     }
 
-    // Create target doc (client ID 2) and sync to base state
-    let target_doc = Doc::with_client_id(2);
+    // Create target doc and sync to base state
+    // CRITICAL: Must use unique client ID (Doc::new()) to avoid conflicts
+    let target_doc = Doc::new();
     let target_fragment = target_doc.get_or_insert_xml_fragment(TEXT_ROOT_NAME);
 
     // Sync target_doc to match base_doc state
@@ -318,7 +327,9 @@ pub fn compute_xml_diff_update_with_base(
     let new_inner = strip_xml_wrapper(new_content);
 
     // Create target doc and sync to actual base state
-    let target_doc = Doc::with_client_id(2);
+    // CRITICAL: Must use unique client ID (Doc::new()) to avoid CRDT corruption
+    // when concurrent replace requests generate updates from the same base state
+    let target_doc = Doc::new();
     let target_fragment = target_doc.get_or_insert_xml_fragment(TEXT_ROOT_NAME);
 
     // Apply the actual base state from server
