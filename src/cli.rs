@@ -390,3 +390,29 @@ pub async fn fetch_head(
         .await
         .map_err(|e| format!("Failed to parse response: {}", e))
 }
+
+/// Fetch commit history from the /documents/:id/changes endpoint.
+///
+/// # Errors
+/// Returns an error string if the request fails or returns non-success status.
+pub async fn fetch_changes(
+    client: &reqwest::Client,
+    server: &str,
+    uuid: &str,
+) -> Result<ChangesResponse, String> {
+    let url = format!("{}/documents/{}/changes", server, uuid);
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch changes: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Failed to fetch changes: HTTP {}", resp.status()));
+    }
+
+    resp.json()
+        .await
+        .map_err(|e| format!("Failed to parse changes: {}", e))
+}

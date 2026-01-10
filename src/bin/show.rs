@@ -6,7 +6,7 @@
 //!   commonplace-show --stat path/to/file.txt        # Show with change stats
 
 use clap::Parser;
-use commonplace_doc::cli::{fetch_head, ChangesResponse, CommitChange, HeadResponse, ShowArgs};
+use commonplace_doc::cli::{fetch_changes, fetch_head, CommitChange, HeadResponse, ShowArgs};
 use commonplace_doc::workspace::{format_timestamp, resolve_path_to_uuid};
 use reqwest::Client;
 use serde::Serialize;
@@ -52,16 +52,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get commit info (timestamp, etc.)
     let commit_info: Option<CommitChange> = if let Some(ref cid) = head.cid {
         // Fetch changes to find timestamp for this commit
-        let changes_url = format!("{}/documents/{}/changes", args.server, uuid);
-        if let Ok(resp) = client.get(&changes_url).send().await {
-            if let Ok(changes) = resp.json::<ChangesResponse>().await {
-                changes.changes.into_iter().find(|c| &c.commit_id == cid)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+        fetch_changes(&client, &args.server, &uuid)
+            .await
+            .ok()
+            .and_then(|changes| changes.changes.into_iter().find(|c| &c.commit_id == cid))
     } else {
         None
     };
@@ -135,14 +129,10 @@ async fn compute_stats(
     current_content: &str,
 ) -> Result<Option<ChangeStats>, Box<dyn std::error::Error>> {
     // Fetch all changes to find the parent commit
-    let changes_url = format!("{}/documents/{}/changes", server, uuid);
-    let resp = client.get(&changes_url).send().await?;
-
-    if !resp.status().is_success() {
-        return Ok(None);
-    }
-
-    let changes: ChangesResponse = resp.json().await?;
+    let changes = match fetch_changes(client, server, uuid).await {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
 
     // Find the current commit and its predecessor
     let current_idx = changes

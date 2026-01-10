@@ -6,7 +6,7 @@
 //!   commonplace-replay path/to/file.txt --at <cid>   # Show content at commit
 
 use clap::Parser;
-use commonplace_doc::cli::{fetch_head, ChangesResponse, ReplayArgs};
+use commonplace_doc::cli::{fetch_changes, fetch_head, ReplayArgs};
 use commonplace_doc::fs::{Entry, FsSchema};
 use commonplace_doc::sync::SCHEMA_FILENAME;
 use reqwest::Client;
@@ -58,15 +58,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.list {
         // Fetch commit history
-        let url = format!("{}/documents/{}/changes", args.server, uuid);
-        let resp = client.get(&url).send().await?;
-
-        if !resp.status().is_success() {
-            eprintln!("Failed to fetch changes: HTTP {}", resp.status());
-            std::process::exit(1);
-        }
-
-        let changes: ChangesResponse = resp.json().await?;
+        let changes = match fetch_changes(&client, &args.server, &uuid).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        };
 
         if args.json {
             let output = ListOutput {
@@ -110,16 +108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Also fetch commit count for context (unless showing historical content)
         let commit_count = if args.at.is_none() {
-            let changes_url = format!("{}/documents/{}/changes", args.server, uuid);
-            if let Ok(resp) = client.get(&changes_url).send().await {
-                if let Ok(changes) = resp.json::<ChangesResponse>().await {
-                    Some(changes.changes.len())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+            fetch_changes(&client, &args.server, &uuid)
+                .await
+                .ok()
+                .map(|c| c.changes.len())
         } else {
             None
         };
