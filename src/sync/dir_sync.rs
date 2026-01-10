@@ -1044,13 +1044,41 @@ async fn push_nested_schemas_recursive(
                         }
 
                         // Recursively handle any nested node-backed directories within this schema
-                        if let Some(ref sub_root) = parsed_schema.root {
+                        if let Some(Entry::Dir(ref sub_dir)) = parsed_schema.root {
+                            if let Some(ref entries) = sub_dir.entries {
+                                for (entry_name, child_entry) in entries {
+                                    if let Entry::Dir(ref child_dir) = child_entry {
+                                        if child_dir.node_id.is_some() {
+                                            let child_path = current_dir.join(entry_name);
+                                            pushed_count += push_nested_schemas_recursive(
+                                                client,
+                                                server,
+                                                _base_dir,
+                                                child_entry,
+                                                &child_path,
+                                            )
+                                            .await?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Non-node-backed directory: iterate over inline entries (deprecated but handle for safety)
+            if let Some(ref entries) = dir.entries {
+                for (entry_name, child_entry) in entries {
+                    if let Entry::Dir(ref child_dir) = child_entry {
+                        if child_dir.node_id.is_some() {
+                            let child_path = current_dir.join(entry_name);
                             pushed_count += push_nested_schemas_recursive(
                                 client,
                                 server,
                                 _base_dir,
-                                sub_root,
-                                current_dir,
+                                child_entry,
+                                &child_path,
                             )
                             .await?;
                         }
@@ -1058,8 +1086,6 @@ async fn push_nested_schemas_recursive(
                 }
             }
         }
-
-        // Note: inline subdirectories were deprecated - all directories are now node-backed
     }
 
     Ok(pushed_count)
