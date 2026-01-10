@@ -149,6 +149,15 @@ This means you can edit files in `workspace/` directly and trust that changes wi
 
 **Note**: The sync client must be running (via orchestrator or standalone) for changes to propagate.
 
+### Process Configuration
+
+Processes are configured via `__processes.json` files in the workspace. The location of the config determines what the process can see:
+
+- `workspace/__processes.json` - Process sees the **entire workspace**
+- `workspace/subdir/__processes.json` - Process only sees that subdirectory
+
+**CRITICAL: Bartleby must be in the toplevel `workspace/__processes.json`** so he can see the whole workspace (including `bartleby/`, `text-to-telegram/`, `tmux/`, etc.). Never move bartleby to `workspace/bartleby/__processes.json` - this breaks his ability to see other directories.
+
 ### CLI Tools
 
 #### commonplace-ps

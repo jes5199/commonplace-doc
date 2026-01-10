@@ -644,6 +644,7 @@ async fn test_head_at_commit_returns_historical_state() {
                     serde_json::json!({
                         "verb": "update",
                         "value": update2_b64,
+                        "parent_cid": cid1,  // Required: must specify parent when document has history
                     })
                     .to_string(),
                 ))
@@ -985,13 +986,13 @@ async fn test_is_ancestor_endpoint() {
         serde_json::from_str(&body_to_string(commit1_response.into_body()).await).unwrap();
     let cid1 = commit1["cid"].as_str().unwrap();
 
-    // Make another commit
+    // Make another commit (must specify parent since document now has history)
     let commit2_response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/docs/{}/replace", doc_id))
+                .uri(format!("/docs/{}/replace?parent_cid={}", doc_id, cid1))
                 .header("Content-Type", "text/plain")
                 .body(Body::from("version 3"))
                 .unwrap(),

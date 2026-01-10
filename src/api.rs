@@ -31,6 +31,8 @@ impl ServiceError {
             ServiceError::InvalidInput(_) => StatusCode::BAD_REQUEST,
             ServiceError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServiceError::Conflict => StatusCode::CONFLICT,
+            // 428 Precondition Required: client must include parent_cid
+            ServiceError::ParentRequired(_) => StatusCode::PRECONDITION_REQUIRED,
         }
     }
 }

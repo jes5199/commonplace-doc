@@ -344,7 +344,8 @@ pub async fn upload_task(
         }
 
         // Get parent CID to decide which endpoint to use
-        // In force-push mode, always fetch HEAD to ensure we replace current content
+        // CRDT safety: if we don't know the parent, fetch HEAD from server first
+        // This prevents blind overwrites when server has content we don't know about
         let parent_cid = if force_push {
             // Force-push: fetch HEAD's cid to ensure we replace current content
             let head_url = build_head_url(&server, &identifier, use_paths);
@@ -366,8 +367,59 @@ pub async fn upload_task(
                 }
             }
         } else {
-            let s = state.read().await;
-            s.last_written_cid.clone()
+            let known_parent = {
+                let s = state.read().await;
+                s.last_written_cid.clone()
+            };
+
+            // If we don't know the parent, fetch HEAD to check if server has content
+            // This prevents blind overwrites when syncing a file the server already has
+            if known_parent.is_none() {
+                let head_url = build_head_url(&server, &identifier, use_paths);
+                match client.get(&head_url).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        match resp.json::<HeadResponse>().await {
+                            Ok(head) => {
+                                if let Some(cid) = head.cid {
+                                    info!(
+                                        "Server has existing content (cid: {}), syncing from server first",
+                                        &cid[..8.min(cid.len())]
+                                    );
+                                    // Fetch and apply server content before uploading
+                                    let refresh_succeeded = refresh_from_head(
+                                        &client,
+                                        &server,
+                                        &identifier,
+                                        &file_path,
+                                        &state,
+                                        use_paths,
+                                    )
+                                    .await;
+                                    if refresh_succeeded {
+                                        // Now we have the server content, get the new parent
+                                        let s = state.read().await;
+                                        s.last_written_cid.clone()
+                                    } else {
+                                        // Refresh failed, skip this upload
+                                        error!("Failed to sync from server, skipping upload");
+                                        continue;
+                                    }
+                                } else {
+                                    // Server has no content, proceed with initial commit
+                                    None
+                                }
+                            }
+                            Err(e) => {
+                                debug!("Failed to parse HEAD response: {}", e);
+                                None // Proceed with initial commit
+                            }
+                        }
+                    }
+                    Ok(_) | Err(_) => None, // Server has no content or request failed
+                }
+            } else {
+                known_parent
+            }
         };
 
         // Track upload success - only refresh if upload succeeded
@@ -737,6 +789,7 @@ pub async fn upload_task_with_flock(
         }
 
         // Get parent CID for text file upload
+        // CRDT safety: if we don't know the parent, fetch HEAD from server first
         let parent_cid = if force_push {
             let head_url = build_head_url(&server, &identifier, use_paths);
             match client.get(&head_url).send().await {
@@ -757,8 +810,54 @@ pub async fn upload_task_with_flock(
                 }
             }
         } else {
-            let s = state.read().await;
-            s.last_written_cid.clone()
+            let known_parent = {
+                let s = state.read().await;
+                s.last_written_cid.clone()
+            };
+
+            // If we don't know the parent, fetch HEAD to check if server has content
+            if known_parent.is_none() {
+                let head_url = build_head_url(&server, &identifier, use_paths);
+                match client.get(&head_url).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        match resp.json::<HeadResponse>().await {
+                            Ok(head) => {
+                                if let Some(cid) = head.cid {
+                                    info!(
+                                        "Server has existing content (cid: {}), syncing from server first",
+                                        &cid[..8.min(cid.len())]
+                                    );
+                                    let refresh_succeeded = refresh_from_head(
+                                        &client,
+                                        &server,
+                                        &identifier,
+                                        &file_path,
+                                        &state,
+                                        use_paths,
+                                    )
+                                    .await;
+                                    if refresh_succeeded {
+                                        let s = state.read().await;
+                                        s.last_written_cid.clone()
+                                    } else {
+                                        error!("Failed to sync from server, skipping upload");
+                                        continue;
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                            Err(e) => {
+                                debug!("Failed to parse HEAD response: {}", e);
+                                None
+                            }
+                        }
+                    }
+                    Ok(_) | Err(_) => None,
+                }
+            } else {
+                known_parent
+            }
         };
 
         let mut upload_succeeded = false;

@@ -33,6 +33,9 @@ pub enum ServiceError {
     Internal(String),
     /// Conflict (e.g., concurrent modification)
     Conflict,
+    /// Parent commit required - document has history but no parent_cid provided
+    /// Contains the current HEAD cid that client should use
+    ParentRequired(String),
 }
 
 impl From<ApplyError> for ServiceError {
@@ -379,6 +382,16 @@ impl DocumentService {
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
+        // CRDT safety: reject blind edits when document has history
+        // If client doesn't specify a parent but document has commits, the client
+        // doesn't know the current state and could accidentally corrupt data.
+        // Client must fetch HEAD first and include parent_cid in the request.
+        if parent_cid.is_none() {
+            if let Some(head) = &current_head {
+                return Err(ServiceError::ParentRequired(head.clone()));
+            }
+        }
+
         let mut notifications: Vec<(String, u64)> = Vec::new();
 
         let (commit_cid, merge_cid) = if let Some(parent) = parent_cid {
@@ -575,6 +588,16 @@ impl DocumentService {
             .get_document_head(id)
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        // CRDT safety: reject blind overwrites when document has history
+        // If client doesn't specify a parent but document has commits, the client
+        // doesn't know the current state and could accidentally overwrite data.
+        // Client must fetch HEAD first and include parent_cid in the request.
+        if parent_cid.is_none() {
+            if let Some(head) = &current_head {
+                return Err(ServiceError::ParentRequired(head.clone()));
+            }
+        }
 
         // Check if this is a JSON document type (uses Y.Map/Y.Array instead of Y.Text)
         let is_json_type = matches!(
