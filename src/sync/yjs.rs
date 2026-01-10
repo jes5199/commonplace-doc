@@ -2,7 +2,7 @@
 //!
 //! This module provides functions to create Yjs CRDT updates for text and JSON content.
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use crate::b64;
 use yrs::any::Any;
 use yrs::types::ToJson;
 use yrs::updates::decoder::Decode;
@@ -445,14 +445,14 @@ pub fn any_to_json_value(any: Any) -> serde_json::Value {
     }
 }
 
-/// Simple base64 encoding (matching server's b64 module)
+/// Base64 encoding using crate::b64
 pub fn base64_encode(data: &[u8]) -> String {
-    STANDARD.encode(data)
+    b64::encode(data)
 }
 
-/// Simple base64 decoding (matching server's b64 module)
-pub fn base64_decode(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    STANDARD.decode(data)
+/// Base64 decoding using crate::b64
+pub fn base64_decode(data: &str) -> Result<Vec<u8>, b64::DecodeError> {
+    b64::decode(data)
 }
 
 #[cfg(test)]
