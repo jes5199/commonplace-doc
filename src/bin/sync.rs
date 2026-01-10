@@ -5,6 +5,7 @@
 //! server changes update local files.
 
 use clap::Parser;
+use commonplace_doc::fs::{DocEntry, Entry, FsSchema};
 use commonplace_doc::mqtt::{MqttClient, MqttConfig};
 use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
 use commonplace_doc::sync::{
@@ -1882,6 +1883,83 @@ async fn run_exec_mode(
         (exec_cmd, exec_args)
     };
 
+    // Calculate exec_name early - needed for log file schema entries
+    // Use provided process_name if available, otherwise extract from program path
+    let exec_name = process_name.unwrap_or_else(|| {
+        std::path::Path::new(&program)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("exec")
+            .to_string()
+    });
+
+    // In sandbox mode, add log file entries to schema BEFORE starting exec
+    // This prevents race condition where sync deletes newly created log files
+    if sandbox {
+        let stdout_name = format!("__{}.stdout.txt", exec_name);
+        let stderr_name = format!("__{}.stderr.txt", exec_name);
+
+        // Fetch current schema
+        let head_url = format!("{}/docs/{}/head", server, fs_root_id);
+        if let Ok(resp) = client.get(&head_url).send().await {
+            if let Ok(head) = resp.json::<serde_json::Value>().await {
+                if let Some(content) = head.get("content").and_then(|c| c.as_str()) {
+                    if let Ok(mut schema) = serde_json::from_str::<FsSchema>(content) {
+                        // Add log file entries if they don't exist
+                        if let Some(Entry::Dir(ref mut dir)) = schema.root {
+                            let entries = dir.entries.get_or_insert_with(HashMap::new);
+
+                            let mut added = false;
+                            if !entries.contains_key(&stdout_name) {
+                                entries.insert(
+                                    stdout_name.clone(),
+                                    Entry::Doc(DocEntry {
+                                        node_id: None,
+                                        content_type: Some("text/plain".to_string()),
+                                    }),
+                                );
+                                added = true;
+                            }
+                            if !entries.contains_key(&stderr_name) {
+                                entries.insert(
+                                    stderr_name.clone(),
+                                    Entry::Doc(DocEntry {
+                                        node_id: None,
+                                        content_type: Some("text/plain".to_string()),
+                                    }),
+                                );
+                                added = true;
+                            }
+
+                            if added {
+                                // Push updated schema
+                                let schema_json =
+                                    serde_json::to_string_pretty(&schema).unwrap_or_default();
+                                info!(
+                                    "Adding log file entries to schema: {}, {}",
+                                    stdout_name, stderr_name
+                                );
+                                if let Err(e) = push_schema_to_server(
+                                    &client,
+                                    &server,
+                                    &fs_root_id,
+                                    &schema_json,
+                                )
+                                .await
+                                {
+                                    warn!("Failed to add log file entries to schema: {}", e);
+                                } else {
+                                    // Wait for reconciler to create the documents
+                                    sleep(Duration::from_millis(200)).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     info!("Launching: {} {:?}", program, args);
 
     // Build the command
@@ -1940,15 +2018,6 @@ async fn run_exec_mode(
         .map_err(|e| format!("Failed to spawn command '{}': {}", program, e))?;
 
     // In sandbox mode, spawn tasks to log stdout/stderr to files
-    // Use provided process_name if available, otherwise extract from program path
-    let exec_name = process_name.unwrap_or_else(|| {
-        std::path::Path::new(&program)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("exec")
-            .to_string()
-    });
-
     if sandbox {
         use tokio::fs::OpenOptions;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
