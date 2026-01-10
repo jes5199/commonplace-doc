@@ -10,7 +10,7 @@
 
 use base64::prelude::*;
 use clap::Parser;
-use commonplace_doc::cli::LogArgs;
+use commonplace_doc::cli::{CommitChange, LogArgs};
 use commonplace_doc::workspace::{
     format_timestamp, format_timestamp_short, parse_date, resolve_path_to_uuid,
 };
@@ -337,17 +337,6 @@ struct CommitsResponse {
     #[allow(dead_code)]
     doc_id: String,
     commits: Vec<CommitWithUpdate>,
-}
-
-/// Legacy commit change (for --follow mode which uses SSE)
-#[derive(Deserialize)]
-struct CommitChange {
-    #[allow(dead_code)]
-    doc_id: String,
-    commit_id: String,
-    timestamp: u64,
-    #[allow(dead_code)]
-    url: String,
 }
 
 #[derive(Serialize)]

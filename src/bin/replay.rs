@@ -6,28 +6,13 @@
 //!   commonplace-replay path/to/file.txt --at <cid>   # Show content at commit
 
 use clap::Parser;
-use commonplace_doc::cli::{fetch_head, ReplayArgs};
+use commonplace_doc::cli::{fetch_head, ChangesResponse, ReplayArgs};
 use commonplace_doc::fs::{Entry, FsSchema};
 use commonplace_doc::sync::SCHEMA_FILENAME;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-#[derive(Deserialize)]
-struct CommitChange {
-    #[allow(dead_code)]
-    doc_id: String,
-    commit_id: String,
-    timestamp: u64,
-    #[allow(dead_code)]
-    url: String,
-}
-
-#[derive(Deserialize)]
-struct ChangesResponse {
-    changes: Vec<CommitChange>,
-}
 
 #[derive(Serialize)]
 struct CommitInfo {

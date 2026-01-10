@@ -340,6 +340,24 @@ pub struct HeadResponse {
     pub content: Option<String>,
 }
 
+/// A single commit change from the /documents/:id/changes endpoint.
+/// Shared by CLI binaries that fetch commit history.
+#[derive(Deserialize)]
+pub struct CommitChange {
+    #[allow(dead_code)]
+    pub doc_id: String,
+    pub commit_id: String,
+    pub timestamp: u64,
+    #[allow(dead_code)]
+    pub url: String,
+}
+
+/// Response from /documents/:id/changes endpoint.
+#[derive(Deserialize)]
+pub struct ChangesResponse {
+    pub changes: Vec<CommitChange>,
+}
+
 /// Fetch document HEAD from the server.
 ///
 /// Builds the appropriate URL and makes a GET request to retrieve the
