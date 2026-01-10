@@ -11,6 +11,7 @@ pub mod client;
 pub mod content_type;
 pub mod dir_sync;
 pub mod directory;
+pub mod file_events;
 pub mod file_sync;
 #[cfg(unix)]
 pub mod flock;
@@ -64,9 +65,12 @@ pub use client::{
 };
 pub use dir_sync::{
     check_server_has_content, directory_mqtt_task, directory_sse_task, ensure_fs_root_exists,
-    handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
-    handle_schema_modified, push_nested_schemas, spawn_subdir_mqtt_task, spawn_subdir_sse_task,
-    subdir_mqtt_task, subdir_sse_task, sync_schema,
+    handle_schema_change, handle_schema_modified, push_nested_schemas, spawn_subdir_mqtt_task,
+    spawn_subdir_sse_task, subdir_mqtt_task, subdir_sse_task, sync_schema,
+};
+pub use file_events::{
+    find_owning_document, handle_file_created, handle_file_deleted, handle_file_modified,
+    OwningDocument,
 };
 pub use file_sync::{
     initial_sync, spawn_file_sync_tasks, spawn_file_sync_tasks_with_flock, sync_single_file,

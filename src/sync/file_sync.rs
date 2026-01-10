@@ -2,8 +2,8 @@
 //!
 //! This module contains functions for syncing a single file with a server document.
 
-use crate::sync::dir_sync::find_owning_document;
 use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
+use crate::sync::file_events::find_owning_document;
 use crate::sync::state_file::compute_content_hash;
 use crate::sync::uuid_map::fetch_node_id_from_schema;
 use crate::sync::{
