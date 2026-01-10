@@ -10,8 +10,8 @@ use crate::sync::state_file::compute_content_hash;
 use crate::sync::uuid_map::fetch_node_id_from_schema;
 use crate::sync::{
     delete_schema_entry, detect_from_path, fork_node, is_allowed_extension, is_binary_content,
-    normalize_path, push_file_content, push_json_content, push_jsonl_content,
-    push_schema_to_server, spawn_file_sync_tasks, FileSyncState, SyncState,
+    normalize_path, push_content_by_type, push_schema_to_server, spawn_file_sync_tasks,
+    FileSyncState, SyncState,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -382,15 +382,18 @@ pub async fn handle_file_created(
                 String::from_utf8_lossy(&raw_content).to_string()
             };
 
-            let is_json = !is_binary && content_info.mime_type == "application/json";
-            let is_jsonl = !is_binary && content_info.mime_type == "application/x-ndjson";
-            if let Err(e) = if is_json {
-                push_json_content(client, server, &identifier, &content, &state, use_paths).await
-            } else if is_jsonl {
-                push_jsonl_content(client, server, &identifier, &content, &state, use_paths).await
-            } else {
-                push_file_content(client, server, &identifier, &content, &state, use_paths).await
-            } {
+            if let Err(e) = push_content_by_type(
+                client,
+                server,
+                &identifier,
+                &content,
+                &state,
+                use_paths,
+                is_binary,
+                &content_info.mime_type,
+            )
+            .await
+            {
                 warn!("Failed to push new file content: {}", e);
             }
         }

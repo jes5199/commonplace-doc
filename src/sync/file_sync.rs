@@ -1114,39 +1114,17 @@ pub async fn sync_single_file(
                     identifier,
                     file.content.len()
                 );
-                let is_json = !file.is_binary && file.content_type.starts_with("application/json");
-                let is_jsonl = !file.is_binary && file.content_type == "application/x-ndjson";
-                if is_json {
-                    crate::sync::push_json_content(
-                        client,
-                        server,
-                        &identifier,
-                        &file.content,
-                        &state,
-                        use_paths,
-                    )
-                    .await?;
-                } else if is_jsonl {
-                    crate::sync::push_jsonl_content(
-                        client,
-                        server,
-                        &identifier,
-                        &file.content,
-                        &state,
-                        use_paths,
-                    )
-                    .await?;
-                } else {
-                    crate::sync::push_file_content(
-                        client,
-                        server,
-                        &identifier,
-                        &file.content,
-                        &state,
-                        use_paths,
-                    )
-                    .await?;
-                }
+                crate::sync::push_content_by_type(
+                    client,
+                    server,
+                    &identifier,
+                    &file.content,
+                    &state,
+                    use_paths,
+                    file.is_binary,
+                    &file.content_type,
+                )
+                .await?;
             } else {
                 // Server has content - use CRDT ancestry to determine sync direction
                 if initial_sync_strategy == "server" {
@@ -1233,41 +1211,17 @@ pub async fn sync_single_file(
 
                     if should_push {
                         // Push local content to server
-                        let is_json =
-                            !file.is_binary && file.content_type.starts_with("application/json");
-                        let is_jsonl =
-                            !file.is_binary && file.content_type == "application/x-ndjson";
-                        if is_json {
-                            crate::sync::push_json_content(
-                                client,
-                                server,
-                                &identifier,
-                                &file.content,
-                                &state,
-                                use_paths,
-                            )
-                            .await?;
-                        } else if is_jsonl {
-                            crate::sync::push_jsonl_content(
-                                client,
-                                server,
-                                &identifier,
-                                &file.content,
-                                &state,
-                                use_paths,
-                            )
-                            .await?;
-                        } else {
-                            crate::sync::push_file_content(
-                                client,
-                                server,
-                                &identifier,
-                                &file.content,
-                                &state,
-                                use_paths,
-                            )
-                            .await?;
-                        }
+                        crate::sync::push_content_by_type(
+                            client,
+                            server,
+                            &identifier,
+                            &file.content,
+                            &state,
+                            use_paths,
+                            file.is_binary,
+                            &file.content_type,
+                        )
+                        .await?;
                     } else {
                         // Pull server content to local
                         if file.is_binary {
@@ -1286,45 +1240,22 @@ pub async fn sync_single_file(
                     }
                 } else if initial_sync_strategy == "skip" && file.content != head.content {
                     // Offline edits detected - push local changes to server
-                    // Note: push_json_content/push_file_content update state with new CID internally
+                    // Note: push_content_by_type updates state with new CID internally
                     info!(
                         "Detected offline edits for: {} - pushing to server",
                         identifier
                     );
-                    let is_json =
-                        !file.is_binary && file.content_type.starts_with("application/json");
-                    let is_jsonl = !file.is_binary && file.content_type == "application/x-ndjson";
-                    if is_json {
-                        crate::sync::push_json_content(
-                            client,
-                            server,
-                            &identifier,
-                            &file.content,
-                            &state,
-                            use_paths,
-                        )
-                        .await?;
-                    } else if is_jsonl {
-                        crate::sync::push_jsonl_content(
-                            client,
-                            server,
-                            &identifier,
-                            &file.content,
-                            &state,
-                            use_paths,
-                        )
-                        .await?;
-                    } else {
-                        crate::sync::push_file_content(
-                            client,
-                            server,
-                            &identifier,
-                            &file.content,
-                            &state,
-                            use_paths,
-                        )
-                        .await?;
-                    }
+                    crate::sync::push_content_by_type(
+                        client,
+                        server,
+                        &identifier,
+                        &file.content,
+                        &state,
+                        use_paths,
+                        file.is_binary,
+                        &file.content_type,
+                    )
+                    .await?;
                     // Push functions already updated state with new CID, just set content
                     let mut s = state.write().await;
                     s.last_written_content = file.content.clone();
@@ -1338,39 +1269,17 @@ pub async fn sync_single_file(
         } else {
             // Node doesn't exist yet - push content
             info!("Node not ready, will push with retries for: {}", identifier);
-            let is_json = !file.is_binary && file.content_type.starts_with("application/json");
-            let is_jsonl = !file.is_binary && file.content_type == "application/x-ndjson";
-            if is_json {
-                crate::sync::push_json_content(
-                    client,
-                    server,
-                    &identifier,
-                    &file.content,
-                    &state,
-                    use_paths,
-                )
-                .await?;
-            } else if is_jsonl {
-                crate::sync::push_jsonl_content(
-                    client,
-                    server,
-                    &identifier,
-                    &file.content,
-                    &state,
-                    use_paths,
-                )
-                .await?;
-            } else {
-                crate::sync::push_file_content(
-                    client,
-                    server,
-                    &identifier,
-                    &file.content,
-                    &state,
-                    use_paths,
-                )
-                .await?;
-            }
+            crate::sync::push_content_by_type(
+                client,
+                server,
+                &identifier,
+                &file.content,
+                &state,
+                use_paths,
+                file.is_binary,
+                &file.content_type,
+            )
+            .await?;
         }
     }
 

@@ -335,6 +335,32 @@ pub async fn push_jsonl_content(
     }
 }
 
+/// Push content to a node, dispatching to the appropriate function based on content type.
+///
+/// This helper handles the common pattern of detecting content type and calling
+/// the right push function (JSON, JSONL, or text/binary).
+pub async fn push_content_by_type(
+    client: &Client,
+    server: &str,
+    identifier: &str,
+    content: &str,
+    state: &Arc<RwLock<SyncState>>,
+    use_paths: bool,
+    is_binary: bool,
+    mime_type: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let is_json = !is_binary && mime_type == "application/json";
+    let is_jsonl = !is_binary && mime_type == "application/x-ndjson";
+
+    if is_json {
+        push_json_content(client, server, identifier, content, state, use_paths).await
+    } else if is_jsonl {
+        push_jsonl_content(client, server, identifier, content, state, use_paths).await
+    } else {
+        push_file_content(client, server, identifier, content, state, use_paths).await
+    }
+}
+
 /// Push file content to a node (text files use replace/edit endpoints).
 pub async fn push_file_content(
     client: &Client,

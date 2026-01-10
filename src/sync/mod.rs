@@ -61,8 +61,8 @@ pub fn acquire_sync_lock(directory: &Path) -> io::Result<File> {
 }
 
 pub use client::{
-    delete_schema_entry, fork_node, push_file_content, push_json_content, push_json_content_merge,
-    push_jsonl_content, push_schema_to_server,
+    delete_schema_entry, fork_node, push_content_by_type, push_file_content, push_json_content,
+    push_json_content_merge, push_jsonl_content, push_schema_to_server,
 };
 pub use dir_sync::{
     check_server_has_content, ensure_fs_root_exists, handle_schema_change, handle_schema_modified,
