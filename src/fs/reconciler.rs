@@ -195,11 +195,7 @@ impl FilesystemReconciler {
                         .unwrap_or(ContentType::Json);
 
                     // First, ensure the document exists
-                    results.push((
-                        current_path.to_string(),
-                        doc_id.clone(),
-                        content_type.clone(),
-                    ));
+                    results.push((current_path.to_string(), doc_id.clone(), content_type));
 
                     // Track this as a document-backed directory
                     doc_backed_dirs.insert(doc_id.clone());

@@ -181,7 +181,7 @@ impl DocumentStore {
             yrs::Update::decode_v1(update).map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
 
         let mut txn = ydoc.transact_mut();
-        let content_type = doc.content_type.clone();
+        let content_type = doc.content_type;
         txn.apply_update(update);
 
         doc.content = match content_type {
@@ -280,9 +280,7 @@ impl DocumentStore {
     /// - Json/JsonArray: uses Y.Map/Y.Array operations to preserve JSON structure
     /// - Jsonl: uses Y.Array with line-based parsing for newline-delimited JSON
     pub async fn set_content(&self, id: &str, new_content: &str) -> Result<(), ApplyError> {
-        use crate::sync::yjs::{
-            base64_decode, base64_encode, create_yjs_json_update, create_yjs_jsonl_update,
-        };
+        use crate::sync::yjs::{base64_decode, base64_encode, create_yjs_structured_update};
 
         let mut documents = self.documents.write().await;
         let doc = documents.get_mut(id).ok_or(ApplyError::NotFound)?;
@@ -311,17 +309,14 @@ impl DocumentStore {
                     .map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
                 diff_result.update_bytes
             }
-            ContentType::Json | ContentType::JsonArray => {
-                // Use Y.Map/Y.Array operations for JSON objects/arrays
-                // create_yjs_json_update handles both object roots (Y.Map) and array roots (Y.Array)
-                let update_b64 = create_yjs_json_update(new_content, Some(&base_state_b64))
-                    .map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
-                base64_decode(&update_b64).map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?
-            }
-            ContentType::Jsonl => {
-                // Use Y.Array with line-based parsing for JSONL (newline-delimited JSON)
-                let update_b64 = create_yjs_jsonl_update(new_content, Some(&base_state_b64))
-                    .map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
+            ContentType::Json | ContentType::JsonArray | ContentType::Jsonl => {
+                // Use create_yjs_structured_update to handle JSON/JSONL content types
+                let update_b64 = create_yjs_structured_update(
+                    doc.content_type,
+                    new_content,
+                    Some(&base_state_b64),
+                )
+                .map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
                 base64_decode(&update_b64).map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?
             }
         };

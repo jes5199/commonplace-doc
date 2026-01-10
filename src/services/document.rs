@@ -13,7 +13,7 @@ use crate::document::{ApplyError, ContentType, Document, DocumentStore};
 use crate::events::{CommitBroadcaster, CommitNotification};
 use crate::fs::FilesystemReconciler;
 use crate::store::CommitStore;
-use crate::sync::{base64_decode, create_yjs_json_update, create_yjs_jsonl_update};
+use crate::sync::{base64_decode, create_yjs_structured_update};
 use crate::{b64, diff, replay::CommitReplayer};
 
 fn preview_text(text: &str, max_chars: usize) -> String {
@@ -496,7 +496,7 @@ impl DocumentService {
         // Create new document with same content type
         let new_id = self
             .doc_store
-            .create_document(source_doc.content_type.clone())
+            .create_document(source_doc.content_type)
             .await;
 
         // Get target commit (specified or HEAD)
@@ -626,8 +626,12 @@ impl DocumentService {
                 let diff = if is_json_type {
                     // JSON documents use Y.Map/Y.Array - use JSON update with base state
                     let base_state_b64 = b64::encode(&base_state_bytes);
-                    let is_jsonl = doc.content_type == ContentType::Jsonl;
-                    compute_json_diff(new_content, &old_content, Some(&base_state_b64), is_jsonl)?
+                    compute_json_diff(
+                        new_content,
+                        &old_content,
+                        Some(&base_state_b64),
+                        doc.content_type,
+                    )?
                 } else if is_xml_type {
                     // XML documents use Y.XmlFragment - use base state for proper CRDT merge
                     diff::compute_xml_diff_update_with_base(
@@ -674,8 +678,12 @@ impl DocumentService {
                         .get_yjs_state(id)
                         .await
                         .map(|b| b64::encode(&b));
-                    let is_jsonl = doc.content_type == ContentType::Jsonl;
-                    compute_json_diff(new_content, &doc.content, base_state.as_deref(), is_jsonl)?
+                    compute_json_diff(
+                        new_content,
+                        &doc.content,
+                        base_state.as_deref(),
+                        doc.content_type,
+                    )?
                 } else if is_xml_type {
                     // XML documents use Y.XmlFragment - use server's actual Yjs state
                     let base_state = self.doc_store.get_yjs_state(id).await;
@@ -720,8 +728,12 @@ impl DocumentService {
                     .get_yjs_state(id)
                     .await
                     .map(|b| b64::encode(&b));
-                let is_jsonl = doc.content_type == ContentType::Jsonl;
-                compute_json_diff(new_content, &doc.content, base_state.as_deref(), is_jsonl)?
+                compute_json_diff(
+                    new_content,
+                    &doc.content,
+                    base_state.as_deref(),
+                    doc.content_type,
+                )?
             } else if is_xml_type {
                 // XML documents use Y.XmlFragment - use server's actual Yjs state
                 let base_state = self.doc_store.get_yjs_state(id).await;
@@ -825,21 +837,15 @@ impl DocumentService {
 /// Compute a JSON diff using Y.Map/Y.Array updates instead of Y.Text.
 ///
 /// Returns a DiffResult compatible with the text diff output.
-/// For JSONL content, set `is_jsonl` to true to parse as newline-delimited JSON
-/// and store as Y.Array<Y.Map>.
+/// ContentType determines whether to use JSON or JSONL (newline-delimited JSON) parsing.
 fn compute_json_diff(
     new_content: &str,
     old_content: &str,
     base_state_b64: Option<&str>,
-    is_jsonl: bool,
+    content_type: ContentType,
 ) -> Result<diff::DiffResult, ServiceError> {
-    let update_b64 = if is_jsonl {
-        create_yjs_jsonl_update(new_content, base_state_b64)
-            .map_err(|e| ServiceError::Internal(format!("JSONL update failed: {}", e)))?
-    } else {
-        create_yjs_json_update(new_content, base_state_b64)
-            .map_err(|e| ServiceError::Internal(format!("JSON update failed: {}", e)))?
-    };
+    let update_b64 = create_yjs_structured_update(content_type, new_content, base_state_b64)
+        .map_err(|e| ServiceError::Internal(format!("Structured update failed: {}", e)))?;
 
     let update_bytes = base64_decode(&update_b64)
         .map_err(|e| ServiceError::Internal(format!("Base64 decode failed: {}", e)))?;

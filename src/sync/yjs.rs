@@ -3,6 +3,7 @@
 //! This module provides functions to create Yjs CRDT updates for text and JSON content.
 
 use crate::b64;
+use crate::content_type::ContentType;
 use yrs::any::Any;
 use yrs::types::ToJson;
 use yrs::updates::decoder::Decode;
@@ -21,6 +22,23 @@ pub fn create_yjs_text_update(content: &str) -> String {
         txn.encode_update_v1()
     };
     base64_encode(&update)
+}
+
+/// Create a Yjs update for structured content based on ContentType.
+/// Dispatches to the appropriate update function for JSON vs JSONL content.
+/// Returns a base64-encoded Yjs update.
+pub fn create_yjs_structured_update(
+    content_type: ContentType,
+    content: &str,
+    base_state: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match content_type {
+        ContentType::Json | ContentType::JsonArray => create_yjs_json_update(content, base_state),
+        ContentType::Jsonl => create_yjs_jsonl_update(content, base_state),
+        ContentType::Text | ContentType::Xml => {
+            Err("create_yjs_structured_update only handles JSON/JSONL content types".into())
+        }
+    }
 }
 
 /// Create a Yjs update that applies a JSON replacement.

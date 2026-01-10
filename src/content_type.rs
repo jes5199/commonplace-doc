@@ -10,7 +10,7 @@
 ///
 /// Each variant maps to a specific Yrs CRDT structure and has associated
 /// MIME types and default content.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContentType {
     /// JSON object (`{}`) using Y.Map
     Json,
