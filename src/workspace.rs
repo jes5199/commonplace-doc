@@ -3,11 +3,10 @@
 //! Provides utilities for resolving file paths to UUIDs within a synced workspace.
 
 use crate::fs::{Entry, FsSchema};
+use crate::sync::schema_io::SCHEMA_FILENAME;
 use chrono::TimeZone;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-const SCHEMA_FILENAME: &str = ".commonplace.json";
 
 /// Error type for workspace operations
 #[derive(Debug)]

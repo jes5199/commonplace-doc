@@ -15,14 +15,11 @@ use clap::Parser;
 use commonplace_doc::{
     cli::CmdArgs,
     mqtt::{CommandMessage, MqttClient, MqttConfig, Topic},
-    sync::state_file::SyncStateFile,
+    sync::{state_file::SyncStateFile, SCHEMA_FILENAME},
 };
 use rumqttc::QoS;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-/// Schema filename used to identify synced directories
-const SCHEMA_FILENAME: &str = ".commonplace.json";
 
 /// Resolve a path argument to a commonplace document path.
 ///

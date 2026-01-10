@@ -10,12 +10,10 @@ use clap::Parser;
 use commonplace_doc::{
     cli::UuidArgs,
     fs::{Entry, FsSchema},
+    sync::SCHEMA_FILENAME,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
-
-/// Schema filename used to identify synced directories
-const SCHEMA_FILENAME: &str = ".commonplace.json";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = UuidArgs::parse();

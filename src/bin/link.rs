@@ -13,15 +13,12 @@ use clap::Parser;
 use commonplace_doc::{
     cli::LinkArgs,
     fs::{DocEntry, Entry, FsSchema},
-    sync::client::push_schema_to_server,
+    sync::{client::push_schema_to_server, SCHEMA_FILENAME},
 };
 use reqwest::Client;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-/// Schema filename used to identify synced directories
-const SCHEMA_FILENAME: &str = ".commonplace.json";
 
 /// Represents which schema file a path resolves to
 struct ResolvedPath {

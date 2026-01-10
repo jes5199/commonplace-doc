@@ -2,6 +2,7 @@
 
 use crate::fs::{DirEntry, DocEntry, Entry, FsSchema};
 use crate::sync::content_type::{detect_from_path, is_allowed_extension, is_binary_content};
+use crate::sync::schema_io::SCHEMA_FILENAME;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -9,9 +10,6 @@ use std::io;
 use std::path::Path;
 use thiserror::Error;
 use tracing::warn;
-
-/// Schema filename for preserving node_ids
-const SCHEMA_FILENAME: &str = ".commonplace.json";
 
 /// Load existing node_ids from .commonplace.json if present.
 /// Recursively loads from nested .commonplace.json files for node-backed directories.

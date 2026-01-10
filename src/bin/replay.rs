@@ -8,12 +8,11 @@
 use clap::Parser;
 use commonplace_doc::cli::ReplayArgs;
 use commonplace_doc::fs::{Entry, FsSchema};
+use commonplace_doc::sync::SCHEMA_FILENAME;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-
-const SCHEMA_FILENAME: &str = ".commonplace.json";
 
 #[derive(Deserialize)]
 struct CommitChange {
