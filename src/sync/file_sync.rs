@@ -27,6 +27,44 @@ pub const BARRIER_RETRY_COUNT: u32 = 5;
 /// Delay between retries when checking for stable content
 pub const BARRIER_RETRY_DELAY: Duration = Duration::from_millis(50);
 
+/// Handle refresh logic after an upload attempt.
+///
+/// This helper encapsulates the common pattern of refreshing from HEAD after upload,
+/// handling both success and failure cases consistently. If refresh is needed and
+/// upload succeeded, it attempts to refresh from HEAD. If either upload or refresh
+/// fails, it sets the needs_head_refresh flag so refresh is retried later.
+///
+/// # Arguments
+/// * `should_refresh` - Whether a refresh was requested (e.g., due to skipped SSE events)
+/// * `upload_succeeded` - Whether the upload operation succeeded
+/// * Other args are passed through to `refresh_from_head`
+#[allow(clippy::too_many_arguments)]
+async fn handle_upload_refresh(
+    client: &Client,
+    server: &str,
+    identifier: &str,
+    file_path: &PathBuf,
+    state: &Arc<RwLock<SyncState>>,
+    use_paths: bool,
+    should_refresh: bool,
+    upload_succeeded: bool,
+) {
+    if should_refresh {
+        if upload_succeeded {
+            let refresh_succeeded =
+                refresh_from_head(client, server, identifier, file_path, state, use_paths).await;
+            if !refresh_succeeded {
+                let mut s = state.write().await;
+                s.needs_head_refresh = true;
+            }
+        } else {
+            // Upload failed - re-set the flag so we try again next time
+            let mut s = state.write().await;
+            s.needs_head_refresh = true;
+        }
+    }
+}
+
 /// Ensures text content ends with a trailing newline.
 /// This is important for text files (especially JSON) to maintain proper formatting.
 fn ensure_trailing_newline(content: &str) -> String {
@@ -260,29 +298,17 @@ pub async fn upload_task(
                         false
                     }
                 };
-            // Refresh from HEAD if server edits were skipped AND upload succeeded
-            // IMPORTANT: Don't refresh after failed upload to avoid overwriting local edits
-            if should_refresh {
-                if json_upload_succeeded {
-                    let refresh_succeeded = refresh_from_head(
-                        &client,
-                        &server,
-                        &identifier,
-                        &file_path,
-                        &state,
-                        use_paths,
-                    )
-                    .await;
-                    if !refresh_succeeded {
-                        let mut s = state.write().await;
-                        s.needs_head_refresh = true;
-                    }
-                } else {
-                    // Upload failed - re-set the flag so we try again next time
-                    let mut s = state.write().await;
-                    s.needs_head_refresh = true;
-                }
-            }
+            handle_upload_refresh(
+                &client,
+                &server,
+                &identifier,
+                &file_path,
+                &state,
+                use_paths,
+                should_refresh,
+                json_upload_succeeded,
+            )
+            .await;
             continue;
         }
 
@@ -303,26 +329,17 @@ pub async fn upload_task(
                     false
                 }
             };
-            if should_refresh {
-                if jsonl_upload_succeeded {
-                    let refresh_succeeded = refresh_from_head(
-                        &client,
-                        &server,
-                        &identifier,
-                        &file_path,
-                        &state,
-                        use_paths,
-                    )
-                    .await;
-                    if !refresh_succeeded {
-                        let mut s = state.write().await;
-                        s.needs_head_refresh = true;
-                    }
-                } else {
-                    let mut s = state.write().await;
-                    s.needs_head_refresh = true;
-                }
-            }
+            handle_upload_refresh(
+                &client,
+                &server,
+                &identifier,
+                &file_path,
+                &state,
+                use_paths,
+                should_refresh,
+                jsonl_upload_succeeded,
+            )
+            .await;
             continue;
         }
 
@@ -677,26 +694,17 @@ pub async fn upload_task_with_flock(
             } else {
                 error!("JSON upload failed");
             }
-            if should_refresh {
-                if json_upload_succeeded {
-                    let refresh_succeeded = refresh_from_head(
-                        &client,
-                        &server,
-                        &identifier,
-                        &file_path,
-                        &state,
-                        use_paths,
-                    )
-                    .await;
-                    if !refresh_succeeded {
-                        let mut s = state.write().await;
-                        s.needs_head_refresh = true;
-                    }
-                } else {
-                    let mut s = state.write().await;
-                    s.needs_head_refresh = true;
-                }
-            }
+            handle_upload_refresh(
+                &client,
+                &server,
+                &identifier,
+                &file_path,
+                &state,
+                use_paths,
+                should_refresh,
+                json_upload_succeeded,
+            )
+            .await;
             continue;
         }
 
@@ -714,26 +722,17 @@ pub async fn upload_task_with_flock(
             } else {
                 error!("JSONL upload failed");
             }
-            if should_refresh {
-                if jsonl_upload_succeeded {
-                    let refresh_succeeded = refresh_from_head(
-                        &client,
-                        &server,
-                        &identifier,
-                        &file_path,
-                        &state,
-                        use_paths,
-                    )
-                    .await;
-                    if !refresh_succeeded {
-                        let mut s = state.write().await;
-                        s.needs_head_refresh = true;
-                    }
-                } else {
-                    let mut s = state.write().await;
-                    s.needs_head_refresh = true;
-                }
-            }
+            handle_upload_refresh(
+                &client,
+                &server,
+                &identifier,
+                &file_path,
+                &state,
+                use_paths,
+                should_refresh,
+                jsonl_upload_succeeded,
+            )
+            .await;
             continue;
         }
 
