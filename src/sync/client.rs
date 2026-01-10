@@ -112,38 +112,37 @@ pub async fn push_schema_to_server(
     fs_root_id: &str,
     schema_json: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Use shared URL builders (schemas always use ID-based URLs, not paths)
-    let head_url = build_head_url(server, fs_root_id, false);
     let edit_url = build_edit_url(server, fs_root_id, false);
 
     // First fetch current server content and state
-    let head_resp = client.get(&head_url).send().await?;
-    let (old_content, base_state) = if head_resp.status().is_success() {
-        let head: HeadResponse = head_resp.json().await?;
-        (Some(head.content), head.state)
-    } else {
-        // Document doesn't exist, create it first
-        info!("Creating document {} before pushing schema", fs_root_id);
-        let create_url = format!("{}/docs", server);
-        let create_resp = client
-            .post(&create_url)
-            .json(&serde_json::json!({
-                "type": "document",
-                "id": fs_root_id,
-                "content_type": "application/json"
-            }))
-            .send()
-            .await?;
-        if !create_resp.status().is_success() {
-            let status = create_resp.status();
-            let body = create_resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "Failed to create document {}: {} - {}",
-                fs_root_id, status, body
-            )
-            .into());
+    let (old_content, base_state) = match fetch_head(client, server, fs_root_id, false).await {
+        Ok(Some(head)) => (Some(head.content), head.state),
+        Ok(None) | Err(FetchHeadError::Status(_, _)) => {
+            // Document doesn't exist, create it first
+            info!("Creating document {} before pushing schema", fs_root_id);
+            let create_url = format!("{}/docs", server);
+            let create_resp = client
+                .post(&create_url)
+                .json(&serde_json::json!({
+                    "type": "document",
+                    "id": fs_root_id,
+                    "content_type": "application/json"
+                }))
+                .send()
+                .await?;
+            if !create_resp.status().is_success() {
+                let status = create_resp.status();
+                let body = create_resp.text().await.unwrap_or_default();
+                return Err(format!(
+                    "Failed to create document {}: {} - {}",
+                    fs_root_id, status, body
+                )
+                .into());
+            }
+            (None, None)
         }
-        (None, None)
+        Err(FetchHeadError::Request(e)) => return Err(e.into()),
+        Err(FetchHeadError::Parse(e)) => return Err(e.into()),
     };
 
     // Skip update if schema hasn't changed (prevents feedback loops)
@@ -193,17 +192,15 @@ pub async fn delete_schema_entry(
     fs_root_id: &str,
     entry_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Use shared URL builders (schemas always use ID-based URLs, not paths)
-    let head_url = build_head_url(server, fs_root_id, false);
     let edit_url = build_edit_url(server, fs_root_id, false);
 
     // Fetch current server state
-    let head_resp = client.get(&head_url).send().await?;
-    let base_state = if head_resp.status().is_success() {
-        let head: HeadResponse = head_resp.json().await?;
-        head.state
-    } else {
-        None
+    let base_state = match fetch_head(client, server, fs_root_id, false).await {
+        Ok(Some(head)) => head.state,
+        Ok(None) => None,
+        Err(FetchHeadError::Status(_, _)) => None,
+        Err(FetchHeadError::Request(e)) => return Err(e.into()),
+        Err(FetchHeadError::Parse(e)) => return Err(e.into()),
     };
 
     // Create an update that deletes just this entry
@@ -428,31 +425,24 @@ pub async fn push_file_content(
     use_paths: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // First check if there's existing content
-    let head_url = build_head_url(server, identifier, use_paths);
-    let head_resp = client.get(&head_url).send().await;
-
-    match head_resp {
-        Ok(resp) if resp.status().is_success() => {
-            let head: HeadResponse = resp.json().await?;
-            if let Some(parent_cid) = head.cid {
-                // Use replace endpoint
-                let replace_url = build_replace_url(server, identifier, &parent_cid, use_paths);
-                let resp = client
-                    .post(&replace_url)
-                    .header("content-type", "text/plain")
-                    .body(content.to_string())
-                    .send()
-                    .await?;
-                if resp.status().is_success() {
-                    let result: ReplaceResponse = resp.json().await?;
-                    let mut s = state.write().await;
-                    s.last_written_cid = Some(result.cid);
-                    s.last_written_content = content.to_string();
-                }
-                return Ok(());
+    if let Ok(Some(head)) = fetch_head(client, server, identifier, use_paths).await {
+        if let Some(parent_cid) = head.cid {
+            // Use replace endpoint
+            let replace_url = build_replace_url(server, identifier, &parent_cid, use_paths);
+            let resp = client
+                .post(&replace_url)
+                .header("content-type", "text/plain")
+                .body(content.to_string())
+                .send()
+                .await?;
+            if resp.status().is_success() {
+                let result: ReplaceResponse = resp.json().await?;
+                let mut s = state.write().await;
+                s.last_written_cid = Some(result.cid);
+                s.last_written_content = content.to_string();
             }
+            return Ok(());
         }
-        _ => {}
     }
 
     // No existing content, use edit endpoint with retry for node creation
