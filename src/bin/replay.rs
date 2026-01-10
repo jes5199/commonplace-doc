@@ -6,7 +6,7 @@
 //!   commonplace-replay path/to/file.txt --at <cid>   # Show content at commit
 
 use clap::Parser;
-use commonplace_doc::cli::{HeadResponse, ReplayArgs};
+use commonplace_doc::cli::{fetch_head, ReplayArgs};
 use commonplace_doc::fs::{Entry, FsSchema};
 use commonplace_doc::sync::SCHEMA_FILENAME;
 use reqwest::Client;
@@ -115,20 +115,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         // Fetch content (optionally at specific commit)
-        let url = if let Some(ref at) = args.at {
-            format!("{}/docs/{}/head?at_commit={}", args.server, uuid, at)
-        } else {
-            format!("{}/docs/{}/head", args.server, uuid)
+        let head = match fetch_head(&client, &args.server, &uuid, args.at.as_deref()).await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
         };
-
-        let resp = client.get(&url).send().await?;
-
-        if !resp.status().is_success() {
-            eprintln!("Failed to fetch content: HTTP {}", resp.status());
-            std::process::exit(1);
-        }
-
-        let head: HeadResponse = resp.json().await?;
 
         // Also fetch commit count for context (unless showing historical content)
         let commit_count = if args.at.is_none() {

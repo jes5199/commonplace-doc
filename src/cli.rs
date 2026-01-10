@@ -339,3 +339,36 @@ pub struct HeadResponse {
     pub cid: Option<String>,
     pub content: Option<String>,
 }
+
+/// Fetch document HEAD from the server.
+///
+/// Builds the appropriate URL and makes a GET request to retrieve the
+/// document head, optionally at a specific commit.
+///
+/// # Errors
+/// Returns an error string if the request fails or returns non-success status.
+pub async fn fetch_head(
+    client: &reqwest::Client,
+    server: &str,
+    uuid: &str,
+    at_commit: Option<&str>,
+) -> Result<HeadResponse, String> {
+    let url = match at_commit {
+        Some(commit) => format!("{}/docs/{}/head?at_commit={}", server, uuid, commit),
+        None => format!("{}/docs/{}/head", server, uuid),
+    };
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch content: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Failed to fetch content: HTTP {}", resp.status()));
+    }
+
+    resp.json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))
+}

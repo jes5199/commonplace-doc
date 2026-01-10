@@ -6,7 +6,7 @@
 //!   commonplace-show --stat path/to/file.txt        # Show with change stats
 
 use clap::Parser;
-use commonplace_doc::cli::{HeadResponse, ShowArgs};
+use commonplace_doc::cli::{fetch_head, HeadResponse, ShowArgs};
 use commonplace_doc::workspace::{format_timestamp, resolve_path_to_uuid};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -56,20 +56,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new();
 
     // Fetch content (optionally at specific commit)
-    let url = if let Some(ref commit) = args.commit {
-        format!("{}/docs/{}/head?at_commit={}", args.server, uuid, commit)
-    } else {
-        format!("{}/docs/{}/head", args.server, uuid)
+    let head = match fetch_head(&client, &args.server, &uuid, args.commit.as_deref()).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
     };
-
-    let resp = client.get(&url).send().await?;
-
-    if !resp.status().is_success() {
-        eprintln!("Failed to fetch content: HTTP {}", resp.status());
-        std::process::exit(1);
-    }
-
-    let head: HeadResponse = resp.json().await?;
 
     // Get commit info (timestamp, etc.)
     let commit_info: Option<CommitChange> = if let Some(ref cid) = head.cid {
