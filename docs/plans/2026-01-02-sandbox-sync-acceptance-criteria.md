@@ -1,7 +1,8 @@
 # Sandbox Sync Acceptance Criteria
 
 **Date:** 2026-01-02
-**Status:** Draft
+**Updated:** 2026-01-10
+**Status:** Active
 
 ## Overview
 
@@ -23,20 +24,40 @@ The workspace directory on the host contains the authoritative structure that th
 
 ## Process Configuration Topology
 
-Each sandbox's sync scope is determined by where its `processes.json` is located. A process syncs at the directory containing its `processes.json`:
+Discovered processes are defined in `__processes.json` files (note the double underscore prefix). Each sandbox's sync scope is determined by where its `__processes.json` is located. A process syncs at the directory containing its `__processes.json`:
 
 ```
 workspace/
-├── processes.json          ← bartleby defined here (syncs entire workspace/)
+├── __processes.json        ← bartleby defined here (syncs entire workspace/)
 ├── bartleby/
-│   └── (no processes.json - bartleby is defined at root level)
+│   └── (no __processes.json - bartleby is defined at root level)
 ├── text-to-telegram/
-│   └── processes.json      ← text-to-telegram defined here (syncs only this subdirectory)
+│   └── __processes.json    ← text-to-telegram defined here (syncs only this subdirectory)
 └── tmux/
-    └── processes.json      ← file-tmux-file defined here (syncs only this subdirectory)
+    └── __processes.json    ← file-tmux-file defined here (syncs only this subdirectory)
 ```
 
-**Key principle:** If a process needs access to the entire workspace tree, define it in `workspace/processes.json`. If a process only needs its own subdirectory, define it in `workspace/<subdirectory>/processes.json`.
+**Key principle:** If a process needs access to the entire workspace tree, define it in `workspace/__processes.json`. If a process only needs its own subdirectory, define it in `workspace/<subdirectory>/__processes.json`.
+
+### Process Definition Format
+
+Each `__processes.json` contains a `processes` object with named process definitions:
+
+```json
+{
+  "processes": {
+    "bartleby": {
+      "sandbox-exec": "/home/jes/.local/bin/uv run --project /home/jes/bartleby python /home/jes/bartleby/bartleby.py"
+    }
+  }
+}
+```
+
+The `sandbox-exec` field specifies the command to run inside a sandbox. The orchestrator automatically:
+1. Creates a temporary sandbox directory
+2. Starts a sync process for that sandbox
+3. Sets environment variables (COMMONPLACE_SERVER, COMMONPLACE_PATH)
+4. Runs the specified command
 
 ## UUID Link Topology
 
@@ -56,32 +77,79 @@ workspace/
 - `text-to-telegram/content.txt` and `bartleby/prompts.txt` share UUID-A
 - `bartleby/output.txt` and `text-to-telegram/input.txt` share UUID-B
 
+## Orchestrator Configuration
+
+The orchestrator is configured via `commonplace.json` in the project root:
+
+```json
+{
+  "database": "./data/commonplace.redb",
+  "mqtt_broker": "localhost:1883",
+  "managed_paths": ["/"],
+  "processes": {
+    "server": {
+      "command": "./target/release/commonplace-server",
+      "args": ["--fs-root", "workspace"],
+      "restart": { "policy": "always", "backoff_ms": 500, "max_backoff_ms": 10000 }
+    },
+    "sync": {
+      "command": "./target/release/commonplace-sync",
+      "args": ["--server", "http://localhost:3000", "--node", "workspace", "--directory", "./workspace", "--initial-sync", "local"],
+      "restart": { "policy": "always", "backoff_ms": 500, "max_backoff_ms": 10000 },
+      "depends_on": ["server"]
+    }
+  }
+}
+```
+
+**Key fields:**
+- `database`: Path to the redb database file. The orchestrator automatically passes `--database` to the server.
+- `managed_paths`: Paths to monitor for `__processes.json` discovery (use `["/"]` for recursive)
+- `processes`: Base processes (server, sync) that the orchestrator manages directly
+
 ## Acceptance Criteria Checklist
 
 ### Prerequisites
 
-Start these processes in order:
+Start the orchestrator (it manages everything else):
 
 ```bash
-# 1. Server (with persistence)
-./target/release/commonplace-server --database ./data.redb --fs-root workspace
+# Build release binaries
+cargo build --release
 
-# 2. Workspace sync (syncs local ./workspace to server)
-./target/release/commonplace-sync --server http://localhost:3000 --directory ./workspace --path ""
-
-# 3. Orchestrator (discovers processes.json files from server, starts sandbox syncs)
-./target/release/commonplace-orchestrator --server http://localhost:3000
+# Start orchestrator (manages server, sync, and discovered processes)
+./target/release/commonplace-orchestrator
 ```
 
-The orchestrator uses recursive discovery mode by default. It reads `processes.json` files from the server's fs-root and automatically starts sandbox sync processes for each one.
+The orchestrator:
+1. Starts the server with `--database` from config
+2. Waits for server health check
+3. Starts the workspace sync
+4. Discovers `__processes.json` files via SSE subscription
+5. Starts sandbox processes for each discovered process
 
-> **Note:** An older `commonplace.json` config may reference `sandbox-workspace` - this is outdated. The standard is `workspace`.
+Check status with `commonplace-ps`:
 
-- [ ] **P1**: Server is running with `--database` and `--fs-root workspace`
-- [ ] **P2**: Workspace sync is running: `commonplace-sync --directory ./workspace --path ""`
-- [ ] **P3**: Orchestrator is running and has started both sandbox processes
-- [ ] **P4**: Bartleby sandbox exists at `/tmp/commonplace-sandbox-*/` with full workspace tree (including `bartleby/` subdirectory)
-- [ ] **P5**: Text-to-telegram sandbox exists at `/tmp/commonplace-sandbox-*/` with `text-to-telegram/` files only
+```bash
+$ commonplace-ps
+Orchestrator PID: 12345 (started at 2026-01-10 19:36:56)
+
+NAME                           PID STATE      SOURCE               CWD
+----------------------------------------------------------------------------------------------------
+bartleby                   12350 Running    /                    /tmp/commonplace-sandbox-abc123
+beads-sync                 12348 Running    (commonplace.json)   /home/jes/commonplace
+file-tmux-file             12351 Running    /tmux                /tmp/commonplace-sandbox-def456
+server                     12346 Running    (commonplace.json)   /home/jes/commonplace
+sync                       12347 Running    (commonplace.json)   /home/jes/commonplace
+text-to-telegram           12352 Running    /text-to-telegram    /tmp/commonplace-sandbox-ghi789
+```
+
+- [ ] **P1**: Orchestrator is running: `commonplace-ps` shows orchestrator PID
+- [ ] **P2**: Server is running with database persistence
+- [ ] **P3**: Workspace sync is running
+- [ ] **P4**: Bartleby is discovered and running (source: `/`)
+- [ ] **P5**: Text-to-telegram is discovered and running (source: `/text-to-telegram`)
+- [ ] **P6**: File-tmux-file is discovered and running (source: `/tmux`)
 
 ### File Creation Propagation
 
@@ -157,11 +225,11 @@ This tests the full message round-trip using UUID-linked files.
 
 ### Offline Editing
 
-- [ ] **O1**: Stop the workspace sync process (Ctrl-C or kill)
+- [ ] **O1**: Stop the workspace sync process: `commonplace-signal -n sync -s TERM`
 - [ ] **O2**: Edit `workspace/bartleby/system_prompt.txt` to append "offline edit test"
 - [ ] **O3**: Verify the server content has NOT changed (edit was local only)
-- [ ] **O4**: Restart the workspace sync process
-- [ ] **O5**: Within 5 seconds of startup, verify server content now includes "offline edit test"
+- [ ] **O4**: Wait for orchestrator to restart sync (automatic restart policy)
+- [ ] **O5**: Within 5 seconds of restart, verify server content now includes "offline edit test"
 - [ ] **O6**: Verify bartleby sandbox `bartleby/system_prompt.txt` also received the edit
 
 ### End-to-End Integration
@@ -177,76 +245,99 @@ This tests the full message round-trip using UUID-linked files.
 
 > **IMPORTANT:** Text-to-telegram MUST write to `text-to-telegram/content.txt` (the UUID-linked file),
 > not `content.txt` at workspace root. If messages appear in `workspace/content.txt`, the sandbox
-> configuration is wrong - text-to-telegram needs its own subdirectory processes.json so it only
+> configuration is wrong - text-to-telegram needs its own subdirectory `__processes.json` so it only
 > sees its own files.
 
 ### Process Termination Cascade
 
 When the orchestrator is killed, all managed processes and their children should terminate.
 
-- [ ] **T1**: Record the PIDs of all running processes:
-  - Orchestrator PID
-  - Bartleby sandbox sync PID
-  - Bartleby process PID (python/uv)
-  - Text-to-telegram sandbox sync PID
-  - Text-to-telegram process PID
-- [ ] **T2**: Kill only the orchestrator: `kill <orchestrator-pid>`
-- [ ] **T3**: Within 5 seconds, verify all sandbox sync processes have terminated
-- [ ] **T4**: Verify all subprocess PIDs (bartleby, text-to-telegram) have terminated
-- [ ] **T5**: Verify no orphaned python/node processes remain from managed sandboxes
-- [ ] **T6**: Verify sandbox directories are cleaned up (or marked for cleanup on restart)
+- [ ] **T1**: Record the PIDs: `commonplace-ps`
+- [ ] **T2**: Kill only the orchestrator: `kill $(commonplace-ps --json | jq -r '.orchestrator_pid')`
+- [ ] **T3**: Within 5 seconds, verify all processes have terminated: `ps aux | grep commonplace`
+- [ ] **T4**: Verify no orphaned python/node processes remain from managed sandboxes
+- [ ] **T5**: Verify sandbox directories still exist (cleanup happens on next orchestrator start)
 
 > **Note:** This tests graceful shutdown cascade. Use `kill` (SIGTERM), not `kill -9` (SIGKILL), to allow proper cleanup signal propagation.
+
+### Process Hot-Reload
+
+The orchestrator watches `__processes.json` files and restarts processes when configuration changes.
+
+- [ ] **H1**: Edit `workspace/__processes.json` to change bartleby's command slightly
+- [ ] **H2**: Within 10 seconds, verify bartleby process restarted with new PID: `commonplace-ps`
+- [ ] **H3**: Add a new process to `workspace/__processes.json`
+- [ ] **H4**: Within 10 seconds, verify new process appears in `commonplace-ps`
+- [ ] **H5**: Remove a process from `workspace/__processes.json`
+- [ ] **H6**: Within 10 seconds, verify process is stopped and removed from `commonplace-ps`
 
 ## Cleanup
 
 - [ ] **X1**: Remove any test files created during verification
-- [ ] **X2**: Verify sandbox directories still exist and processes are healthy
+- [ ] **X2**: Verify sandbox directories still exist and processes are healthy: `commonplace-ps`
 
 ## Environment Reset
 
 To fully reset the environment after testing:
 
 ```bash
-# 1. Stop all processes
+# 1. Stop orchestrator (stops all managed processes)
 pkill -f commonplace-orchestrator
-pkill -f commonplace-sync
-pkill -f commonplace-server
 
-# 2. Clean up sandbox directories
+# 2. Wait for graceful shutdown
+sleep 5
+
+# 3. Clean up sandbox directories
 rm -rf /tmp/commonplace-sandbox-*
 
-# 3. Remove test files from workspace
+# 4. Remove test files from workspace
 rm -f workspace/text-to-telegram/test-file.txt
 rm -f workspace/bartleby/test-note.txt
 rm -f workspace/shared-a.txt
 rm -f workspace/bartleby/shared-b.txt
 
-# 4. (Optional) Reset database for fresh start
-rm -f ./data.redb
+# 5. (Optional) Reset database for fresh start
+rm -f ./data/commonplace.redb
 
-# 5. (Optional) Remove sync state files
+# 6. (Optional) Remove sync state files
 find workspace -name ".commonplace-sync-state.json" -delete
 
-# 6. Restart services
-./target/release/commonplace-server --database ./data.redb --fs-root workspace &
-sleep 2
-./target/release/commonplace-sync --server http://localhost:3000 --directory ./workspace --path "" &
-sleep 3
-./target/release/commonplace-orchestrator --server http://localhost:3000 &
+# 7. Restart orchestrator
+./target/release/commonplace-orchestrator
 ```
 
-> **Note:** Removing the database (step 4) will lose all document history. Only do this if you want a completely fresh start.
+> **Note:** Removing the database (step 5) will lose all document history. Only do this if you want a completely fresh start.
+
+## CLI Tools Reference
+
+| Command | Description |
+|---------|-------------|
+| `commonplace-ps` | List all managed processes and their status |
+| `commonplace-signal -n <name> -s <signal>` | Send signal to a named process |
+| `commonplace-uuid <path>` | Get UUID for a synced file |
+| `commonplace-replay <path> --list` | List commit history for a file |
+| `commonplace-link <source> <target>` | Link two files to share same UUID |
 
 ## Notes
 
 - All sync propagation should complete within 5 seconds under normal conditions
-- If a step fails, check the sync logs at `/tmp/sync.log` and `/tmp/orchestrator.log`
+- Use `commonplace-ps` to check process status and find sandbox paths
 - The Yjs CRDT ensures that concurrent edits merge correctly without conflicts
 - Files with shared UUIDs are logically the same document - changes anywhere appear everywhere
-- Bartleby is a non-deterministic AI agent - his responses will vary between runs, so only verify that *some* response was generated, not the exact content
+- Bartleby is a non-deterministic AI agent - his responses will vary between runs
 - Bartleby's sandbox has the full workspace tree, allowing it to see files outside its primary directory
 - Text-to-telegram's sandbox only contains its own subdirectory files
+- Database persistence is critical - without `--database`, server loses all data on restart
+
+## Sync Protection
+
+The sync system includes three-layer protection against data loss during concurrent edits:
+
+1. **Shadow Hardlinks**: Detect writes to old inodes after atomic rename
+2. **Flock Protection**: Coordinate with agents via advisory file locks
+3. **Ancestry Checking**: Ensure causal ordering of CRDT commits
+
+See `docs/SYNC_PROTECTION.md` for detailed documentation.
 
 ## Offline Editing Behavior
 
@@ -258,3 +349,21 @@ When sync is not running and files are edited locally, the sync process should d
 2. On startup, sync compares local file hashes against the stored state
 3. Any files that changed locally while sync was down are automatically pushed to the server
 4. This ensures no edits are lost when sync restarts
+
+## Troubleshooting
+
+### Server shows "Failed" state
+Check if the database file is locked by another process. The server requires exclusive access to the database file.
+
+### Processes not discovered
+1. Verify `__processes.json` exists and has valid JSON
+2. Check that the file is synced to server: `curl http://localhost:3000/docs/<uuid>/head`
+3. Check orchestrator logs for discovery errors
+
+### Sandbox files not syncing
+1. Verify sandbox sync is running: `commonplace-ps`
+2. Check sandbox directory exists: look at CWD column in `commonplace-ps`
+3. Verify the sandbox has correct files: `ls /tmp/commonplace-sandbox-*/`
+
+### Empty `__processes.json` after restart
+If the server restarts without database persistence, it loses all data. When sync reconnects, it may pull empty content from the server and overwrite local files. Always ensure the `database` field is set in `commonplace.json`.
