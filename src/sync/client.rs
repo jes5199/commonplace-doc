@@ -174,6 +174,31 @@ pub async fn push_json_content(
     state: &Arc<RwLock<SyncState>>,
     use_paths: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    push_json_content_impl(client, server, identifier, content, state, use_paths, false).await
+}
+
+/// Push JSON content with merge semantics (additive, preserves other clients' entries).
+pub async fn push_json_content_merge(
+    client: &Client,
+    server: &str,
+    identifier: &str,
+    content: &str,
+    state: &Arc<RwLock<SyncState>>,
+    use_paths: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    push_json_content_impl(client, server, identifier, content, state, use_paths, true).await
+}
+
+/// Internal implementation for pushing JSON content with optional merge mode.
+async fn push_json_content_impl(
+    client: &Client,
+    server: &str,
+    identifier: &str,
+    content: &str,
+    state: &Arc<RwLock<SyncState>>,
+    use_paths: bool,
+    merge: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let head_url = build_head_url(server, identifier, use_paths);
     let edit_url = build_edit_url(server, identifier, use_paths);
     let mut attempts = 0;
@@ -191,14 +216,30 @@ pub async fn push_json_content(
             continue;
         }
 
-        let base_state = if head_resp.status().is_success() {
+        let (old_content, base_state) = if head_resp.status().is_success() {
             let head: HeadResponse = head_resp.json().await?;
-            head.state
+            (Some(head.content), head.state)
         } else {
-            None
+            (None, None)
         };
 
-        let update = create_yjs_json_update(content, base_state.as_deref())?;
+        // Skip update if content hasn't changed (prevents feedback loops)
+        if let Some(ref old) = old_content {
+            let old_parsed: Result<serde_json::Value, _> = serde_json::from_str(old);
+            let new_parsed: Result<serde_json::Value, _> = serde_json::from_str(content);
+            if let (Ok(old_json), Ok(new_json)) = (old_parsed, new_parsed) {
+                if old_json == new_json {
+                    debug!("JSON content unchanged, skipping push");
+                    return Ok(());
+                }
+            }
+        }
+
+        let update = if merge {
+            create_yjs_json_merge(content, base_state.as_deref())?
+        } else {
+            create_yjs_json_update(content, base_state.as_deref())?
+        };
         let edit_req = EditRequest {
             update,
             author: Some("sync-client".to_string()),
