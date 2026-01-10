@@ -14,12 +14,135 @@ use reqwest::{Client, StatusCode};
 use reqwest_eventsource::{Error as SseError, Event as SseEvent, EventSource};
 use rumqttc::QoS;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
+
+// ============================================================================
+// Shared Helpers
+// ============================================================================
+
+/// Handle a subdirectory schema edit event (shared by SSE and MQTT paths).
+///
+/// This performs the common operations when a subdirectory schema changes:
+/// 1. Cleanup deleted files and orphaned directories
+/// 2. Sync NEW files from server
+/// 3. Create directories for new node-backed subdirectories
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_subdir_edit(
+    client: &Client,
+    server: &str,
+    subdir_node_id: &str,
+    subdir_path: &str,
+    subdir_full_path: &Path,
+    directory: &Path,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    use_paths: bool,
+    push_only: bool,
+    pull_only: bool,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    log_prefix: &str,
+) {
+    // First, cleanup deleted files and orphaned directories
+    match handle_subdir_schema_cleanup(
+        client,
+        server,
+        subdir_node_id,
+        subdir_path,
+        subdir_full_path,
+        directory,
+        file_states,
+    )
+    .await
+    {
+        Ok(()) => {
+            debug!(
+                "{}: Subdir {} schema cleanup completed",
+                log_prefix, subdir_path
+            );
+        }
+        Err(e) => {
+            warn!(
+                "{}: Failed to handle subdir {} schema cleanup: {}",
+                log_prefix, subdir_path, e
+            );
+        }
+    }
+
+    // Then, sync NEW files from server
+    match handle_subdir_new_files(
+        client,
+        server,
+        subdir_node_id,
+        subdir_path,
+        subdir_full_path,
+        directory,
+        file_states,
+        use_paths,
+        push_only,
+        pull_only,
+        #[cfg(unix)]
+        inode_tracker,
+    )
+    .await
+    {
+        Ok(()) => {
+            debug!(
+                "{}: Subdir {} new files sync completed",
+                log_prefix, subdir_path
+            );
+        }
+        Err(e) => {
+            warn!(
+                "{}: Failed to sync new files for subdir {}: {}",
+                log_prefix, subdir_path, e
+            );
+        }
+    }
+
+    // Also create directories for any NEW node-backed subdirectories
+    if let Err(e) =
+        create_subdir_nested_directories(client, server, subdir_node_id, subdir_full_path).await
+    {
+        warn!(
+            "{}: Failed to create nested directories for subdir {}: {}",
+            log_prefix, subdir_path, e
+        );
+    }
+}
+
+/// Collect newly discovered subdirectories that aren't already being watched.
+///
+/// Returns a list of (path, node_id) tuples for subdirs that should be spawned.
+/// Updates the watched_subdirs set with the new entries.
+pub async fn collect_new_subdirs(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    watched_subdirs: &Arc<RwLock<HashSet<String>>>,
+) -> Vec<(String, String)> {
+    let all_subdirs = crate::sync::get_all_node_backed_dir_ids(client, server, fs_root_id).await;
+
+    let mut watched = watched_subdirs.write().await;
+    all_subdirs
+        .into_iter()
+        .filter(|(_, node_id)| {
+            if watched.contains(node_id) {
+                false
+            } else {
+                watched.insert(node_id.clone());
+                true
+            }
+        })
+        .collect()
+}
+
+// ============================================================================
+// SSE Tasks
+// ============================================================================
 
 /// SSE task for directory-level events (watching fs-root).
 ///
@@ -269,31 +392,8 @@ pub async fn subdir_sse_task(
                             info!("Subdir {} schema changed, triggering sync", subdir_path);
                             let subdir_full_path = directory.join(&subdir_path);
 
-                            // First, cleanup deleted files and orphaned directories
-                            match handle_subdir_schema_cleanup(
-                                &client,
-                                &server,
-                                &subdir_node_id,
-                                &subdir_path,
-                                &subdir_full_path,
-                                &directory,
-                                &file_states,
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    debug!("Subdir {} schema cleanup completed", subdir_path);
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to handle subdir {} schema cleanup: {}",
-                                        subdir_path, e
-                                    );
-                                }
-                            }
-
-                            // Then, sync NEW files from server
-                            match handle_subdir_new_files(
+                            // Use shared helper for edit handling
+                            handle_subdir_edit(
                                 &client,
                                 &server,
                                 &subdir_node_id,
@@ -306,63 +406,20 @@ pub async fn subdir_sse_task(
                                 pull_only,
                                 #[cfg(unix)]
                                 inode_tracker.clone(),
+                                "SSE",
                             )
-                            .await
-                            {
-                                Ok(()) => {
-                                    debug!("Subdir {} new files sync completed", subdir_path);
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to sync new files for subdir {}: {}",
-                                        subdir_path, e
-                                    );
-                                }
-                            }
-
-                            // Also create directories for any NEW node-backed subdirectories
-                            // This ensures directories like 0-commonplace get created when added
-                            if let Err(e) = create_subdir_nested_directories(
-                                &client,
-                                &server,
-                                &subdir_node_id,
-                                &subdir_full_path,
-                            )
-                            .await
-                            {
-                                warn!(
-                                    "Failed to create nested directories for subdir {}: {}",
-                                    subdir_path, e
-                                );
-                            }
+                            .await;
 
                             // Check for newly discovered nested node-backed subdirs and spawn SSE tasks
-                            // This handles cases like tmux/0 being created inside tmux
                             if !push_only {
-                                let all_subdirs = crate::sync::get_all_node_backed_dir_ids(
+                                let subdirs_to_spawn = collect_new_subdirs(
                                     &client,
                                     &server,
                                     &fs_root_id,
+                                    &watched_subdirs,
                                 )
                                 .await;
 
-                                // Collect new subdirs to spawn (must drop lock before spawning to avoid Send issues)
-                                let subdirs_to_spawn: Vec<(String, String)> = {
-                                    let mut watched = watched_subdirs.write().await;
-                                    all_subdirs
-                                        .into_iter()
-                                        .filter(|(_, node_id)| {
-                                            if watched.contains(node_id) {
-                                                false
-                                            } else {
-                                                watched.insert(node_id.clone());
-                                                true
-                                            }
-                                        })
-                                        .collect()
-                                };
-
-                                // Spawn tasks after releasing the lock
                                 for (nested_subdir_path, nested_subdir_node_id) in subdirs_to_spawn
                                 {
                                     info!(
@@ -663,31 +720,8 @@ pub async fn subdir_mqtt_task(
                     );
                     let subdir_full_path = directory.join(&subdir_path);
 
-                    // First, cleanup deleted files and orphaned directories
-                    match handle_subdir_schema_cleanup(
-                        &http_client,
-                        &server,
-                        &subdir_node_id,
-                        &subdir_path,
-                        &subdir_full_path,
-                        &directory,
-                        &file_states,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            debug!("MQTT: Subdir {} schema cleanup completed", subdir_path);
-                        }
-                        Err(e) => {
-                            warn!(
-                                "MQTT: Failed to handle subdir {} schema cleanup: {}",
-                                subdir_path, e
-                            );
-                        }
-                    }
-
-                    // Then, sync NEW files from server
-                    match handle_subdir_new_files(
+                    // Use shared helper for edit handling
+                    handle_subdir_edit(
                         &http_client,
                         &server,
                         &subdir_node_id,
@@ -700,61 +734,20 @@ pub async fn subdir_mqtt_task(
                         pull_only,
                         #[cfg(unix)]
                         inode_tracker.clone(),
+                        "MQTT",
                     )
-                    .await
-                    {
-                        Ok(()) => {
-                            debug!("MQTT: Subdir {} new files sync completed", subdir_path);
-                        }
-                        Err(e) => {
-                            warn!(
-                                "MQTT: Failed to sync new files for subdir {}: {}",
-                                subdir_path, e
-                            );
-                        }
-                    }
-
-                    // Also create directories for any NEW node-backed subdirectories
-                    if let Err(e) = create_subdir_nested_directories(
-                        &http_client,
-                        &server,
-                        &subdir_node_id,
-                        &subdir_full_path,
-                    )
-                    .await
-                    {
-                        warn!(
-                            "MQTT: Failed to create nested directories for subdir {}: {}",
-                            subdir_path, e
-                        );
-                    }
+                    .await;
 
                     // Check for newly discovered nested node-backed subdirs and spawn MQTT tasks
                     if !push_only {
-                        let all_subdirs = crate::sync::get_all_node_backed_dir_ids(
+                        let subdirs_to_spawn = collect_new_subdirs(
                             &http_client,
                             &server,
                             &fs_root_id,
+                            &watched_subdirs,
                         )
                         .await;
 
-                        // Collect new subdirs to spawn (must drop lock before spawning to avoid Send issues)
-                        let subdirs_to_spawn: Vec<(String, String)> = {
-                            let mut watched = watched_subdirs.write().await;
-                            all_subdirs
-                                .into_iter()
-                                .filter(|(_, node_id)| {
-                                    if watched.contains(node_id) {
-                                        false
-                                    } else {
-                                        watched.insert(node_id.clone());
-                                        true
-                                    }
-                                })
-                                .collect()
-                        };
-
-                        // Spawn tasks after releasing the lock
                         for (nested_subdir_path, nested_subdir_node_id) in subdirs_to_spawn {
                             info!(
                                 "MQTT: Spawning task for newly discovered nested subdir: {} ({})",
