@@ -87,6 +87,112 @@ pub async fn write_schema_file(
     Ok(())
 }
 
+/// Check if a file path exists in any recently written schema.
+///
+/// This is used for echo detection during file deletion - we should not delete
+/// a file if we recently pushed a schema update containing it, as the server
+/// may not have processed our update yet.
+///
+/// `base_directory` is the directory being synced (the root of the sync), used to
+/// compute relative paths when checking nested schemas.
+async fn path_in_written_schemas(
+    path: &str,
+    base_directory: &Path,
+    written_schemas: Option<&crate::sync::WrittenSchemas>,
+) -> bool {
+    let Some(ws) = written_schemas else {
+        return false;
+    };
+
+    // Wait for read lock - this is safe because schema writes are brief
+    let ws_guard = ws.read().await;
+
+    for (schema_path, schema_content) in ws_guard.iter() {
+        if let Ok(schema) = serde_json::from_str::<FsSchema>(schema_content) {
+            // The schema_path is the canonical path to the .commonplace.json file.
+            // We need to compute the path relative to that schema's directory.
+            //
+            // Example: if we're checking "bartleby/prompts.txt" and the schema is at
+            // "/workspace/bartleby/.commonplace.json", we need to strip "bartleby/"
+            // from the path to get "prompts.txt".
+            let schema_dir = schema_path.parent().unwrap_or(schema_path.as_path());
+
+            // Get the relative path from base_directory to the schema's directory
+            let relative_schema_dir = schema_dir
+                .strip_prefix(base_directory)
+                .unwrap_or(Path::new(""));
+
+            // If the path starts with the schema's relative directory, strip it
+            let relative_path = if relative_schema_dir.as_os_str().is_empty() {
+                // Schema is at base directory, use full path
+                path.to_string()
+            } else {
+                let schema_prefix = relative_schema_dir.to_string_lossy();
+                if let Some(stripped) = path.strip_prefix(&*schema_prefix) {
+                    stripped.strip_prefix('/').unwrap_or(stripped).to_string()
+                } else {
+                    // Path doesn't start with this schema's directory, skip
+                    continue;
+                }
+            };
+
+            if schema_has_path(&schema, &relative_path) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Check if a schema contains an entry for the given path.
+///
+/// This only handles single-level nesting because inline subdirectories are deprecated.
+/// All directories are now node-backed, meaning each subdirectory has its own schema
+/// document stored in `written_schemas` with its own canonical path. Multi-level paths
+/// like "a/b/file.txt" are handled by checking the nested schema at "a/b/.commonplace.json".
+fn schema_has_path(schema: &FsSchema, path: &str) -> bool {
+    let Some(Entry::Dir(ref root)) = schema.root else {
+        return false;
+    };
+
+    let Some(ref entries) = root.entries else {
+        return false;
+    };
+
+    // Handle simple single-level paths
+    if !path.contains('/') {
+        return entries.contains_key(path);
+    }
+
+    // Handle nested paths (e.g., "bartleby/prompts.txt")
+    let parts: Vec<&str> = path.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return entries.contains_key(path);
+    }
+
+    let (first, rest) = (parts[0], parts[1]);
+    if let Some(Entry::Dir(subdir)) = entries.get(first) {
+        // For node-backed directories, the files are defined in a separate schema
+        // document, not in the root schema. We should NOT return true just because
+        // the directory exists - that would prevent all deletions under that directory.
+        // Instead, return false here and let the function continue to check other
+        // written schemas (the nested schema should also be in written_schemas if
+        // we wrote it).
+        if subdir.node_id.is_some() {
+            // Node-backed directory - can't determine from this schema alone
+            // Continue checking other schemas in written_schemas
+            return false;
+        }
+        // Inline directory entries
+        if let Some(ref sub_entries) = subdir.entries {
+            return sub_entries.contains_key(rest);
+        }
+    }
+
+    false
+}
+
 /// Clean up directories that exist on disk but not in the schema.
 ///
 /// After deleting files that were removed from the schema, this function
@@ -1206,6 +1312,17 @@ pub async fn handle_schema_change(
         .collect();
 
     for path in &deleted_paths {
+        // Check if we recently wrote a schema containing this file
+        // This prevents race conditions where we create a file, push schema,
+        // but receive a stale SSE update before the server processes our push
+        if path_in_written_schemas(path, directory, written_schemas).await {
+            debug!(
+                "Skipping deletion of {} - found in recently written schema (echo detection)",
+                path
+            );
+            continue;
+        }
+
         info!("Server removed file: {} - deleting local copy", path);
         let file_path = directory.join(path);
 
