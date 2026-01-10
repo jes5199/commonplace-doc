@@ -5,8 +5,6 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use uuid::Uuid;
 
-use super::urls::build_is_ancestor_url;
-
 #[derive(Debug, Deserialize)]
 struct AncestorResponse {
     is_ancestor: bool,
@@ -28,16 +26,25 @@ pub enum SyncDirection {
 /// Check if `ancestor` is an ancestor of `descendant` in the commit DAG.
 ///
 /// Returns Ok(true) if ancestor is in the history of descendant.
+///
+/// Note: The doc_id parameter is kept for API consistency but the server doesn't actually
+/// use it - commits are global across documents. We use a placeholder "any" in the URL.
 pub async fn is_ancestor(
     client: &Client,
     server_url: &str,
-    doc_id: &str,
+    _doc_id: &str,
     ancestor: &str,
     descendant: &str,
 ) -> Result<bool, reqwest::Error> {
-    // Parse doc_id as UUID, or use a dummy if it's a path-based ID
-    let uuid = Uuid::parse_str(doc_id).unwrap_or_else(|_| Uuid::nil());
-    let url = build_is_ancestor_url(server_url, &uuid, ancestor, descendant);
+    // The server's is-ancestor endpoint doesn't use the doc_id (commits are global),
+    // so we use a placeholder. This avoids issues with path-based identifiers.
+    // URL-encode the CIDs since they may contain special characters.
+    let url = format!(
+        "{}/docs/any/is-ancestor?ancestor={}&descendant={}",
+        server_url,
+        urlencoding::encode(ancestor),
+        urlencoding::encode(descendant)
+    );
     let response: AncestorResponse = client.get(&url).send().await?.json().await?;
     Ok(response.is_ancestor)
 }
@@ -85,15 +92,25 @@ pub async fn determine_sync_direction(
 ///
 /// Returns true only if every pending commit is an ancestor.
 /// Used to verify local edits are included in server's merged state.
+///
+/// Note: The doc_id parameter is kept for API consistency but the server doesn't actually
+/// use it - commits are global across documents. We use a placeholder "any" in the URL.
 pub async fn all_are_ancestors(
     client: &Client,
     server_url: &str,
-    doc_id: &Uuid,
+    _doc_id: &Uuid,
     pending: &HashSet<String>,
     descendant: &str,
 ) -> Result<bool, reqwest::Error> {
     for ancestor in pending {
-        let url = build_is_ancestor_url(server_url, doc_id, ancestor, descendant);
+        // The server's is-ancestor endpoint doesn't use the doc_id (commits are global).
+        // URL-encode the CIDs since they may contain special characters.
+        let url = format!(
+            "{}/docs/any/is-ancestor?ancestor={}&descendant={}",
+            server_url,
+            urlencoding::encode(ancestor),
+            urlencoding::encode(descendant)
+        );
         let response: AncestorResponse = client.get(&url).send().await?.json().await?;
 
         if !response.is_ancestor {

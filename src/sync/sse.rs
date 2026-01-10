@@ -10,6 +10,7 @@ use crate::sync::{
     flock_state::PathState,
 };
 use crate::sync::{
+    ancestry::{determine_sync_direction, SyncDirection},
     build_head_url, build_sse_url, detect_from_path, is_binary_content, looks_like_base64_binary,
     process_pending_inbound_after_confirm, EditEventData, FlockSyncState, HeadResponse,
     PendingWrite, SyncState,
@@ -714,6 +715,46 @@ pub async fn refresh_from_head(
         }
     };
 
+    // Get our last known CID (snapshot from state) to check ancestry
+    let local_cid = state.read().await.last_written_cid.clone();
+
+    // Use CRDT ancestry to determine if we should apply server content.
+    // Only pull if server is ahead of us (our CID is ancestor of server's CID).
+    let server_cid = head.cid.as_deref();
+    let direction = match determine_sync_direction(
+        client,
+        server,
+        identifier,
+        local_cid.as_deref(),
+        server_cid,
+    )
+    .await
+    {
+        Ok(dir) => dir,
+        Err(e) => {
+            // Ancestry check failed - be conservative and skip
+            warn!("Ancestry check failed in refresh: {}", e);
+            return false;
+        }
+    };
+
+    match direction {
+        SyncDirection::Pull | SyncDirection::InSync => {
+            // Server is ahead or we're in sync - proceed with refresh
+            debug!("Ancestry check for refresh: {:?}, proceeding", direction);
+        }
+        SyncDirection::Push => {
+            // We're ahead of server - don't refresh, our content should be pushed
+            debug!("Ancestry check for refresh: Push (local ahead), skipping");
+            return false;
+        }
+        SyncDirection::Diverged => {
+            // Diverged state - skip for now
+            warn!("Ancestry check for refresh: Diverged, skipping");
+            return false;
+        }
+    }
+
     // Read current local file to check for pending changes
     use base64::{engine::general_purpose::STANDARD, Engine};
     let content_info = detect_from_path(file_path);
@@ -854,6 +895,53 @@ pub async fn handle_server_edit(
             return;
         }
     };
+
+    // Get our last known CID (snapshot from state) to check ancestry
+    let local_cid = state.read().await.last_written_cid.clone();
+
+    // Use CRDT ancestry to determine if we should apply server content.
+    // Only pull if server is ahead of us (our CID is ancestor of server's CID).
+    let server_cid = head.cid.as_deref();
+    let direction = match determine_sync_direction(
+        client,
+        server,
+        identifier,
+        local_cid.as_deref(),
+        server_cid,
+    )
+    .await
+    {
+        Ok(dir) => dir,
+        Err(e) => {
+            // Ancestry check failed - be conservative and skip
+            warn!("Ancestry check failed, skipping server edit: {}", e);
+            state.write().await.needs_head_refresh = true;
+            return;
+        }
+    };
+
+    match direction {
+        SyncDirection::Pull | SyncDirection::InSync => {
+            // Server is ahead or we're in sync - proceed with write
+            debug!(
+                "Ancestry check: {:?}, proceeding with server edit",
+                direction
+            );
+        }
+        SyncDirection::Push => {
+            // We're ahead of server - skip, our content should be pushed instead
+            debug!("Ancestry check: Push (local ahead), skipping server edit");
+            state.write().await.needs_head_refresh = true;
+            return;
+        }
+        SyncDirection::Diverged => {
+            // Diverged state - skip for now, let merge handle it
+            // TODO: Implement proper merge for diverged state
+            warn!("Ancestry check: Diverged, skipping server edit (needs merge)");
+            state.write().await.needs_head_refresh = true;
+            return;
+        }
+    }
 
     // Acquire write lock and set up barrier atomically
     let write_id = {
@@ -1123,6 +1211,52 @@ pub async fn handle_server_edit_with_tracker(
             return;
         }
     };
+
+    // Get our last known CID (snapshot from state) to check ancestry
+    let local_cid = state.read().await.last_written_cid.clone();
+
+    // Use CRDT ancestry to determine if we should apply server content.
+    // Only pull if server is ahead of us (our CID is ancestor of server's CID).
+    let server_cid = head.cid.as_deref();
+    let direction = match determine_sync_direction(
+        client,
+        server,
+        identifier,
+        local_cid.as_deref(),
+        server_cid,
+    )
+    .await
+    {
+        Ok(dir) => dir,
+        Err(e) => {
+            // Ancestry check failed - be conservative and skip
+            warn!("Ancestry check failed, skipping server edit: {}", e);
+            state.write().await.needs_head_refresh = true;
+            return;
+        }
+    };
+
+    match direction {
+        SyncDirection::Pull | SyncDirection::InSync => {
+            // Server is ahead or we're in sync - proceed with write
+            debug!(
+                "Ancestry check: {:?}, proceeding with server edit",
+                direction
+            );
+        }
+        SyncDirection::Push => {
+            // We're ahead of server - skip, our content should be pushed instead
+            debug!("Ancestry check: Push (local ahead), skipping server edit");
+            state.write().await.needs_head_refresh = true;
+            return;
+        }
+        SyncDirection::Diverged => {
+            // Diverged state - skip for now, let merge handle it
+            warn!("Ancestry check: Diverged, skipping server edit (needs merge)");
+            state.write().await.needs_head_refresh = true;
+            return;
+        }
+    }
 
     // Acquire write lock and set up barrier atomically
     let write_id = {
