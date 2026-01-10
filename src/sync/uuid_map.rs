@@ -54,6 +54,62 @@ pub async fn fetch_node_id_from_schema(
     uuid_map.get(relative_path).cloned()
 }
 
+/// Fetch the node_id for a subdirectory from the parent schema.
+///
+/// Unlike `fetch_node_id_from_schema` which looks up files, this function
+/// looks up the node_id of a node-backed subdirectory entry.
+pub async fn fetch_subdir_node_id(
+    client: &Client,
+    server: &str,
+    parent_doc_id: &str,
+    subdir_name: &str,
+) -> Option<String> {
+    use crate::sync::fetch_head;
+    use crate::sync::FetchHeadError;
+
+    let head = match fetch_head(client, server, parent_doc_id, false).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            warn!("No HEAD for parent document {}", parent_doc_id);
+            return None;
+        }
+        Err(FetchHeadError::Status(_, _)) => {
+            warn!("Document {} not found", parent_doc_id);
+            return None;
+        }
+        Err(e) => {
+            warn!("Failed to fetch HEAD for {}: {:?}", parent_doc_id, e);
+            return None;
+        }
+    };
+
+    let schema: FsSchema = match serde_json::from_str(&head.content) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "Document {} failed to parse as schema ({})",
+                parent_doc_id, e
+            );
+            return None;
+        }
+    };
+
+    // Look up the subdirectory entry in the root entries
+    if let Some(ref root) = schema.root {
+        if let crate::fs::Entry::Dir(dir) = root {
+            if let Some(ref entries) = dir.entries {
+                if let Some(entry) = entries.get(subdir_name) {
+                    if let crate::fs::Entry::Dir(subdir) = entry {
+                        return subdir.node_id.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Recursively build a map of relative paths to UUIDs by fetching all schemas.
 ///
 /// This function follows node-backed directories and fetches their schemas

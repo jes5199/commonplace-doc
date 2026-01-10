@@ -5,8 +5,19 @@ use commonplace_doc::{
 use std::net::SocketAddr;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Build tokio runtime with 8MB thread stack size to handle deep recursion
+    // in filesystem reconciler with nested node-backed directories
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024) // 8MB stack instead of default 2MB
+        .build()
+        .expect("Failed to create Tokio runtime");
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() {
     // Parse CLI arguments
     let args = Args::parse();
 

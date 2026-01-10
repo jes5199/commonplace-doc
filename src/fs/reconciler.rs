@@ -3,6 +3,7 @@
 use super::error::FsError;
 use super::schema::{DirEntry, Entry, FsSchema};
 use crate::document::{ContentType, DocumentStore};
+use async_recursion::async_recursion;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -146,6 +147,7 @@ impl FilesystemReconciler {
     /// Walk the entry tree, collecting entries and tracking document-backed directory IDs.
     /// Uses recursion_stack to detect cycles (same document in current path), while
     /// doc_backed_dirs collects all unique document-backed dirs for tracking.
+    #[async_recursion]
     async fn collect_entries_with_dirs(
         &self,
         entry: &Entry,
@@ -241,12 +243,12 @@ impl FilesystemReconciler {
                             format!("{}/{}", current_path, name)
                         };
                         results.extend(
-                            Box::pin(self.collect_entries_with_dirs(
+                            self.collect_entries_with_dirs(
                                 child,
                                 &child_path,
                                 doc_backed_dirs,
                                 recursion_stack,
-                            ))
+                            )
                             .await?,
                         );
                     }
@@ -258,6 +260,7 @@ impl FilesystemReconciler {
     }
 
     /// Try to fetch and parse a document-backed directory's content.
+    #[async_recursion]
     async fn collect_doc_backed_dir_entries_with_dirs(
         &self,
         doc_id: &str,
@@ -371,6 +374,7 @@ impl FilesystemReconciler {
     }
 
     /// Collect entries from a validated document schema.
+    #[async_recursion]
     async fn collect_from_valid_doc_schema(
         &self,
         schema: &FsSchema,
@@ -379,13 +383,9 @@ impl FilesystemReconciler {
         recursion_stack: &mut HashSet<String>,
     ) -> Option<Vec<(String, String, ContentType)>> {
         if let Some(ref root) = schema.root {
-            match Box::pin(self.collect_entries_with_dirs(
-                root,
-                base_path,
-                doc_backed_dirs,
-                recursion_stack,
-            ))
-            .await
+            match self
+                .collect_entries_with_dirs(root, base_path, doc_backed_dirs, recursion_stack)
+                .await
             {
                 Ok(entries) => Some(entries),
                 Err(e) => {

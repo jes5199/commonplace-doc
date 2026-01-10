@@ -7,7 +7,7 @@ use crate::fs::{Entry, FsSchema};
 use crate::sync::directory::{scan_directory_to_json, ScanOptions};
 use crate::sync::schema_io::SCHEMA_FILENAME;
 use crate::sync::state_file::compute_content_hash;
-use crate::sync::uuid_map::fetch_node_id_from_schema;
+use crate::sync::uuid_map::{fetch_node_id_from_schema, fetch_subdir_node_id};
 use crate::sync::{
     delete_schema_entry, detect_from_path, fork_node, is_allowed_extension, is_binary_content,
     normalize_path, push_content_by_type, push_schema_to_server, spawn_file_sync_tasks,
@@ -519,19 +519,43 @@ pub async fn handle_file_deleted(
     }
 
     // Delete from schema
-    // For nested paths, check if the immediate subdirectory is node-backed (has its own sync)
-    // Node-backed directories have their own .commonplace.json and sync process
+    // For nested paths, check if the immediate subdirectory is node-backed
+    // Node-backed directories have their own document on the server - we need to
+    // delete the file entry from that document, not from the parent schema
     if relative_path.contains('/') {
         // Extract first path component (the immediate subdirectory)
         let first_component = relative_path.split('/').next().unwrap();
         let subdir_schema_path = directory.join(first_component).join(SCHEMA_FILENAME);
 
         if subdir_schema_path.exists() {
-            // Node-backed directory has its own sync - skip deletion here
-            debug!(
-                "Skipping schema delete for {} - subdirectory {} has its own sync",
-                relative_path, first_component
-            );
+            // Node-backed directory - need to get its node_id and delete from that schema
+            let file_in_subdir = relative_path
+                .strip_prefix(first_component)
+                .and_then(|s| s.strip_prefix('/'))
+                .unwrap_or(&relative_path);
+
+            // Get the subdirectory's node_id from the parent schema
+            if let Some(subdir_node_id) =
+                fetch_subdir_node_id(client, server, fs_root_id, first_component).await
+            {
+                info!(
+                    "Deleting {} from node-backed subdirectory {} (node_id: {})",
+                    file_in_subdir, first_component, subdir_node_id
+                );
+                if let Err(e) =
+                    delete_schema_entry(client, server, &subdir_node_id, file_in_subdir).await
+                {
+                    warn!(
+                        "Failed to delete schema entry {} from subdirectory {}: {}",
+                        file_in_subdir, first_component, e
+                    );
+                }
+            } else {
+                warn!(
+                    "Could not find node_id for subdirectory {} - skipping deletion of {}",
+                    first_component, file_in_subdir
+                );
+            }
             return;
         }
         // Non-node-backed subdirectory: fall through to delete from this schema
