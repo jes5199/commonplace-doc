@@ -162,11 +162,9 @@ impl EditsHandler {
 
         // Store the commit if we have a commit store
         let cid = if let Some(store) = &self.commit_store {
-            let cid = store.store_commit(&commit).await?;
-
-            // Update document head using the document ID (UUID or fs-root path)
-            store.set_document_head(&document_id, &cid).await?;
-
+            let (cid, _timestamp) = store
+                .store_commit_and_set_head(&document_id, &commit)
+                .await?;
             debug!("Stored commit {} for document {}", cid, document_id);
             Some(cid)
         } else {

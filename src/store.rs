@@ -96,6 +96,22 @@ impl CommitStore {
             .map_err(|e| StoreError::DatabaseError(e.to_string()))
     }
 
+    /// Store a commit and update the document head atomically.
+    ///
+    /// Returns (cid, timestamp) for optional broadcast.
+    /// This is the preferred method for persisting commits as it keeps
+    /// storage and head-update behavior aligned across ingress paths.
+    pub async fn store_commit_and_set_head(
+        &self,
+        doc_id: &str,
+        commit: &Commit,
+    ) -> Result<(String, u64), StoreError> {
+        let timestamp = commit.timestamp;
+        let cid = self.store_commit(commit).await?;
+        self.set_document_head(doc_id, &cid).await?;
+        Ok((cid, timestamp))
+    }
+
     /// Set the head commit for a document
     pub async fn set_document_head(&self, doc_id: &str, cid: &str) -> Result<(), StoreError> {
         let db = self.db.write().await;

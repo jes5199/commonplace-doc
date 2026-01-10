@@ -274,19 +274,13 @@ impl DocumentService {
         let author = author.unwrap_or_else(|| "anonymous".to_string());
 
         let commit = Commit::new(parents, update_b64.to_string(), author, message);
-        let timestamp = commit.timestamp;
-
-        let cid = commit_store
-            .store_commit(&commit)
-            .await
-            .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
         // Apply update to document
         self.doc_store.apply_yjs_update(id, &update_bytes).await?;
 
-        // Update head
-        commit_store
-            .set_document_head(id, &cid)
+        // Store commit and update head
+        let (cid, timestamp) = commit_store
+            .store_commit_and_set_head(id, &commit)
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
@@ -547,13 +541,8 @@ impl DocumentService {
             Some(format!("Forked from {} at {}", source_id, target_cid)),
         );
 
-        let new_cid = commit_store
-            .store_commit(&commit)
-            .await
-            .map_err(|e| ServiceError::Internal(e.to_string()))?;
-
-        commit_store
-            .set_document_head(&new_id, &new_cid)
+        let (new_cid, _timestamp) = commit_store
+            .store_commit_and_set_head(&new_id, &commit)
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
@@ -782,12 +771,6 @@ impl DocumentService {
 
         let author = author.unwrap_or_else(|| "anonymous".to_string());
         let commit = Commit::new(parents, diff_result.update_b64.clone(), author, None);
-        let timestamp = commit.timestamp;
-
-        let cid = commit_store
-            .store_commit(&commit)
-            .await
-            .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
         // Apply update
         let content_before = self
@@ -818,8 +801,9 @@ impl DocumentService {
             content_after.len()
         );
 
-        commit_store
-            .set_document_head(id, &cid)
+        // Store commit and update head
+        let (cid, timestamp) = commit_store
+            .store_commit_and_set_head(id, &commit)
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
