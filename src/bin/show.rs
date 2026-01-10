@@ -6,7 +6,10 @@
 //!   commonplace-show --stat path/to/file.txt        # Show with change stats
 
 use clap::Parser;
-use commonplace_doc::cli::{fetch_changes, fetch_head, CommitChange, HeadResponse, ShowArgs};
+use commonplace_doc::cli::{
+    compute_diff_stats, fetch_changes, fetch_head, ChangeStats, CommitChange, HeadResponse,
+    ShowArgs,
+};
 use commonplace_doc::workspace::{format_timestamp, resolve_path_to_uuid};
 use reqwest::Client;
 use serde::Serialize;
@@ -21,14 +24,6 @@ struct ShowOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     stats: Option<ChangeStats>,
     content: Option<String>,
-}
-
-#[derive(Serialize, Clone)]
-struct ChangeStats {
-    lines_added: usize,
-    lines_removed: usize,
-    chars_added: usize,
-    chars_removed: usize,
 }
 
 #[tokio::main]
@@ -171,32 +166,4 @@ async fn compute_stats(
     }
 
     Ok(None)
-}
-
-fn compute_diff_stats(old: &str, new: &str) -> ChangeStats {
-    // Simple line-based diff stats
-    let old_lines: std::collections::HashSet<&str> = old.lines().collect();
-    let new_lines: std::collections::HashSet<&str> = new.lines().collect();
-
-    let added: usize = new_lines.difference(&old_lines).count();
-    let removed: usize = old_lines.difference(&new_lines).count();
-
-    // Character diff (simple approximation)
-    let chars_added = if new.len() > old.len() {
-        new.len() - old.len()
-    } else {
-        0
-    };
-    let chars_removed = if old.len() > new.len() {
-        old.len() - new.len()
-    } else {
-        0
-    };
-
-    ChangeStats {
-        lines_added: added,
-        lines_removed: removed,
-        chars_added,
-        chars_removed,
-    }
 }

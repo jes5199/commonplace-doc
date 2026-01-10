@@ -10,7 +10,7 @@
 
 use base64::prelude::*;
 use clap::Parser;
-use commonplace_doc::cli::{CommitChange, LogArgs};
+use commonplace_doc::cli::{compute_diff_stats, ChangeStats, CommitChange, LogArgs};
 use commonplace_doc::workspace::{
     format_timestamp, format_timestamp_short, parse_date, resolve_path_to_uuid,
 };
@@ -346,14 +346,6 @@ struct CommitInfo {
     datetime: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     stats: Option<ChangeStats>,
-}
-
-#[derive(Serialize, Clone)]
-struct ChangeStats {
-    lines_added: usize,
-    lines_removed: usize,
-    chars_added: usize,
-    chars_removed: usize,
 }
 
 /// SSE edit event from server
@@ -860,37 +852,6 @@ fn colorize_diff(diff: &str) -> String {
         }
     }
     out
-}
-
-fn compute_diff_stats(old: &str, new: &str) -> ChangeStats {
-    use similar::{ChangeTag, TextDiff};
-
-    let diff = TextDiff::from_lines(old, new);
-    let mut lines_added = 0;
-    let mut lines_removed = 0;
-    let mut chars_added = 0;
-    let mut chars_removed = 0;
-
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            ChangeTag::Insert => {
-                lines_added += 1;
-                chars_added += change.value().len();
-            }
-            ChangeTag::Delete => {
-                lines_removed += 1;
-                chars_removed += change.value().len();
-            }
-            ChangeTag::Equal => {}
-        }
-    }
-
-    ChangeStats {
-        lines_added,
-        lines_removed,
-        chars_added,
-        chars_removed,
-    }
 }
 
 fn compute_unified_diff(old: &str, new: &str) -> String {

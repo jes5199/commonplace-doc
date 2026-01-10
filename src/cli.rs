@@ -416,3 +416,47 @@ pub async fn fetch_changes(
         .await
         .map_err(|e| format!("Failed to parse changes: {}", e))
 }
+
+/// Statistics about changes between two text versions.
+/// Shared by CLI binaries for diff stat display.
+#[derive(serde::Serialize, Clone)]
+pub struct ChangeStats {
+    pub lines_added: usize,
+    pub lines_removed: usize,
+    pub chars_added: usize,
+    pub chars_removed: usize,
+}
+
+/// Compute diff statistics between old and new text.
+///
+/// Uses line-based diff to count added/removed lines and characters.
+pub fn compute_diff_stats(old: &str, new: &str) -> ChangeStats {
+    use similar::{ChangeTag, TextDiff};
+
+    let diff = TextDiff::from_lines(old, new);
+    let mut lines_added = 0;
+    let mut lines_removed = 0;
+    let mut chars_added = 0;
+    let mut chars_removed = 0;
+
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Insert => {
+                lines_added += 1;
+                chars_added += change.value().len();
+            }
+            ChangeTag::Delete => {
+                lines_removed += 1;
+                chars_removed += change.value().len();
+            }
+            ChangeTag::Equal => {}
+        }
+    }
+
+    ChangeStats {
+        lines_added,
+        lines_removed,
+        chars_added,
+        chars_removed,
+    }
+}
