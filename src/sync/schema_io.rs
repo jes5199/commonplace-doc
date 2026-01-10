@@ -4,7 +4,7 @@
 //! and feedback loop prevention.
 
 use crate::fs::{Entry, FsSchema};
-use crate::sync::{encode_node_id, HeadResponse, WrittenSchemas};
+use crate::sync::{encode_node_id, fetch_head, WrittenSchemas};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::path::Path;
@@ -38,28 +38,14 @@ pub async fn fetch_and_validate_schema(
     node_id: &str,
     require_valid_root: bool,
 ) -> Option<FetchedSchema> {
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
-    let resp = match client.get(&head_url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Failed to fetch schema for {}: {}", node_id, e);
+    let head = match fetch_head(client, server, &encode_node_id(node_id), false).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            debug!("Schema not found for {}", node_id);
             return None;
         }
-    };
-
-    if !resp.status().is_success() {
-        warn!(
-            "Failed to fetch schema HEAD for {}: status {}",
-            node_id,
-            resp.status()
-        );
-        return None;
-    }
-
-    let head: HeadResponse = match resp.json().await {
-        Ok(h) => h,
         Err(e) => {
-            warn!("Failed to parse HEAD response for {}: {}", node_id, e);
+            warn!("Failed to fetch schema for {}: {:?}", node_id, e);
             return None;
         }
     };
@@ -225,131 +211,108 @@ async fn write_nested_schemas_recursive(
                         let subdir_path = current_dir.join(name);
 
                         // Fetch the directory's schema from server
-                        let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
                         info!(
-                            "write_nested_schemas_recursive: fetching schema from {}",
-                            head_url
+                            "write_nested_schemas_recursive: fetching schema for {}",
+                            node_id
                         );
-                        match client.get(&head_url).send().await {
-                            Ok(resp) => {
-                                if resp.status().is_success() {
-                                    match resp.json::<HeadResponse>().await {
-                                        Ok(head) => {
-                                            // Compute content hash and check if content has changed
-                                            let content_hash =
-                                                crate::sync::state_file::compute_content_hash(
-                                                    head.content.as_bytes(),
-                                                );
+                        let head = match fetch_head(client, server, &encode_node_id(node_id), false)
+                            .await
+                        {
+                            Ok(Some(h)) => h,
+                            Ok(None) => {
+                                debug!("Schema not found for {}", node_id);
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!("Failed to fetch schema for {}: {:?}", node_id, e);
+                                continue;
+                            }
+                        };
 
-                                            // Mark as processed with current hash
-                                            processed_hashes.insert(node_id.clone(), content_hash);
+                        // Compute content hash and check if content has changed
+                        let content_hash =
+                            crate::sync::state_file::compute_content_hash(head.content.as_bytes());
 
-                                            // Create directory for node-backed subdirectory (even if schema is empty)
-                                            if !subdir_path.exists() {
-                                                info!(
-                                                    "Creating directory for node-backed subdirectory: {:?}",
-                                                    subdir_path
-                                                );
-                                                if let Err(e) =
-                                                    tokio::fs::create_dir_all(&subdir_path).await
-                                                {
-                                                    warn!(
-                                                        "Failed to create directory for nested schema {:?}: {}",
-                                                        subdir_path, e
-                                                    );
-                                                }
-                                            } else {
-                                                debug!(
-                                                    "Directory already exists: {:?}",
-                                                    subdir_path
-                                                );
-                                            }
+                        // Mark as processed with current hash
+                        processed_hashes.insert(node_id.clone(), content_hash);
 
-                                            // Only write schema if content is valid (not just "{}")
-                                            if !head.content.is_empty() && head.content != "{}" {
-                                                info!(
-                                                    "write_nested_schemas_recursive: parsing schema for {} (content len: {})",
-                                                    node_id, head.content.len()
-                                                );
-                                                match serde_json::from_str::<FsSchema>(
-                                                    &head.content,
-                                                ) {
-                                                    Ok(sub_schema) => {
-                                                        info!(
-                                                            "write_nested_schemas_recursive: parsed schema, root={:?}",
-                                                            sub_schema.root.is_some()
-                                                        );
-                                                        // Write the schema to the subdirectory (write_schema_file has its own dedup)
-                                                        if subdir_path.exists() {
-                                                            if let Err(e) = write_schema_file(
-                                                                &subdir_path,
-                                                                &head.content,
-                                                                written_schemas,
-                                                            )
-                                                            .await
-                                                            {
-                                                                warn!(
-                                                                    "Failed to write nested schema to {:?}: {}",
-                                                                    subdir_path, e
-                                                                );
-                                                            }
-                                                        }
-                                                        // Recursively handle any nested node-backed directories
-                                                        if let Some(ref sub_root) = sub_schema.root
-                                                        {
-                                                            info!(
-                                                                "write_nested_schemas_recursive: recursing into {:?}",
-                                                                subdir_path
-                                                            );
-                                                            write_nested_schemas_recursive(
-                                                                client,
-                                                                server,
-                                                                _base_dir,
-                                                                sub_root,
-                                                                &subdir_path,
-                                                                processed_hashes,
-                                                                written_schemas,
-                                                            )
-                                                            .await?;
-                                                        } else {
-                                                            info!(
-                                                                "write_nested_schemas_recursive: no root in schema for {}",
-                                                                node_id
-                                                            );
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(
-                                                            "Failed to parse schema for {}: {} (content: {})",
-                                                            node_id, e, &head.content[..100.min(head.content.len())]
-                                                        );
-                                                    }
-                                                }
-                                            } else {
-                                                debug!(
-                                                    "Schema for {} is empty, skipping recursion",
-                                                    node_id
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
+                        // Create directory for node-backed subdirectory (even if schema is empty)
+                        if !subdir_path.exists() {
+                            info!(
+                                "Creating directory for node-backed subdirectory: {:?}",
+                                subdir_path
+                            );
+                            if let Err(e) = tokio::fs::create_dir_all(&subdir_path).await {
+                                warn!(
+                                    "Failed to create directory for nested schema {:?}: {}",
+                                    subdir_path, e
+                                );
+                            }
+                        } else {
+                            debug!("Directory already exists: {:?}", subdir_path);
+                        }
+
+                        // Only write schema if content is valid (not just "{}")
+                        if !head.content.is_empty() && head.content != "{}" {
+                            info!(
+                                "write_nested_schemas_recursive: parsing schema for {} (content len: {})",
+                                node_id, head.content.len()
+                            );
+                            match serde_json::from_str::<FsSchema>(&head.content) {
+                                Ok(sub_schema) => {
+                                    info!(
+                                        "write_nested_schemas_recursive: parsed schema, root={:?}",
+                                        sub_schema.root.is_some()
+                                    );
+                                    // Write the schema to the subdirectory (write_schema_file has its own dedup)
+                                    if subdir_path.exists() {
+                                        if let Err(e) = write_schema_file(
+                                            &subdir_path,
+                                            &head.content,
+                                            written_schemas,
+                                        )
+                                        .await
+                                        {
                                             warn!(
-                                                "Failed to parse HEAD response for {}: {}",
-                                                node_id, e
+                                                "Failed to write nested schema to {:?}: {}",
+                                                subdir_path, e
                                             );
                                         }
                                     }
-                                } else {
+                                    // Recursively handle any nested node-backed directories
+                                    if let Some(ref sub_root) = sub_schema.root {
+                                        info!(
+                                            "write_nested_schemas_recursive: recursing into {:?}",
+                                            subdir_path
+                                        );
+                                        write_nested_schemas_recursive(
+                                            client,
+                                            server,
+                                            _base_dir,
+                                            sub_root,
+                                            &subdir_path,
+                                            processed_hashes,
+                                            written_schemas,
+                                        )
+                                        .await?;
+                                    } else {
+                                        info!(
+                                            "write_nested_schemas_recursive: no root in schema for {}",
+                                            node_id
+                                        );
+                                    }
+                                }
+                                Err(e) => {
                                     warn!(
-                                        "Failed to fetch schema for {}: status {}",
+                                        "Failed to parse schema for {}: {} (content: {})",
                                         node_id,
-                                        resp.status()
+                                        e,
+                                        &head.content[..100.min(head.content.len())]
                                     );
                                 }
                             }
-                            Err(e) => {
-                                warn!("Failed to fetch schema for {}: {}", node_id, e);
-                            }
+                        } else {
+                            debug!("Schema for {} is empty, skipping recursion", node_id);
                         }
                     }
                 }
