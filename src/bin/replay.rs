@@ -9,7 +9,7 @@ use clap::Parser;
 use commonplace_doc::cli::{fetch_changes, fetch_head, ReplayArgs};
 use commonplace_doc::fs::{Entry, FsSchema};
 use commonplace_doc::sync::SCHEMA_FILENAME;
-use commonplace_doc::workspace::format_timestamp;
+use commonplace_doc::workspace::{format_timestamp, normalize_path};
 use reqwest::Client;
 use serde::Serialize;
 use std::fs;
@@ -157,28 +157,6 @@ fn find_workspace_root(start: &Path) -> Result<(PathBuf, PathBuf), Box<dyn std::
             .into());
         }
     }
-}
-
-fn normalize_path(
-    path: &Path,
-    cwd: &Path,
-    workspace_root: &Path,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let abs_path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    };
-
-    let rel_path = abs_path.strip_prefix(workspace_root).map_err(|_| {
-        format!(
-            "Path {} is not under workspace {}",
-            path.display(),
-            workspace_root.display()
-        )
-    })?;
-
-    Ok(rel_path.to_string_lossy().to_string())
 }
 
 fn split_path(path: &str) -> Result<(Vec<String>, String), Box<dyn std::error::Error>> {

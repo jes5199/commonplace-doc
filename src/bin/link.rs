@@ -14,6 +14,7 @@ use commonplace_doc::{
     cli::LinkArgs,
     fs::{DocEntry, Entry, FsSchema},
     sync::{client::push_schema_to_server, SCHEMA_FILENAME},
+    workspace::normalize_path,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -192,31 +193,6 @@ fn find_workspace_root(start: &Path) -> Result<(PathBuf, PathBuf), Box<dyn std::
             .into());
         }
     }
-}
-
-/// Normalize a path to be relative to the workspace root
-fn normalize_path(
-    path: &Path,
-    cwd: &Path,
-    workspace_root: &Path,
-) -> Result<String, Box<dyn std::error::Error>> {
-    // Make the path absolute
-    let abs_path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    };
-
-    // Strip the workspace root to get relative path
-    let rel_path = abs_path.strip_prefix(workspace_root).map_err(|_| {
-        format!(
-            "Path {} is not under workspace {}",
-            path.display(),
-            workspace_root.display()
-        )
-    })?;
-
-    Ok(rel_path.to_string_lossy().to_string())
 }
 
 /// Split a path into directory components and filename
