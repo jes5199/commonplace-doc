@@ -43,6 +43,7 @@ pub async fn handle_subdir_edit(
     use_paths: bool,
     push_only: bool,
     pull_only: bool,
+    shared_state_file: Option<&crate::sync::SharedStateFile>,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     log_prefix: &str,
 ) {
@@ -84,6 +85,7 @@ pub async fn handle_subdir_edit(
         use_paths,
         push_only,
         pull_only,
+        shared_state_file,
         #[cfg(unix)]
         inode_tracker,
     )
@@ -263,6 +265,7 @@ pub async fn directory_sse_task(
                                             use_paths,
                                             push_only,
                                             pull_only,
+                                            shared_state_file.clone(),
                                             #[cfg(unix)]
                                             inode_tracker.clone(),
                                             watched_subdirs.clone(),
@@ -312,6 +315,7 @@ pub fn spawn_subdir_sse_task(
     use_paths: bool,
     push_only: bool,
     pull_only: bool,
+    shared_state_file: Option<crate::sync::SharedStateFile>,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     watched_subdirs: Arc<RwLock<HashSet<String>>>,
 ) {
@@ -326,6 +330,7 @@ pub fn spawn_subdir_sse_task(
         use_paths,
         push_only,
         pull_only,
+        shared_state_file,
         #[cfg(unix)]
         inode_tracker,
         watched_subdirs,
@@ -352,6 +357,7 @@ pub async fn subdir_sse_task(
     use_paths: bool,
     push_only: bool,
     pull_only: bool,
+    shared_state_file: Option<crate::sync::SharedStateFile>,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     watched_subdirs: Arc<RwLock<HashSet<String>>>,
 ) {
@@ -408,6 +414,7 @@ pub async fn subdir_sse_task(
                                 use_paths,
                                 push_only,
                                 pull_only,
+                                shared_state_file.as_ref(),
                                 #[cfg(unix)]
                                 inode_tracker.clone(),
                                 "SSE",
@@ -441,6 +448,7 @@ pub async fn subdir_sse_task(
                                         use_paths,
                                         push_only,
                                         pull_only,
+                                        shared_state_file.clone(),
                                         #[cfg(unix)]
                                         inode_tracker.clone(),
                                         watched_subdirs.clone(),
@@ -602,6 +610,7 @@ pub async fn directory_mqtt_task(
                                     use_paths,
                                     push_only,
                                     pull_only,
+                                    shared_state_file.clone(),
                                     #[cfg(unix)]
                                     inode_tracker.clone(),
                                     mqtt_client.clone(),
@@ -638,6 +647,7 @@ pub fn spawn_subdir_mqtt_task(
     use_paths: bool,
     push_only: bool,
     pull_only: bool,
+    shared_state_file: Option<crate::sync::SharedStateFile>,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     mqtt_client: Arc<MqttClient>,
     workspace: String,
@@ -654,6 +664,7 @@ pub fn spawn_subdir_mqtt_task(
         use_paths,
         push_only,
         pull_only,
+        shared_state_file,
         #[cfg(unix)]
         inode_tracker,
         mqtt_client,
@@ -684,6 +695,7 @@ pub async fn subdir_mqtt_task(
     use_paths: bool,
     push_only: bool,
     pull_only: bool,
+    shared_state_file: Option<crate::sync::SharedStateFile>,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     mqtt_client: Arc<MqttClient>,
     workspace: String,
@@ -740,6 +752,7 @@ pub async fn subdir_mqtt_task(
                         use_paths,
                         push_only,
                         pull_only,
+                        shared_state_file.as_ref(),
                         #[cfg(unix)]
                         inode_tracker.clone(),
                         "MQTT",
@@ -772,6 +785,7 @@ pub async fn subdir_mqtt_task(
                                 use_paths,
                                 push_only,
                                 pull_only,
+                                shared_state_file.clone(),
                                 #[cfg(unix)]
                                 inode_tracker.clone(),
                                 mqtt_client.clone(),

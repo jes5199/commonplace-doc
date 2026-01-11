@@ -1125,6 +1125,19 @@ async fn run_directory_mode(
     )
     .await?;
 
+    // Save state file after initial sync to persist CIDs
+    {
+        let sf = shared_state_file.read().await;
+        if let Err(e) = sf.save(&state_file_path).await {
+            warn!("Failed to save state file after initial sync: {}", e);
+        } else {
+            debug!(
+                "Saved state file after initial sync with {} tracked files",
+                sf.files.len()
+            );
+        }
+    }
+
     // Start directory watcher (skip if pull-only)
     let (dir_tx, mut dir_rx) = mpsc::channel::<DirEvent>(100);
     let watcher_handle = if !pull_only {
@@ -1227,6 +1240,7 @@ async fn run_directory_mode(
                     use_paths,
                     push_only,
                     pull_only,
+                    Some(shared_state_file.clone()),
                     #[cfg(unix)]
                     inode_tracker.clone(),
                     mqtt.clone(),
@@ -1250,6 +1264,7 @@ async fn run_directory_mode(
                     use_paths,
                     push_only,
                     pull_only,
+                    Some(shared_state_file.clone()),
                     #[cfg(unix)]
                     inode_tracker.clone(),
                     watched_subdirs.clone(),
@@ -1327,6 +1342,7 @@ async fn run_directory_mode(
         let directory = directory.clone();
         let options = options.clone();
         let file_states = file_states.clone();
+        let shared_state_file = shared_state_file.clone();
         #[cfg(unix)]
         let inode_tracker = inode_tracker.clone();
         async move {
@@ -1344,6 +1360,7 @@ async fn run_directory_mode(
                             use_paths,
                             push_only,
                             pull_only,
+                            Some(&shared_state_file),
                             #[cfg(unix)]
                             inode_tracker.clone(),
                         )
@@ -1424,6 +1441,17 @@ async fn run_directory_mode(
             for handle in &file_state.task_handles {
                 handle.abort();
             }
+        }
+    }
+
+    // Save state file on shutdown
+    info!("Saving state file...");
+    {
+        let sf = shared_state_file.read().await;
+        if let Err(e) = sf.save(&state_file_path).await {
+            warn!("Failed to save state file on shutdown: {}", e);
+        } else {
+            info!("Saved state file with {} tracked files", sf.files.len());
         }
     }
 
@@ -1721,6 +1749,7 @@ async fn run_exec_mode(
                 use_paths,
                 push_only,
                 pull_only,
+                Some(shared_state_file.clone()),
                 #[cfg(unix)]
                 inode_tracker.clone(),
                 watched_subdirs.clone(),
@@ -1796,6 +1825,7 @@ async fn run_exec_mode(
         let directory = directory.clone();
         let options = options.clone();
         let file_states = file_states.clone();
+        let shared_state_file = shared_state_file.clone();
         #[cfg(unix)]
         let inode_tracker = inode_tracker.clone();
         async move {
@@ -1813,6 +1843,7 @@ async fn run_exec_mode(
                             use_paths,
                             push_only,
                             pull_only,
+                            Some(&shared_state_file),
                             #[cfg(unix)]
                             inode_tracker.clone(),
                         )
@@ -2184,6 +2215,17 @@ async fn run_exec_mode(
             for handle in &file_state.task_handles {
                 handle.abort();
             }
+        }
+    }
+
+    // Save state file on shutdown
+    info!("Saving state file...");
+    {
+        let sf = shared_state_file.read().await;
+        if let Err(e) = sf.save(&state_file_path).await {
+            warn!("Failed to save state file on shutdown: {}", e);
+        } else {
+            info!("Saved state file with {} tracked files", sf.files.len());
         }
     }
 

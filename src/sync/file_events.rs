@@ -161,6 +161,7 @@ pub async fn handle_file_created(
     use_paths: bool,
     push_only: bool,
     pull_only: bool,
+    shared_state_file: Option<&crate::sync::SharedStateFile>,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
 ) {
     debug!("Directory event: file created: {}", path.display());
@@ -277,7 +278,16 @@ pub async fn handle_file_created(
         } else {
             format!("{}:{}", owning_doc.document_id, owning_doc.relative_path)
         };
-        let state = Arc::new(RwLock::new(SyncState::new()));
+        // Create SyncState - use directory mode if we have a shared state file
+        let state = if let Some(sf) = shared_state_file {
+            Arc::new(RwLock::new(SyncState::for_directory_file(
+                None, // No initial CID for new files
+                sf.clone(),
+                relative_path.clone(),
+            )))
+        } else {
+            Arc::new(RwLock::new(SyncState::new()))
+        };
 
         // If content matches an existing file, try to fork it
         let forked_successfully = if let Some(source_id) = matching_source {

@@ -344,6 +344,7 @@ pub async fn handle_subdir_new_files(
     use_paths: bool,
     push_only: bool,
     pull_only: bool,
+    shared_state_file: Option<&crate::sync::SharedStateFile>,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Don't pull if push_only mode
@@ -494,16 +495,21 @@ pub async fn handle_subdir_new_files(
                     // Hash the actual bytes written to disk
                     let content_hash = compute_content_hash(&bytes_written);
 
-                    // Add to file states
-                    let state = Arc::new(RwLock::new(SyncState {
-                        last_written_cid: file_head.cid.clone(),
-                        last_written_content: file_head.content,
-                        current_write_id: 0,
-                        pending_write: None,
-                        needs_head_refresh: false,
-                        state_file: None,
-                        state_file_path: None,
-                    }));
+                    // Add to file states - use directory mode if shared state file available
+                    let state = if let Some(sf) = shared_state_file {
+                        Arc::new(RwLock::new(SyncState::for_directory_file(
+                            file_head.cid.clone(),
+                            sf.clone(),
+                            root_relative_path.clone(),
+                        )))
+                    } else {
+                        Arc::new(RwLock::new(SyncState::with_cid(file_head.cid.clone())))
+                    };
+                    // Update with content for echo detection
+                    {
+                        let mut s = state.write().await;
+                        s.last_written_content = file_head.content;
+                    }
 
                     info!("Created local file from subdir: {}", file_path.display());
 
@@ -941,7 +947,16 @@ pub async fn handle_schema_change(
                         } else {
                             None
                         };
-                        let state = Arc::new(RwLock::new(SyncState::with_cid(initial_cid)));
+                        // Create SyncState - use directory mode if we have a shared state file
+                        let state = if let Some(sf) = shared_state_file {
+                            Arc::new(RwLock::new(SyncState::for_directory_file(
+                                initial_cid,
+                                sf.clone(),
+                                path.clone(),
+                            )))
+                        } else {
+                            Arc::new(RwLock::new(SyncState::with_cid(initial_cid)))
+                        };
                         // Update state with content for echo detection
                         {
                             let mut s = state.write().await;

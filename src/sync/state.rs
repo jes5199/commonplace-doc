@@ -11,6 +11,7 @@
 //! watches them for writes, and merges those writes via CRDT.
 
 use crate::sync::state_file::SyncStateFile;
+use crate::sync::SharedStateFile;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -316,7 +317,6 @@ pub struct PendingWrite {
 /// - **Echo detection**: Prevents re-uploading content we just received from server
 /// - **Write barrier**: Tracks pending server writes to handle concurrent edits
 /// - **State file**: Persists sync state for offline change detection
-#[derive(Debug)]
 pub struct SyncState {
     /// CID of the commit we last wrote to the local file
     pub last_written_cid: Option<String>,
@@ -333,6 +333,10 @@ pub struct SyncState {
     pub state_file: Option<SyncStateFile>,
     /// Path to save the state file
     pub state_file_path: Option<PathBuf>,
+    /// Shared state file for directory mode (multiple files share one state file)
+    pub shared_state_file: Option<SharedStateFile>,
+    /// Relative path for this file within the directory (for shared state file updates)
+    pub relative_path: Option<String>,
 }
 
 impl SyncState {
@@ -346,6 +350,8 @@ impl SyncState {
             needs_head_refresh: false,
             state_file: None,
             state_file_path: None,
+            shared_state_file: None,
+            relative_path: None,
         }
     }
 
@@ -361,6 +367,30 @@ impl SyncState {
             needs_head_refresh: false,
             state_file: None,
             state_file_path: None,
+            shared_state_file: None,
+            relative_path: None,
+        }
+    }
+
+    /// Create a SyncState for directory mode with a shared state file.
+    ///
+    /// This enables per-file CID persistence in directory sync mode. The shared state file
+    /// is updated whenever a sync completes, allowing CIDs to survive restart.
+    pub fn for_directory_file(
+        cid: Option<String>,
+        shared_state_file: SharedStateFile,
+        relative_path: String,
+    ) -> Self {
+        Self {
+            last_written_cid: cid,
+            last_written_content: String::new(),
+            current_write_id: 0,
+            pending_write: None,
+            needs_head_refresh: false,
+            state_file: None,
+            state_file_path: None,
+            shared_state_file: Some(shared_state_file),
+            relative_path: Some(relative_path),
         }
     }
 
@@ -376,13 +406,17 @@ impl SyncState {
             needs_head_refresh: false,
             state_file: Some(state_file),
             state_file_path: Some(state_file_path),
+            shared_state_file: None,
+            relative_path: None,
         }
     }
 
     /// Update state file after successful sync and save to disk.
     ///
     /// Called after a successful upload or download to record the new state.
+    /// Works with both file mode (single state file) and directory mode (shared state file).
     pub async fn mark_synced(&mut self, cid: &str, content_hash: &str, relative_path: &str) {
+        // File mode: update single-file state file
         if let Some(ref mut state_file) = self.state_file {
             state_file.mark_synced(cid.to_string());
             state_file.update_file(relative_path, content_hash.to_string());
@@ -392,6 +426,27 @@ impl SyncState {
                 if let Err(e) = state_file.save(path).await {
                     warn!("Failed to save state file: {}", e);
                 }
+            }
+        }
+
+        // Directory mode: update shared state file with per-file CID
+        if let Some(ref shared_sf) = self.shared_state_file {
+            // Use our stored relative path for the key (not the filename parameter)
+            let path_key = self.relative_path.as_deref().unwrap_or(relative_path);
+
+            let mut sf = shared_sf.write().await;
+            sf.update_file_with_cid(path_key, content_hash.to_string(), Some(cid.to_string()));
+        }
+    }
+
+    /// Save the shared state file to disk.
+    ///
+    /// Called periodically or at shutdown to persist per-file CIDs in directory mode.
+    pub async fn save_shared_state_file(&self, state_file_path: &std::path::Path) {
+        if let Some(ref shared_sf) = self.shared_state_file {
+            let sf = shared_sf.read().await;
+            if let Err(e) = sf.save(state_file_path).await {
+                warn!("Failed to save shared state file: {}", e);
             }
         }
     }
