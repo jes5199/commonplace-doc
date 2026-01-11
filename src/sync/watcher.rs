@@ -359,24 +359,32 @@ pub async fn directory_watcher_task(
                                         // Read the file content
                                         if let Ok(content) = std::fs::read_to_string(&path) {
                                             let canonical = path.canonicalize().unwrap_or(path.clone());
-                                            let ws_guard = ws.blocking_read();
-                                            let is_our_write = if let Some(last_written) = ws_guard.get(&canonical) {
-                                                // Compare as JSON to ignore whitespace differences
-                                                if let (Ok(last_json), Ok(new_json)) = (
-                                                    serde_json::from_str::<serde_json::Value>(last_written),
-                                                    serde_json::from_str::<serde_json::Value>(&content),
-                                                ) {
-                                                    last_json == new_json
-                                                } else {
-                                                    // If JSON parsing fails, compare raw strings
-                                                    last_written == &content
+                                            // Use try_read() instead of blocking_read() to avoid panic in async context
+                                            let is_our_write = match ws.try_read() {
+                                                Ok(ws_guard) => {
+                                                    if let Some(last_written) = ws_guard.get(&canonical) {
+                                                        // Compare as JSON to ignore whitespace differences
+                                                        if let (Ok(last_json), Ok(new_json)) = (
+                                                            serde_json::from_str::<serde_json::Value>(last_written),
+                                                            serde_json::from_str::<serde_json::Value>(&content),
+                                                        ) {
+                                                            last_json == new_json
+                                                        } else {
+                                                            // If JSON parsing fails, compare raw strings
+                                                            last_written == &content
+                                                        }
+                                                    } else {
+                                                        // Not in our tracking map - could be initial load or user edit
+                                                        // Treat as user edit to be safe
+                                                        false
+                                                    }
                                                 }
-                                            } else {
-                                                // Not in our tracking map - could be initial load or user edit
-                                                // Treat as user edit to be safe
-                                                false
+                                                Err(_) => {
+                                                    // Lock is held - treat as potential user edit to be safe
+                                                    // This could cause extra resyncs but won't miss user edits
+                                                    false
+                                                }
                                             };
-                                            drop(ws_guard);
 
                                             if is_our_write {
                                                 debug!("Skipping schema file event (our write): {}", path.display());
@@ -1070,5 +1078,68 @@ mod tests {
         assert!(!is_temp_file("tmp"), "Just 'tmp' is too short");
         assert!(!is_temp_file("template.txt"), "Contains 'tmp' but not temp");
         assert!(!is_temp_file("input.txt"), "Normal input file");
+    }
+
+    /// Test that file_watcher_task detects MULTIPLE consecutive modifications.
+    /// This verifies the watcher continues working after the first event.
+    #[tokio::test]
+    async fn test_file_watcher_detects_multiple_modifications() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let target_path = temp_dir.path().join("target.txt");
+
+        // Create initial file
+        fs::write(&target_path, "initial content").expect("Failed to write initial file");
+
+        let (tx, mut rx) = mpsc::channel::<FileEvent>(10);
+
+        // Start the watcher task
+        let target_path_clone = target_path.clone();
+        let watcher_handle = tokio::spawn(async move {
+            file_watcher_task(target_path_clone, tx).await;
+        });
+
+        // Give the watcher time to start
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // First modification
+        fs::write(&target_path, "content v1").expect("Failed to modify file");
+
+        // Wait for the first event
+        let result1 = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            matches!(result1, Ok(Some(FileEvent::Modified(_)))),
+            "First modification not detected: {:?}",
+            result1
+        );
+
+        // Wait for debounce to fully settle
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Second modification
+        fs::write(&target_path, "content v2").expect("Failed to modify file again");
+
+        // Wait for the second event
+        let result2 = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            matches!(result2, Ok(Some(FileEvent::Modified(_)))),
+            "Second modification not detected: {:?}",
+            result2
+        );
+
+        // Wait for debounce
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Third modification
+        fs::write(&target_path, "content v3").expect("Failed to modify file third time");
+
+        // Wait for the third event
+        let result3 = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            matches!(result3, Ok(Some(FileEvent::Modified(_)))),
+            "Third modification not detected: {:?}",
+            result3
+        );
+
+        watcher_handle.abort();
     }
 }

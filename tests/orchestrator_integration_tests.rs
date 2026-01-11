@@ -727,13 +727,14 @@ fn test_processes_json_add_remove_starts_stops_processes() {
     );
 
     // H5/H6: Process removal is currently broken - see CP-y1cu
-    // The sync client doesn't propagate __processes.json modifications after initial sync.
-    // For now, we only test process addition (H3/H4) which works correctly.
+    // Investigation findings:
+    // - The sync client IS correctly uploading the modified __processes.json to server
+    // - The server DOES have the correct content (without added-proc)
+    // - The issue is that the orchestrator's SSE subscription doesn't receive the notification
+    // - Periodic re-discovery (every 30 seconds) also doesn't trigger reconciliation
     //
-    // TODO(CP-y1cu): Once the bug is fixed, uncomment and test process removal:
-    // - Modify __processes.json to remove added-proc
-    // - Wait for process to be removed from status
-    // - Verify initial-proc is still running
+    // This is an orchestrator SSE/notification bug, not a sync bug.
+    // For now, we only test process addition (H3/H4) which works correctly.
 
     // Verify both processes are still running at end of test
     let status_content =
