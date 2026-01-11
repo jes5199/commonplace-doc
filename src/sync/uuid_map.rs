@@ -95,15 +95,11 @@ pub async fn fetch_subdir_node_id(
     };
 
     // Look up the subdirectory entry in the root entries
-    if let Some(ref root) = schema.root {
-        if let crate::fs::Entry::Dir(dir) = root {
-            if let Some(ref entries) = dir.entries {
-                if let Some(entry) = entries.get(subdir_name) {
-                    if let crate::fs::Entry::Dir(subdir) = entry {
-                        return subdir.node_id.clone();
-                    }
-                }
-            }
+    if let Some(crate::fs::Entry::Dir(dir)) = schema.root.as_ref() {
+        if let Some(crate::fs::Entry::Dir(subdir)) =
+            dir.entries.as_ref().and_then(|e| e.get(subdir_name))
+        {
+            return subdir.node_id.clone();
         }
     }
 
