@@ -4,6 +4,7 @@
 //! with a server document, including schema traversal and UUID mapping.
 
 use crate::fs::{Entry, FsSchema};
+use crate::sync::client::fetch_head;
 use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
 use crate::sync::schema_io::{
     fetch_and_validate_schema, write_nested_schemas, write_schema_file, SCHEMA_FILENAME,
@@ -16,9 +17,9 @@ use crate::sync::uuid_map::{
     build_uuid_map_recursive_with_status,
 };
 use crate::sync::{
-    ancestry::determine_sync_direction, build_head_url, detect_from_path, encode_node_id,
-    is_allowed_extension, is_binary_content, looks_like_base64_binary, push_schema_to_server,
-    spawn_file_sync_tasks, FileSyncState, HeadResponse, SyncState,
+    ancestry::determine_sync_direction, detect_from_path, encode_node_id, is_allowed_extension,
+    is_binary_content, looks_like_base64_binary, push_schema_to_server, spawn_file_sync_tasks,
+    FileSyncState, SyncState,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -465,83 +466,78 @@ pub async fn handle_subdir_new_files(
         };
 
         // Fetch content from server
-        let file_head_url = build_head_url(server, &identifier, use_paths);
-        if let Ok(resp) = client.get(&file_head_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(file_head) = resp.json::<HeadResponse>().await {
-                    // Detect if file is binary and decode base64 if needed
-                    use base64::{engine::general_purpose::STANDARD, Engine};
-                    let content_info = detect_from_path(&file_path);
-                    let bytes_written: Vec<u8> = if content_info.is_binary {
-                        // Extension indicates binary - decode base64
-                        match STANDARD.decode(&file_head.content) {
-                            Ok(decoded) => decoded,
-                            Err(e) => {
-                                warn!("Failed to decode binary content: {}", e);
-                                file_head.content.as_bytes().to_vec()
-                            }
-                        }
-                    } else if looks_like_base64_binary(&file_head.content) {
-                        // Extension says text, but content looks like base64 binary
-                        match STANDARD.decode(&file_head.content) {
-                            Ok(decoded) if is_binary_content(&decoded) => decoded,
-                            _ => file_head.content.as_bytes().to_vec(),
-                        }
-                    } else {
+        if let Ok(Some(file_head)) = fetch_head(client, server, &identifier, use_paths).await {
+            // Detect if file is binary and decode base64 if needed
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            let content_info = detect_from_path(&file_path);
+            let bytes_written: Vec<u8> = if content_info.is_binary {
+                // Extension indicates binary - decode base64
+                match STANDARD.decode(&file_head.content) {
+                    Ok(decoded) => decoded,
+                    Err(e) => {
+                        warn!("Failed to decode binary content: {}", e);
                         file_head.content.as_bytes().to_vec()
-                    };
-                    tokio::fs::write(&file_path, &bytes_written).await?;
-
-                    // Hash the actual bytes written to disk
-                    let content_hash = compute_content_hash(&bytes_written);
-
-                    // Add to file states - use directory mode if shared state file available
-                    let state = if let Some(sf) = shared_state_file {
-                        Arc::new(RwLock::new(SyncState::for_directory_file(
-                            file_head.cid.clone(),
-                            sf.clone(),
-                            root_relative_path.clone(),
-                        )))
-                    } else {
-                        Arc::new(RwLock::new(SyncState::with_cid(file_head.cid.clone())))
-                    };
-                    // Update with content for echo detection
-                    {
-                        let mut s = state.write().await;
-                        s.last_written_content = file_head.content;
                     }
-
-                    info!("Created local file from subdir: {}", file_path.display());
-
-                    // Spawn sync tasks for the new file
-                    let task_handles = spawn_file_sync_tasks(
-                        client.clone(),
-                        server.to_string(),
-                        identifier.clone(),
-                        file_path.clone(),
-                        state.clone(),
-                        use_paths,
-                        push_only,
-                        pull_only,
-                        false, // force_push: directory mode doesn't support force-push
-                        #[cfg(unix)]
-                        inode_tracker.clone(),
-                    );
-
-                    let mut states = file_states.write().await;
-                    states.insert(
-                        root_relative_path.clone(),
-                        FileSyncState {
-                            relative_path: root_relative_path.clone(),
-                            identifier,
-                            state,
-                            task_handles,
-                            use_paths,
-                            content_hash: Some(content_hash),
-                        },
-                    );
                 }
+            } else if looks_like_base64_binary(&file_head.content) {
+                // Extension says text, but content looks like base64 binary
+                match STANDARD.decode(&file_head.content) {
+                    Ok(decoded) if is_binary_content(&decoded) => decoded,
+                    _ => file_head.content.as_bytes().to_vec(),
+                }
+            } else {
+                file_head.content.as_bytes().to_vec()
+            };
+            tokio::fs::write(&file_path, &bytes_written).await?;
+
+            // Hash the actual bytes written to disk
+            let content_hash = compute_content_hash(&bytes_written);
+
+            // Add to file states - use directory mode if shared state file available
+            let state = if let Some(sf) = shared_state_file {
+                Arc::new(RwLock::new(SyncState::for_directory_file(
+                    file_head.cid.clone(),
+                    sf.clone(),
+                    root_relative_path.clone(),
+                )))
+            } else {
+                Arc::new(RwLock::new(SyncState::with_cid(file_head.cid.clone())))
+            };
+            // Update with content for echo detection
+            {
+                let mut s = state.write().await;
+                s.last_written_content = file_head.content;
             }
+
+            info!("Created local file from subdir: {}", file_path.display());
+
+            // Spawn sync tasks for the new file
+            let task_handles = spawn_file_sync_tasks(
+                client.clone(),
+                server.to_string(),
+                identifier.clone(),
+                file_path.clone(),
+                state.clone(),
+                use_paths,
+                push_only,
+                pull_only,
+                false, // force_push: directory mode doesn't support force-push
+                #[cfg(unix)]
+                inode_tracker.clone(),
+            );
+
+            let mut states = file_states.write().await;
+            states.insert(
+                root_relative_path.clone(),
+                FileSyncState {
+                    relative_path: root_relative_path.clone(),
+                    identifier,
+                    state,
+                    task_handles,
+                    use_paths,
+                    content_hash: Some(content_hash),
+                },
+            );
         }
     }
 
@@ -610,14 +606,11 @@ pub async fn create_subdir_nested_directories(
     subdir_directory: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Fetch the subdirectory's schema from server
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(subdir_node_id));
-    let resp = client.get(&head_url).send().await?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Failed to fetch subdir schema: {}", resp.status()).into());
-    }
-
-    let head: HeadResponse = resp.json().await?;
+    let head = match fetch_head(client, server, subdir_node_id, false).await {
+        Ok(Some(h)) => h,
+        Ok(None) => return Err(format!("Subdir {} not found", subdir_node_id).into()),
+        Err(e) => return Err(format!("Failed to fetch subdir schema: {}", e).into()),
+    };
     if head.content.is_empty() || head.content == "{}" {
         return Ok(());
     }
@@ -695,20 +688,13 @@ async fn push_nested_schemas_recursive(
                     // Validate it's a proper schema
                     if let Ok(parsed_schema) = serde_json::from_str::<FsSchema>(&local_schema) {
                         // Check if server document is empty or has different content
-                        let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
-                        let should_push = if let Ok(resp) = client.get(&head_url).send().await {
-                            if resp.status().is_success() {
-                                if let Ok(head) = resp.json::<HeadResponse>().await {
-                                    // Push if server is empty or has trivial content
-                                    head.content.is_empty() || head.content == "{}"
-                                } else {
-                                    true
-                                }
-                            } else {
-                                true
+                        let should_push = match fetch_head(client, server, node_id, false).await {
+                            Ok(Some(head)) => {
+                                // Push if server is empty or has trivial content
+                                head.content.is_empty() || head.content == "{}"
                             }
-                        } else {
-                            true
+                            // Push if document not found or error
+                            Ok(None) | Err(_) => true,
                         };
 
                         if should_push {
@@ -897,106 +883,101 @@ pub async fn handle_schema_change(
             }
 
             // Fetch content from server
-            let file_head_url = build_head_url(server, &identifier, use_paths);
-            if let Ok(resp) = client.get(&file_head_url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(file_head) = resp.json::<HeadResponse>().await {
-                        // Detect if file is binary and decode base64 if needed
-                        // Use both extension-based detection AND try decoding as base64
-                        // to handle files that were uploaded as binary via content sniffing
-                        // Track actual bytes written for consistent hash computation
-                        use base64::{engine::general_purpose::STANDARD, Engine};
-                        let content_info = detect_from_path(&file_path);
-                        let bytes_written: Vec<u8> = if content_info.is_binary {
-                            // Extension indicates binary - decode base64
-                            match STANDARD.decode(&file_head.content) {
-                                Ok(decoded) => decoded,
-                                Err(e) => {
-                                    warn!("Failed to decode binary content: {}", e);
-                                    file_head.content.as_bytes().to_vec()
-                                }
-                            }
-                        } else if looks_like_base64_binary(&file_head.content) {
-                            // Extension says text, but content looks like base64 binary
-                            // This handles files that were detected as binary on upload
-                            match STANDARD.decode(&file_head.content) {
-                                Ok(decoded) if is_binary_content(&decoded) => {
-                                    // Successfully decoded and content is binary
-                                    decoded
-                                }
-                                _ => {
-                                    // Decode failed or not binary - write as text
-                                    file_head.content.as_bytes().to_vec()
-                                }
-                            }
-                        } else {
-                            // Extension says text, content doesn't look like base64 binary
+            if let Ok(Some(file_head)) = fetch_head(client, server, &identifier, use_paths).await {
+                // Detect if file is binary and decode base64 if needed
+                // Use both extension-based detection AND try decoding as base64
+                // to handle files that were uploaded as binary via content sniffing
+                // Track actual bytes written for consistent hash computation
+                use base64::{engine::general_purpose::STANDARD, Engine};
+                let content_info = detect_from_path(&file_path);
+                let bytes_written: Vec<u8> = if content_info.is_binary {
+                    // Extension indicates binary - decode base64
+                    match STANDARD.decode(&file_head.content) {
+                        Ok(decoded) => decoded,
+                        Err(e) => {
+                            warn!("Failed to decode binary content: {}", e);
                             file_head.content.as_bytes().to_vec()
-                        };
-                        tokio::fs::write(&file_path, &bytes_written).await?;
-
-                        // Hash the actual bytes written to disk for consistent fork detection
-                        let content_hash = compute_content_hash(&bytes_written);
-
-                        // Add to file states
-                        // Use CID from server response, or fall back to persisted CID if available
-                        let initial_cid = if file_head.cid.is_some() {
-                            file_head.cid.clone()
-                        } else if let Some(sf) = shared_state_file {
-                            sf.read().await.get_file_cid(path)
-                        } else {
-                            None
-                        };
-                        // Create SyncState - use directory mode if we have a shared state file
-                        let state = if let Some(sf) = shared_state_file {
-                            Arc::new(RwLock::new(SyncState::for_directory_file(
-                                initial_cid,
-                                sf.clone(),
-                                path.clone(),
-                            )))
-                        } else {
-                            Arc::new(RwLock::new(SyncState::with_cid(initial_cid)))
-                        };
-                        // Update state with content for echo detection
-                        {
-                            let mut s = state.write().await;
-                            s.last_written_content = file_head.content;
                         }
-
-                        info!("Created local file: {}", file_path.display());
-
-                        // Spawn sync tasks for the new file (only if requested)
-                        let task_handles = if spawn_tasks {
-                            spawn_file_sync_tasks(
-                                client.clone(),
-                                server.to_string(),
-                                identifier.clone(),
-                                file_path.clone(),
-                                state.clone(),
-                                use_paths,
-                                push_only,
-                                pull_only,
-                                false, // force_push: directory mode doesn't support force-push
-                                #[cfg(unix)]
-                                inode_tracker.clone(),
-                            )
-                        } else {
-                            Vec::new()
-                        };
-                        let mut states = file_states.write().await;
-                        states.insert(
-                            path.clone(),
-                            FileSyncState {
-                                relative_path: path.clone(),
-                                identifier,
-                                state,
-                                task_handles,
-                                use_paths,
-                                content_hash: Some(content_hash),
-                            },
-                        );
                     }
+                } else if looks_like_base64_binary(&file_head.content) {
+                    // Extension says text, but content looks like base64 binary
+                    // This handles files that were detected as binary on upload
+                    match STANDARD.decode(&file_head.content) {
+                        Ok(decoded) if is_binary_content(&decoded) => {
+                            // Successfully decoded and content is binary
+                            decoded
+                        }
+                        _ => {
+                            // Decode failed or not binary - write as text
+                            file_head.content.as_bytes().to_vec()
+                        }
+                    }
+                } else {
+                    // Extension says text, content doesn't look like base64 binary
+                    file_head.content.as_bytes().to_vec()
+                };
+                tokio::fs::write(&file_path, &bytes_written).await?;
+
+                // Hash the actual bytes written to disk for consistent fork detection
+                let content_hash = compute_content_hash(&bytes_written);
+
+                // Add to file states
+                // Use CID from server response, or fall back to persisted CID if available
+                let initial_cid = if file_head.cid.is_some() {
+                    file_head.cid.clone()
+                } else if let Some(sf) = shared_state_file {
+                    sf.read().await.get_file_cid(path)
+                } else {
+                    None
+                };
+                // Create SyncState - use directory mode if we have a shared state file
+                let state = if let Some(sf) = shared_state_file {
+                    Arc::new(RwLock::new(SyncState::for_directory_file(
+                        initial_cid,
+                        sf.clone(),
+                        path.clone(),
+                    )))
+                } else {
+                    Arc::new(RwLock::new(SyncState::with_cid(initial_cid)))
+                };
+                // Update state with content for echo detection
+                {
+                    let mut s = state.write().await;
+                    s.last_written_content = file_head.content;
                 }
+
+                info!("Created local file: {}", file_path.display());
+
+                // Spawn sync tasks for the new file (only if requested)
+                let task_handles = if spawn_tasks {
+                    spawn_file_sync_tasks(
+                        client.clone(),
+                        server.to_string(),
+                        identifier.clone(),
+                        file_path.clone(),
+                        state.clone(),
+                        use_paths,
+                        push_only,
+                        pull_only,
+                        false, // force_push: directory mode doesn't support force-push
+                        #[cfg(unix)]
+                        inode_tracker.clone(),
+                    )
+                } else {
+                    Vec::new()
+                };
+                let mut states = file_states.write().await;
+                states.insert(
+                    path.clone(),
+                    FileSyncState {
+                        relative_path: path.clone(),
+                        identifier,
+                        state,
+                        task_handles,
+                        use_paths,
+                        content_hash: Some(content_hash),
+                    },
+                );
             }
         }
     }
@@ -1088,14 +1069,11 @@ pub async fn handle_schema_change_with_dedup(
     shared_state_file: Option<&crate::sync::SharedStateFile>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     // Fetch current schema from server
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
-    let resp = client.get(&head_url).send().await?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Failed to fetch fs-root HEAD: {}", resp.status()).into());
-    }
-
-    let head: HeadResponse = resp.json().await?;
+    let head = match fetch_head(client, server, fs_root_id, false).await {
+        Ok(Some(h)) => h,
+        Ok(None) => return Ok(false), // Document not found, nothing to poll
+        Err(e) => return Err(format!("Failed to fetch fs-root HEAD: {}", e).into()),
+    };
     if head.content.is_empty() {
         return Ok(false);
     }
@@ -1254,27 +1232,21 @@ pub async fn sync_schema(
         // This ensures all sync clients get the same server-assigned UUIDs.
         let mut final_schema_json = schema_json.clone();
         let mut final_cid: Option<String> = None;
-        let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
-        if let Ok(resp) = client.get(&head_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(head) = resp.json::<HeadResponse>().await {
-                    // Write server's schema (with UUIDs) to local file
-                    final_schema_json = head.content.clone();
-                    final_cid = head.cid.clone();
-                    if let Err(e) = write_schema_file(directory, &head.content, None).await {
-                        warn!("Failed to write schema file: {}", e);
-                    }
+        if let Ok(Some(head)) = fetch_head(client, server, fs_root_id, false).await {
+            // Write server's schema (with UUIDs) to local file
+            final_schema_json = head.content.clone();
+            final_cid = head.cid.clone();
+            if let Err(e) = write_schema_file(directory, &head.content, None).await {
+                warn!("Failed to write schema file: {}", e);
+            }
 
-                    // Write nested schemas from server
-                    if let Ok(server_schema) = serde_json::from_str::<FsSchema>(&head.content) {
-                        info!("Writing nested schemas from server...");
-                        if let Err(e) =
-                            write_nested_schemas(client, server, directory, &server_schema, None)
-                                .await
-                        {
-                            warn!("Failed to write nested schemas from server: {}", e);
-                        }
-                    }
+            // Write nested schemas from server
+            if let Ok(server_schema) = serde_json::from_str::<FsSchema>(&head.content) {
+                info!("Writing nested schemas from server...");
+                if let Err(e) =
+                    write_nested_schemas(client, server, directory, &server_schema, None).await
+                {
+                    warn!("Failed to write nested schemas from server: {}", e);
                 }
             }
         }
@@ -1288,28 +1260,18 @@ pub async fn sync_schema(
             );
             sleep(Duration::from_secs(3)).await;
 
-            if let Ok(resp) = client.get(&head_url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(head) = resp.json::<HeadResponse>().await {
-                        // Update final_cid with the latest CID from retry
-                        final_cid = head.cid.clone();
-                        if let Ok(server_schema) = serde_json::from_str::<FsSchema>(&head.content) {
-                            info!(
-                                "Writing nested schemas from server (attempt {})...",
-                                attempt
-                            );
-                            if let Err(e) = write_nested_schemas(
-                                client,
-                                server,
-                                directory,
-                                &server_schema,
-                                None,
-                            )
-                            .await
-                            {
-                                warn!("Failed to write nested schemas from server: {}", e);
-                            }
-                        }
+            if let Ok(Some(head)) = fetch_head(client, server, fs_root_id, false).await {
+                // Update final_cid with the latest CID from retry
+                final_cid = head.cid.clone();
+                if let Ok(server_schema) = serde_json::from_str::<FsSchema>(&head.content) {
+                    info!(
+                        "Writing nested schemas from server (attempt {})...",
+                        attempt
+                    );
+                    if let Err(e) =
+                        write_nested_schemas(client, server, directory, &server_schema, None).await
+                    {
+                        warn!("Failed to write nested schemas from server: {}", e);
                     }
                 }
             }
@@ -1327,40 +1289,35 @@ pub async fn sync_schema(
         let local_schema_exists = local_schema_path.exists();
 
         // Fetch server schema
-        let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
-        if let Ok(resp) = client.get(&head_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(head) = resp.json::<HeadResponse>().await {
-                    // Parse the server schema for nested schema operations
-                    let server_schema: FsSchema = serde_json::from_str(&head.content)
-                        .map_err(|e| format!("Failed to parse server schema: {}", e))?;
+        if let Ok(Some(head)) = fetch_head(client, server, fs_root_id, false).await {
+            // Parse the server schema for nested schema operations
+            let server_schema: FsSchema = serde_json::from_str(&head.content)
+                .map_err(|e| format!("Failed to parse server schema: {}", e))?;
 
-                    if local_schema_exists {
-                        // Don't overwrite local schema - it may have been modified
-                        // by commonplace-link or manual edits. Use --initial-sync local
-                        // to push local changes to server, or delete .commonplace.json
-                        // to reset to server state.
-                        debug!(
-                            "Local schema exists, preserving it (use --initial-sync local to push changes)"
-                        );
-                    } else {
-                        // No local schema exists, write server's schema
-                        if let Err(e) = write_schema_file(directory, &head.content, None).await {
-                            warn!("Failed to write schema file: {}", e);
-                        }
-                    }
-
-                    // Write nested schemas for node-backed directories to local subdirectories.
-                    // This persists subdirectory schemas so they survive server restarts.
-                    if let Err(e) =
-                        write_nested_schemas(client, server, directory, &server_schema, None).await
-                    {
-                        warn!("Failed to write nested schemas: {}", e);
-                    }
-
-                    return Ok((head.content, head.cid));
+            if local_schema_exists {
+                // Don't overwrite local schema - it may have been modified
+                // by commonplace-link or manual edits. Use --initial-sync local
+                // to push local changes to server, or delete .commonplace.json
+                // to reset to server state.
+                debug!(
+                    "Local schema exists, preserving it (use --initial-sync local to push changes)"
+                );
+            } else {
+                // No local schema exists, write server's schema
+                if let Err(e) = write_schema_file(directory, &head.content, None).await {
+                    warn!("Failed to write schema file: {}", e);
                 }
             }
+
+            // Write nested schemas for node-backed directories to local subdirectories.
+            // This persists subdirectory schemas so they survive server restarts.
+            if let Err(e) =
+                write_nested_schemas(client, server, directory, &server_schema, None).await
+            {
+                warn!("Failed to write nested schemas: {}", e);
+            }
+
+            return Ok((head.content, head.cid));
         }
         Ok((schema_json, None))
     }
@@ -1370,13 +1327,8 @@ pub async fn sync_schema(
 ///
 /// Returns true if the server has non-empty, non-trivial content.
 pub async fn check_server_has_content(client: &Client, server: &str, fs_root_id: &str) -> bool {
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
-    if let Ok(resp) = client.get(&head_url).send().await {
-        if resp.status().is_success() {
-            if let Ok(head) = resp.json::<HeadResponse>().await {
-                return !head.content.is_empty() && head.content != "{}";
-            }
-        }
+    if let Ok(Some(head)) = fetch_head(client, server, fs_root_id, false).await {
+        return !head.content.is_empty() && head.content != "{}";
     }
     false
 }

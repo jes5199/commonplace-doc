@@ -2,6 +2,7 @@
 //!
 //! This module contains functions for syncing a single file with a server document.
 
+use crate::sync::client::fetch_head;
 use crate::sync::directory::{scan_directory_to_json, ScanOptions};
 use crate::sync::file_events::find_owning_document;
 use crate::sync::state::InodeKey;
@@ -9,10 +10,10 @@ use crate::sync::state_file::compute_content_hash;
 use crate::sync::uuid_map::fetch_node_id_from_schema;
 use crate::sync::{
     build_edit_url, build_head_url, build_replace_url, create_yjs_text_update, detect_from_path,
-    encode_node_id, file_watcher_task, is_binary_content, looks_like_base64_binary,
-    push_json_content, push_jsonl_content, push_schema_to_server, record_upload_result,
-    refresh_from_head, sse_task, EditRequest, EditResponse, FileEvent, FlockSyncState,
-    HeadResponse, ReplaceResponse, SyncState, PENDING_WRITE_TIMEOUT,
+    file_watcher_task, is_binary_content, looks_like_base64_binary, push_json_content,
+    push_jsonl_content, push_schema_to_server, record_upload_result, refresh_from_head, sse_task,
+    EditRequest, EditResponse, FileEvent, FlockSyncState, HeadResponse, ReplaceResponse, SyncState,
+    PENDING_WRITE_TIMEOUT,
 };
 use reqwest::Client;
 use std::path::{Path, PathBuf};
@@ -1029,14 +1030,11 @@ pub async fn initial_sync(
     file_path: &PathBuf,
     state: &Arc<RwLock<SyncState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
-    let resp = client.get(&head_url).send().await?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Failed to get HEAD: {}", resp.status()).into());
-    }
-
-    let head: HeadResponse = resp.json().await?;
+    let head = match fetch_head(client, server, node_id, false).await {
+        Ok(Some(h)) => h,
+        Ok(None) => return Err(format!("Document {} not found", node_id).into()),
+        Err(e) => return Err(format!("Failed to get HEAD: {}", e).into()),
+    };
 
     // Write content to file, handling binary content (base64-encoded on server)
     // Track the bytes we actually write to disk for proper hash computation

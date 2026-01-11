@@ -4,7 +4,8 @@
 //! fetching schemas from the server and traversing node-backed directories.
 
 use crate::fs::{Entry, FsSchema};
-use crate::sync::{encode_node_id, write_schema_file, HeadResponse, WrittenSchemas};
+use crate::sync::client::fetch_head;
+use crate::sync::{write_schema_file, WrittenSchemas};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::path::Path;
@@ -191,30 +192,15 @@ async fn build_uuid_map_from_doc_and_write_schemas(
     written_schemas: Option<&WrittenSchemas>,
 ) {
     // Fetch the schema from this document
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(doc_id));
-    let resp = match client.get(&head_url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Failed to fetch schema for {}: {}", doc_id, e);
+    let head = match fetch_head(client, server, doc_id, false).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            warn!("Document {} not found", doc_id);
             *all_succeeded = false;
             return;
         }
-    };
-
-    if !resp.status().is_success() {
-        warn!(
-            "Failed to fetch schema: {} (status {})",
-            doc_id,
-            resp.status()
-        );
-        *all_succeeded = false;
-        return;
-    }
-
-    let head: HeadResponse = match resp.json().await {
-        Ok(h) => h,
         Err(e) => {
-            warn!("Failed to parse schema response for {}: {}", doc_id, e);
+            warn!("Failed to fetch schema for {}: {}", doc_id, e);
             *all_succeeded = false;
             return;
         }
@@ -360,30 +346,15 @@ pub async fn build_uuid_map_from_doc_with_status(
     all_succeeded: &mut bool,
 ) {
     // Fetch the schema from this document
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(doc_id));
-    let resp = match client.get(&head_url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Failed to fetch schema for {}: {}", doc_id, e);
+    let head = match fetch_head(client, server, doc_id, false).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            warn!("Document {} not found", doc_id);
             *all_succeeded = false;
             return;
         }
-    };
-
-    if !resp.status().is_success() {
-        warn!(
-            "Failed to fetch schema: {} (status {})",
-            doc_id,
-            resp.status()
-        );
-        *all_succeeded = false;
-        return;
-    }
-
-    let head: HeadResponse = match resp.json().await {
-        Ok(h) => h,
         Err(e) => {
-            warn!("Failed to parse schema response for {}: {}", doc_id, e);
+            warn!("Failed to fetch schema for {}: {}", doc_id, e);
             *all_succeeded = false;
             return;
         }
@@ -535,18 +506,10 @@ pub async fn collect_node_backed_dir_ids(
                 result.push((prefix.to_string(), node_id.clone()));
 
                 // Also recursively check if this subdirectory has nested node-backed dirs
-                let url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
-                if let Ok(resp) = client.get(&url).send().await {
-                    if resp.status().is_success() {
-                        if let Ok(head) = resp.json::<HeadResponse>().await {
-                            if let Ok(schema) = serde_json::from_str::<FsSchema>(&head.content) {
-                                if let Some(ref root) = schema.root {
-                                    collect_node_backed_dir_ids(
-                                        client, server, root, prefix, result,
-                                    )
-                                    .await;
-                                }
-                            }
+                if let Ok(Some(head)) = fetch_head(client, server, node_id, false).await {
+                    if let Ok(schema) = serde_json::from_str::<FsSchema>(&head.content) {
+                        if let Some(ref root) = schema.root {
+                            collect_node_backed_dir_ids(client, server, root, prefix, result).await;
                         }
                     }
                 }
@@ -580,24 +543,14 @@ pub async fn get_all_node_backed_dir_ids(
 ) -> Vec<(String, String)> {
     let mut result = Vec::new();
 
-    let url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Failed to fetch fs-root schema: {}", e);
+    let head = match fetch_head(client, server, fs_root_id, false).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            warn!("fs-root document {} not found", fs_root_id);
             return result;
         }
-    };
-
-    if !resp.status().is_success() {
-        warn!("Failed to fetch fs-root: {}", resp.status());
-        return result;
-    }
-
-    let head: HeadResponse = match resp.json().await {
-        Ok(h) => h,
         Err(e) => {
-            warn!("Failed to parse fs-root response: {}", e);
+            warn!("Failed to fetch fs-root schema: {}", e);
             return result;
         }
     };

@@ -508,22 +508,24 @@ pub async fn resolve_path_to_uuid_http(
     let mut current_id = fs_root_id.to_string();
 
     for (i, segment) in segments.iter().enumerate() {
-        let url = format!("{}/docs/{}/head", server, current_id);
-        let resp = client.get(&url).send().await?;
-
-        if !resp.status().is_success() {
-            return Err(format!(
-                "Failed to fetch schema for '{}': HTTP {}",
-                segments[..=i].join("/"),
-                resp.status()
-            )
-            .into());
-        }
-
-        #[derive(Deserialize)]
-        struct HeadResp {
-            content: String,
-        }
+        let head = match fetch_head(client, server, &current_id, false).await {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                return Err(format!(
+                    "Failed to fetch schema for '{}': document not found",
+                    segments[..=i].join("/")
+                )
+                .into());
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Failed to fetch schema for '{}': {}",
+                    segments[..=i].join("/"),
+                    e
+                )
+                .into());
+            }
+        };
 
         #[derive(Deserialize, Default)]
         struct Schema {
@@ -541,7 +543,6 @@ pub async fn resolve_path_to_uuid_http(
             node_id: Option<String>,
         }
 
-        let head: HeadResp = resp.json().await?;
         let schema: Schema = if head.content.trim() == "{}" {
             Schema::default()
         } else {
