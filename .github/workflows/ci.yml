@@ -16,6 +16,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install and start mosquitto
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mosquitto
+          sudo systemctl start mosquitto
+          # Wait for mosquitto to be ready
+          for i in {1..10}; do
+            if nc -z localhost 1883; then
+              echo "Mosquitto is ready"
+              break
+            fi
+            echo "Waiting for mosquitto..."
+            sleep 1
+          done
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 

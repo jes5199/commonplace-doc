@@ -5,10 +5,23 @@
 //!
 //! NOTE: These tests must run serially (--test-threads=1) because they share
 //! the orchestrator status file at /tmp/commonplace-orchestrator-status.json.
+//!
+//! NOTE: These tests require MQTT broker (mosquitto) running on localhost:1883.
+//! They are skipped automatically if MQTT is not available.
 
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
+
+/// Check if MQTT broker is available on localhost:1883
+fn mqtt_available() -> bool {
+    TcpStream::connect_timeout(
+        &"127.0.0.1:1883".parse().unwrap(),
+        Duration::from_millis(100),
+    )
+    .is_ok()
+}
 
 /// Find an available port
 fn get_available_port() -> u16 {
@@ -129,8 +142,15 @@ fn wait_for_orchestrator_ready(timeout: Duration) -> Result<serde_json::Value, S
 /// - P1: Orchestrator is running (commonplace-ps shows orchestrator PID)
 /// - P2: Server is running with database persistence
 /// - P3: Workspace sync is running
+///
+/// Requires MQTT broker on localhost:1883 (skipped if not available).
 #[test]
 fn test_orchestrator_starts_base_processes() {
+    if !mqtt_available() {
+        eprintln!("Skipping test: MQTT broker not available on localhost:1883");
+        return;
+    }
+
     // Clean up any stale status file from previous runs
     let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
 
@@ -246,8 +266,15 @@ fn test_orchestrator_starts_base_processes() {
 }
 
 /// Test that commonplace-ps correctly reports orchestrator status
+///
+/// Requires MQTT broker on localhost:1883 (skipped if not available).
 #[test]
 fn test_commonplace_ps_reports_status() {
+    if !mqtt_available() {
+        eprintln!("Skipping test: MQTT broker not available on localhost:1883");
+        return;
+    }
+
     // Clean up any stale status file from previous runs
     let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
 
