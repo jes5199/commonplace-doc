@@ -4,6 +4,7 @@
 
 use crate::sync::directory::{scan_directory_to_json, ScanOptions};
 use crate::sync::file_events::find_owning_document;
+use crate::sync::state::InodeKey;
 use crate::sync::state_file::compute_content_hash;
 use crate::sync::uuid_map::fetch_node_id_from_schema;
 use crate::sync::{
@@ -461,11 +462,15 @@ pub async fn upload_task(
                                         .file_name()
                                         .map(|n| n.to_string_lossy().to_string())
                                         .unwrap_or_else(|| "file".to_string());
+                                    let inode_key = InodeKey::from_path(&file_path)
+                                        .ok()
+                                        .map(|k| k.shadow_filename());
 
                                     let mut s = state.write().await;
                                     s.last_written_cid = Some(result.cid);
                                     s.last_written_content = content;
-                                    s.mark_synced(&cid, &content_hash, &file_name).await;
+                                    s.mark_synced(&cid, &content_hash, &file_name, inode_key)
+                                        .await;
                                     upload_succeeded = true;
                                 }
                                 Err(e) => {
@@ -517,11 +522,15 @@ pub async fn upload_task(
                                         .file_name()
                                         .map(|n| n.to_string_lossy().to_string())
                                         .unwrap_or_else(|| "file".to_string());
+                                    let inode_key = InodeKey::from_path(&file_path)
+                                        .ok()
+                                        .map(|k| k.shadow_filename());
 
                                     let mut s = state.write().await;
                                     s.last_written_cid = Some(result.cid);
                                     s.last_written_content = content;
-                                    s.mark_synced(&cid, &content_hash, &file_name).await;
+                                    s.mark_synced(&cid, &content_hash, &file_name, inode_key)
+                                        .await;
                                     upload_succeeded = true;
                                 }
                                 Err(e) => {
@@ -894,11 +903,15 @@ pub async fn upload_task_with_flock(
                                         .file_name()
                                         .map(|n| n.to_string_lossy().to_string())
                                         .unwrap_or_else(|| "file".to_string());
+                                    let inode_key = InodeKey::from_path(&file_path)
+                                        .ok()
+                                        .map(|k| k.shadow_filename());
 
                                     let mut s = state.write().await;
                                     s.last_written_cid = Some(result.cid);
                                     s.last_written_content = content;
-                                    s.mark_synced(&cid, &content_hash, &file_name).await;
+                                    s.mark_synced(&cid, &content_hash, &file_name, inode_key)
+                                        .await;
                                     upload_succeeded = true;
 
                                     // Record successful upload in flock state
@@ -951,11 +964,15 @@ pub async fn upload_task_with_flock(
                                         .file_name()
                                         .map(|n| n.to_string_lossy().to_string())
                                         .unwrap_or_else(|| "file".to_string());
+                                    let inode_key = InodeKey::from_path(&file_path)
+                                        .ok()
+                                        .map(|k| k.shadow_filename());
 
                                     let mut s = state.write().await;
                                     s.last_written_cid = Some(result.cid);
                                     s.last_written_content = content;
-                                    s.mark_synced(&cid, &content_hash, &file_name).await;
+                                    s.mark_synced(&cid, &content_hash, &file_name, inode_key)
+                                        .await;
                                     upload_succeeded = true;
 
                                     // Record successful upload in flock state
@@ -1076,7 +1093,11 @@ pub async fn initial_sync(
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "file".to_string());
-            s.mark_synced(cid, &content_hash, &file_name).await;
+            let inode_key = InodeKey::from_path(file_path)
+                .ok()
+                .map(|k| k.shadow_filename());
+            s.mark_synced(cid, &content_hash, &file_name, inode_key)
+                .await;
         }
     }
 

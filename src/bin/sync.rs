@@ -1010,6 +1010,19 @@ async fn run_directory_mode(
         shared_state_file.read().await.files.len()
     );
 
+    // Initialize inode tracker from persisted state
+    if let Some(ref tracker) = inode_tracker {
+        let sf = shared_state_file.read().await;
+        let mut t = tracker.write().await;
+        t.init_from_state_file(&sf, &directory);
+        if !t.states.is_empty() {
+            info!(
+                "Initialized inode tracker with {} persisted entries",
+                t.states.len()
+            );
+        }
+    }
+
     // If strategy is "server" and server has content, pull server files first
     // This creates the temporary file_states that handle_schema_change needs
     let file_states: Arc<RwLock<HashMap<String, FileSyncState>>> =
@@ -1556,6 +1569,19 @@ async fn run_exec_mode(
         state_file_path.display(),
         shared_state_file.read().await.files.len()
     );
+
+    // Initialize inode tracker from persisted state (sandbox mode)
+    if let Some(ref tracker) = inode_tracker {
+        let sf = shared_state_file.read().await;
+        let mut t = tracker.write().await;
+        t.init_from_state_file(&sf, &directory);
+        if !t.states.is_empty() {
+            info!(
+                "Initialized inode tracker with {} persisted entries",
+                t.states.len()
+            );
+        }
+    }
 
     // If strategy is "server" and server has content, pull server files first
     let file_states: Arc<RwLock<HashMap<String, FileSyncState>>> =

@@ -41,6 +41,10 @@ pub struct FileState {
     /// Commit ID of the last successful sync for this file
     #[serde(default)]
     pub last_cid: Option<String>,
+    /// Inode key (dev-ino hex format) of the file at last sync.
+    /// Used to initialize InodeTracker on startup.
+    #[serde(default)]
+    pub inode_key: Option<String>,
 }
 
 impl SyncStateFile {
@@ -110,6 +114,30 @@ impl SyncStateFile {
 
     /// Update file state with CID after a successful sync.
     pub fn update_file_with_cid(&mut self, relative_path: &str, hash: String, cid: Option<String>) {
+        self.update_file_full(relative_path, hash, cid, None);
+    }
+
+    /// Update file state with CID and inode after a successful sync.
+    ///
+    /// The inode_key should be in "dev-ino" hex format (e.g., "fc00-1234abcd").
+    pub fn update_file_with_inode(
+        &mut self,
+        relative_path: &str,
+        hash: String,
+        cid: Option<String>,
+        inode_key: Option<String>,
+    ) {
+        self.update_file_full(relative_path, hash, cid, inode_key);
+    }
+
+    /// Internal: update file state with all fields.
+    fn update_file_full(
+        &mut self,
+        relative_path: &str,
+        hash: String,
+        cid: Option<String>,
+        inode_key: Option<String>,
+    ) {
         let now = chrono::Utc::now().to_rfc3339();
         self.files.insert(
             relative_path.to_string(),
@@ -117,6 +145,7 @@ impl SyncStateFile {
                 hash,
                 last_modified: Some(now),
                 last_cid: cid,
+                inode_key,
             },
         );
     }
@@ -126,6 +155,13 @@ impl SyncStateFile {
         self.files
             .get(relative_path)
             .and_then(|f| f.last_cid.clone())
+    }
+
+    /// Get the inode key for a file, if known.
+    pub fn get_file_inode(&self, relative_path: &str) -> Option<String> {
+        self.files
+            .get(relative_path)
+            .and_then(|f| f.inode_key.clone())
     }
 
     /// Mark a sync as complete.

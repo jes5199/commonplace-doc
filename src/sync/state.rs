@@ -288,6 +288,39 @@ impl InodeTracker {
     pub fn clear(&mut self) {
         self.states.clear();
     }
+
+    /// Initialize tracker from persisted state file.
+    ///
+    /// On startup, this populates the tracker with inode→CID mappings from the
+    /// persisted state file. This ensures InodeTracker starts with correct state
+    /// rather than being empty.
+    ///
+    /// The `base_dir` is the directory containing the synced files (used to
+    /// construct absolute paths from relative paths in the state file).
+    pub fn init_from_state_file(
+        &mut self,
+        state_file: &crate::sync::state_file::SyncStateFile,
+        base_dir: &std::path::Path,
+    ) {
+        for (relative_path, file_state) in &state_file.files {
+            // Skip files without inode or CID
+            let (Some(inode_str), Some(cid)) = (&file_state.inode_key, &file_state.last_cid) else {
+                continue;
+            };
+
+            // Parse the inode key
+            let Some(inode_key) = InodeKey::from_shadow_filename(inode_str) else {
+                tracing::warn!("Invalid inode key in state file: {}", inode_str);
+                continue;
+            };
+
+            // Construct primary path
+            let primary_path = base_dir.join(relative_path);
+
+            // Track this inode
+            self.track(inode_key, cid.clone(), primary_path);
+        }
+    }
 }
 
 /// Pending write from server - used for barrier-based echo detection.
@@ -415,11 +448,25 @@ impl SyncState {
     ///
     /// Called after a successful upload or download to record the new state.
     /// Works with both file mode (single state file) and directory mode (shared state file).
-    pub async fn mark_synced(&mut self, cid: &str, content_hash: &str, relative_path: &str) {
+    ///
+    /// The optional `inode_key` should be in "dev-ino" hex format (e.g., "fc00-1234abcd").
+    /// Use `InodeKey::from_path()` to compute it from the file path.
+    pub async fn mark_synced(
+        &mut self,
+        cid: &str,
+        content_hash: &str,
+        relative_path: &str,
+        inode_key: Option<String>,
+    ) {
         // File mode: update single-file state file
         if let Some(ref mut state_file) = self.state_file {
             state_file.mark_synced(cid.to_string());
-            state_file.update_file(relative_path, content_hash.to_string());
+            state_file.update_file_with_inode(
+                relative_path,
+                content_hash.to_string(),
+                Some(cid.to_string()),
+                inode_key.clone(),
+            );
 
             // Save to disk
             if let Some(ref path) = self.state_file_path {
@@ -429,13 +476,18 @@ impl SyncState {
             }
         }
 
-        // Directory mode: update shared state file with per-file CID
+        // Directory mode: update shared state file with per-file CID and inode
         if let Some(ref shared_sf) = self.shared_state_file {
             // Use our stored relative path for the key (not the filename parameter)
             let path_key = self.relative_path.as_deref().unwrap_or(relative_path);
 
             let mut sf = shared_sf.write().await;
-            sf.update_file_with_cid(path_key, content_hash.to_string(), Some(cid.to_string()));
+            sf.update_file_with_inode(
+                path_key,
+                content_hash.to_string(),
+                Some(cid.to_string()),
+                inode_key,
+            );
         }
     }
 

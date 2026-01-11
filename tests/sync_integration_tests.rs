@@ -386,6 +386,27 @@ fn test_cid_persistence_survives_sync_restart() {
         state_content
     );
 
+    // CP-bsjy: Verify inode_key is also persisted for unified inode/CID tracking
+    // The files map should have an entry with inode_key set
+    let files = &state["files"];
+    assert!(
+        files.is_object() && !files.as_object().unwrap().is_empty(),
+        "State file should have files map: {}",
+        state_content
+    );
+
+    // Check that at least one file entry has an inode_key
+    let has_inode_key = files
+        .as_object()
+        .unwrap()
+        .values()
+        .any(|f| f["inode_key"].is_string() && !f["inode_key"].as_str().unwrap().is_empty());
+    assert!(
+        has_inode_key,
+        "At least one file should have inode_key persisted: {}",
+        state_content
+    );
+
     // Make a local edit while sync is stopped
     let edited_content = "Edited locally while sync was stopped";
     std::fs::write(&sync_file, edited_content).expect("Failed to write local file");
