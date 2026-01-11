@@ -20,6 +20,7 @@ pub mod schema_io;
 pub mod sse;
 pub mod state;
 pub mod state_file;
+pub mod subdir_spawn;
 pub mod subscriptions;
 pub mod types;
 pub mod urls;

@@ -357,7 +357,6 @@ fn test_cid_persistence_survives_sync_restart() {
     // Gracefully stop the sync client with SIGTERM (so it saves state file)
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
         unsafe {
             libc::kill(sync.id() as i32, libc::SIGTERM);
         }
@@ -430,5 +429,195 @@ fn test_cid_persistence_survives_sync_restart() {
         server_content.contains("Edited locally"),
         "Server should have received local edit. Server content: {}",
         server_content
+    );
+}
+
+/// Helper to spawn sync client in directory mode
+fn spawn_sync_directory(server_url: &str, directory: &std::path::Path, node_id: &str) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_commonplace-sync"))
+        .args([
+            "--server",
+            server_url,
+            "--node",
+            node_id,
+            "--directory",
+            directory.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn sync client")
+}
+
+/// CP-q52x: Test that newly created node-backed subdirectories propagate without restart.
+///
+/// Scenario:
+/// 1. Create a fs-root document on server with initial schema
+/// 2. Start sync client watching the directory
+/// 3. Create a new node-backed subdirectory via HTTP API
+/// 4. Verify sync client discovers and watches the new subdir (via SSE)
+/// 5. Create a file in the subdirectory
+/// 6. Verify the file appears locally without restarting sync
+#[test]
+fn test_node_backed_subdir_propagates_without_restart() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+
+    let mut guard = ProcessGuard::new();
+    let server = spawn_server(port, &db_path);
+    guard.add(server);
+
+    let client = reqwest::blocking::Client::new();
+
+    // Create fs-root document with initial schema (empty directory)
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let fs_root_id = body["id"].as_str().expect("No id in response");
+
+    // Start sync client in directory mode
+    let sync = spawn_sync_directory(&server_url, &sync_dir, fs_root_id);
+    guard.add(sync);
+
+    // Wait for initial sync to complete
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Create a node-backed subdirectory by updating the schema
+    // First, create a document for the subdir
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create subdir document");
+
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let subdir_id = body["id"].as_str().expect("No id in response");
+
+    // Update fs-root schema to include the node-backed subdirectory
+    // First fetch HEAD to get parent CID
+    let resp = client
+        .get(format!("{}/docs/{}/head", server_url, fs_root_id))
+        .send()
+        .expect("Failed to get fs-root HEAD");
+    let head: serde_json::Value = resp.json().expect("Failed to parse HEAD");
+    let parent_cid = head["cid"].as_str().expect("No cid in HEAD");
+
+    let schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "newsubdir": {
+                    "type": "dir",
+                    "node_id": subdir_id
+                }
+            }
+        }
+    });
+
+    let resp = client
+        .post(format!(
+            "{}/docs/{}/replace?parent_cid={}",
+            server_url, fs_root_id, parent_cid
+        ))
+        .header("Content-Type", "application/json")
+        .body(schema.to_string())
+        .send()
+        .expect("Failed to update fs-root schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to update schema: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    // Wait for sync to discover the new subdir via SSE
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Verify the subdirectory was created locally
+    let subdir_path = sync_dir.join("newsubdir");
+    assert!(
+        subdir_path.exists(),
+        "Subdirectory should be created locally: {}",
+        subdir_path.display()
+    );
+
+    // Create a file in the subdirectory on the server
+    let file_content = "Hello from new subdir!";
+
+    // Create the file document
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create file document");
+
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let file_id = body["id"].as_str().expect("No id in response");
+
+    // Set file content - for new documents with no commits, we don't need parent_cid
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(file_content)
+        .send()
+        .expect("Failed to set file content");
+    assert!(
+        resp.status().is_success(),
+        "Failed to set file content: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    // Update subdir schema with file's node_id - subdir is new, no parent_cid needed
+    let file_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "test.txt": {
+                    "type": "doc",
+                    "node_id": file_id
+                }
+            }
+        }
+    });
+
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, subdir_id))
+        .header("Content-Type", "application/json")
+        .body(file_schema.to_string())
+        .send()
+        .expect("Failed to update subdir schema with file");
+    assert!(
+        resp.status().is_success(),
+        "Failed to update subdir schema: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    // Wait for sync to propagate the file
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Verify the file was created locally
+    let file_path = subdir_path.join("test.txt");
+    assert!(
+        file_path.exists(),
+        "File should be created in subdirectory: {}",
+        file_path.display()
+    );
+
+    let local_content = std::fs::read_to_string(&file_path).expect("Failed to read file");
+    assert!(
+        local_content.contains("Hello from new subdir"),
+        "File content should match. Got: {}",
+        local_content
     );
 }

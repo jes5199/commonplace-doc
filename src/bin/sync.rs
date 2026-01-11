@@ -8,14 +8,16 @@ use clap::Parser;
 use commonplace_doc::fs::{DocEntry, Entry, FsSchema};
 use commonplace_doc::mqtt::{MqttClient, MqttConfig};
 use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
+use commonplace_doc::sync::subdir_spawn::{
+    spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport,
+};
 use commonplace_doc::sync::{
     acquire_sync_lock, build_replace_url, build_uuid_map_recursive, check_server_has_content,
     detect_from_path, directory_mqtt_task, directory_sse_task, directory_watcher_task,
-    encode_node_id, ensure_fs_root_exists, file_watcher_task, fork_node,
-    get_all_node_backed_dir_ids, handle_file_created, handle_file_deleted, handle_file_modified,
-    handle_schema_change, handle_schema_modified, initial_sync, is_binary_content,
-    push_schema_to_server, scan_directory_with_contents, spawn_file_sync_tasks_with_flock,
-    sse_task, subdir_mqtt_task, subdir_sse_task, sync_schema, sync_single_file, upload_task,
+    encode_node_id, ensure_fs_root_exists, file_watcher_task, fork_node, handle_file_created,
+    handle_file_deleted, handle_file_modified, handle_schema_change, handle_schema_modified,
+    initial_sync, is_binary_content, push_schema_to_server, scan_directory_with_contents,
+    spawn_file_sync_tasks_with_flock, sse_task, sync_schema, sync_single_file, upload_task,
     DirEvent, FileEvent, FileSyncState, FlockSyncState, InodeKey, InodeTracker, ReplaceResponse,
     ScanOptions, SyncState, SCHEMA_FILENAME,
 };
@@ -1229,62 +1231,30 @@ async fn run_directory_mode(
     // Start tasks for all node-backed subdirectories (skip if push-only)
     // This allows files created in subdirectories to propagate to other sync clients
     if !push_only {
-        let node_backed_subdirs = get_all_node_backed_dir_ids(&client, &server, &fs_root_id).await;
-        info!(
-            "Found {} node-backed subdirectories to watch",
-            node_backed_subdirs.len()
-        );
-        let mut watched = watched_subdirs.write().await;
-        for (subdir_path, subdir_node_id) in node_backed_subdirs {
-            if let Some(ref mqtt) = mqtt_client {
-                info!(
-                    "Spawning MQTT task for node-backed subdir: {} ({})",
-                    subdir_path, subdir_node_id
-                );
-                watched.insert(subdir_node_id.clone());
-                tokio::spawn(subdir_mqtt_task(
-                    client.clone(),
-                    server.clone(),
-                    fs_root_id.clone(),
-                    subdir_path,
-                    subdir_node_id,
-                    directory.clone(),
-                    file_states.clone(),
-                    use_paths,
-                    push_only,
-                    pull_only,
-                    Some(shared_state_file.clone()),
-                    #[cfg(unix)]
-                    inode_tracker.clone(),
-                    mqtt.clone(),
-                    workspace.clone(),
-                    watched_subdirs.clone(),
-                ));
-            } else {
-                info!(
-                    "Spawning SSE task for node-backed subdir: {} ({})",
-                    subdir_path, subdir_node_id
-                );
-                watched.insert(subdir_node_id.clone());
-                tokio::spawn(subdir_sse_task(
-                    client.clone(),
-                    server.clone(),
-                    fs_root_id.clone(),
-                    subdir_path,
-                    subdir_node_id,
-                    directory.clone(),
-                    file_states.clone(),
-                    use_paths,
-                    push_only,
-                    pull_only,
-                    Some(shared_state_file.clone()),
-                    #[cfg(unix)]
-                    inode_tracker.clone(),
-                    watched_subdirs.clone(),
-                ));
+        let params = SubdirSpawnParams {
+            client: client.clone(),
+            server: server.clone(),
+            fs_root_id: fs_root_id.clone(),
+            directory: directory.clone(),
+            file_states: file_states.clone(),
+            use_paths,
+            push_only,
+            pull_only,
+            shared_state_file: Some(shared_state_file.clone()),
+            #[cfg(unix)]
+            inode_tracker: inode_tracker.clone(),
+            watched_subdirs: watched_subdirs.clone(),
+        };
+        let transport = if let Some(ref mqtt) = mqtt_client {
+            SubdirTransport::Mqtt {
+                client: mqtt.clone(),
+                workspace: workspace.clone(),
             }
-        }
-        drop(watched); // Release lock before continuing
+        } else {
+            SubdirTransport::Sse
+        };
+        let count = spawn_subdir_watchers(&params, transport).await;
+        info!("Spawned {} node-backed subdirectory watcher(s)", count);
     }
 
     // Start file sync tasks for each file and store handles in FileSyncState
@@ -1752,36 +1722,22 @@ async fn run_exec_mode(
 
     // Start SSE tasks for all node-backed subdirectories (skip if push-only)
     if !push_only {
-        let node_backed_subdirs = get_all_node_backed_dir_ids(&client, &server, &fs_root_id).await;
-        info!(
-            "Found {} node-backed subdirectories to watch",
-            node_backed_subdirs.len()
-        );
-        let mut watched = watched_subdirs.write().await;
-        for (subdir_path, subdir_node_id) in node_backed_subdirs {
-            info!(
-                "Spawning SSE task for node-backed subdir: {} ({})",
-                subdir_path, subdir_node_id
-            );
-            watched.insert(subdir_node_id.clone());
-            tokio::spawn(subdir_sse_task(
-                client.clone(),
-                server.clone(),
-                fs_root_id.clone(),
-                subdir_path,
-                subdir_node_id,
-                directory.clone(),
-                file_states.clone(),
-                use_paths,
-                push_only,
-                pull_only,
-                Some(shared_state_file.clone()),
-                #[cfg(unix)]
-                inode_tracker.clone(),
-                watched_subdirs.clone(),
-            ));
-        }
-        drop(watched); // Release lock before continuing
+        let params = SubdirSpawnParams {
+            client: client.clone(),
+            server: server.clone(),
+            fs_root_id: fs_root_id.clone(),
+            directory: directory.clone(),
+            file_states: file_states.clone(),
+            use_paths,
+            push_only,
+            pull_only,
+            shared_state_file: Some(shared_state_file.clone()),
+            #[cfg(unix)]
+            inode_tracker: inode_tracker.clone(),
+            watched_subdirs: watched_subdirs.clone(),
+        };
+        let count = spawn_subdir_watchers(&params, SubdirTransport::Sse).await;
+        info!("Spawned {} node-backed subdirectory watcher(s)", count);
     }
 
     // Start file sync tasks for each file

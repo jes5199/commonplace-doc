@@ -8,6 +8,7 @@ use crate::sync::dir_sync::{
     create_subdir_nested_directories, handle_schema_change_with_dedup, handle_subdir_new_files,
     handle_subdir_schema_cleanup,
 };
+use crate::sync::subdir_spawn::{spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport};
 use crate::sync::{encode_node_id, FileSyncState};
 use futures::StreamExt;
 use reqwest::{Client, StatusCode};
@@ -237,41 +238,22 @@ pub async fn directory_sse_task(
                             }
 
                             // Check for newly discovered node-backed subdirs and spawn SSE tasks
-                            // (Done outside the match to avoid holding non-Send error across await)
                             if !push_only {
-                                let all_subdirs = crate::sync::get_all_node_backed_dir_ids(
-                                    &client,
-                                    &server,
-                                    &fs_root_id,
-                                )
-                                .await;
-
-                                let mut watched = watched_subdirs.write().await;
-                                for (subdir_path, subdir_node_id) in all_subdirs {
-                                    if !watched.contains(&subdir_node_id) {
-                                        info!(
-                                            "Spawning SSE task for newly discovered subdir: {} ({})",
-                                            subdir_path, subdir_node_id
-                                        );
-                                        watched.insert(subdir_node_id.clone());
-                                        tokio::spawn(subdir_sse_task(
-                                            client.clone(),
-                                            server.clone(),
-                                            fs_root_id.clone(),
-                                            subdir_path,
-                                            subdir_node_id,
-                                            directory.clone(),
-                                            file_states.clone(),
-                                            use_paths,
-                                            push_only,
-                                            pull_only,
-                                            shared_state_file.clone(),
-                                            #[cfg(unix)]
-                                            inode_tracker.clone(),
-                                            watched_subdirs.clone(),
-                                        ));
-                                    }
-                                }
+                                let params = SubdirSpawnParams {
+                                    client: client.clone(),
+                                    server: server.clone(),
+                                    fs_root_id: fs_root_id.clone(),
+                                    directory: directory.clone(),
+                                    file_states: file_states.clone(),
+                                    use_paths,
+                                    push_only,
+                                    pull_only,
+                                    shared_state_file: shared_state_file.clone(),
+                                    #[cfg(unix)]
+                                    inode_tracker: inode_tracker.clone(),
+                                    watched_subdirs: watched_subdirs.clone(),
+                                };
+                                spawn_subdir_watchers(&params, SubdirTransport::Sse).await;
                             }
                         }
                         "closed" => {
@@ -584,41 +566,28 @@ pub async fn directory_mqtt_task(
 
                     // Check for newly discovered node-backed subdirs and spawn tasks
                     if !push_only {
-                        let all_subdirs = crate::sync::get_all_node_backed_dir_ids(
-                            &http_client,
-                            &server,
-                            &fs_root_id,
+                        let params = SubdirSpawnParams {
+                            client: http_client.clone(),
+                            server: server.clone(),
+                            fs_root_id: fs_root_id.clone(),
+                            directory: directory.clone(),
+                            file_states: file_states.clone(),
+                            use_paths,
+                            push_only,
+                            pull_only,
+                            shared_state_file: shared_state_file.clone(),
+                            #[cfg(unix)]
+                            inode_tracker: inode_tracker.clone(),
+                            watched_subdirs: watched_subdirs.clone(),
+                        };
+                        spawn_subdir_watchers(
+                            &params,
+                            SubdirTransport::Mqtt {
+                                client: mqtt_client.clone(),
+                                workspace: workspace.clone(),
+                            },
                         )
                         .await;
-
-                        let mut watched = watched_subdirs.write().await;
-                        for (subdir_path, subdir_node_id) in all_subdirs {
-                            if !watched.contains(&subdir_node_id) {
-                                info!(
-                                    "Spawning MQTT task for newly discovered subdir: {} ({})",
-                                    subdir_path, subdir_node_id
-                                );
-                                watched.insert(subdir_node_id.clone());
-                                tokio::spawn(subdir_mqtt_task(
-                                    http_client.clone(),
-                                    server.clone(),
-                                    fs_root_id.clone(),
-                                    subdir_path,
-                                    subdir_node_id,
-                                    directory.clone(),
-                                    file_states.clone(),
-                                    use_paths,
-                                    push_only,
-                                    pull_only,
-                                    shared_state_file.clone(),
-                                    #[cfg(unix)]
-                                    inode_tracker.clone(),
-                                    mqtt_client.clone(),
-                                    workspace.clone(),
-                                    watched_subdirs.clone(),
-                                ));
-                            }
-                        }
                     }
                 }
             }
