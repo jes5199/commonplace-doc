@@ -177,18 +177,18 @@ mod tests {
     mod url_builders {
         use super::*;
 
-        const SERVER: &str = "http://localhost:3000";
+        const SERVER: &str = "http://localhost:5199";
 
         #[test]
         fn test_build_head_url_with_paths() {
             let url = build_head_url(SERVER, "notes/todo.txt", true);
-            assert_eq!(url, "http://localhost:3000/files/notes/todo.txt/head");
+            assert_eq!(url, "http://localhost:5199/files/notes/todo.txt/head");
         }
 
         #[test]
         fn test_build_head_url_with_id() {
             let url = build_head_url(SERVER, "abc-123", false);
-            assert_eq!(url, "http://localhost:3000/docs/abc-123/head");
+            assert_eq!(url, "http://localhost:5199/docs/abc-123/head");
         }
 
         #[test]
@@ -196,20 +196,20 @@ mod tests {
             let url = build_head_url(SERVER, "fs-root:notes/todo.txt", false);
             assert_eq!(
                 url,
-                "http://localhost:3000/docs/fs-root%3Anotes%2Ftodo.txt/head"
+                "http://localhost:5199/docs/fs-root%3Anotes%2Ftodo.txt/head"
             );
         }
 
         #[test]
         fn test_build_edit_url_with_paths() {
             let url = build_edit_url(SERVER, "notes/todo.txt", true);
-            assert_eq!(url, "http://localhost:3000/files/notes/todo.txt/edit");
+            assert_eq!(url, "http://localhost:5199/files/notes/todo.txt/edit");
         }
 
         #[test]
         fn test_build_edit_url_with_id() {
             let url = build_edit_url(SERVER, "abc-123", false);
-            assert_eq!(url, "http://localhost:3000/docs/abc-123/edit");
+            assert_eq!(url, "http://localhost:5199/docs/abc-123/edit");
         }
 
         #[test]
@@ -217,7 +217,7 @@ mod tests {
             let url = build_replace_url(SERVER, "notes/todo.txt", "cid123", true);
             assert_eq!(
                 url,
-                "http://localhost:3000/files/notes/todo.txt/replace?parent_cid=cid123&author=sync-client"
+                "http://localhost:5199/files/notes/todo.txt/replace?parent_cid=cid123&author=sync-client"
             );
         }
 
@@ -226,20 +226,20 @@ mod tests {
             let url = build_replace_url(SERVER, "abc-123", "cid456", false);
             assert_eq!(
                 url,
-                "http://localhost:3000/docs/abc-123/replace?parent_cid=cid456&author=sync-client"
+                "http://localhost:5199/docs/abc-123/replace?parent_cid=cid456&author=sync-client"
             );
         }
 
         #[test]
         fn test_build_sse_url_with_paths() {
             let url = build_sse_url(SERVER, "notes/todo.txt", true);
-            assert_eq!(url, "http://localhost:3000/sse/files/notes/todo.txt");
+            assert_eq!(url, "http://localhost:5199/sse/files/notes/todo.txt");
         }
 
         #[test]
         fn test_build_sse_url_with_id() {
             let url = build_sse_url(SERVER, "abc-123", false);
-            assert_eq!(url, "http://localhost:3000/sse/docs/abc-123");
+            assert_eq!(url, "http://localhost:5199/sse/docs/abc-123");
         }
 
         #[test]
@@ -247,14 +247,14 @@ mod tests {
             let url = build_head_url(SERVER, "my notes/my file.txt", true);
             assert_eq!(
                 url,
-                "http://localhost:3000/files/my%20notes/my%20file.txt/head"
+                "http://localhost:5199/files/my%20notes/my%20file.txt/head"
             );
         }
 
         #[test]
         fn test_build_fork_url_simple() {
             let url = build_fork_url(SERVER, "my-node", None);
-            assert_eq!(url, "http://localhost:3000/docs/my-node/fork");
+            assert_eq!(url, "http://localhost:5199/docs/my-node/fork");
         }
 
         #[test]
@@ -262,21 +262,21 @@ mod tests {
             let url = build_fork_url(SERVER, "my-node", Some("abc123"));
             assert_eq!(
                 url,
-                "http://localhost:3000/docs/my-node/fork?at_commit=abc123"
+                "http://localhost:5199/docs/my-node/fork?at_commit=abc123"
             );
         }
 
         #[test]
         fn test_build_is_ancestor_url() {
             let url = build_is_ancestor_url(
-                "http://localhost:3000",
+                "http://localhost:5199",
                 &uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
                 "abc123",
                 "def456",
             );
             assert_eq!(
                 url,
-                "http://localhost:3000/docs/550e8400-e29b-41d4-a716-446655440000/is-ancestor?ancestor=abc123&descendant=def456"
+                "http://localhost:5199/docs/550e8400-e29b-41d4-a716-446655440000/is-ancestor?ancestor=abc123&descendant=def456"
             );
         }
     }

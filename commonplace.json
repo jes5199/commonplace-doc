@@ -14,7 +14,7 @@
     },
     "sync": {
       "command": "/home/jes/commonplace/target/release/commonplace-sync",
-      "args": ["--server", "http://localhost:3000", "--node", "workspace", "--directory", "./workspace", "--initial-sync", "local"],
+      "args": ["--server", "http://localhost:5199", "--node", "workspace", "--directory", "./workspace", "--initial-sync", "local"],
       "restart": {
         "policy": "always",
         "backoff_ms": 500,
@@ -24,7 +24,7 @@
     },
     "beads-sync": {
       "command": "/home/jes/commonplace/target/release/commonplace-sync",
-      "args": ["--server", "http://localhost:3000", "--path", "beads/commonplace-issues.jsonl", "--file", ".beads/issues.jsonl", "--push-only"],
+      "args": ["--server", "http://localhost:5199", "--path", "beads/commonplace-issues.jsonl", "--file", ".beads/issues.jsonl", "--push-only"],
       "restart": {
         "policy": "always",
         "backoff_ms": 500,

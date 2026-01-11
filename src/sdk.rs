@@ -1,7 +1,7 @@
 //! SDK serving endpoints for JS evaluator.
 //!
 //! Serves TypeScript SDK files from the sdk/ directory so Deno scripts
-//! can import them via URL (e.g., `import { cp } from "http://localhost:3000/sdk/mod.ts"`).
+//! can import them via URL (e.g., `import { cp } from "http://localhost:5199/sdk/mod.ts"`).
 
 use axum::body::Body;
 use axum::extract::Path;

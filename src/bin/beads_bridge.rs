@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Default server URL
-const DEFAULT_SERVER: &str = "http://localhost:3000";
+const DEFAULT_SERVER: &str = "http://localhost:5199";
 
 #[derive(Parser)]
 #[command(

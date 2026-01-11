@@ -1566,7 +1566,7 @@ mod tests {
             None,
             &mut path_state,
             &client,
-            "http://localhost:3000",
+            "http://localhost:5199",
         )
         .await
         .unwrap();
@@ -1592,7 +1592,7 @@ mod tests {
             None,
             &mut path_state,
             &client,
-            "http://localhost:3000",
+            "http://localhost:5199",
         )
         .await
         .unwrap();
@@ -1623,7 +1623,7 @@ mod tests {
             None,
             &mut path_state,
             &client,
-            "http://localhost:3000",
+            "http://localhost:5199",
         )
         .await
         .unwrap();

@@ -115,7 +115,7 @@ impl OrchestratorConfig {
     /// Resolve the HTTP server URL with fallback chain:
     /// 1. Parse --port from http process args
     /// 2. Use http_server config field
-    /// 3. Default to http://localhost:3000
+    /// 3. Default to http://localhost:5199
     pub fn resolve_server_url(&self) -> String {
         // Try to parse port from http process args
         if let Some(http_config) = self.processes.get("http") {
@@ -135,7 +135,7 @@ impl OrchestratorConfig {
         }
 
         // Default
-        "http://localhost:3000".to_string()
+        "http://localhost:5199".to_string()
     }
 
     /// Returns process names in dependency order (dependencies first)
@@ -242,7 +242,7 @@ mod tests {
                 },
                 "http": {
                     "command": "commonplace-http",
-                    "args": ["--port", "3000"],
+                    "args": ["--port", "5199"],
                     "depends_on": ["store"]
                 }
             }
@@ -315,7 +315,7 @@ mod tests {
     fn test_resolve_server_url_default() {
         let json = r#"{ "database": "./data.redb", "processes": {} }"#;
         let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.resolve_server_url(), "http://localhost:3000");
+        assert_eq!(config.resolve_server_url(), "http://localhost:5199");
     }
 
     #[test]

@@ -1318,10 +1318,10 @@ mod tests {
     fn test_discovered_process_manager_new() {
         let manager = DiscoveredProcessManager::new(
             "localhost:1883".to_string(),
-            "http://localhost:3000".to_string(),
+            "http://localhost:5199".to_string(),
         );
         assert_eq!(manager.mqtt_broker(), "localhost:1883");
-        assert_eq!(manager.server_url(), "http://localhost:3000");
+        assert_eq!(manager.server_url(), "http://localhost:5199");
         assert!(manager.processes().is_empty());
     }
 
@@ -1329,7 +1329,7 @@ mod tests {
     fn test_add_process() {
         let mut manager = DiscoveredProcessManager::new(
             "localhost:1883".to_string(),
-            "http://localhost:3000".to_string(),
+            "http://localhost:5199".to_string(),
         );
 
         let config = DiscoveredProcess {
@@ -1360,7 +1360,7 @@ mod tests {
     fn test_add_directory_attached_process() {
         let mut manager = DiscoveredProcessManager::new(
             "localhost:1883".to_string(),
-            "http://localhost:3000".to_string(),
+            "http://localhost:5199".to_string(),
         );
 
         let config = DiscoveredProcess {
@@ -1389,17 +1389,17 @@ mod tests {
     async fn test_spawn_sets_server_env() {
         let manager = DiscoveredProcessManager::new(
             "localhost:1883".to_string(),
-            "http://localhost:3000".to_string(),
+            "http://localhost:5199".to_string(),
         );
 
-        assert_eq!(manager.server_url(), "http://localhost:3000");
+        assert_eq!(manager.server_url(), "http://localhost:5199");
     }
 
     #[test]
     fn test_add_evaluate_process() {
         let mut manager = DiscoveredProcessManager::new(
             "localhost:1883".to_string(),
-            "http://localhost:3000".to_string(),
+            "http://localhost:5199".to_string(),
         );
 
         let config = DiscoveredProcess {

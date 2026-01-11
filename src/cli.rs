@@ -12,7 +12,7 @@ pub struct Args {
     pub database: Option<PathBuf>,
 
     /// Port to listen on
-    #[clap(short, long, default_value = "3000")]
+    #[clap(short, long, default_value = "5199")]
     pub port: u16,
 
     /// Host to bind to
@@ -74,7 +74,7 @@ pub struct StoreArgs {
 #[clap(about = "HTTP gateway that translates requests to MQTT", long_about = None)]
 pub struct HttpArgs {
     /// Port to listen on
-    #[clap(short, long, default_value = "3000")]
+    #[clap(short, long, default_value = "5199")]
     pub port: u16,
 
     /// Host to bind to
@@ -116,7 +116,7 @@ pub struct OrchestratorArgs {
     pub only: Option<String>,
 
     /// HTTP server URL for recursive process discovery
-    #[clap(long, value_name = "URL", default_value = "http://localhost:3000")]
+    #[clap(long, value_name = "URL", default_value = "http://localhost:5199")]
     pub server: String,
 }
 
@@ -159,8 +159,8 @@ pub struct LinkArgs {
     /// Target link path (must not exist)
     pub target: PathBuf,
 
-    /// Server URL to push schema changes to (optional, defaults to http://localhost:3000)
-    #[clap(short, long, default_value = "http://localhost:3000")]
+    /// Server URL to push schema changes to (optional, defaults to http://localhost:5199)
+    #[clap(short, long, default_value = "http://localhost:5199")]
     pub server: String,
 }
 
@@ -204,7 +204,7 @@ pub struct ReplayArgs {
     pub at: Option<String>,
 
     /// Server URL
-    #[clap(long, default_value = "http://localhost:3000")]
+    #[clap(long, default_value = "http://localhost:5199")]
     pub server: String,
 
     /// Output in JSON format
@@ -274,7 +274,7 @@ pub struct LogArgs {
     pub reverse: bool,
 
     /// Server URL
-    #[clap(long, default_value = "http://localhost:3000")]
+    #[clap(long, default_value = "http://localhost:5199")]
     pub server: String,
 
     /// Output in JSON format
@@ -302,7 +302,7 @@ pub struct ShowArgs {
     pub stat: bool,
 
     /// Server URL
-    #[clap(long, default_value = "http://localhost:3000")]
+    #[clap(long, default_value = "http://localhost:5199")]
     pub server: String,
 
     /// Output in JSON format

@@ -1,6 +1,6 @@
 # API
 
-Base URL (default): `http://127.0.0.1:3000`
+Base URL (default): `http://127.0.0.1:5199`
 
 ## Health
 
@@ -34,7 +34,7 @@ Errors:
 Example:
 
 ```bash
-curl -X POST http://127.0.0.1:3000/docs -H 'Content-Type: application/json'
+curl -X POST http://127.0.0.1:5199/docs -H 'Content-Type: application/json'
 ```
 
 ### `GET /docs/:id`
@@ -49,7 +49,7 @@ Response:
 Example:
 
 ```bash
-curl -i http://127.0.0.1:3000/docs/<uuid>
+curl -i http://127.0.0.1:5199/docs/<uuid>
 ```
 
 ### `DELETE /docs/:id`
@@ -112,7 +112,7 @@ Status codes:
 Example (simple commit):
 
 ```bash
-curl -X POST http://127.0.0.1:3000/docs/<uuid>/commit \
+curl -X POST http://127.0.0.1:5199/docs/<uuid>/commit \
   -H 'Content-Type: application/json' \
   -d '{"verb":"update","value":"AAEC...","author":"jes","message":"first"}'
 ```
@@ -120,7 +120,7 @@ curl -X POST http://127.0.0.1:3000/docs/<uuid>/commit \
 Example (merge workflow):
 
 ```bash
-curl -X POST http://127.0.0.1:3000/docs/<uuid>/commit \
+curl -X POST http://127.0.0.1:5199/docs/<uuid>/commit \
   -H 'Content-Type: application/json' \
   -d '{"verb":"update","value":"AAEC...","author":"jes","parent_cid":"<some prior cid>"}'
 ```
@@ -134,5 +134,5 @@ Returns a `text/event-stream` that emits a `heartbeat` event every ~30s.
 Example:
 
 ```bash
-curl -N http://127.0.0.1:3000/sse/documents/<uuid>
+curl -N http://127.0.0.1:5199/sse/documents/<uuid>
 ```

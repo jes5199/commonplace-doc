@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Default server URL
-const DEFAULT_SERVER: &str = "http://localhost:3000";
+const DEFAULT_SERVER: &str = "http://localhost:5199";
 
 /// Default path to issues JSONL in commonplace
 const DEFAULT_PATH: &str = "beads/commonplace-issues.jsonl";

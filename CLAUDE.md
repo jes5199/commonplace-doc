@@ -57,7 +57,7 @@ src/
 └── cli.rs              # CLI argument definitions
 ```
 
-The server runs on `localhost:3000` by default.
+The server runs on `localhost:5199` by default.
 
 ### API Endpoints
 
@@ -133,7 +133,7 @@ For development/testing, you can run components separately:
 cargo run --bin commonplace-server -- --database ./data.redb --fs-root workspace
 
 # Sync only (requires server running)
-cargo run --bin commonplace-sync -- --server http://localhost:3000 --node workspace --directory ./workspace
+cargo run --bin commonplace-sync -- --server http://localhost:5199 --node workspace --directory ./workspace
 ```
 
 ### Working in workspace/

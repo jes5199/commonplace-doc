@@ -43,7 +43,7 @@ struct Args {
     #[arg(
         short,
         long,
-        default_value = "http://localhost:3000",
+        default_value = "http://localhost:5199",
         env = "COMMONPLACE_SERVER"
     )]
     server: String,

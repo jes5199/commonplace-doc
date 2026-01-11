@@ -296,8 +296,8 @@ mod tests {
 
     #[test]
     fn test_new_state() {
-        let state = SyncStateFile::new("http://localhost:3000".to_string(), "doc-123".to_string());
-        assert_eq!(state.server, "http://localhost:3000");
+        let state = SyncStateFile::new("http://localhost:5199".to_string(), "doc-123".to_string());
+        assert_eq!(state.server, "http://localhost:5199");
         assert_eq!(state.node_id, "doc-123");
         assert!(state.last_synced_cid.is_none());
         assert!(state.files.is_empty());
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn test_update_file() {
         let mut state =
-            SyncStateFile::new("http://localhost:3000".to_string(), "doc-123".to_string());
+            SyncStateFile::new("http://localhost:5199".to_string(), "doc-123".to_string());
         state.update_file("notes/test.txt", "abc123".to_string());
 
         assert!(state.files.contains_key("notes/test.txt"));
@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn test_has_file_changed() {
         let mut state =
-            SyncStateFile::new("http://localhost:3000".to_string(), "doc-123".to_string());
+            SyncStateFile::new("http://localhost:5199".to_string(), "doc-123".to_string());
         state.update_file("test.txt", "abc123".to_string());
 
         // Same hash - not changed
@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn test_mark_synced() {
         let mut state =
-            SyncStateFile::new("http://localhost:3000".to_string(), "doc-123".to_string());
+            SyncStateFile::new("http://localhost:5199".to_string(), "doc-123".to_string());
         state.mark_synced("Qm123".to_string());
 
         assert_eq!(state.last_synced_cid, Some("Qm123".to_string()));
@@ -345,14 +345,14 @@ mod tests {
         let path = dir.path().join("state.json");
 
         let mut state =
-            SyncStateFile::new("http://localhost:3000".to_string(), "doc-123".to_string());
+            SyncStateFile::new("http://localhost:5199".to_string(), "doc-123".to_string());
         state.update_file("test.txt", "abc123".to_string());
         state.mark_synced("Qm123".to_string());
 
         state.save(&path).await.unwrap();
 
         let loaded = SyncStateFile::load(&path).await.unwrap().unwrap();
-        assert_eq!(loaded.server, "http://localhost:3000");
+        assert_eq!(loaded.server, "http://localhost:5199");
         assert_eq!(loaded.node_id, "doc-123");
         assert_eq!(loaded.last_synced_cid, Some("Qm123".to_string()));
         assert_eq!(loaded.files["test.txt"].hash, "abc123");
@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn test_update_file_with_cid() {
         let mut state =
-            SyncStateFile::new("http://localhost:3000".to_string(), "doc-123".to_string());
+            SyncStateFile::new("http://localhost:5199".to_string(), "doc-123".to_string());
         state.update_file_with_cid("test.txt", "abc123".to_string(), Some("cid456".to_string()));
 
         assert!(state.files.contains_key("test.txt"));
@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn test_get_file_cid() {
         let mut state =
-            SyncStateFile::new("http://localhost:3000".to_string(), "doc-123".to_string());
+            SyncStateFile::new("http://localhost:5199".to_string(), "doc-123".to_string());
 
         // No CID initially
         assert!(state.get_file_cid("test.txt").is_none());

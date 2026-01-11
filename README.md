@@ -25,7 +25,7 @@ A Rust server for managing documents with a small REST API, plus Server-Sent Eve
 cargo run
 ```
 
-The server will start on `http://localhost:3000`.
+The server will start on `http://localhost:5199`.
 
 ### Running With Commit Storage
 
@@ -131,15 +131,15 @@ Creates a new blank document with the specified content type. Returns:
 **Examples:**
 ```bash
 # Create JSON document
-curl -X POST http://localhost:3000/docs \
+curl -X POST http://localhost:5199/docs \
   -H "Content-Type: application/json"
 
 # Create XML document
-curl -X POST http://localhost:3000/docs \
+curl -X POST http://localhost:5199/docs \
   -H "Content-Type: application/xml"
 
 # Create text document
-curl -X POST http://localhost:3000/docs \
+curl -X POST http://localhost:5199/docs \
   -H "Content-Type: text/plain"
 ```
 
@@ -152,7 +152,7 @@ Retrieves the document content. The response Content-Type matches the document's
 
 **Example:**
 ```bash
-curl http://localhost:3000/docs/{uuid}
+curl http://localhost:5199/docs/{uuid}
 ```
 
 #### Delete Document
@@ -164,7 +164,7 @@ Deletes the specified document. Returns 204 No Content on success, 404 if not fo
 
 **Example:**
 ```bash
-curl -X DELETE http://localhost:3000/docs/{uuid}
+curl -X DELETE http://localhost:5199/docs/{uuid}
 ```
 
 #### Health Check
@@ -250,7 +250,7 @@ Streams Server-Sent Events:
 
 **Example:**
 ```bash
-curl -N http://localhost:3000/sse/docs/{id}
+curl -N http://localhost:5199/sse/docs/{id}
 ```
 
 #### Document Change History
