@@ -621,3 +621,158 @@ fn test_node_backed_subdir_propagates_without_restart() {
         local_content
     );
 }
+
+/// CP-k51z: Test that offline edits sync on reconnect.
+///
+/// Scenario (acceptance criteria O1-O5):
+/// O1: Stop workspace sync process
+/// O2: Edit file locally while sync is down
+/// O3: Verify server content has NOT changed
+/// O4: Restart sync process
+/// O5: Verify server content now includes local edit
+#[test]
+fn test_offline_edits_sync_on_reconnect() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+
+    let mut guard = ProcessGuard::new();
+    let server = spawn_server(port, &db_path);
+    guard.add(server);
+
+    let client = reqwest::blocking::Client::new();
+
+    // Create fs-root document with a file
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let fs_root_id = body["id"].as_str().expect("No id in response");
+
+    // Create a file document with initial content
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create file document");
+
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let file_id = body["id"].as_str().expect("No id in response");
+
+    // Set initial file content
+    let initial_content = "Initial server content";
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(initial_content)
+        .send()
+        .expect("Failed to set file content");
+    assert!(resp.status().is_success());
+
+    // Update fs-root schema to include the file
+    // fs-root is new, so no parent_cid needed
+    let schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "notes.txt": {
+                    "type": "doc",
+                    "node_id": file_id
+                }
+            }
+        }
+    });
+
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(schema.to_string())
+        .send()
+        .expect("Failed to update fs-root schema");
+    assert!(resp.status().is_success());
+
+    // Start sync client in directory mode
+    let mut sync = spawn_sync_directory(&server_url, &sync_dir, fs_root_id);
+
+    // Wait for initial sync to complete
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Verify local file was created with initial content
+    let local_file = sync_dir.join("notes.txt");
+    assert!(
+        local_file.exists(),
+        "Local file should exist after initial sync"
+    );
+    let content = std::fs::read_to_string(&local_file).expect("Failed to read local file");
+    assert!(
+        content.contains("Initial server content"),
+        "Local file should have initial content. Got: {}",
+        content
+    );
+
+    // O1: Stop sync process
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(sync.id() as i32, libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sync.kill();
+    }
+    let _ = sync.wait();
+
+    // Wait for sync to fully stop
+    std::thread::sleep(Duration::from_millis(500));
+
+    // O2: Edit file locally while sync is down
+    let offline_edit = "Edited while offline - important changes!";
+    std::fs::write(&local_file, offline_edit).expect("Failed to write local file");
+
+    // O3: Verify server content has NOT changed
+    let resp = client
+        .get(format!("{}/docs/{}/head", server_url, file_id))
+        .send()
+        .expect("Failed to get file HEAD");
+    let head: serde_json::Value = resp.json().expect("Failed to parse HEAD");
+    let server_content = head["content"].as_str().expect("No content in HEAD");
+    assert!(
+        server_content.contains("Initial server content"),
+        "Server should still have initial content while sync is down. Got: {}",
+        server_content
+    );
+    assert!(
+        !server_content.contains("offline"),
+        "Server should NOT have offline edit yet. Got: {}",
+        server_content
+    );
+
+    // O4: Restart sync process
+    let sync = spawn_sync_directory(&server_url, &sync_dir, fs_root_id);
+    guard.add(sync);
+
+    // Wait for sync to reconnect and push local changes
+    std::thread::sleep(Duration::from_secs(3));
+
+    // O5: Verify server content now includes local edit
+    let resp = client
+        .get(format!("{}/docs/{}/head", server_url, file_id))
+        .send()
+        .expect("Failed to get file HEAD after restart");
+    let head: serde_json::Value = resp.json().expect("Failed to parse HEAD");
+    let server_content = head["content"].as_str().expect("No content in HEAD");
+    assert!(
+        server_content.contains("Edited while offline"),
+        "Server should have received offline edit after sync restart. Got: {}",
+        server_content
+    );
+}
