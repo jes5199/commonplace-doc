@@ -165,6 +165,7 @@ pub async fn directory_sse_task(
     watched_subdirs: Arc<RwLock<HashSet<String>>>,
     written_schemas: Option<crate::sync::WrittenSchemas>,
     initial_schema_cid: Option<String>,
+    shared_state_file: Option<crate::sync::SharedStateFile>,
 ) {
     // fs-root schema subscription always uses ID-based API
     let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&fs_root_id));
@@ -218,6 +219,7 @@ pub async fn directory_sse_task(
                                 #[cfg(unix)]
                                 inode_tracker.clone(),
                                 written_schemas.as_ref(),
+                                shared_state_file.as_ref(),
                             )
                             .await
                             {
@@ -504,6 +506,7 @@ pub async fn directory_mqtt_task(
     workspace: String,
     written_schemas: Option<crate::sync::WrittenSchemas>,
     initial_schema_cid: Option<String>,
+    shared_state_file: Option<crate::sync::SharedStateFile>,
 ) {
     // Subscribe to edits for the fs-root document
     let edits_topic = Topic::edits(&workspace, &fs_root_id);
@@ -556,6 +559,7 @@ pub async fn directory_mqtt_task(
                         #[cfg(unix)]
                         inode_tracker.clone(),
                         written_schemas.as_ref(),
+                        shared_state_file.as_ref(),
                     )
                     .await
                     {

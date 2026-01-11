@@ -349,6 +349,21 @@ impl SyncState {
         }
     }
 
+    /// Create a SyncState with an initial CID.
+    ///
+    /// Used in directory mode when loading persisted per-file CIDs from a shared state file.
+    pub fn with_cid(cid: Option<String>) -> Self {
+        Self {
+            last_written_cid: cid,
+            last_written_content: String::new(),
+            current_write_id: 0,
+            pending_write: None,
+            needs_head_refresh: false,
+            state_file: None,
+            state_file_path: None,
+        }
+    }
+
     /// Create a SyncState initialized from a persisted state file.
     ///
     /// This is used when resuming sync to detect offline changes.

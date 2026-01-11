@@ -21,6 +21,13 @@ use tokio::task::JoinHandle;
 /// Value: Content we last wrote (as normalized JSON string)
 pub type WrittenSchemas = Arc<RwLock<HashMap<PathBuf, String>>>;
 
+/// Shared state file for directory sync mode.
+///
+/// This is loaded at startup and shared across all file sync states.
+/// Each file's last CID is stored in the `files` map, enabling proper
+/// ancestry checking after restart.
+pub type SharedStateFile = Arc<RwLock<crate::sync::state_file::SyncStateFile>>;
+
 /// Response from GET /docs/:id/head
 #[derive(Debug, Deserialize)]
 pub struct HeadResponse {

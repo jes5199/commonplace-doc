@@ -38,6 +38,9 @@ pub struct FileState {
     pub hash: String,
     /// Last modified time (RFC 3339)
     pub last_modified: Option<String>,
+    /// Commit ID of the last successful sync for this file
+    #[serde(default)]
+    pub last_cid: Option<String>,
 }
 
 impl SyncStateFile {
@@ -102,14 +105,27 @@ impl SyncStateFile {
 
     /// Update file state after a successful sync.
     pub fn update_file(&mut self, relative_path: &str, hash: String) {
+        self.update_file_with_cid(relative_path, hash, None);
+    }
+
+    /// Update file state with CID after a successful sync.
+    pub fn update_file_with_cid(&mut self, relative_path: &str, hash: String, cid: Option<String>) {
         let now = chrono::Utc::now().to_rfc3339();
         self.files.insert(
             relative_path.to_string(),
             FileState {
                 hash,
                 last_modified: Some(now),
+                last_cid: cid,
             },
         );
+    }
+
+    /// Get the last synced CID for a file, if known.
+    pub fn get_file_cid(&self, relative_path: &str) -> Option<String> {
+        self.files
+            .get(relative_path)
+            .and_then(|f| f.last_cid.clone())
     }
 
     /// Mark a sync as complete.
@@ -336,5 +352,33 @@ mod tests {
             hash,
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
+    }
+
+    #[test]
+    fn test_update_file_with_cid() {
+        let mut state =
+            SyncStateFile::new("http://localhost:3000".to_string(), "doc-123".to_string());
+        state.update_file_with_cid("test.txt", "abc123".to_string(), Some("cid456".to_string()));
+
+        assert!(state.files.contains_key("test.txt"));
+        assert_eq!(state.files["test.txt"].hash, "abc123");
+        assert_eq!(state.files["test.txt"].last_cid, Some("cid456".to_string()));
+    }
+
+    #[test]
+    fn test_get_file_cid() {
+        let mut state =
+            SyncStateFile::new("http://localhost:3000".to_string(), "doc-123".to_string());
+
+        // No CID initially
+        assert!(state.get_file_cid("test.txt").is_none());
+
+        // Add file without CID
+        state.update_file("test.txt", "abc123".to_string());
+        assert!(state.get_file_cid("test.txt").is_none());
+
+        // Update with CID
+        state.update_file_with_cid("test.txt", "def456".to_string(), Some("cid789".to_string()));
+        assert_eq!(state.get_file_cid("test.txt"), Some("cid789".to_string()));
     }
 }

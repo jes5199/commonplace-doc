@@ -792,6 +792,7 @@ pub async fn handle_schema_change(
     pull_only: bool,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
+    shared_state_file: Option<&crate::sync::SharedStateFile>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Fetch, parse, and validate schema from server
     let fetched = match fetch_and_validate_schema(client, server, fs_root_id, true).await {
@@ -932,15 +933,20 @@ pub async fn handle_schema_change(
                         let content_hash = compute_content_hash(&bytes_written);
 
                         // Add to file states
-                        let state = Arc::new(RwLock::new(SyncState {
-                            last_written_cid: file_head.cid.clone(),
-                            last_written_content: file_head.content,
-                            current_write_id: 0,
-                            pending_write: None,
-                            needs_head_refresh: false,
-                            state_file: None, // Directory mode doesn't use state files yet
-                            state_file_path: None,
-                        }));
+                        // Use CID from server response, or fall back to persisted CID if available
+                        let initial_cid = if file_head.cid.is_some() {
+                            file_head.cid.clone()
+                        } else if let Some(sf) = shared_state_file {
+                            sf.read().await.get_file_cid(path)
+                        } else {
+                            None
+                        };
+                        let state = Arc::new(RwLock::new(SyncState::with_cid(initial_cid)));
+                        // Update state with content for echo detection
+                        {
+                            let mut s = state.write().await;
+                            s.last_written_content = file_head.content;
+                        }
 
                         info!("Created local file: {}", file_path.display());
 
@@ -1064,6 +1070,7 @@ pub async fn handle_schema_change_with_dedup(
     pull_only: bool,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
+    shared_state_file: Option<&crate::sync::SharedStateFile>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     // Fetch current schema from server
     let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
@@ -1131,6 +1138,7 @@ pub async fn handle_schema_change_with_dedup(
         #[cfg(unix)]
         inode_tracker,
         written_schemas,
+        shared_state_file,
     )
     .await?;
 

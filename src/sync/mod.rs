@@ -125,7 +125,7 @@ pub use state::{hardlink_from_fd, hardlink_from_path, SHADOW_IDLE_TIMEOUT, SHADO
 pub use state::{InodeKey, InodeState, InodeTracker, PendingWrite, SyncState};
 pub use types::{
     CommitData, DirEvent, EditEventData, EditRequest, EditResponse, FileEvent, FileSyncState,
-    ForkResponse, HeadResponse, ReplaceResponse, ReplaceSummary, WrittenSchemas,
+    ForkResponse, HeadResponse, ReplaceResponse, ReplaceSummary, SharedStateFile, WrittenSchemas,
 };
 pub use urls::{
     build_edit_url, build_fork_url, build_head_url, build_replace_url, build_sse_url,

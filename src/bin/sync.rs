@@ -989,6 +989,27 @@ async fn run_directory_mode(
     // Check if server has existing schema
     let server_has_content = check_server_has_content(&client, &server, &fs_root_id).await;
 
+    // Load or create state file for persisting per-file CIDs
+    let state_file_path =
+        commonplace_doc::sync::state_file::SyncStateFile::state_file_path(&directory);
+    let state_file = commonplace_doc::sync::state_file::SyncStateFile::load_or_create(
+        &directory,
+        &server,
+        &fs_root_id,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        warn!("Failed to load state file: {} - creating new one", e);
+        commonplace_doc::sync::state_file::SyncStateFile::new(server.clone(), fs_root_id.clone())
+    });
+    let shared_state_file: commonplace_doc::sync::SharedStateFile =
+        Arc::new(RwLock::new(state_file));
+    info!(
+        "Loaded state file from {} with {} tracked files",
+        state_file_path.display(),
+        shared_state_file.read().await.files.len()
+    );
+
     // If strategy is "server" and server has content, pull server files first
     // This creates the temporary file_states that handle_schema_change needs
     let file_states: Arc<RwLock<HashMap<String, FileSyncState>>> =
@@ -1015,6 +1036,7 @@ async fn run_directory_mode(
             #[cfg(unix)]
             inode_tracker.clone(),
             Some(&written_schemas),
+            Some(&shared_state_file),
         )
         .await?;
         info!("Server files pulled to local directory");
@@ -1099,6 +1121,7 @@ async fn run_directory_mode(
         #[cfg(unix)]
         inode_tracker.clone(),
         Some(&written_schemas),
+        Some(&shared_state_file),
     )
     .await?;
 
@@ -1151,6 +1174,7 @@ async fn run_directory_mode(
                 workspace.clone(),
                 Some(written_schemas.clone()),
                 initial_schema_cid.clone(),
+                Some(shared_state_file.clone()),
             )))
         } else {
             info!("Using SSE for directory sync subscriptions");
@@ -1168,6 +1192,7 @@ async fn run_directory_mode(
                 watched_subdirs.clone(),
                 Some(written_schemas.clone()),
                 initial_schema_cid.clone(),
+                Some(shared_state_file.clone()),
             )))
         }
     } else {
@@ -1483,6 +1508,27 @@ async fn run_exec_mode(
     // Check if server has existing schema
     let server_has_content = check_server_has_content(&client, &server, &fs_root_id).await;
 
+    // Load or create state file for persisting per-file CIDs (sandbox mode)
+    let state_file_path =
+        commonplace_doc::sync::state_file::SyncStateFile::state_file_path(&directory);
+    let state_file = commonplace_doc::sync::state_file::SyncStateFile::load_or_create(
+        &directory,
+        &server,
+        &fs_root_id,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        warn!("Failed to load state file: {} - creating new one", e);
+        commonplace_doc::sync::state_file::SyncStateFile::new(server.clone(), fs_root_id.clone())
+    });
+    let shared_state_file: commonplace_doc::sync::SharedStateFile =
+        Arc::new(RwLock::new(state_file));
+    info!(
+        "Loaded state file from {} with {} tracked files",
+        state_file_path.display(),
+        shared_state_file.read().await.files.len()
+    );
+
     // If strategy is "server" and server has content, pull server files first
     let file_states: Arc<RwLock<HashMap<String, FileSyncState>>> =
         Arc::new(RwLock::new(HashMap::new()));
@@ -1507,6 +1553,7 @@ async fn run_exec_mode(
             #[cfg(unix)]
             inode_tracker.clone(),
             Some(&written_schemas),
+            Some(&shared_state_file),
         )
         .await?;
         info!("Server files pulled to local directory");
@@ -1642,6 +1689,7 @@ async fn run_exec_mode(
             watched_subdirs.clone(),
             Some(written_schemas.clone()),
             initial_schema_cid.clone(),
+            Some(shared_state_file.clone()),
         )))
     } else {
         info!("Push-only mode: skipping SSE subscription");
