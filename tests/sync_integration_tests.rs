@@ -296,3 +296,118 @@ fn test_local_content_survives_restart_with_default_server_content() {
         final_content
     );
 }
+
+/// CP-fbk3: Test that per-file CIDs are persisted and loaded across sync restarts.
+///
+/// Scenario:
+/// 1. Create a document on server, sync to local file
+/// 2. Gracefully stop sync client (SIGTERM so state file is saved)
+/// 3. Verify state file exists and contains the CID
+/// 4. Make a local edit while sync is stopped
+/// 5. Restart sync client
+/// 6. Verify local edit is pushed to server (ancestry check using persisted CID)
+#[test]
+fn test_cid_persistence_survives_sync_restart() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_file = temp_dir.path().join("data.txt");
+    let state_file = temp_dir.path().join(".data.txt.commonplace-sync.json");
+    let port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+
+    let mut guard = ProcessGuard::new();
+    let server = spawn_server(port, &db_path);
+    guard.add(server);
+
+    let client = reqwest::blocking::Client::new();
+
+    // Create a text document
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create document");
+
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let doc_id = body["id"].as_str().expect("No id in response");
+
+    // Set initial content on server
+    let initial_content = "Initial server content";
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, doc_id))
+        .header("Content-Type", "text/plain")
+        .body(initial_content)
+        .send()
+        .expect("Failed to replace content");
+    assert!(resp.status().is_success(), "Failed to replace content");
+
+    // Start sync client - it should pull the initial content
+    let mut sync = spawn_sync_file(&server_url, &sync_file, doc_id);
+
+    // Wait for sync to create file
+    let start = std::time::Instant::now();
+    while !sync_file.exists() && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(sync_file.exists(), "Sync should create the file");
+
+    // Wait a bit more for sync to establish and CID to be tracked
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // Gracefully stop the sync client with SIGTERM (so it saves state file)
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            libc::kill(sync.id() as i32, libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sync.kill();
+    }
+    let _ = sync.wait();
+
+    // Verify state file was created
+    assert!(
+        state_file.exists(),
+        "State file should exist after graceful shutdown: {}",
+        state_file.display()
+    );
+
+    // Read and verify state file contains CID
+    let state_content = std::fs::read_to_string(&state_file).expect("Failed to read state file");
+    let state: serde_json::Value =
+        serde_json::from_str(&state_content).expect("Failed to parse state file");
+
+    assert!(
+        state["last_synced_cid"].is_string(),
+        "State file should contain last_synced_cid: {}",
+        state_content
+    );
+
+    // Make a local edit while sync is stopped
+    let edited_content = "Edited locally while sync was stopped";
+    std::fs::write(&sync_file, edited_content).expect("Failed to write local file");
+
+    // Restart sync client
+    let sync2 = spawn_sync_file(&server_url, &sync_file, doc_id);
+    guard.add(sync2);
+
+    // Wait for sync to process and push the local edit
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Verify server received the local edit
+    let resp = client
+        .get(format!("{}/docs/{}/head", server_url, doc_id))
+        .send()
+        .expect("Failed to get HEAD");
+    let head: serde_json::Value = resp.json().expect("Failed to parse HEAD");
+    let server_content = head["content"].as_str().expect("No content in HEAD");
+
+    assert!(
+        server_content.contains("Edited locally"),
+        "Server should have received local edit. Server content: {}",
+        server_content
+    );
+}
