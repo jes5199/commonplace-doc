@@ -949,8 +949,17 @@ fn test_process_config_change_triggers_restart() {
     assert!(marker_v1.exists(), "Process v1 should have written marker");
     eprintln!("H1 setup: Initial process running");
 
-    // Get the initial PID from status
-    let initial_pid = get_process_pid("restart-proc").expect("Should get initial PID");
+    // Get the initial PID from status (with retry - PID may take a moment to appear in status file)
+    let start = std::time::Instant::now();
+    let initial_pid = loop {
+        if let Some(pid) = get_process_pid("restart-proc") {
+            break pid;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            panic!("Timeout waiting for initial PID in status file");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
     eprintln!("Initial PID: {:?}", initial_pid);
 
     // === H1: Edit __processes.json to change the process command ===

@@ -6,6 +6,7 @@
 use clap::Parser;
 use commonplace_doc::cli::OrchestratorArgs;
 use commonplace_doc::orchestrator::{DiscoveredProcessManager, OrchestratorConfig, ProcessManager};
+use commonplace_doc::sync::{discover_fs_root, DiscoverFsRootError};
 use fs2::FileExt;
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
@@ -438,36 +439,15 @@ async fn main() {
     }
 
     // Get fs-root ID from server (needed for sync wait polling)
-    let fs_root_url = format!("{}/fs-root", args.server);
-    let fs_root_id = match client.get(&fs_root_url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            #[derive(serde::Deserialize)]
-            struct FsRootResponse {
-                id: String,
-            }
-            match resp.json::<FsRootResponse>().await {
-                Ok(r) => r.id,
-                Err(e) => {
-                    tracing::error!("[orchestrator] Failed to parse fs-root response: {}", e);
-                    base_manager.shutdown().await;
-                    std::process::exit(1);
-                }
-            }
-        }
-        Ok(resp) => {
-            tracing::error!(
-                "[orchestrator] Failed to get fs-root: HTTP {}",
-                resp.status()
-            );
-            tracing::error!("[orchestrator] Make sure server was started with --fs-root");
+    let fs_root_id = match discover_fs_root(&client, &args.server).await {
+        Ok(id) => id,
+        Err(DiscoverFsRootError::NotConfigured) => {
+            tracing::error!("[orchestrator] Server was not started with --fs-root");
             base_manager.shutdown().await;
             std::process::exit(1);
         }
         Err(e) => {
-            tracing::error!(
-                "[orchestrator] Failed to connect to server for fs-root: {}",
-                e
-            );
+            tracing::error!("[orchestrator] Failed to get fs-root: {}", e);
             base_manager.shutdown().await;
             std::process::exit(1);
         }

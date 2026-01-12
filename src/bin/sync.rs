@@ -14,12 +14,12 @@ use commonplace_doc::sync::subdir_spawn::{
 use commonplace_doc::sync::{
     acquire_sync_lock, build_replace_url, build_uuid_map_recursive, check_server_has_content,
     detect_from_path, directory_mqtt_task, directory_sse_task, directory_watcher_task,
-    encode_node_id, ensure_fs_root_exists, file_watcher_task, fork_node, handle_file_created,
-    handle_file_deleted, handle_file_modified, handle_schema_change, handle_schema_modified,
-    initial_sync, is_binary_content, push_schema_to_server, scan_directory_with_contents,
-    spawn_file_sync_tasks_with_flock, sse_task, sync_schema, sync_single_file, upload_task,
-    DirEvent, FileEvent, FileSyncState, FlockSyncState, InodeKey, InodeTracker, ReplaceResponse,
-    ScanOptions, SyncState, SCHEMA_FILENAME,
+    discover_fs_root, encode_node_id, ensure_fs_root_exists, file_watcher_task, fork_node,
+    handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
+    handle_schema_modified, initial_sync, is_binary_content, push_schema_to_server,
+    scan_directory_with_contents, spawn_file_sync_tasks_with_flock, sse_task, sync_schema,
+    sync_single_file, upload_task, DirEvent, FileEvent, FileSyncState, FlockSyncState, InodeKey,
+    InodeTracker, ReplaceResponse, ScanOptions, SyncState, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -152,34 +152,6 @@ struct Args {
     /// MQTT workspace name for topic namespacing (also reads from COMMONPLACE_WORKSPACE env var)
     #[arg(long, default_value = "commonplace", env = "COMMONPLACE_WORKSPACE")]
     workspace: String,
-}
-
-/// Discover the fs-root document ID from the server.
-///
-/// Queries the GET /fs-root endpoint to get the fs-root ID.
-/// This allows sync to work with --use-paths without requiring --node.
-async fn discover_fs_root(
-    client: &Client,
-    server: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/fs-root", server);
-    let resp = client.get(&url).send().await?;
-
-    if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-        return Err("Server was not started with --fs-root".into());
-    }
-
-    if !resp.status().is_success() {
-        return Err(format!("Failed to discover fs-root: HTTP {}", resp.status()).into());
-    }
-
-    #[derive(serde::Deserialize)]
-    struct FsRootResponse {
-        id: String,
-    }
-
-    let response: FsRootResponse = resp.json().await?;
-    Ok(response.id)
 }
 
 /// Resolve a path relative to fs-root to a UUID.

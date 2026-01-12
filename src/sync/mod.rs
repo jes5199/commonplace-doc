@@ -62,9 +62,9 @@ pub fn acquire_sync_lock(directory: &Path) -> io::Result<File> {
 }
 
 pub use client::{
-    delete_schema_entry, fetch_head, fork_node, push_content_by_type, push_file_content,
-    push_json_content, push_json_content_merge, push_jsonl_content, push_schema_to_server,
-    resolve_path_to_uuid_http, FetchHeadError,
+    delete_schema_entry, discover_fs_root, fetch_head, fork_node, push_content_by_type,
+    push_file_content, push_json_content, push_json_content_merge, push_jsonl_content,
+    push_schema_to_server, resolve_path_to_uuid_http, DiscoverFsRootError, FetchHeadError,
 };
 pub use dir_sync::{
     check_server_has_content, ensure_fs_root_exists, handle_schema_change, handle_schema_modified,

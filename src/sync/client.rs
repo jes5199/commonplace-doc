@@ -588,3 +588,69 @@ pub async fn resolve_path_to_uuid_http(
 
     Ok(current_id)
 }
+
+/// Error from discovering fs-root
+#[derive(Debug)]
+pub enum DiscoverFsRootError {
+    /// HTTP request failed
+    Request(reqwest::Error),
+    /// JSON parsing failed
+    Parse(reqwest::Error),
+    /// Server not configured with --fs-root (503)
+    NotConfigured,
+    /// Server returned error status
+    Status(reqwest::StatusCode, String),
+}
+
+impl std::fmt::Display for DiscoverFsRootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(e) => write!(f, "fs-root request failed: {}", e),
+            Self::Parse(e) => write!(f, "Failed to parse fs-root response: {}", e),
+            Self::NotConfigured => write!(f, "Server was not started with --fs-root"),
+            Self::Status(code, body) => write!(f, "fs-root failed with {}: {}", code, body),
+        }
+    }
+}
+
+impl std::error::Error for DiscoverFsRootError {}
+
+/// Response from GET /fs-root endpoint.
+#[derive(Debug, serde::Deserialize)]
+struct FsRootResponse {
+    id: String,
+}
+
+/// Discover the fs-root document ID from the server.
+///
+/// Queries the GET /fs-root endpoint to get the fs-root ID.
+/// This allows sync to work with --use-paths without requiring --node.
+///
+/// Returns:
+/// - `Ok(id)` if the fs-root was discovered successfully
+/// - `Err(NotConfigured)` if the server wasn't started with --fs-root (503)
+/// - `Err(_)` if there was a network error or parse error
+pub async fn discover_fs_root(
+    client: &Client,
+    server: &str,
+) -> Result<String, DiscoverFsRootError> {
+    let url = format!("{}/fs-root", server);
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(DiscoverFsRootError::Request)?;
+
+    if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return Err(DiscoverFsRootError::NotConfigured);
+    }
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(DiscoverFsRootError::Status(status, body));
+    }
+
+    let response: FsRootResponse = resp.json().await.map_err(DiscoverFsRootError::Parse)?;
+    Ok(response.id)
+}
