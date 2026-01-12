@@ -1,3 +1,4 @@
+use crate::{DEFAULT_MQTT_BROKER_ADDR, DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,11 +23,11 @@ pub struct OrchestratorConfig {
 }
 
 fn default_workspace() -> String {
-    "commonplace".to_string()
+    DEFAULT_WORKSPACE.to_string()
 }
 
 fn default_mqtt_broker() -> String {
-    "localhost:1883".to_string()
+    DEFAULT_MQTT_BROKER_ADDR.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,7 +136,7 @@ impl OrchestratorConfig {
         }
 
         // Default
-        "http://localhost:5199".to_string()
+        DEFAULT_SERVER_URL.to_string()
     }
 
     /// Returns process names in dependency order (dependencies first)

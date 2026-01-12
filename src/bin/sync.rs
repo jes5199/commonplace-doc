@@ -23,6 +23,7 @@ use commonplace_doc::sync::{
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
+use commonplace_doc::{DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -43,7 +44,7 @@ struct Args {
     #[arg(
         short,
         long,
-        default_value = "http://localhost:5199",
+        default_value = DEFAULT_SERVER_URL,
         env = "COMMONPLACE_SERVER"
     )]
     server: String,
@@ -150,7 +151,7 @@ struct Args {
     mqtt_broker: Option<String>,
 
     /// MQTT workspace name for topic namespacing (also reads from COMMONPLACE_WORKSPACE env var)
-    #[arg(long, default_value = "commonplace", env = "COMMONPLACE_WORKSPACE")]
+    #[arg(long, default_value = DEFAULT_WORKSPACE, env = "COMMONPLACE_WORKSPACE")]
     workspace: String,
 }
 

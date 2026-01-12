@@ -17,6 +17,7 @@ pub mod topics;
 
 use crate::document::DocumentStore;
 use crate::store::CommitStore;
+use crate::{DEFAULT_MQTT_BROKER_URL, DEFAULT_WORKSPACE};
 use rumqttc::QoS;
 use std::sync::Arc;
 use thiserror::Error;
@@ -94,9 +95,9 @@ pub struct MqttConfig {
 impl Default for MqttConfig {
     fn default() -> Self {
         Self {
-            broker_url: "mqtt://localhost:1883".to_string(),
+            broker_url: DEFAULT_MQTT_BROKER_URL.to_string(),
             client_id: uuid::Uuid::new_v4().to_string(),
-            workspace: "commonplace".to_string(),
+            workspace: DEFAULT_WORKSPACE.to_string(),
             keep_alive_secs: 60,
             clean_session: true,
         }

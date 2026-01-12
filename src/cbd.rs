@@ -11,6 +11,7 @@
 //!   cbd close <id> [reason]     # Close an issue
 //!   cbd update <id> --status X  # Update issue fields
 
+use crate::DEFAULT_SERVER_URL;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use reqwest::blocking::Client;
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Default server URL
-const DEFAULT_SERVER: &str = "http://localhost:5199";
+const DEFAULT_SERVER: &str = DEFAULT_SERVER_URL;
 
 /// Default path to issues JSONL in commonplace
 const DEFAULT_PATH: &str = "beads/commonplace-issues.jsonl";

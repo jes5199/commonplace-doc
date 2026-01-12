@@ -9,12 +9,13 @@
 //!   commonplace-beads-bridge --path cbd/myrepo  # Custom commonplace path
 
 use clap::Parser;
+use commonplace_doc::DEFAULT_SERVER_URL;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Default server URL
-const DEFAULT_SERVER: &str = "http://localhost:5199";
+const DEFAULT_SERVER: &str = DEFAULT_SERVER_URL;
 
 #[derive(Parser)]
 #[command(

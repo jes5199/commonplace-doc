@@ -23,6 +23,21 @@ pub mod viewer;
 pub mod workspace;
 pub mod ws;
 
+// Default configuration constants
+// These are used across CLI argument structs and configuration to ensure consistency.
+
+/// Default server URL for the commonplace HTTP server.
+pub const DEFAULT_SERVER_URL: &str = "http://localhost:5199";
+
+/// Default MQTT broker URL.
+pub const DEFAULT_MQTT_BROKER_URL: &str = "mqtt://localhost:1883";
+
+/// Default MQTT broker address (without protocol prefix, for direct socket connections).
+pub const DEFAULT_MQTT_BROKER_ADDR: &str = "localhost:1883";
+
+/// Default workspace name for MQTT topic namespacing.
+pub const DEFAULT_WORKSPACE: &str = "commonplace";
+
 use axum::{routing::get, Router};
 use content_type::ContentType;
 use document::DocumentStore;

@@ -1,3 +1,4 @@
+use crate::{DEFAULT_MQTT_BROKER_URL, DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
 use clap::Parser;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -64,7 +65,7 @@ pub struct StoreArgs {
     pub fs_root: String,
 
     /// Workspace name for MQTT topic namespacing
-    #[clap(long, default_value = "commonplace")]
+    #[clap(long, default_value = DEFAULT_WORKSPACE)]
     pub workspace: String,
 }
 
@@ -90,7 +91,7 @@ pub struct HttpArgs {
     pub mqtt_client_id: String,
 
     /// Workspace name for MQTT topic namespacing
-    #[clap(long, default_value = "commonplace")]
+    #[clap(long, default_value = DEFAULT_WORKSPACE)]
     pub workspace: String,
 }
 
@@ -116,7 +117,7 @@ pub struct OrchestratorArgs {
     pub only: Option<String>,
 
     /// HTTP server URL for recursive process discovery
-    #[clap(long, value_name = "URL", default_value = "http://localhost:5199")]
+    #[clap(long, value_name = "URL", default_value = DEFAULT_SERVER_URL)]
     pub server: String,
 }
 
@@ -136,7 +137,7 @@ pub struct CmdArgs {
     pub payload: String,
 
     /// MQTT broker URL
-    #[clap(long, default_value = "mqtt://localhost:1883")]
+    #[clap(long, default_value = DEFAULT_MQTT_BROKER_URL)]
     pub mqtt_broker: String,
 
     /// Source identifier for the command
@@ -144,7 +145,7 @@ pub struct CmdArgs {
     pub source: String,
 
     /// Workspace name for MQTT topic namespacing (can also be set via MQTT_WORKSPACE env var)
-    #[clap(long, env = "MQTT_WORKSPACE", default_value = "commonplace")]
+    #[clap(long, env = "MQTT_WORKSPACE", default_value = DEFAULT_WORKSPACE)]
     pub workspace: String,
 }
 
@@ -159,8 +160,8 @@ pub struct LinkArgs {
     /// Target link path (must not exist)
     pub target: PathBuf,
 
-    /// Server URL to push schema changes to (optional, defaults to http://localhost:5199)
-    #[clap(short, long, default_value = "http://localhost:5199")]
+    /// Server URL to push schema changes to
+    #[clap(short, long, default_value = DEFAULT_SERVER_URL)]
     pub server: String,
 }
 
@@ -204,7 +205,7 @@ pub struct ReplayArgs {
     pub at: Option<String>,
 
     /// Server URL
-    #[clap(long, default_value = "http://localhost:5199")]
+    #[clap(long, default_value = DEFAULT_SERVER_URL)]
     pub server: String,
 
     /// Output in JSON format
@@ -274,7 +275,7 @@ pub struct LogArgs {
     pub reverse: bool,
 
     /// Server URL
-    #[clap(long, default_value = "http://localhost:5199")]
+    #[clap(long, default_value = DEFAULT_SERVER_URL)]
     pub server: String,
 
     /// Output in JSON format
@@ -302,7 +303,7 @@ pub struct ShowArgs {
     pub stat: bool,
 
     /// Server URL
-    #[clap(long, default_value = "http://localhost:5199")]
+    #[clap(long, default_value = DEFAULT_SERVER_URL)]
     pub server: String,
 
     /// Output in JSON format
