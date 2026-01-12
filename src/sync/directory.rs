@@ -3,6 +3,7 @@
 use crate::fs::{DirEntry, DocEntry, Entry, FsSchema};
 use crate::sync::content_type::{detect_from_path, is_allowed_extension, is_binary_content};
 use crate::sync::schema_io::SCHEMA_FILENAME;
+use crate::sync::urls::normalize_path;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -202,14 +203,6 @@ fn load_linked_entries(
     }
 
     linked
-}
-
-/// Normalize a path to use forward slashes regardless of OS.
-///
-/// Schema paths always use forward slashes, so relative paths must be
-/// normalized for consistency across platforms.
-fn normalize_path(path: &str) -> String {
-    path.replace('\\', "/")
 }
 
 fn json_content_type_from_bytes(bytes: &[u8]) -> Option<&'static str> {
