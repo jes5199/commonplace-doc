@@ -9,6 +9,7 @@
 //! NOTE: These tests require MQTT broker (mosquitto) running on localhost:1883.
 //! They are skipped automatically if MQTT is not available.
 
+use std::collections::HashSet;
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -812,4 +813,289 @@ fn test_processes_json_add_remove_starts_stops_processes() {
         removed,
         added_running
     );
+}
+
+/// Get all current sandbox directories (those matching /tmp/commonplace-sandbox-*).
+fn get_sandbox_dirs() -> HashSet<std::path::PathBuf> {
+    let mut dirs = HashSet::new();
+    if let Ok(entries) = std::fs::read_dir("/tmp") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("commonplace-sandbox-") && path.is_dir() {
+                    dirs.insert(path);
+                }
+            }
+        }
+    }
+    dirs
+}
+
+/// Wait for a new sandbox directory to appear that wasn't in the initial set.
+fn wait_for_new_sandbox_dir(
+    initial_dirs: &HashSet<std::path::PathBuf>,
+    timeout: Duration,
+) -> Result<std::path::PathBuf, String> {
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed() > timeout {
+            return Err("Timeout waiting for new sandbox directory".to_string());
+        }
+        let current_dirs = get_sandbox_dirs();
+        for dir in &current_dirs {
+            if !initial_dirs.contains(dir) {
+                // Found a new sandbox directory
+                // Check if it has a .pid file (indicates it's active)
+                if dir.join(".pid").exists() {
+                    return Ok(dir.clone());
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Wait for a file to exist with optional content check.
+fn wait_for_file(
+    path: &std::path::Path,
+    expected_content: Option<&str>,
+    timeout: Duration,
+) -> Result<String, String> {
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed() > timeout {
+            return Err(format!("Timeout waiting for file {:?}", path));
+        }
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Some(expected) = expected_content {
+                    if content.trim() == expected.trim() {
+                        return Ok(content);
+                    }
+                } else {
+                    return Ok(content);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Wait for a file to be deleted.
+fn wait_for_file_deleted(path: &std::path::Path, timeout: Duration) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed() > timeout {
+            return Err(format!("Timeout waiting for file {:?} to be deleted", path));
+        }
+        if !path.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// CP-s7sx: Test workspace <-> sandbox file sync for create/edit/delete operations.
+///
+/// Verifies:
+/// - C1-C3: Create file in workspace, verify it appears in sandbox with matching content
+/// - E1-E2: Edit file in workspace, verify sandbox reflects the change
+/// - E3-E4: Edit file in sandbox, verify workspace reflects the change
+/// - D1-D2: Delete file in workspace, verify it's removed from sandbox
+///
+/// Requires MQTT broker on localhost:1883 (skipped if not available).
+#[test]
+fn test_workspace_sandbox_file_sync_create_edit_delete() {
+    if !mqtt_available() {
+        eprintln!("Skipping test: MQTT broker not available on localhost:1883");
+        return;
+    }
+
+    // Clean up any stale status file from previous runs
+    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let workspace_dir = temp_dir.path().join("workspace");
+    let config_path = temp_dir.path().join("commonplace.json");
+    let port = get_available_port();
+
+    // Create workspace directory with schema
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    let schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {}
+        }
+    });
+    std::fs::write(
+        workspace_dir.join(".commonplace.json"),
+        serde_json::to_string_pretty(&schema).unwrap(),
+    )
+    .unwrap();
+
+    // Create a subdirectory for the sandbox test
+    let sync_test_dir = workspace_dir.join("sync-test");
+    std::fs::create_dir_all(&sync_test_dir).unwrap();
+
+    // Create schema for the subdirectory
+    let subdir_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {}
+        }
+    });
+    std::fs::write(
+        sync_test_dir.join(".commonplace.json"),
+        serde_json::to_string_pretty(&subdir_schema).unwrap(),
+    )
+    .unwrap();
+
+    // Create __processes.json with a long-running sandbox process that keeps the sandbox alive
+    // We use a sleep command that runs long enough for us to do our file sync tests
+    let processes_json = serde_json::json!({
+        "processes": {
+            "sync-test-proc": {
+                "sandbox-exec": "sleep 120"
+            }
+        }
+    });
+    std::fs::write(
+        sync_test_dir.join("__processes.json"),
+        serde_json::to_string_pretty(&processes_json).unwrap(),
+    )
+    .unwrap();
+
+    // Write config file with process discovery enabled
+    let config =
+        create_test_config_with_discovery(temp_dir.path(), port, &db_path, &workspace_dir, true);
+    std::fs::write(&config_path, &config).unwrap();
+
+    // Record existing sandbox directories before starting orchestrator
+    let initial_sandbox_dirs = get_sandbox_dirs();
+    eprintln!(
+        "Initial sandbox directories: {:?}",
+        initial_sandbox_dirs.len()
+    );
+
+    let mut guard = ProcessGuard::new();
+
+    // Spawn orchestrator
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let orchestrator = Command::new(env!("CARGO_BIN_EXE_commonplace-orchestrator"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--server",
+            &server_url,
+        ])
+        .current_dir(temp_dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to spawn orchestrator");
+
+    guard.add(orchestrator);
+
+    // Wait for orchestrator to be ready
+    wait_for_orchestrator_ready(Duration::from_secs(30))
+        .expect("Orchestrator failed to start within timeout");
+
+    // Wait for the sandbox process to be discovered and appear in status
+    wait_for_discovered_process("sync-test-proc", Duration::from_secs(60))
+        .expect("Sandbox process 'sync-test-proc' was not discovered");
+
+    // Wait for the sandbox directory to be created (commonplace-sync creates it)
+    let sandbox_dir = wait_for_new_sandbox_dir(&initial_sandbox_dirs, Duration::from_secs(30))
+        .expect("Failed to find new sandbox directory");
+
+    eprintln!("Sandbox directory: {:?}", sandbox_dir);
+
+    // === C1-C3: File Creation Propagation ===
+    eprintln!("=== Testing file creation propagation ===");
+
+    // C1: Create a new file in workspace
+    let test_file_name = "test-file.txt";
+    let workspace_test_file = sync_test_dir.join(test_file_name);
+    std::fs::write(&workspace_test_file, "hello").expect("Failed to write test file");
+
+    // C2-C3: Verify file appears in sandbox with matching content
+    let sandbox_test_file = sandbox_dir.join(test_file_name);
+    let content = wait_for_file(&sandbox_test_file, Some("hello"), Duration::from_secs(10))
+        .expect("File should appear in sandbox with content 'hello'");
+    assert_eq!(content.trim(), "hello", "Sandbox file content should match");
+    eprintln!("C1-C3: File creation propagation PASSED");
+
+    // === E1-E2: Edit Propagation (workspace -> sandbox) ===
+    eprintln!("=== Testing edit propagation: workspace -> sandbox ===");
+
+    // E1: Edit file in workspace
+    std::fs::write(&workspace_test_file, "hello world").expect("Failed to edit test file");
+
+    // E2: Verify sandbox reflects the change
+    let content = wait_for_file(
+        &sandbox_test_file,
+        Some("hello world"),
+        Duration::from_secs(10),
+    )
+    .expect("Sandbox file should be updated to 'hello world'");
+    assert_eq!(
+        content.trim(),
+        "hello world",
+        "Sandbox file should show edit"
+    );
+    eprintln!("E1-E2: Edit propagation (workspace -> sandbox) PASSED");
+
+    // === E3-E4: Edit Propagation (sandbox -> workspace) ===
+    eprintln!("=== Testing edit propagation: sandbox -> workspace ===");
+
+    // Wait for CRDT states to fully synchronize before making sandbox edit
+    // This gives time for all pending sync operations to complete
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Verify both sides have the same content before sandbox edit
+    let workspace_pre = std::fs::read_to_string(&workspace_test_file).unwrap();
+    let sandbox_pre = std::fs::read_to_string(&sandbox_test_file).unwrap();
+    eprintln!("Pre-edit workspace: {:?}", workspace_pre);
+    eprintln!("Pre-edit sandbox: {:?}", sandbox_pre);
+    assert_eq!(
+        workspace_pre.trim(),
+        sandbox_pre.trim(),
+        "Files should be in sync before sandbox edit"
+    );
+
+    // E3: Edit file in sandbox - append "!" to existing content
+    // Use a completely different content to avoid CRDT merge confusion
+    let new_content = "sandbox edit test";
+    std::fs::write(&sandbox_test_file, new_content).expect("Failed to edit sandbox file");
+    eprintln!("Sandbox file written: {:?}", new_content);
+
+    // E4: Verify workspace reflects the change
+    let content = wait_for_file(
+        &workspace_test_file,
+        Some(new_content),
+        Duration::from_secs(30),
+    )
+    .expect("Workspace file should be updated with sandbox edit");
+    assert_eq!(
+        content.trim(),
+        new_content,
+        "Workspace file should show sandbox edit"
+    );
+    eprintln!("E3-E4: Edit propagation (sandbox -> workspace) PASSED");
+
+    // === D1-D2: File Deletion Propagation ===
+    eprintln!("=== Testing file deletion propagation ===");
+
+    // D1: Delete file in workspace
+    std::fs::remove_file(&workspace_test_file).expect("Failed to delete test file");
+
+    // D2: Verify file is removed from sandbox
+    wait_for_file_deleted(&sandbox_test_file, Duration::from_secs(10))
+        .expect("Sandbox file should be deleted when workspace file is deleted");
+    eprintln!("D1-D2: File deletion propagation PASSED");
+
+    eprintln!("=== All sync tests PASSED ===");
 }
