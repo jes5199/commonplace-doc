@@ -538,6 +538,41 @@ async fn main() {
         &fs_root_id[..8.min(fs_root_id.len())]
     );
 
+    // Connect to MQTT if configured (for sync-complete event subscription)
+    let mqtt_client: Option<Arc<MqttClient>> = if !broker_raw.is_empty() {
+        let mqtt_config = MqttConfig {
+            broker_url: broker_raw.to_string(),
+            client_id: format!("orchestrator-{}", std::process::id()),
+            workspace: fs_root_id.clone(),
+            keep_alive_secs: 30,
+            clean_session: true,
+        };
+        match MqttClient::connect(mqtt_config).await {
+            Ok(client) => {
+                let client = Arc::new(client);
+                // Start event loop in background
+                let client_for_loop = client.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = client_for_loop.run_event_loop().await {
+                        tracing::error!("[orchestrator] MQTT event loop error: {}", e);
+                    }
+                });
+                tracing::info!("[orchestrator] Connected to MQTT broker: {}", broker_raw);
+                Some(client)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[orchestrator] Failed to connect to MQTT ({}), will poll instead: {}",
+                    broker_raw,
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Start sync if configured (to push initial content to server)
     if config.processes.contains_key("sync") {
         tracing::info!("[orchestrator] Starting sync from config...");
@@ -547,15 +582,16 @@ async fn main() {
             std::process::exit(1);
         }
 
-        // Wait for sync to push initial content by polling fs-root schema
-        // Timeout after 2 minutes to avoid hanging indefinitely
-        let sync_ready = wait_for_sync_initial_push(
-            &client,
-            &args.server,
-            &fs_root_id,
-            Duration::from_secs(120),
-        )
-        .await;
+        // Wait for sync to complete initial push
+        // Use MQTT subscription if available, otherwise fall back to polling
+        let sync_ready = if let Some(ref mqtt) = mqtt_client {
+            wait_for_sync_via_mqtt(mqtt.clone(), &fs_root_id, Duration::from_secs(120))
+                .await
+                .is_some()
+        } else {
+            wait_for_sync_initial_push(&client, &args.server, &fs_root_id, Duration::from_secs(120))
+                .await
+        };
 
         if !sync_ready {
             tracing::warn!(
