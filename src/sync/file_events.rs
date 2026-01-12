@@ -10,8 +10,8 @@ use crate::sync::state_file::compute_content_hash;
 use crate::sync::uuid_map::{fetch_node_id_from_schema, fetch_subdir_node_id};
 use crate::sync::{
     delete_schema_entry, detect_from_path, fork_node, is_allowed_extension, is_binary_content,
-    normalize_path, push_content_by_type, push_schema_to_server, spawn_file_sync_tasks,
-    FileSyncState, SyncState,
+    normalize_path, push_content_by_type, push_schema_to_server, remove_file_state_and_abort,
+    spawn_file_sync_tasks, FileSyncState, SyncState,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -518,14 +518,11 @@ pub async fn handle_file_deleted(
     };
 
     // Stop sync tasks for this file and remove from file_states
+    if remove_file_state_and_abort(file_states, &relative_path)
+        .await
+        .is_some()
     {
-        let mut states = file_states.write().await;
-        if let Some(file_state) = states.remove(&relative_path) {
-            info!("Stopping sync tasks for deleted file: {}", relative_path);
-            for handle in file_state.task_handles {
-                handle.abort();
-            }
-        }
+        info!("Stopping sync tasks for deleted file: {}", relative_path);
     }
 
     // Delete from schema

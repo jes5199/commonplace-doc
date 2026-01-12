@@ -137,3 +137,24 @@ pub struct FileSyncState {
     /// Content hash for fork detection (SHA-256 hex)
     pub content_hash: Option<String>,
 }
+
+/// Remove a file state from the map and abort its associated tasks.
+///
+/// This helper consolidates the common pattern of removing a file state
+/// and cleaning up its task handles when a file is deleted or no longer tracked.
+///
+/// Returns the removed state if it existed.
+pub async fn remove_file_state_and_abort(
+    file_states: &tokio::sync::RwLock<std::collections::HashMap<String, FileSyncState>>,
+    path: &str,
+) -> Option<FileSyncState> {
+    let mut states = file_states.write().await;
+    if let Some(file_state) = states.remove(path) {
+        for handle in &file_state.task_handles {
+            handle.abort();
+        }
+        Some(file_state)
+    } else {
+        None
+    }
+}

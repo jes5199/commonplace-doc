@@ -18,8 +18,8 @@ use crate::sync::uuid_map::{
 };
 use crate::sync::{
     ancestry::determine_sync_direction, build_info_url, detect_from_path, is_allowed_extension,
-    is_binary_content, looks_like_base64_binary, push_schema_to_server, spawn_file_sync_tasks,
-    FileSyncState, SyncState,
+    is_binary_content, looks_like_base64_binary, push_schema_to_server,
+    remove_file_state_and_abort, spawn_file_sync_tasks, FileSyncState, SyncState,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -305,14 +305,7 @@ pub async fn handle_subdir_schema_cleanup(
             let file_path = root_directory.join(path);
 
             // Stop sync tasks and remove from file_states
-            {
-                let mut states = file_states.write().await;
-                if let Some(file_state) = states.remove(path) {
-                    for handle in file_state.task_handles {
-                        handle.abort();
-                    }
-                }
-            }
+            remove_file_state_and_abort(file_states, path).await;
 
             // Delete the file from disk
             if file_path.exists() && file_path.is_file() {
@@ -1009,14 +1002,7 @@ pub async fn handle_schema_change(
         let file_path = directory.join(path);
 
         // Stop sync tasks and remove from file_states
-        {
-            let mut states = file_states.write().await;
-            if let Some(file_state) = states.remove(path) {
-                for handle in file_state.task_handles {
-                    handle.abort();
-                }
-            }
-        }
+        remove_file_state_and_abort(file_states, path).await;
 
         // Delete the file from disk
         if file_path.exists() && file_path.is_file() {
