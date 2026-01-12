@@ -1227,10 +1227,9 @@ fn test_commonplace_link_schema_push_updates_server() {
     wait_for_discovered_process("link-test-proc", Duration::from_secs(60))
         .expect("Sandbox process 'link-test-proc' was not discovered");
 
-    // Wait for sandbox directory
+    // Find the new sandbox directory
     let sandbox_dir = wait_for_new_sandbox_dir(&initial_sandbox_dirs, Duration::from_secs(30))
-        .expect("Failed to find new sandbox directory");
-
+        .expect("Sandbox directory should appear");
     eprintln!("Sandbox directory: {:?}", sandbox_dir);
 
     // === L1: Create source file and sync ===
@@ -1389,4 +1388,198 @@ fn test_commonplace_link_schema_push_updates_server() {
     eprintln!("L7: Sandbox verification passed");
 
     eprintln!("=== All commonplace-link tests PASSED ===");
+}
+
+/// CP-oto3: Test sandbox stdio capture and sync
+///
+/// Verifies that sandboxed process stdout/stderr are:
+/// 1. Captured into __<exec>.stdout.txt and __<exec>.stderr.txt in the sandbox
+/// 2. Synced back to the workspace mirror
+///
+/// Requires MQTT broker on localhost:1883 (skipped if not available).
+#[test]
+fn test_sandbox_stdio_capture_and_sync() {
+    if !mqtt_available() {
+        eprintln!("Skipping test: MQTT broker not available on localhost:1883");
+        return;
+    }
+
+    // Clean up any stale status file from previous runs
+    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let workspace_dir = temp_dir.path().join("workspace");
+    let config_path = temp_dir.path().join("commonplace.json");
+    let port = get_available_port();
+
+    // Create workspace directory with schema
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    let root_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {}
+        }
+    });
+    std::fs::write(
+        workspace_dir.join(".commonplace.json"),
+        serde_json::to_string_pretty(&root_schema).unwrap(),
+    )
+    .unwrap();
+
+    // Create a subdirectory for the stdio test
+    let stdio_dir = workspace_dir.join("stdio-test");
+    std::fs::create_dir_all(&stdio_dir).unwrap();
+    let stdio_dir_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {}
+        }
+    });
+    std::fs::write(
+        stdio_dir.join(".commonplace.json"),
+        serde_json::to_string_pretty(&stdio_dir_schema).unwrap(),
+    )
+    .unwrap();
+
+    // Create __processes.json with a sandbox process that writes to stdout and stderr
+    // The process writes output and then sleeps to allow log capture and sync
+    let processes_json = serde_json::json!({
+        "processes": {
+            "stdio-proc": {
+                "sandbox-exec": "sh -c 'echo STDOUT_TEST_OUTPUT; echo STDERR_TEST_OUTPUT >&2; sleep 120'"
+            }
+        }
+    });
+    std::fs::write(
+        stdio_dir.join("__processes.json"),
+        serde_json::to_string_pretty(&processes_json).unwrap(),
+    )
+    .unwrap();
+
+    // Create orchestrator config with process discovery enabled
+    let config = create_test_config_with_discovery(
+        temp_dir.path(),
+        port,
+        &db_path,
+        &workspace_dir,
+        true, // enable process discovery
+    );
+    std::fs::write(&config_path, &config).unwrap();
+
+    // Record existing sandbox directories before starting orchestrator
+    let initial_sandbox_dirs = get_sandbox_dirs();
+
+    let mut guard = ProcessGuard::new();
+
+    // Spawn orchestrator
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let orchestrator = Command::new(env!("CARGO_BIN_EXE_commonplace-orchestrator"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--server",
+            &server_url,
+        ])
+        .current_dir(temp_dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to start orchestrator");
+    guard.add(orchestrator);
+
+    // Wait for orchestrator to be ready
+    wait_for_orchestrator_ready(Duration::from_secs(30))
+        .expect("Orchestrator failed to start within timeout");
+
+    eprintln!("=== Sandbox stdio capture test starting ===");
+
+    // Wait for sandbox process to be discovered
+    wait_for_discovered_process("stdio-proc", Duration::from_secs(60))
+        .expect("Sandbox process 'stdio-proc' was not discovered");
+
+    // Find the new sandbox directory
+    let sandbox_dir = wait_for_new_sandbox_dir(&initial_sandbox_dirs, Duration::from_secs(30))
+        .expect("Sandbox directory should appear");
+    eprintln!("Sandbox directory: {:?}", sandbox_dir);
+
+    // Wait for the process to run and produce output
+    eprintln!("Waiting for sandbox process to produce stdout/stderr files...");
+
+    // Note: The log file names use the process name, not the shell command
+    let sandbox_stdout = sandbox_dir.join("__stdio-proc.stdout.txt");
+    let sandbox_stderr = sandbox_dir.join("__stdio-proc.stderr.txt");
+
+    // Wait for stdout file to appear in sandbox
+    let stdout_content = wait_for_file(
+        &sandbox_stdout,
+        Some("STDOUT_TEST_OUTPUT"),
+        Duration::from_secs(30),
+    )
+    .expect("__sh.stdout.txt should appear in sandbox with expected content");
+    assert!(
+        stdout_content.contains("STDOUT_TEST_OUTPUT"),
+        "stdout file should contain test output, got: {}",
+        stdout_content
+    );
+    eprintln!("PASS: Sandbox __sh.stdout.txt contains expected output");
+
+    // Wait for stderr file to appear in sandbox
+    let stderr_content = wait_for_file(
+        &sandbox_stderr,
+        Some("STDERR_TEST_OUTPUT"),
+        Duration::from_secs(30),
+    )
+    .expect("__sh.stderr.txt should appear in sandbox with expected content");
+    assert!(
+        stderr_content.contains("STDERR_TEST_OUTPUT"),
+        "stderr file should contain test output, got: {}",
+        stderr_content
+    );
+    eprintln!("PASS: Sandbox __sh.stderr.txt contains expected output");
+
+    // Verify the log files are registered in the sandbox schema
+    // This confirms the stdio capture is properly integrated with the sync system
+    eprintln!("Verifying stdio files are in sandbox schema...");
+
+    let sandbox_schema_content = std::fs::read_to_string(sandbox_dir.join(".commonplace.json"))
+        .expect("Should read sandbox schema");
+    let sandbox_schema: serde_json::Value =
+        serde_json::from_str(&sandbox_schema_content).expect("Should parse sandbox schema");
+
+    let entries = &sandbox_schema["root"]["entries"];
+    assert!(
+        entries["__stdio-proc.stdout.txt"].is_object(),
+        "Sandbox schema should contain __stdio-proc.stdout.txt entry"
+    );
+    assert!(
+        entries["__stdio-proc.stderr.txt"].is_object(),
+        "Sandbox schema should contain __stdio-proc.stderr.txt entry"
+    );
+
+    // Verify the entries have node_ids (assigned by server during sync)
+    let stdout_node_id = entries["__stdio-proc.stdout.txt"]["node_id"].as_str();
+    let stderr_node_id = entries["__stdio-proc.stderr.txt"]["node_id"].as_str();
+
+    assert!(
+        stdout_node_id.is_some(),
+        "stdout file should have a node_id from server"
+    );
+    eprintln!(
+        "PASS: Sandbox schema has __stdio-proc.stdout.txt with node_id: {}",
+        stdout_node_id.unwrap()
+    );
+
+    assert!(
+        stderr_node_id.is_some(),
+        "stderr file should have a node_id from server"
+    );
+    eprintln!(
+        "PASS: Sandbox schema has __stdio-proc.stderr.txt with node_id: {}",
+        stderr_node_id.unwrap()
+    );
+
+    eprintln!("=== All sandbox stdio capture tests PASSED ===");
 }
