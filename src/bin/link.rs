@@ -14,7 +14,7 @@ use commonplace_doc::{
     cli::LinkArgs,
     fs::{DocEntry, Entry, FsSchema},
     sync::{client::push_schema_to_server, SCHEMA_FILENAME},
-    workspace::normalize_path,
+    workspace::{find_workspace_root, normalize_path, split_path},
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -175,38 +175,6 @@ fn find_parent_schema(
             .parent()
             .ok_or("Reached filesystem root without finding schema")?;
     }
-}
-
-/// Find the workspace root by searching up the directory tree for .commonplace.json
-fn find_workspace_root(start: &Path) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
-    let mut current = start.to_path_buf();
-    loop {
-        let schema_path = current.join(SCHEMA_FILENAME);
-        if schema_path.exists() {
-            return Ok((current, schema_path));
-        }
-        if !current.pop() {
-            return Err(format!(
-                "Not in a commonplace sync directory: {} not found in any parent directory",
-                SCHEMA_FILENAME
-            )
-            .into());
-        }
-    }
-}
-
-/// Split a path into directory components and filename
-fn split_path(path: &str) -> Result<(Vec<String>, String), Box<dyn std::error::Error>> {
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.is_empty() {
-        return Err("Empty path".into());
-    }
-    let filename = parts.last().unwrap().to_string();
-    let dirs: Vec<String> = parts[..parts.len() - 1]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    Ok((dirs, filename))
 }
 
 /// Resolve which schema file a path belongs to, handling node-backed directories
