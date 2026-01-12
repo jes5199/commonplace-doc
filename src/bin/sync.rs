@@ -147,6 +147,31 @@ async fn handle_dir_event(
     }
 }
 
+/// Fetch UUID map from server with logging.
+///
+/// When `use_paths` is true, returns an empty map (paths used directly).
+/// Otherwise, recursively fetches all UUIDs from the server schema.
+async fn fetch_uuid_map_with_logging(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    use_paths: bool,
+) -> HashMap<String, String> {
+    if use_paths {
+        return HashMap::new();
+    }
+
+    let map = build_uuid_map_recursive(client, server, fs_root_id).await;
+    info!(
+        "Resolved {} UUIDs from server schema for initial sync",
+        map.len()
+    );
+    for (path, uuid) in &map {
+        debug!("  UUID map: {} -> {}", path, uuid);
+    }
+    map
+}
+
 /// Commonplace Sync - Keep a local file or directory in sync with a server document
 #[derive(Parser, Debug)]
 #[command(name = "commonplace-sync")]
@@ -1168,19 +1193,7 @@ async fn run_directory_mode(
     // When not using paths, fetch the updated schema to get UUIDs assigned by reconciler
     // Build a map of relative_path -> node_id for UUID resolution
     // This recursively follows node-backed directories to get all UUIDs
-    let uuid_map = if !use_paths {
-        let map = build_uuid_map_recursive(&client, &server, &fs_root_id).await;
-        info!(
-            "Resolved {} UUIDs from server schema for initial sync",
-            map.len()
-        );
-        for (path, uuid) in &map {
-            debug!("  UUID map: {} -> {}", path, uuid);
-        }
-        map
-    } else {
-        std::collections::HashMap::new()
-    };
+    let uuid_map = fetch_uuid_map_with_logging(&client, &server, &fs_root_id, use_paths).await;
 
     // Sync each file
     for file in &files {
@@ -1647,19 +1660,7 @@ async fn run_exec_mode(
     // When not using paths, fetch the updated schema to get UUIDs assigned by reconciler
     // Build a map of relative_path -> node_id for UUID resolution
     // This recursively follows node-backed directories to get all UUIDs
-    let uuid_map = if !use_paths {
-        let map = build_uuid_map_recursive(&client, &server, &fs_root_id).await;
-        info!(
-            "Resolved {} UUIDs from server schema for initial sync",
-            map.len()
-        );
-        for (path, uuid) in &map {
-            debug!("  UUID map: {} -> {}", path, uuid);
-        }
-        map
-    } else {
-        std::collections::HashMap::new()
-    };
+    let uuid_map = fetch_uuid_map_with_logging(&client, &server, &fs_root_id, use_paths).await;
 
     // In sandbox mode, use a timeout to not block exec for too long
     // In non-sandbox mode, sync files synchronously before continuing
