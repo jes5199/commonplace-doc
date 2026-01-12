@@ -14,7 +14,7 @@ pub mod protocol;
 pub mod room;
 
 use crate::document::DocumentStore;
-use crate::events::CommitBroadcaster;
+use crate::events::{recv_broadcast, CommitBroadcaster};
 use crate::store::CommitStore;
 use axum::routing::get;
 use axum::Router;
@@ -59,22 +59,13 @@ pub fn router(
 async fn commit_listener(room_manager: Arc<RoomManager>, broadcaster: CommitBroadcaster) {
     let mut rx = broadcaster.subscribe();
 
-    loop {
-        match rx.recv().await {
-            Ok(notification) => {
-                // Forward to all rooms (each room filters by doc_id)
-                let rooms = room_manager.get_all_rooms().await;
-                for room in rooms {
-                    room.handle_commit_notification(&notification).await;
-                }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("WebSocket commit listener lagged by {} messages", n);
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                tracing::info!("Commit broadcaster closed, stopping WebSocket listener");
-                break;
-            }
+    while let Some(notification) = recv_broadcast(&mut rx, "WebSocket commit listener").await {
+        // Forward to all rooms (each room filters by doc_id)
+        let rooms = room_manager.get_all_rooms().await;
+        for room in rooms {
+            room.handle_commit_notification(&notification).await;
         }
     }
+
+    tracing::info!("Commit broadcaster closed, stopping WebSocket listener");
 }

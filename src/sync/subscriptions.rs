@@ -3,6 +3,7 @@
 //! This module contains the task functions that subscribe to SSE and MQTT
 //! events for directory-level synchronization.
 
+use crate::events::recv_broadcast;
 use crate::mqtt::{MqttClient, Topic};
 use crate::sync::dir_sync::{
     create_subdir_nested_directories, handle_schema_change_with_dedup, handle_subdir_new_files,
@@ -522,84 +523,75 @@ pub async fn directory_mqtt_task(
     let mut last_schema_cid: Option<String> = initial_schema_cid;
 
     // Process incoming MQTT messages
-    loop {
-        match message_rx.recv().await {
-            Ok(msg) => {
-                // Check if this message is for our topic
-                if msg.topic == topic_str {
-                    debug!(
-                        "MQTT edit received for fs-root: {} bytes",
-                        msg.payload.len()
-                    );
+    while let Some(msg) = recv_broadcast(&mut message_rx, "MQTT fs-root receiver").await {
+        // Check if this message is for our topic
+        if msg.topic == topic_str {
+            debug!(
+                "MQTT edit received for fs-root: {} bytes",
+                msg.payload.len()
+            );
 
-                    // An edit message means the schema has changed
-                    // Use content-based deduplication and ancestry checking
-                    match handle_schema_change_with_dedup(
-                        &http_client,
-                        &server,
-                        &fs_root_id,
-                        &directory,
-                        &file_states,
-                        true, // spawn_tasks: true for runtime schema changes
-                        use_paths,
-                        &mut last_schema_hash,
-                        &mut last_schema_cid,
-                        push_only,
-                        pull_only,
-                        #[cfg(unix)]
-                        inode_tracker.clone(),
-                        written_schemas.as_ref(),
-                        shared_state_file.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(true) => {
-                            debug!("MQTT: Schema change processed successfully");
-                        }
-                        Ok(false) => {
-                            debug!("MQTT: Schema unchanged, skipped processing");
-                        }
-                        Err(e) => {
-                            warn!("MQTT: Failed to handle schema change: {}", e);
-                        }
-                    }
-
-                    // Check for newly discovered node-backed subdirs and spawn tasks
-                    if !push_only {
-                        let params = SubdirSpawnParams {
-                            client: http_client.clone(),
-                            server: server.clone(),
-                            fs_root_id: fs_root_id.clone(),
-                            directory: directory.clone(),
-                            file_states: file_states.clone(),
-                            use_paths,
-                            push_only,
-                            pull_only,
-                            shared_state_file: shared_state_file.clone(),
-                            #[cfg(unix)]
-                            inode_tracker: inode_tracker.clone(),
-                            watched_subdirs: watched_subdirs.clone(),
-                        };
-                        spawn_subdir_watchers(
-                            &params,
-                            SubdirTransport::Mqtt {
-                                client: mqtt_client.clone(),
-                                workspace: workspace.clone(),
-                            },
-                        )
-                        .await;
-                    }
+            // An edit message means the schema has changed
+            // Use content-based deduplication and ancestry checking
+            match handle_schema_change_with_dedup(
+                &http_client,
+                &server,
+                &fs_root_id,
+                &directory,
+                &file_states,
+                true, // spawn_tasks: true for runtime schema changes
+                use_paths,
+                &mut last_schema_hash,
+                &mut last_schema_cid,
+                push_only,
+                pull_only,
+                #[cfg(unix)]
+                inode_tracker.clone(),
+                written_schemas.as_ref(),
+                shared_state_file.as_ref(),
+            )
+            .await
+            {
+                Ok(true) => {
+                    debug!("MQTT: Schema change processed successfully");
+                }
+                Ok(false) => {
+                    debug!("MQTT: Schema unchanged, skipped processing");
+                }
+                Err(e) => {
+                    warn!("MQTT: Failed to handle schema change: {}", e);
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                warn!("MQTT message receiver lagged by {} messages", n);
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                info!("MQTT message channel closed");
-                break;
+
+            // Check for newly discovered node-backed subdirs and spawn tasks
+            if !push_only {
+                let params = SubdirSpawnParams {
+                    client: http_client.clone(),
+                    server: server.clone(),
+                    fs_root_id: fs_root_id.clone(),
+                    directory: directory.clone(),
+                    file_states: file_states.clone(),
+                    use_paths,
+                    push_only,
+                    pull_only,
+                    shared_state_file: shared_state_file.clone(),
+                    #[cfg(unix)]
+                    inode_tracker: inode_tracker.clone(),
+                    watched_subdirs: watched_subdirs.clone(),
+                };
+                spawn_subdir_watchers(
+                    &params,
+                    SubdirTransport::Mqtt {
+                        client: mqtt_client.clone(),
+                        workspace: workspace.clone(),
+                    },
+                )
+                .await;
             }
         }
     }
+
+    info!("MQTT fs-root message channel closed");
 }
 
 /// Helper to spawn MQTT tasks for subdirectories.
@@ -691,90 +683,74 @@ pub async fn subdir_mqtt_task(
     let mut message_rx = mqtt_client.subscribe_messages();
 
     // Process incoming MQTT messages
-    loop {
-        match message_rx.recv().await {
-            Ok(msg) => {
-                // Check if this message is for our topic
-                if msg.topic == topic_str {
-                    debug!(
-                        "MQTT edit received for subdir {}: {} bytes",
-                        subdir_path,
-                        msg.payload.len()
-                    );
+    let context = format!("MQTT subdir {} receiver", subdir_path);
+    while let Some(msg) = recv_broadcast(&mut message_rx, &context).await {
+        // Check if this message is for our topic
+        if msg.topic == topic_str {
+            debug!(
+                "MQTT edit received for subdir {}: {} bytes",
+                subdir_path,
+                msg.payload.len()
+            );
 
-                    // Subdirectory schema changed - handle cleanup and sync new files
+            // Subdirectory schema changed - handle cleanup and sync new files
+            info!(
+                "MQTT: Subdir {} schema changed, triggering sync",
+                subdir_path
+            );
+            let subdir_full_path = directory.join(&subdir_path);
+
+            // Use shared helper for edit handling
+            handle_subdir_edit(
+                &http_client,
+                &server,
+                &subdir_node_id,
+                &subdir_path,
+                &subdir_full_path,
+                &directory,
+                &file_states,
+                use_paths,
+                push_only,
+                pull_only,
+                shared_state_file.as_ref(),
+                #[cfg(unix)]
+                inode_tracker.clone(),
+                "MQTT",
+            )
+            .await;
+
+            // Check for newly discovered nested node-backed subdirs and spawn MQTT tasks
+            if !push_only {
+                let subdirs_to_spawn =
+                    collect_new_subdirs(&http_client, &server, &fs_root_id, &watched_subdirs).await;
+
+                for (nested_subdir_path, nested_subdir_node_id) in subdirs_to_spawn {
                     info!(
-                        "MQTT: Subdir {} schema changed, triggering sync",
-                        subdir_path
+                        "MQTT: Spawning task for newly discovered nested subdir: {} ({})",
+                        nested_subdir_path, nested_subdir_node_id
                     );
-                    let subdir_full_path = directory.join(&subdir_path);
-
-                    // Use shared helper for edit handling
-                    handle_subdir_edit(
-                        &http_client,
-                        &server,
-                        &subdir_node_id,
-                        &subdir_path,
-                        &subdir_full_path,
-                        &directory,
-                        &file_states,
+                    spawn_subdir_mqtt_task(
+                        http_client.clone(),
+                        server.clone(),
+                        fs_root_id.clone(),
+                        nested_subdir_path,
+                        nested_subdir_node_id,
+                        directory.clone(),
+                        file_states.clone(),
                         use_paths,
                         push_only,
                         pull_only,
-                        shared_state_file.as_ref(),
+                        shared_state_file.clone(),
                         #[cfg(unix)]
                         inode_tracker.clone(),
-                        "MQTT",
-                    )
-                    .await;
-
-                    // Check for newly discovered nested node-backed subdirs and spawn MQTT tasks
-                    if !push_only {
-                        let subdirs_to_spawn = collect_new_subdirs(
-                            &http_client,
-                            &server,
-                            &fs_root_id,
-                            &watched_subdirs,
-                        )
-                        .await;
-
-                        for (nested_subdir_path, nested_subdir_node_id) in subdirs_to_spawn {
-                            info!(
-                                "MQTT: Spawning task for newly discovered nested subdir: {} ({})",
-                                nested_subdir_path, nested_subdir_node_id
-                            );
-                            spawn_subdir_mqtt_task(
-                                http_client.clone(),
-                                server.clone(),
-                                fs_root_id.clone(),
-                                nested_subdir_path,
-                                nested_subdir_node_id,
-                                directory.clone(),
-                                file_states.clone(),
-                                use_paths,
-                                push_only,
-                                pull_only,
-                                shared_state_file.clone(),
-                                #[cfg(unix)]
-                                inode_tracker.clone(),
-                                mqtt_client.clone(),
-                                workspace.clone(),
-                                watched_subdirs.clone(),
-                            );
-                        }
-                    }
+                        mqtt_client.clone(),
+                        workspace.clone(),
+                        watched_subdirs.clone(),
+                    );
                 }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                warn!(
-                    "MQTT message receiver for subdir {} lagged by {} messages",
-                    subdir_path, n
-                );
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                info!("MQTT message channel closed for subdir {}", subdir_path);
-                break;
             }
         }
     }
+
+    info!("MQTT message channel closed for subdir {}", subdir_path);
 }

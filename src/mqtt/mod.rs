@@ -16,6 +16,7 @@ pub mod sync;
 pub mod topics;
 
 use crate::document::DocumentStore;
+use crate::events::recv_broadcast;
 use crate::store::CommitStore;
 use crate::{DEFAULT_MQTT_BROKER_URL, DEFAULT_WORKSPACE};
 use rumqttc::QoS;
@@ -239,22 +240,13 @@ impl MqttService {
         });
 
         // Process incoming messages and dispatch to handlers
-        loop {
-            match message_rx.recv().await {
-                Ok(msg) => {
-                    if let Err(e) = self.dispatch_message(&msg.topic, &msg.payload).await {
-                        tracing::warn!("Error dispatching MQTT message: {}", e);
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("MQTT message receiver lagged by {} messages", n);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    tracing::info!("MQTT message channel closed");
-                    break;
-                }
+        while let Some(msg) = recv_broadcast(&mut message_rx, "MQTT message receiver").await {
+            if let Err(e) = self.dispatch_message(&msg.topic, &msg.payload).await {
+                tracing::warn!("Error dispatching MQTT message: {}", e);
             }
         }
+
+        tracing::info!("MQTT message channel closed");
 
         Ok(())
     }
