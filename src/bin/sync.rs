@@ -12,9 +12,9 @@ use commonplace_doc::sync::subdir_spawn::{
     spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport,
 };
 use commonplace_doc::sync::{
-    acquire_sync_lock, build_replace_url, build_uuid_map_recursive, check_server_has_content,
-    detect_from_path, directory_mqtt_task, directory_sse_task, directory_watcher_task,
-    discover_fs_root, encode_node_id, ensure_fs_root_exists, file_watcher_task, fork_node,
+    acquire_sync_lock, build_head_url, build_info_url, build_replace_url, build_uuid_map_recursive,
+    check_server_has_content, detect_from_path, directory_mqtt_task, directory_sse_task,
+    directory_watcher_task, discover_fs_root, ensure_fs_root_exists, file_watcher_task, fork_node,
     handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
     handle_schema_modified, initial_sync, is_binary_content, push_schema_to_server,
     scan_directory_with_contents, spawn_file_sync_tasks_with_flock, sse_task, sync_schema,
@@ -363,7 +363,7 @@ async fn resolve_or_create_path(
     );
 
     // Fetch current parent schema
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(&parent_id));
+    let head_url = build_head_url(server, &parent_id, false);
     let resp = client.get(&head_url).send().await?;
 
     if !resp.status().is_success() {
@@ -455,7 +455,7 @@ async fn resolve_or_create_path(
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Fetch the updated schema to get the server-assigned UUID
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(&parent_id));
+    let head_url = build_head_url(server, &parent_id, false);
     let resp = client.get(&head_url).send().await?;
     if !resp.status().is_success() {
         return Err(format!("Failed to fetch updated schema: HTTP {}", resp.status()).into());
@@ -782,7 +782,7 @@ async fn run_file_mode(
     );
 
     // Verify document exists
-    let doc_url = format!("{}/docs/{}/info", server, encode_node_id(&node_id));
+    let doc_url = build_info_url(&server, &node_id);
     let resp = client.get(&doc_url).send().await?;
     if !resp.status().is_success() {
         error!("Document {} not found on server", node_id);
@@ -1894,7 +1894,7 @@ async fn run_exec_mode(
         let stderr_name = format!("__{}.stderr.txt", exec_name);
 
         // Fetch current schema
-        let head_url = format!("{}/docs/{}/head", server, fs_root_id);
+        let head_url = build_head_url(&server, &fs_root_id, false);
         if let Ok(resp) = client.get(&head_url).send().await {
             if let Ok(head) = resp.json::<serde_json::Value>().await {
                 if let Some(content) = head.get("content").and_then(|c| c.as_str()) {
