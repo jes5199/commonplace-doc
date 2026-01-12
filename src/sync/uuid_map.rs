@@ -140,6 +140,8 @@ pub async fn build_uuid_map_recursive_with_status(
         "",
         &mut uuid_map,
         &mut all_succeeded,
+        None,
+        None,
     )
     .await;
     (uuid_map, all_succeeded)
@@ -164,154 +166,18 @@ pub async fn build_uuid_map_and_write_schemas(
 ) -> (HashMap<String, String>, bool) {
     let mut uuid_map = HashMap::new();
     let mut all_succeeded = true;
-    build_uuid_map_from_doc_and_write_schemas(
+    build_uuid_map_from_doc_with_status(
         client,
         server,
         doc_id,
         "",
-        local_directory,
         &mut uuid_map,
         &mut all_succeeded,
+        Some(local_directory),
         written_schemas,
     )
     .await;
     (uuid_map, all_succeeded)
-}
-
-/// Helper function to recursively build UUID map AND write schema files.
-#[allow(clippy::too_many_arguments)]
-#[async_recursion::async_recursion]
-async fn build_uuid_map_from_doc_and_write_schemas(
-    client: &Client,
-    server: &str,
-    doc_id: &str,
-    path_prefix: &str,
-    local_directory: &Path,
-    uuid_map: &mut HashMap<String, String>,
-    all_succeeded: &mut bool,
-    written_schemas: Option<&WrittenSchemas>,
-) {
-    // Fetch the schema from this document
-    let head = match fetch_head(client, server, doc_id, false).await {
-        Ok(Some(h)) => h,
-        Ok(None) => {
-            warn!("Document {} not found", doc_id);
-            *all_succeeded = false;
-            return;
-        }
-        Err(e) => {
-            warn!("Failed to fetch schema for {}: {}", doc_id, e);
-            *all_succeeded = false;
-            return;
-        }
-    };
-
-    let schema: FsSchema = match serde_json::from_str(&head.content) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Document {} failed to parse as schema ({})", doc_id, e);
-            *all_succeeded = false;
-            return;
-        }
-    };
-
-    // Write the schema file to the local directory for this path prefix
-    let schema_dir = if path_prefix.is_empty() {
-        local_directory.to_path_buf()
-    } else {
-        local_directory.join(path_prefix)
-    };
-
-    // Create directory if it doesn't exist
-    if let Err(e) = tokio::fs::create_dir_all(&schema_dir).await {
-        warn!(
-            "Failed to create directory {:?} for schema: {}",
-            schema_dir, e
-        );
-    } else {
-        // Write the schema file
-        if let Err(e) = write_schema_file(&schema_dir, &head.content, written_schemas).await {
-            warn!("Failed to write schema file to {:?}: {}", schema_dir, e);
-        } else {
-            debug!("Wrote schema file to {:?}", schema_dir);
-        }
-    }
-
-    // Traverse the schema and collect UUIDs
-    if let Some(ref root) = schema.root {
-        collect_paths_and_write_schemas(
-            client,
-            server,
-            root,
-            path_prefix,
-            local_directory,
-            uuid_map,
-            all_succeeded,
-            written_schemas,
-        )
-        .await;
-    }
-}
-
-/// Recursively collect paths and write nested schema files.
-#[allow(clippy::too_many_arguments)]
-#[async_recursion::async_recursion]
-async fn collect_paths_and_write_schemas(
-    client: &Client,
-    server: &str,
-    entry: &Entry,
-    prefix: &str,
-    local_directory: &Path,
-    uuid_map: &mut HashMap<String, String>,
-    all_succeeded: &mut bool,
-    written_schemas: Option<&WrittenSchemas>,
-) {
-    match entry {
-        Entry::Dir(dir) => {
-            // Node-backed directory: fetch its document, write schema, and recurse
-            if let Some(ref node_id) = dir.node_id {
-                build_uuid_map_from_doc_and_write_schemas(
-                    client,
-                    server,
-                    node_id,
-                    prefix,
-                    local_directory,
-                    uuid_map,
-                    all_succeeded,
-                    written_schemas,
-                )
-                .await;
-            }
-            // Directory with inline entries (root or legacy): iterate over entries
-            if let Some(ref entries) = dir.entries {
-                for (name, child) in entries {
-                    let child_path = if prefix.is_empty() {
-                        name.clone()
-                    } else {
-                        format!("{}/{}", prefix, name)
-                    };
-                    collect_paths_and_write_schemas(
-                        client,
-                        server,
-                        child,
-                        &child_path,
-                        local_directory,
-                        uuid_map,
-                        all_succeeded,
-                        written_schemas,
-                    )
-                    .await;
-                }
-            }
-        }
-        Entry::Doc(doc) => {
-            // This is a file - add it to the map if it has a node_id
-            if let Some(ref node_id) = doc.node_id {
-                debug!("Found UUID: {} -> {}", prefix, node_id);
-                uuid_map.insert(prefix.to_string(), node_id.clone());
-            }
-        }
-    }
 }
 
 /// Helper function to recursively build the UUID map from a document and its children.
@@ -331,11 +197,18 @@ pub async fn build_uuid_map_from_doc(
         path_prefix,
         uuid_map,
         &mut success,
+        None,
+        None,
     )
     .await;
 }
 
 /// Helper function to recursively build the UUID map, tracking fetch success.
+///
+/// Optionally writes schema files to the local directory if `local_directory` is provided.
+/// This consolidates the previous separate functions for building UUID maps with and without
+/// schema writing.
+#[allow(clippy::too_many_arguments)]
 #[async_recursion::async_recursion]
 pub async fn build_uuid_map_from_doc_with_status(
     client: &Client,
@@ -344,6 +217,8 @@ pub async fn build_uuid_map_from_doc_with_status(
     path_prefix: &str,
     uuid_map: &mut HashMap<String, String>,
     all_succeeded: &mut bool,
+    local_directory: Option<&Path>,
+    written_schemas: Option<&WrittenSchemas>,
 ) {
     // Fetch the schema from this document
     let head = match fetch_head(client, server, doc_id, false).await {
@@ -372,6 +247,30 @@ pub async fn build_uuid_map_from_doc_with_status(
         }
     };
 
+    // Optionally write schema file to local directory
+    if let Some(local_dir) = local_directory {
+        let schema_dir = if path_prefix.is_empty() {
+            local_dir.to_path_buf()
+        } else {
+            local_dir.join(path_prefix)
+        };
+
+        // Create directory if it doesn't exist
+        if let Err(e) = tokio::fs::create_dir_all(&schema_dir).await {
+            warn!(
+                "Failed to create directory {:?} for schema: {}",
+                schema_dir, e
+            );
+        } else {
+            // Write the schema file
+            if let Err(e) = write_schema_file(&schema_dir, &head.content, written_schemas).await {
+                warn!("Failed to write schema file to {:?}: {}", schema_dir, e);
+            } else {
+                debug!("Wrote schema file to {:?}", schema_dir);
+            }
+        }
+    }
+
     // Traverse the schema and collect UUIDs
     if let Some(ref root) = schema.root {
         collect_paths_with_node_backed_dirs_with_status(
@@ -381,6 +280,8 @@ pub async fn build_uuid_map_from_doc_with_status(
             path_prefix,
             uuid_map,
             all_succeeded,
+            local_directory,
+            written_schemas,
         )
         .await;
     }
@@ -395,43 +296,24 @@ pub async fn collect_paths_with_node_backed_dirs(
     prefix: &str,
     uuid_map: &mut HashMap<String, String>,
 ) {
-    match entry {
-        Entry::Dir(dir) => {
-            // Node-backed directory: fetch its document and recurse
-            if let Some(ref node_id) = dir.node_id {
-                build_uuid_map_from_doc(client, server, node_id, prefix, uuid_map).await;
-            }
-            // Directory with inline entries (root or legacy): iterate over entries
-            // Note: nested inline subdirectories are deprecated, but root entries are valid
-            if let Some(ref entries) = dir.entries {
-                for (name, child) in entries {
-                    let child_path = if prefix.is_empty() {
-                        name.clone()
-                    } else {
-                        format!("{}/{}", prefix, name)
-                    };
-                    collect_paths_with_node_backed_dirs(
-                        client,
-                        server,
-                        child,
-                        &child_path,
-                        uuid_map,
-                    )
-                    .await;
-                }
-            }
-        }
-        Entry::Doc(doc) => {
-            // This is a file - add it to the map if it has a node_id
-            if let Some(ref node_id) = doc.node_id {
-                debug!("Found UUID: {} -> {}", prefix, node_id);
-                uuid_map.insert(prefix.to_string(), node_id.clone());
-            }
-        }
-    }
+    let mut all_succeeded = true;
+    collect_paths_with_node_backed_dirs_with_status(
+        client,
+        server,
+        entry,
+        prefix,
+        uuid_map,
+        &mut all_succeeded,
+        None,
+        None,
+    )
+    .await;
 }
 
 /// Recursively collect paths from an entry, following node-backed directories, with status tracking.
+///
+/// Optionally writes schema files if `local_directory` is provided.
+#[allow(clippy::too_many_arguments)]
 #[async_recursion::async_recursion]
 pub async fn collect_paths_with_node_backed_dirs_with_status(
     client: &Client,
@@ -440,6 +322,8 @@ pub async fn collect_paths_with_node_backed_dirs_with_status(
     prefix: &str,
     uuid_map: &mut HashMap<String, String>,
     all_succeeded: &mut bool,
+    local_directory: Option<&Path>,
+    written_schemas: Option<&WrittenSchemas>,
 ) {
     match entry {
         Entry::Dir(dir) => {
@@ -452,6 +336,8 @@ pub async fn collect_paths_with_node_backed_dirs_with_status(
                     prefix,
                     uuid_map,
                     all_succeeded,
+                    local_directory,
+                    written_schemas,
                 )
                 .await;
             }
@@ -471,6 +357,8 @@ pub async fn collect_paths_with_node_backed_dirs_with_status(
                         &child_path,
                         uuid_map,
                         all_succeeded,
+                        local_directory,
+                        written_schemas,
                     )
                     .await;
                 }
