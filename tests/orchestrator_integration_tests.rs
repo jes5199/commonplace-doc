@@ -855,6 +855,37 @@ fn wait_for_new_sandbox_dir(
     }
 }
 
+/// Wait for a sandbox directory that contains a specific process in __processes.json.
+/// This is more robust than wait_for_new_sandbox_dir when tests run in parallel.
+fn wait_for_sandbox_with_process(
+    initial_dirs: &HashSet<std::path::PathBuf>,
+    process_name: &str,
+    timeout: Duration,
+) -> Result<std::path::PathBuf, String> {
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed() > timeout {
+            return Err(format!(
+                "Timeout waiting for sandbox with process '{}'",
+                process_name
+            ));
+        }
+        let current_dirs = get_sandbox_dirs();
+        for dir in &current_dirs {
+            if !initial_dirs.contains(dir) && dir.join(".pid").exists() {
+                // Check if __processes.json contains our process
+                let procs_path = dir.join("__processes.json");
+                if let Ok(content) = std::fs::read_to_string(&procs_path) {
+                    if content.contains(process_name) {
+                        return Ok(dir.clone());
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Wait for a file to exist with optional content check.
 fn wait_for_file(
     path: &std::path::Path,
@@ -873,6 +904,31 @@ fn wait_for_file(
                         return Ok(content);
                     }
                 } else {
+                    return Ok(content);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Wait for a file to exist and contain a specific substring.
+fn wait_for_file_containing(
+    path: &std::path::Path,
+    expected_substring: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed() > timeout {
+            return Err(format!(
+                "Timeout waiting for file {:?} to contain {:?}",
+                path, expected_substring
+            ));
+        }
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if content.contains(expected_substring) {
                     return Ok(content);
                 }
             }
@@ -1007,9 +1063,13 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     wait_for_discovered_process("sync-test-proc", Duration::from_secs(60))
         .expect("Sandbox process 'sync-test-proc' was not discovered");
 
-    // Wait for the sandbox directory to be created (commonplace-sync creates it)
-    let sandbox_dir = wait_for_new_sandbox_dir(&initial_sandbox_dirs, Duration::from_secs(30))
-        .expect("Failed to find new sandbox directory");
+    // Wait for the sandbox directory for this test's process (handles parallel test runs)
+    let sandbox_dir = wait_for_sandbox_with_process(
+        &initial_sandbox_dirs,
+        "sync-test-proc",
+        Duration::from_secs(30),
+    )
+    .expect("Failed to find sandbox directory for sync-test-proc");
 
     eprintln!("Sandbox directory: {:?}", sandbox_dir);
 
@@ -1227,9 +1287,13 @@ fn test_commonplace_link_schema_push_updates_server() {
     wait_for_discovered_process("link-test-proc", Duration::from_secs(60))
         .expect("Sandbox process 'link-test-proc' was not discovered");
 
-    // Find the new sandbox directory
-    let sandbox_dir = wait_for_new_sandbox_dir(&initial_sandbox_dirs, Duration::from_secs(30))
-        .expect("Sandbox directory should appear");
+    // Find the sandbox directory for this test's process (handles parallel test runs)
+    let sandbox_dir = wait_for_sandbox_with_process(
+        &initial_sandbox_dirs,
+        "link-test-proc",
+        Duration::from_secs(30),
+    )
+    .expect("Sandbox directory for link-test-proc should appear");
     eprintln!("Sandbox directory: {:?}", sandbox_dir);
 
     // === L1: Create source file and sync ===
@@ -1500,9 +1564,10 @@ fn test_sandbox_stdio_capture_and_sync() {
     wait_for_discovered_process("stdio-proc", Duration::from_secs(60))
         .expect("Sandbox process 'stdio-proc' was not discovered");
 
-    // Find the new sandbox directory
-    let sandbox_dir = wait_for_new_sandbox_dir(&initial_sandbox_dirs, Duration::from_secs(30))
-        .expect("Sandbox directory should appear");
+    // Find the sandbox directory for this test's process (handles parallel test runs)
+    let sandbox_dir =
+        wait_for_sandbox_with_process(&initial_sandbox_dirs, "stdio-proc", Duration::from_secs(30))
+            .expect("Sandbox directory for stdio-proc should appear");
     eprintln!("Sandbox directory: {:?}", sandbox_dir);
 
     // Wait for the process to run and produce output
@@ -1582,4 +1647,218 @@ fn test_sandbox_stdio_capture_and_sync() {
     );
 
     eprintln!("=== All sandbox stdio capture tests PASSED ===");
+}
+
+/// CP-05qu: Test JSONL file append/sync behavior
+///
+/// Verifies acceptance criteria J1-J8:
+/// - J1: Create JSONL file with first line
+/// - J2: Verify appears in sandbox
+/// - J3: Content matches
+/// - J4: Append second line
+/// - J5: Verify sandbox has both lines
+/// - J6: Append from sandbox
+/// - J7: Verify workspace has all three lines
+/// - J8: Delete test file
+///
+/// Requires MQTT broker on localhost:1883 (skipped if not available).
+#[test]
+fn test_jsonl_file_append_sync_behavior() {
+    if !mqtt_available() {
+        eprintln!("Skipping test: MQTT broker not available on localhost:1883");
+        return;
+    }
+
+    // Clean up any stale status file from previous runs
+    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let workspace_dir = temp_dir.path().join("workspace");
+    let config_path = temp_dir.path().join("commonplace.json");
+    let port = get_available_port();
+
+    // Create workspace directory with schema
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    let root_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {}
+        }
+    });
+    std::fs::write(
+        workspace_dir.join(".commonplace.json"),
+        serde_json::to_string_pretty(&root_schema).unwrap(),
+    )
+    .unwrap();
+
+    // Create a subdirectory for the JSONL test
+    let jsonl_dir = workspace_dir.join("jsonl-test");
+    std::fs::create_dir_all(&jsonl_dir).unwrap();
+    let jsonl_dir_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {}
+        }
+    });
+    std::fs::write(
+        jsonl_dir.join(".commonplace.json"),
+        serde_json::to_string_pretty(&jsonl_dir_schema).unwrap(),
+    )
+    .unwrap();
+
+    // Create __processes.json with a sandbox process
+    let processes_json = serde_json::json!({
+        "processes": {
+            "jsonl-proc": {
+                "sandbox-exec": "sleep 120"
+            }
+        }
+    });
+    std::fs::write(
+        jsonl_dir.join("__processes.json"),
+        serde_json::to_string_pretty(&processes_json).unwrap(),
+    )
+    .unwrap();
+
+    // Create orchestrator config with process discovery enabled
+    let config = create_test_config_with_discovery(
+        temp_dir.path(),
+        port,
+        &db_path,
+        &workspace_dir,
+        true, // enable process discovery
+    );
+    std::fs::write(&config_path, &config).unwrap();
+
+    // Record existing sandbox directories before starting orchestrator
+    let initial_sandbox_dirs = get_sandbox_dirs();
+
+    let mut guard = ProcessGuard::new();
+
+    // Spawn orchestrator
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let orchestrator = Command::new(env!("CARGO_BIN_EXE_commonplace-orchestrator"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--server",
+            &server_url,
+        ])
+        .current_dir(temp_dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to start orchestrator");
+    guard.add(orchestrator);
+
+    // Wait for orchestrator to be ready
+    wait_for_orchestrator_ready(Duration::from_secs(30))
+        .expect("Orchestrator failed to start within timeout");
+
+    eprintln!("=== JSONL append/sync test starting ===");
+
+    // Wait for sandbox process to be discovered
+    wait_for_discovered_process("jsonl-proc", Duration::from_secs(60))
+        .expect("Sandbox process 'jsonl-proc' was not discovered");
+
+    // Find the sandbox directory for this test's process (handles parallel test runs)
+    let sandbox_dir =
+        wait_for_sandbox_with_process(&initial_sandbox_dirs, "jsonl-proc", Duration::from_secs(30))
+            .expect("Sandbox directory for jsonl-proc should appear");
+    eprintln!("Sandbox directory: {:?}", sandbox_dir);
+
+    // === J1: Create JSONL file with first line ===
+    eprintln!("=== J1: Creating JSONL file with first line ===");
+    let jsonl_file = jsonl_dir.join("test-data.jsonl");
+    let line1 = r#"{"id": 1, "message": "first line"}"#;
+    std::fs::write(&jsonl_file, format!("{}\n", line1)).expect("Failed to write JSONL file");
+    eprintln!("J1: Created JSONL file with first line");
+
+    // === J2-J3: Verify appears in sandbox with correct content ===
+    eprintln!("=== J2-J3: Verifying JSONL appears in sandbox ===");
+    let sandbox_jsonl = sandbox_dir.join("test-data.jsonl");
+
+    // Note: JSON content may be normalized (spaces removed) during sync,
+    // so use substring matching with a value that survives normalization
+    let content = wait_for_file_containing(&sandbox_jsonl, "first line", Duration::from_secs(60))
+        .expect("JSONL file should appear in sandbox");
+    assert!(
+        content.contains("first line"),
+        "Sandbox should have first line, got: {}",
+        content
+    );
+    eprintln!("J2-J3: JSONL file synced to sandbox with correct content");
+
+    // === J4: Append second line ===
+    eprintln!("=== J4: Appending second line ===");
+    let line2 = r#"{"id": 2, "message": "second line"}"#;
+
+    // Read current content and append
+    let current = std::fs::read_to_string(&jsonl_file).unwrap();
+    std::fs::write(&jsonl_file, format!("{}{}\n", current, line2))
+        .expect("Failed to append second line");
+    eprintln!("J4: Appended second line to workspace file");
+
+    // === J5: Verify sandbox has both lines ===
+    eprintln!("=== J5: Verifying sandbox has both lines ===");
+    // Use message value substring for normalized-safe matching
+    let content = wait_for_file_containing(&sandbox_jsonl, "second line", Duration::from_secs(30))
+        .expect("Sandbox should have second line");
+    assert!(
+        content.contains("first line") && content.contains("second line"),
+        "Sandbox should have both lines, got: {}",
+        content
+    );
+    eprintln!("J5: Sandbox has both lines");
+
+    // === J6: Append from sandbox ===
+    eprintln!("=== J6: Appending third line from sandbox ===");
+    let line3 = r#"{"id": 3, "message": "third line from sandbox"}"#;
+
+    // Wait for sync to stabilize
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Read current sandbox content and append
+    let sandbox_content = std::fs::read_to_string(&sandbox_jsonl).unwrap();
+    std::fs::write(&sandbox_jsonl, format!("{}{}\n", sandbox_content, line3))
+        .expect("Failed to append third line from sandbox");
+    eprintln!("J6: Appended third line from sandbox");
+
+    // === J7: Verify workspace has all three lines ===
+    eprintln!("=== J7: Verifying workspace has all three lines ===");
+    // Use message value substring for normalized-safe matching
+    let content = wait_for_file_containing(
+        &jsonl_file,
+        "third line from sandbox",
+        Duration::from_secs(30),
+    )
+    .expect("Workspace should have third line");
+    assert!(
+        content.contains("first line")
+            && content.contains("second line")
+            && content.contains("third line from sandbox"),
+        "Workspace should have all three lines, got: {}",
+        content
+    );
+    eprintln!("J7: Workspace has all three lines");
+
+    // === J8: Delete test file ===
+    eprintln!("=== J8: Deleting test file ===");
+    std::fs::remove_file(&jsonl_file).expect("Failed to delete JSONL file");
+
+    // Verify file is deleted from sandbox
+    let start = std::time::Instant::now();
+    while sandbox_jsonl.exists() && start.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        !sandbox_jsonl.exists(),
+        "JSONL file should be deleted from sandbox"
+    );
+    eprintln!("J8: Test file deleted");
+
+    eprintln!("=== All JSONL append/sync tests PASSED ===");
 }
