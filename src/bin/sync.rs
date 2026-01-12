@@ -707,6 +707,7 @@ async fn main() -> ExitCode {
             args.pull_only,
             args.shadow_dir,
             args.name,
+            None, // No MQTT in standalone exec mode
         )
         .await;
 
@@ -755,6 +756,7 @@ async fn main() -> ExitCode {
                 args.pull_only,
                 args.shadow_dir,
                 args.name,
+                None, // No MQTT in standalone exec mode
             )
             .await
         } else {
@@ -1598,6 +1600,7 @@ async fn run_exec_mode(
     pull_only: bool,
     shadow_dir: String,
     process_name: Option<String>,
+    mqtt_client: Option<Arc<MqttClient>>,
 ) -> Result<u8, Box<dyn std::error::Error>> {
     // Derive author from process_name, defaulting to "sync-client"
     let author = process_name
@@ -1808,6 +1811,16 @@ async fn run_exec_mode(
         file_count,
         sync_start.elapsed().as_millis()
     );
+
+    // Publish initial-sync-complete event via MQTT
+    publish_initial_sync_complete(
+        &mqtt_client,
+        &fs_root_id,
+        synced_count,
+        &initial_sync_strategy,
+        sync_start.elapsed().as_millis() as u64,
+    )
+    .await;
 
     // Start directory watcher and create shared state
     let WatcherSetup {
