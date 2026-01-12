@@ -311,9 +311,14 @@ pub async fn handle_file_created(
                     // Update schema to point to forked node
                     // Use the owning document's directory and ID
                     if let Ok(json) = scan_directory_to_json(&owning_doc.directory, options) {
-                        if let Err(e) =
-                            push_schema_to_server(client, server, &owning_doc.document_id, &json, author)
-                                .await
+                        if let Err(e) = push_schema_to_server(
+                            client,
+                            server,
+                            &owning_doc.document_id,
+                            &json,
+                            author,
+                        )
+                        .await
                         {
                             warn!("Failed to push updated schema: {}", e);
                         }

@@ -1353,7 +1353,8 @@ pub async fn handle_shadow_write(
 
     // Push update using replace endpoint with old commit as parent
     // This creates a CRDT update that merges with HEAD
-    let replace_url = crate::sync::build_replace_url(server, &identifier, &commit_id, use_paths, author);
+    let replace_url =
+        crate::sync::build_replace_url(server, &identifier, &commit_id, use_paths, author);
 
     info!(
         "Pushing shadow write for inode {:x}-{:x} (parent: {}, {} bytes)",
