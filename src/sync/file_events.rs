@@ -491,6 +491,7 @@ pub async fn handle_file_modified(
 /// Handle a file deletion event in directory sync mode.
 ///
 /// Stops sync tasks for the deleted file and updates the schema.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_file_deleted(
     client: &Client,
     server: &str,

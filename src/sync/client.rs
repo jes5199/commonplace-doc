@@ -260,6 +260,7 @@ pub async fn push_json_content_merge(
 }
 
 /// Internal implementation for pushing JSON content with optional merge mode.
+#[allow(clippy::too_many_arguments)]
 async fn push_json_content_impl(
     client: &Client,
     server: &str,

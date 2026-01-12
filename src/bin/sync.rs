@@ -26,6 +26,7 @@ use commonplace_doc::sync::{
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
 use commonplace_doc::workspace::is_process_running;
 use commonplace_doc::{DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
+use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use rumqttc::QoS;
 use std::collections::{HashMap, HashSet};
@@ -34,12 +35,16 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use commonplace_doc::sync::WrittenSchemas;
 use tokio::task::JoinHandle;
+
+/// Maximum number of concurrent file syncs during initial sync.
+/// This limits server load while still providing significant speedup.
+const MAX_CONCURRENT_FILE_SYNCS: usize = 10;
 
 /// Publish initial sync complete event via MQTT if available.
 async fn publish_initial_sync_complete(
@@ -1265,29 +1270,63 @@ async fn run_directory_mode(
     // This recursively follows node-backed directories to get all UUIDs
     let uuid_map = fetch_uuid_map_with_logging(&client, &server, &fs_root_id, use_paths).await;
 
-    // Sync each file
-    for file in &files {
-        let file_path = directory.join(&file.relative_path);
-        if let Err(e) = sync_single_file(
-            &client,
-            &server,
-            &fs_root_id,
-            &directory,
-            file,
-            &file_path,
-            &uuid_map,
-            &initial_sync_strategy,
-            &file_states,
-            use_paths,
-            &author,
-        )
-        .await
-        {
-            warn!("Failed to sync file {}: {}", file.relative_path, e);
+    // Sync files in parallel with concurrency limit
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_SYNCS));
+    let uuid_map = Arc::new(uuid_map);
+    let file_count = files.len();
+
+    // Create futures for all file syncs - they won't run until polled
+    let mut futures: FuturesUnordered<_> = files
+        .into_iter()
+        .map(|file| {
+            let semaphore = semaphore.clone();
+            let client = client.clone();
+            let server = server.clone();
+            let fs_root_id = fs_root_id.clone();
+            let directory = directory.clone();
+            let file_path = directory.join(&file.relative_path);
+            let uuid_map = uuid_map.clone();
+            let initial_sync_strategy = initial_sync_strategy.clone();
+            let file_states = file_states.clone();
+            let author = author.clone();
+
+            async move {
+                // Acquire permit to limit concurrency
+                let _permit = semaphore.acquire().await.unwrap();
+                let result = sync_single_file(
+                    &client,
+                    &server,
+                    &fs_root_id,
+                    &directory,
+                    &file,
+                    &file_path,
+                    &uuid_map,
+                    &initial_sync_strategy,
+                    &file_states,
+                    use_paths,
+                    &author,
+                )
+                .await
+                .map_err(|e| e.to_string());
+                (file.relative_path.clone(), result)
+            }
+        })
+        .collect();
+
+    // Wait for all file syncs to complete
+    let mut failed_count = 0;
+    while let Some((path, result)) = futures.next().await {
+        if let Err(e) = result {
+            warn!("Failed to sync file {}: {}", path, e);
+            failed_count += 1;
         }
     }
 
-    info!("Initial sync complete: {} files synced", files.len());
+    info!(
+        "Initial sync complete: {} files synced ({} failed)",
+        file_count - failed_count,
+        failed_count
+    );
 
     // Create local files for any schema entries that don't exist locally.
     // This handles commonplace-link entries where the linked target exists but the
@@ -1328,7 +1367,7 @@ async fn run_directory_mode(
     publish_initial_sync_complete(
         &mqtt_client,
         &fs_root_id,
-        files.len(),
+        file_count,
         &initial_sync_strategy,
         sync_start.elapsed().as_millis() as u64,
     )
@@ -1770,12 +1809,56 @@ async fn run_exec_mode(
         None
     };
 
+    // Sync files in parallel with concurrency limit
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_SYNCS));
+    let uuid_map = Arc::new(uuid_map);
+
+    // Create futures for all file syncs - they won't run until polled
+    let mut futures: FuturesUnordered<_> = files
+        .into_iter()
+        .map(|file| {
+            let semaphore = semaphore.clone();
+            let client = client.clone();
+            let server = server.clone();
+            let fs_root_id = fs_root_id.clone();
+            let directory = directory.clone();
+            let file_path = directory.join(&file.relative_path);
+            let uuid_map = uuid_map.clone();
+            let initial_sync_strategy = initial_sync_strategy.clone();
+            let file_states = file_states.clone();
+            let author = author.clone();
+
+            async move {
+                // Acquire permit to limit concurrency
+                let _permit = semaphore.acquire().await.unwrap();
+                let result = sync_single_file(
+                    &client,
+                    &server,
+                    &fs_root_id,
+                    &directory,
+                    &file,
+                    &file_path,
+                    &uuid_map,
+                    &initial_sync_strategy,
+                    &file_states,
+                    use_paths,
+                    &author,
+                )
+                .await
+                .map_err(|e| e.to_string());
+                (file.relative_path.clone(), result)
+            }
+        })
+        .collect();
+
     let mut synced_count = 0usize;
     let sync_start = std::time::Instant::now();
-    for file in files {
-        // Check timeout in sandbox mode
-        if let Some(timeout) = sync_timeout {
-            if sync_start.elapsed() > timeout {
+
+    if let Some(timeout_duration) = sync_timeout {
+        // Sandbox mode: sync with timeout
+        loop {
+            let remaining = timeout_duration.saturating_sub(sync_start.elapsed());
+            if remaining.is_zero() {
                 info!(
                     "Sandbox file sync timeout after {} files ({}ms elapsed), proceeding to exec",
                     synced_count,
@@ -1783,28 +1866,35 @@ async fn run_exec_mode(
                 );
                 break;
             }
-        }
 
-        let file_path = directory.join(&file.relative_path);
-        if let Err(e) = sync_single_file(
-            &client,
-            &server,
-            &fs_root_id,
-            &directory,
-            &file,
-            &file_path,
-            &uuid_map,
-            &initial_sync_strategy,
-            &file_states,
-            use_paths,
-            &author,
-        )
-        .await
-        {
-            warn!("Failed to sync file {}: {}", file.relative_path, e);
+            match tokio::time::timeout(remaining, futures.next()).await {
+                Ok(Some((path, result))) => {
+                    if let Err(e) = result {
+                        warn!("Failed to sync file {}: {}", path, e);
+                    }
+                    synced_count += 1;
+                }
+                Ok(None) => break, // All files synced
+                Err(_) => {
+                    info!(
+                        "Sandbox file sync timeout after {} files ({}ms elapsed), proceeding to exec",
+                        synced_count,
+                        sync_start.elapsed().as_millis()
+                    );
+                    break;
+                }
+            }
         }
-        synced_count += 1;
+    } else {
+        // Non-sandbox mode: sync all files without timeout
+        while let Some((path, result)) = futures.next().await {
+            if let Err(e) = result {
+                warn!("Failed to sync file {}: {}", path, e);
+            }
+            synced_count += 1;
+        }
     }
+
     info!(
         "Initial sync complete: {}/{} files synced ({}ms)",
         synced_count,
