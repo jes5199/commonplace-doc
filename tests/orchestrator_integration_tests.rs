@@ -50,8 +50,31 @@ impl ProcessGuard {
 impl Drop for ProcessGuard {
     fn drop(&mut self) {
         for mut child in self.children.drain(..) {
-            let _ = child.kill();
-            let _ = child.wait();
+            let pid = child.id();
+
+            // Send SIGTERM first for graceful shutdown (allows orchestrator to terminate children)
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+
+            // Wait up to 5 seconds for graceful termination
+            let start = std::time::Instant::now();
+            let timeout = Duration::from_secs(5);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break, // Process exited
+                    Ok(None) => {
+                        if start.elapsed() > timeout {
+                            // Graceful shutdown timed out, force kill
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(_) => break,
+                }
+            }
         }
         // Clean up the status file
         let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
