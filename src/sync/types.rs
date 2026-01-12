@@ -158,3 +158,18 @@ pub async fn remove_file_state_and_abort(
         None
     }
 }
+
+/// Event published when initial sync completes.
+///
+/// Published to `{fs_root_id}/events/sync/initial-complete` via MQTT.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitialSyncComplete {
+    /// The filesystem root document ID (workspace name)
+    pub fs_root_id: String,
+    /// Number of files synced during initial sync
+    pub files_synced: usize,
+    /// Sync strategy used: "local", "server", or "skip"
+    pub strategy: String,
+    /// Time taken for initial sync in milliseconds
+    pub duration_ms: u64,
+}
