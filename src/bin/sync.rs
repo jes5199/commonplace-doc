@@ -1113,6 +1113,9 @@ async fn run_directory_mode(
     // Derive author from name parameter, defaulting to "sync-client"
     let author = name.unwrap_or_else(|| "sync-client".to_string());
 
+    // Track timing for initial sync event
+    let sync_start = Instant::now();
+
     let mode = if push_only {
         "push-only"
     } else if pull_only {
@@ -1318,6 +1321,16 @@ async fn run_directory_mode(
             );
         }
     }
+
+    // Publish initial-sync-complete event via MQTT
+    publish_initial_sync_complete(
+        &mqtt_client,
+        &fs_root_id,
+        files.len(),
+        &initial_sync_strategy,
+        sync_start.elapsed().as_millis() as u64,
+    )
+    .await;
 
     // Start directory watcher and create shared state
     let WatcherSetup {
