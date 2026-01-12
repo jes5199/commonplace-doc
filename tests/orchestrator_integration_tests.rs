@@ -679,8 +679,8 @@ fn test_processes_json_add_remove_starts_stops_processes() {
             &server_url,
         ])
         .current_dir(temp_dir.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null()) // Use null to avoid pipe buffer blocking
+        .stderr(Stdio::null())
         .spawn()
         .expect("Failed to spawn orchestrator");
 
@@ -726,17 +726,63 @@ fn test_processes_json_add_remove_starts_stops_processes() {
         "Added process should have written its marker file"
     );
 
-    // H5/H6: Process removal is currently broken - see CP-y1cu
-    // Investigation findings:
-    // - The sync client IS correctly uploading the modified __processes.json to server
-    // - The server DOES have the correct content (without added-proc)
-    // - The issue is that the orchestrator's SSE subscription doesn't receive the notification
-    // - Periodic re-discovery (every 30 seconds) also doesn't trigger reconciliation
-    //
-    // This is an orchestrator SSE/notification bug, not a sync bug.
-    // For now, we only test process addition (H3/H4) which works correctly.
+    // H5: Modify __processes.json again to REMOVE added-proc
+    eprintln!("Writing __processes.json with removed added-proc...");
+    let modified_config2 = serde_json::json!({
+        "processes": {
+            "initial-proc": {
+                "sandbox-exec": format!("sh -c 'echo started > {}/initial-process-ran.txt'", temp_dir.path().display())
+            }
+            // added-proc is removed
+        }
+    });
+    // Write directly to the __processes.json file (simulating an edit)
+    std::fs::write(
+        &processes_json_path,
+        serde_json::to_string_pretty(&modified_config2).unwrap(),
+    )
+    .expect("Failed to write modified __processes.json");
 
-    // Verify both processes are still running at end of test
+    // Give the sync client time to detect the change and upload
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Check server content to verify sync happened
+    // Get the __processes.json content directly
+    let client = reqwest::blocking::Client::new();
+    let processes_url = format!("{}/files/dynamic-test/__processes.json", server_url);
+    let head_resp = client.get(&processes_url).send().unwrap();
+    let server_text = head_resp.text().unwrap();
+    eprintln!("Server __processes.json content: {}", server_text);
+
+    let server_content: serde_json::Value = serde_json::from_str(&server_text).unwrap();
+    let server_has_added = server_content["processes"]
+        .as_object()
+        .map(|p| p.contains_key("added-proc"))
+        .unwrap_or(false);
+
+    // Wait for orchestrator to reconcile (with timeout)
+    let start = std::time::Instant::now();
+    let mut removed = false;
+    while start.elapsed() < Duration::from_secs(15) {
+        std::thread::sleep(Duration::from_millis(500));
+        if let Ok(status_content) =
+            std::fs::read_to_string("/tmp/commonplace-orchestrator-status.json")
+        {
+            if let Ok(status) = serde_json::from_str::<serde_json::Value>(&status_content) {
+                if let Some(processes) = status.get("processes").and_then(|p| p.as_array()) {
+                    let added_still_running = processes
+                        .iter()
+                        .any(|p| p.get("name").and_then(|n| n.as_str()) == Some("added-proc"));
+                    if !added_still_running {
+                        removed = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // H6: Verify added-proc was removed
     let status_content =
         std::fs::read_to_string("/tmp/commonplace-orchestrator-status.json").unwrap();
     let status: serde_json::Value = serde_json::from_str(&status_content).unwrap();
@@ -747,6 +793,23 @@ fn test_processes_json_add_remove_starts_stops_processes() {
     let added_running = processes
         .iter()
         .any(|p| p.get("name").and_then(|n| n.as_str()) == Some("added-proc"));
-    assert!(initial_running, "initial-proc should be running");
-    assert!(added_running, "added-proc should be running");
+
+    eprintln!(
+        "Final status: {}",
+        serde_json::to_string_pretty(&status).unwrap()
+    );
+
+    assert!(initial_running, "initial-proc should still be running");
+    assert!(
+        !server_has_added,
+        "Server should NOT have added-proc (sync worked)"
+    );
+    assert!(
+        removed && !added_running,
+        "Process 'added-proc' should have been removed after updating __processes.json \
+         (server_has_added={}, removed={}, added_running={})",
+        server_has_added,
+        removed,
+        added_running
+    );
 }
