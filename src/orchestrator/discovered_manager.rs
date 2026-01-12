@@ -1333,6 +1333,7 @@ mod tests {
         );
 
         let config = DiscoveredProcess {
+            comment: None,
             command: Some(CommandSpec::Simple("python test.py".to_string())),
             sandbox_exec: None,
             path: None,
@@ -1364,6 +1365,7 @@ mod tests {
         );
 
         let config = DiscoveredProcess {
+            comment: None,
             command: Some(CommandSpec::Simple("sync --sandbox".to_string())),
             sandbox_exec: None,
             path: None,
@@ -1403,6 +1405,7 @@ mod tests {
         );
 
         let config = DiscoveredProcess {
+            comment: None,
             command: None,
             sandbox_exec: None,
             path: None,

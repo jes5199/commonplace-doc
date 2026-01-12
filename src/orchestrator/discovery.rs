@@ -18,6 +18,11 @@ pub struct ProcessesConfig {
 /// A process discovered from a `__processes.json` file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredProcess {
+    /// Optional comment for documentation purposes.
+    /// Ignored by the orchestrator but useful for humans reading the config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+
     /// Command to run (either a string or array of strings)
     /// Mutually exclusive with sandbox_exec
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -275,5 +280,40 @@ mod tests {
         let transform = &config.processes["transform"];
         assert_eq!(transform.evaluate, Some("transform.ts".to_string()));
         assert_eq!(transform.owns, Some("output.txt".to_string()));
+    }
+
+    #[test]
+    fn test_process_with_comment() {
+        let json = r#"{
+            "processes": {
+                "api": {
+                    "comment": "Main API server - handles all HTTP requests",
+                    "sandbox-exec": "node server.js"
+                }
+            }
+        }"#;
+
+        let config = ProcessesConfig::parse(json).unwrap();
+        let api = &config.processes["api"];
+        assert_eq!(
+            api.comment,
+            Some("Main API server - handles all HTTP requests".to_string())
+        );
+        assert_eq!(api.sandbox_exec, Some("node server.js".to_string()));
+    }
+
+    #[test]
+    fn test_comment_is_optional() {
+        let json = r#"{
+            "processes": {
+                "worker": {
+                    "sandbox-exec": "python worker.py"
+                }
+            }
+        }"#;
+
+        let config = ProcessesConfig::parse(json).unwrap();
+        let worker = &config.processes["worker"];
+        assert_eq!(worker.comment, None);
     }
 }
