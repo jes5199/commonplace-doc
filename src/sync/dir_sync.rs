@@ -17,7 +17,7 @@ use crate::sync::uuid_map::{
     build_uuid_map_recursive_with_status,
 };
 use crate::sync::{
-    ancestry::determine_sync_direction, detect_from_path, encode_node_id, is_allowed_extension,
+    ancestry::determine_sync_direction, build_info_url, detect_from_path, is_allowed_extension,
     is_binary_content, looks_like_base64_binary, push_schema_to_server, spawn_file_sync_tasks,
     FileSyncState, SyncState,
 };
@@ -1150,7 +1150,7 @@ pub async fn ensure_fs_root_exists(
     server: &str,
     fs_root_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let doc_url = format!("{}/docs/{}/info", server, encode_node_id(fs_root_id));
+    let doc_url = build_info_url(server, fs_root_id);
     let resp = client.get(&doc_url).send().await?;
     if !resp.status().is_success() {
         // Create the document

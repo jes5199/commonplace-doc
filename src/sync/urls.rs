@@ -38,6 +38,11 @@ pub fn build_head_url(server: &str, path_or_id: &str, use_paths: bool) -> String
     }
 }
 
+/// Build URL for getting document info
+pub fn build_info_url(server: &str, node_id: &str) -> String {
+    format!("{}/docs/{}/info", server, encode_node_id(node_id))
+}
+
 /// Build URL for document edit
 pub fn build_edit_url(server: &str, path_or_id: &str, use_paths: bool) -> String {
     if use_paths {
@@ -248,6 +253,21 @@ mod tests {
             assert_eq!(
                 url,
                 "http://localhost:5199/files/my%20notes/my%20file.txt/head"
+            );
+        }
+
+        #[test]
+        fn test_build_info_url() {
+            let url = build_info_url(SERVER, "abc-123");
+            assert_eq!(url, "http://localhost:5199/docs/abc-123/info");
+        }
+
+        #[test]
+        fn test_build_info_url_with_special_chars() {
+            let url = build_info_url(SERVER, "fs-root:notes/todo.txt");
+            assert_eq!(
+                url,
+                "http://localhost:5199/docs/fs-root%3Anotes%2Ftodo.txt/info"
             );
         }
 
