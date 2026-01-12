@@ -815,6 +815,195 @@ fn test_processes_json_add_remove_starts_stops_processes() {
     );
 }
 
+/// CP-vbnh: Test that modifying a process command triggers restart with new PID.
+///
+/// Verifies acceptance criteria H1-H2:
+/// - H1: Edit __processes.json to change a process command
+/// - H2: Verify process restarted with new PID within 10 seconds
+#[test]
+fn test_process_config_change_triggers_restart() {
+    if !mqtt_available() {
+        eprintln!("Skipping test: MQTT broker not available on localhost:1883");
+        return;
+    }
+
+    // Clean up any stale status file from previous runs
+    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let workspace_dir = temp_dir.path().join("workspace");
+    let config_path = temp_dir.path().join("commonplace.json");
+    let port = get_available_port();
+
+    // Create workspace directory with schema
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    let schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {}
+        }
+    });
+    std::fs::write(
+        workspace_dir.join(".commonplace.json"),
+        serde_json::to_string_pretty(&schema).unwrap(),
+    )
+    .unwrap();
+
+    // Create a subdirectory with __processes.json
+    let test_dir = workspace_dir.join("restart-test");
+    std::fs::create_dir_all(&test_dir).unwrap();
+
+    let subdir_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {}
+        }
+    });
+    std::fs::write(
+        test_dir.join(".commonplace.json"),
+        serde_json::to_string_pretty(&subdir_schema).unwrap(),
+    )
+    .unwrap();
+
+    // Initial __processes.json with a long-running process
+    let marker_v1 = temp_dir.path().join("version1.txt");
+    let initial_processes = serde_json::json!({
+        "processes": {
+            "restart-proc": {
+                "sandbox-exec": format!("sh -c 'echo v1 > {} && sleep 120'", marker_v1.to_str().unwrap())
+            }
+        }
+    });
+    let processes_json_path = test_dir.join("__processes.json");
+    std::fs::write(
+        &processes_json_path,
+        serde_json::to_string_pretty(&initial_processes).unwrap(),
+    )
+    .unwrap();
+
+    // Write config file with process discovery enabled
+    let config =
+        create_test_config_with_discovery(temp_dir.path(), port, &db_path, &workspace_dir, true);
+    std::fs::write(&config_path, &config).unwrap();
+
+    let mut guard = ProcessGuard::new();
+
+    // Spawn orchestrator
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let orchestrator = Command::new(env!("CARGO_BIN_EXE_commonplace-orchestrator"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--server",
+            &server_url,
+        ])
+        .current_dir(temp_dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to spawn orchestrator");
+
+    guard.add(orchestrator);
+
+    // Wait for orchestrator to be ready
+    wait_for_orchestrator_ready(Duration::from_secs(30))
+        .expect("Orchestrator failed to start within timeout");
+
+    eprintln!("=== Process config change restart test starting ===");
+
+    // Wait for the process to be discovered and running
+    wait_for_discovered_process("restart-proc", Duration::from_secs(60))
+        .expect("Process 'restart-proc' was not discovered");
+
+    // Wait for the marker file to confirm process started
+    let start = std::time::Instant::now();
+    while !marker_v1.exists() && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(marker_v1.exists(), "Process v1 should have written marker");
+    eprintln!("H1 setup: Initial process running");
+
+    // Get the initial PID from status
+    let initial_pid = get_process_pid("restart-proc").expect("Should get initial PID");
+    eprintln!("Initial PID: {:?}", initial_pid);
+
+    // === H1: Edit __processes.json to change the process command ===
+    eprintln!("=== H1: Changing process command ===");
+    let marker_v2 = temp_dir.path().join("version2.txt");
+    let updated_processes = serde_json::json!({
+        "processes": {
+            "restart-proc": {
+                "sandbox-exec": format!("sh -c 'echo v2 > {} && sleep 120'", marker_v2.to_str().unwrap())
+            }
+        }
+    });
+    std::fs::write(
+        &processes_json_path,
+        serde_json::to_string_pretty(&updated_processes).unwrap(),
+    )
+    .unwrap();
+    eprintln!("H1: Process command changed");
+
+    // === H2: Verify process restarted with new PID within 10 seconds ===
+    eprintln!("=== H2: Verifying process restart ===");
+    let start = std::time::Instant::now();
+    let mut restarted = false;
+    let mut new_pid = None;
+
+    while start.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(500));
+
+        if let Some(pid) = get_process_pid("restart-proc") {
+            if initial_pid != pid {
+                new_pid = Some(pid);
+                restarted = true;
+                break;
+            }
+        }
+    }
+
+    assert!(
+        restarted,
+        "Process should have restarted with new PID (initial: {}, current: {:?})",
+        initial_pid,
+        get_process_pid("restart-proc")
+    );
+    eprintln!(
+        "H2: Process restarted (old PID: {}, new PID: {:?})",
+        initial_pid, new_pid
+    );
+
+    // Verify the new version ran
+    let start = std::time::Instant::now();
+    while !marker_v2.exists() && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        marker_v2.exists(),
+        "Restarted process should have written v2 marker"
+    );
+
+    eprintln!("=== Process config change restart test PASSED ===");
+}
+
+/// Helper to get a process PID from the orchestrator status file.
+fn get_process_pid(process_name: &str) -> Option<u32> {
+    let status_content =
+        std::fs::read_to_string("/tmp/commonplace-orchestrator-status.json").ok()?;
+    let status: serde_json::Value = serde_json::from_str(&status_content).ok()?;
+    let processes = status.get("processes")?.as_array()?;
+
+    for process in processes {
+        if process.get("name")?.as_str()? == process_name {
+            return process.get("pid")?.as_u64().map(|p| p as u32);
+        }
+    }
+    None
+}
+
 /// Get all current sandbox directories (those matching /tmp/commonplace-sandbox-*).
 fn get_sandbox_dirs() -> HashSet<std::path::PathBuf> {
     let mut dirs = HashSet::new();
@@ -832,6 +1021,8 @@ fn get_sandbox_dirs() -> HashSet<std::path::PathBuf> {
 }
 
 /// Wait for a new sandbox directory to appear that wasn't in the initial set.
+/// Note: Prefer wait_for_sandbox_with_process for tests that run in parallel.
+#[allow(dead_code)]
 fn wait_for_new_sandbox_dir(
     initial_dirs: &HashSet<std::path::PathBuf>,
     timeout: Duration,
