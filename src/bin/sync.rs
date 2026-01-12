@@ -23,6 +23,7 @@ use commonplace_doc::sync::{
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
+use commonplace_doc::workspace::is_process_running;
 use commonplace_doc::{DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
@@ -2278,17 +2279,4 @@ fn cleanup_stale_sandboxes() {
     if cleaned > 0 {
         info!("Cleaned up {} stale sandbox directories", cleaned);
     }
-}
-
-/// Check if a process with the given PID is still running.
-#[cfg(unix)]
-fn is_process_running(pid: u32) -> bool {
-    // On Unix, sending signal 0 checks if process exists without actually sending a signal
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-
-#[cfg(not(unix))]
-fn is_process_running(_pid: u32) -> bool {
-    // On non-Unix platforms, assume process might be running to be safe
-    true
 }

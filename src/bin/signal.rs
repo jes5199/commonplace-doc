@@ -8,6 +8,7 @@
 use clap::Parser;
 use commonplace_doc::cli::SignalArgs;
 use commonplace_doc::orchestrator::OrchestratorStatus;
+use commonplace_doc::workspace::is_process_running;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -132,18 +133,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-/// Check if a process is running by sending signal 0
-fn is_process_running(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 /// Parse signal name to signal number

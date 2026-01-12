@@ -7,6 +7,7 @@
 use clap::Parser;
 use commonplace_doc::cli::PsArgs;
 use commonplace_doc::orchestrator::{get_process_cwd, OrchestratorStatus};
+use commonplace_doc::workspace::{format_timestamp_secs, is_process_running};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = PsArgs::parse();
@@ -43,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "Orchestrator PID: {} (started at {})",
             status.orchestrator_pid,
-            format_timestamp(status.started_at)
+            format_timestamp_secs(status.started_at)
         );
         println!();
 
@@ -94,27 +95,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-/// Check if a process is running by sending signal 0
-fn is_process_running(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        // kill(pid, 0) returns 0 if process exists, -1 otherwise
-        unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        // On non-Unix, assume running
-        true
-    }
-}
-
-/// Format Unix timestamp as human-readable
-fn format_timestamp(ts: u64) -> String {
-    use std::time::{Duration, UNIX_EPOCH};
-
-    let time = UNIX_EPOCH + Duration::from_secs(ts);
-    let datetime: chrono::DateTime<chrono::Local> = time.into();
-    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
 }

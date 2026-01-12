@@ -271,6 +271,35 @@ pub fn parse_date(s: &str) -> Option<u64> {
     None
 }
 
+/// Format a timestamp (seconds since epoch) as a human-readable datetime.
+///
+/// Unlike `format_timestamp` which expects milliseconds, this accepts seconds
+/// as used by the orchestrator status file.
+pub fn format_timestamp_secs(ts: u64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    let time = UNIX_EPOCH + Duration::from_secs(ts);
+    let datetime: chrono::DateTime<chrono::Local> = time.into();
+    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// Check if a process with the given PID is running.
+///
+/// On Unix, sends signal 0 to check if the process exists.
+/// On other platforms, returns true (assumes running to be safe).
+pub fn is_process_running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // kill(pid, 0) returns 0 if process exists, -1 otherwise
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        // On non-Unix, assume running
+        let _ = pid;
+        true
+    }
+}
+
 /// Resolve a file path to its UUID, given a file path (relative or absolute).
 ///
 /// This is a convenience function that handles finding the workspace root,
