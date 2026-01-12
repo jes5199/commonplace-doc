@@ -19,7 +19,7 @@ use commonplace_doc::sync::{
     handle_schema_modified, initial_sync, is_binary_content, push_schema_to_server,
     scan_directory_with_contents, spawn_file_sync_tasks_with_flock, sse_task, sync_schema,
     sync_single_file, upload_task, DirEvent, FileEvent, FileSyncState, FlockSyncState, InodeKey,
-    InodeTracker, ReplaceResponse, ScanOptions, SyncState, SCHEMA_FILENAME,
+    InodeTracker, ReplaceResponse, ScanOptions, SharedStateFile, SyncState, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -80,6 +80,70 @@ fn setup_directory_watchers(
         watcher_handle,
         watched_subdirs: Arc::new(RwLock::new(HashSet::new())),
         flock_state: FlockSyncState::new(),
+    }
+}
+
+/// Handle a single directory event by dispatching to the appropriate handler.
+///
+/// This consolidates the repeated DirEvent match blocks used in both
+/// `run_directory_mode` and `run_exec_mode`.
+#[allow(clippy::too_many_arguments)]
+async fn handle_dir_event(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    directory: &std::path::Path,
+    options: &ScanOptions,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    use_paths: bool,
+    push_only: bool,
+    pull_only: bool,
+    shared_state_file: Option<&SharedStateFile>,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<InodeTracker>>>,
+    event: DirEvent,
+) {
+    match event {
+        DirEvent::Created(path) => {
+            handle_file_created(
+                client,
+                server,
+                fs_root_id,
+                directory,
+                &path,
+                options,
+                file_states,
+                use_paths,
+                push_only,
+                pull_only,
+                shared_state_file,
+                #[cfg(unix)]
+                inode_tracker,
+            )
+            .await;
+        }
+        DirEvent::Modified(path) => {
+            handle_file_modified(client, server, fs_root_id, directory, &path, options).await;
+        }
+        DirEvent::Deleted(path) => {
+            handle_file_deleted(
+                client,
+                server,
+                fs_root_id,
+                directory,
+                &path,
+                options,
+                file_states,
+            )
+            .await;
+        }
+        DirEvent::SchemaModified(path, content) => {
+            info!("User edited schema file: {}", path.display());
+            if let Err(e) =
+                handle_schema_modified(client, server, fs_root_id, directory, &path, &content).await
+            {
+                warn!("Failed to push schema change: {}", e);
+            }
+        }
     }
 }
 
@@ -1345,65 +1409,22 @@ async fn run_directory_mode(
         let inode_tracker = inode_tracker.clone();
         async move {
             while let Some(event) = dir_rx.recv().await {
-                match event {
-                    DirEvent::Created(path) => {
-                        handle_file_created(
-                            &client,
-                            &server,
-                            &fs_root_id,
-                            &directory,
-                            &path,
-                            &options,
-                            &file_states,
-                            use_paths,
-                            push_only,
-                            pull_only,
-                            Some(&shared_state_file),
-                            #[cfg(unix)]
-                            inode_tracker.clone(),
-                        )
-                        .await;
-                    }
-                    DirEvent::Modified(path) => {
-                        handle_file_modified(
-                            &client,
-                            &server,
-                            &fs_root_id,
-                            &directory,
-                            &path,
-                            &options,
-                        )
-                        .await;
-                    }
-                    DirEvent::Deleted(path) => {
-                        handle_file_deleted(
-                            &client,
-                            &server,
-                            &fs_root_id,
-                            &directory,
-                            &path,
-                            &options,
-                            &file_states,
-                        )
-                        .await;
-                    }
-                    DirEvent::SchemaModified(path, content) => {
-                        info!("User edited schema file: {}", path.display());
-                        // Find the owning document for this schema and push to server
-                        if let Err(e) = handle_schema_modified(
-                            &client,
-                            &server,
-                            &fs_root_id,
-                            &directory,
-                            &path,
-                            &content,
-                        )
-                        .await
-                        {
-                            warn!("Failed to push schema change: {}", e);
-                        }
-                    }
-                }
+                handle_dir_event(
+                    &client,
+                    &server,
+                    &fs_root_id,
+                    &directory,
+                    &options,
+                    &file_states,
+                    use_paths,
+                    push_only,
+                    pull_only,
+                    Some(&shared_state_file),
+                    #[cfg(unix)]
+                    inode_tracker.clone(),
+                    event,
+                )
+                .await;
             }
         }
     });
@@ -1820,65 +1841,22 @@ async fn run_exec_mode(
         let inode_tracker = inode_tracker.clone();
         async move {
             while let Some(event) = dir_rx.recv().await {
-                match event {
-                    DirEvent::Created(path) => {
-                        handle_file_created(
-                            &client,
-                            &server,
-                            &fs_root_id,
-                            &directory,
-                            &path,
-                            &options,
-                            &file_states,
-                            use_paths,
-                            push_only,
-                            pull_only,
-                            Some(&shared_state_file),
-                            #[cfg(unix)]
-                            inode_tracker.clone(),
-                        )
-                        .await;
-                    }
-                    DirEvent::Modified(path) => {
-                        handle_file_modified(
-                            &client,
-                            &server,
-                            &fs_root_id,
-                            &directory,
-                            &path,
-                            &options,
-                        )
-                        .await;
-                    }
-                    DirEvent::Deleted(path) => {
-                        handle_file_deleted(
-                            &client,
-                            &server,
-                            &fs_root_id,
-                            &directory,
-                            &path,
-                            &options,
-                            &file_states,
-                        )
-                        .await;
-                    }
-                    DirEvent::SchemaModified(path, content) => {
-                        info!("User edited schema file: {}", path.display());
-                        // Find the owning document for this schema and push to server
-                        if let Err(e) = handle_schema_modified(
-                            &client,
-                            &server,
-                            &fs_root_id,
-                            &directory,
-                            &path,
-                            &content,
-                        )
-                        .await
-                        {
-                            warn!("Failed to push schema change: {}", e);
-                        }
-                    }
-                }
+                handle_dir_event(
+                    &client,
+                    &server,
+                    &fs_root_id,
+                    &directory,
+                    &options,
+                    &file_states,
+                    use_paths,
+                    push_only,
+                    pull_only,
+                    Some(&shared_state_file),
+                    #[cfg(unix)]
+                    inode_tracker.clone(),
+                    event,
+                )
+                .await;
             }
         }
     });
