@@ -34,6 +34,55 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
+use commonplace_doc::sync::WrittenSchemas;
+use tokio::task::JoinHandle;
+
+/// Resources created by setup_directory_watchers().
+///
+/// This struct holds the watcher task handle, event receiver, and shared state
+/// needed for directory synchronization.
+struct WatcherSetup {
+    /// Receiver for directory events from the watcher task.
+    dir_rx: mpsc::Receiver<DirEvent>,
+    /// Handle to the watcher task (None if pull-only mode).
+    watcher_handle: Option<JoinHandle<()>>,
+    /// Tracks which subdirectories have subscription tasks.
+    watched_subdirs: Arc<RwLock<HashSet<String>>>,
+    /// Shared state for ancestry-based sync coordination.
+    flock_state: FlockSyncState,
+}
+
+/// Set up directory watchers and shared state for sync.
+///
+/// This consolidates the repeated setup logic used in both
+/// `run_directory_mode` and `run_exec_mode`.
+fn setup_directory_watchers(
+    pull_only: bool,
+    directory: PathBuf,
+    options: ScanOptions,
+    written_schemas: WrittenSchemas,
+) -> WatcherSetup {
+    let (dir_tx, dir_rx) = mpsc::channel::<DirEvent>(100);
+    let watcher_handle = if !pull_only {
+        Some(tokio::spawn(directory_watcher_task(
+            directory,
+            dir_tx,
+            options,
+            Some(written_schemas),
+        )))
+    } else {
+        info!("Pull-only mode: skipping directory watcher");
+        None
+    };
+
+    WatcherSetup {
+        dir_rx,
+        watcher_handle,
+        watched_subdirs: Arc::new(RwLock::new(HashSet::new())),
+        flock_state: FlockSyncState::new(),
+    }
+}
+
 /// Commonplace Sync - Keep a local file or directory in sync with a server document
 #[derive(Parser, Debug)]
 #[command(name = "commonplace-sync")]
@@ -1126,25 +1175,18 @@ async fn run_directory_mode(
         }
     }
 
-    // Start directory watcher (skip if pull-only)
-    let (dir_tx, mut dir_rx) = mpsc::channel::<DirEvent>(100);
-    let watcher_handle = if !pull_only {
-        Some(tokio::spawn(directory_watcher_task(
-            directory.clone(),
-            dir_tx,
-            options.clone(),
-            Some(written_schemas.clone()),
-        )))
-    } else {
-        info!("Pull-only mode: skipping directory watcher");
-        None
-    };
-
-    // Track which subdirectories have tasks (shared between startup and dynamic discovery)
-    let watched_subdirs: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
-
-    // Create shared flock state for ancestry checking
-    let flock_state = FlockSyncState::new();
+    // Start directory watcher and create shared state
+    let WatcherSetup {
+        mut dir_rx,
+        watcher_handle,
+        watched_subdirs,
+        flock_state,
+    } = setup_directory_watchers(
+        pull_only,
+        directory.clone(),
+        options.clone(),
+        written_schemas.clone(),
+    );
 
     // Start subscription task for fs-root (skip if push-only)
     // Use MQTT if available, otherwise fall back to SSE
@@ -1650,25 +1692,18 @@ async fn run_exec_mode(
         sync_start.elapsed().as_millis()
     );
 
-    // Start directory watcher (skip if pull-only)
-    let (dir_tx, mut dir_rx) = mpsc::channel::<DirEvent>(100);
-    let watcher_handle = if !pull_only {
-        Some(tokio::spawn(directory_watcher_task(
-            directory.clone(),
-            dir_tx,
-            options.clone(),
-            Some(written_schemas.clone()),
-        )))
-    } else {
-        info!("Pull-only mode: skipping directory watcher");
-        None
-    };
-
-    // Track which subdirectories have SSE tasks (shared between startup and dynamic discovery)
-    let watched_subdirs: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
-
-    // Create shared flock state for ancestry checking
-    let flock_state = FlockSyncState::new();
+    // Start directory watcher and create shared state
+    let WatcherSetup {
+        mut dir_rx,
+        watcher_handle,
+        watched_subdirs,
+        flock_state,
+    } = setup_directory_watchers(
+        pull_only,
+        directory.clone(),
+        options.clone(),
+        written_schemas.clone(),
+    );
 
     // Start SSE task for fs-root (skip if push-only)
     let sse_handle = if !push_only {
