@@ -173,3 +173,30 @@ pub struct InitialSyncComplete {
     /// Time taken for initial sync in milliseconds
     pub duration_ms: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_initial_sync_complete_serialization() {
+        let event = InitialSyncComplete {
+            fs_root_id: "workspace".to_string(),
+            files_synced: 42,
+            strategy: "local".to_string(),
+            duration_ms: 1523,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"fs_root_id\":\"workspace\""));
+        assert!(json.contains("\"files_synced\":42"));
+        assert!(json.contains("\"strategy\":\"local\""));
+        assert!(json.contains("\"duration_ms\":1523"));
+
+        let parsed: InitialSyncComplete = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.fs_root_id, "workspace");
+        assert_eq!(parsed.files_synced, 42);
+        assert_eq!(parsed.strategy, "local");
+        assert_eq!(parsed.duration_ms, 1523);
+    }
+}
