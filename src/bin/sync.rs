@@ -11,6 +11,7 @@ use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
 use commonplace_doc::sync::subdir_spawn::{
     spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport,
 };
+use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
     acquire_sync_lock, build_head_url, build_info_url, build_replace_url, build_uuid_map_recursive,
     check_server_has_content, detect_from_path, directory_mqtt_task, directory_sse_task,
@@ -26,17 +27,53 @@ use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
 use commonplace_doc::workspace::is_process_running;
 use commonplace_doc::{DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
 use reqwest::Client;
+use rumqttc::QoS;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use commonplace_doc::sync::WrittenSchemas;
 use tokio::task::JoinHandle;
+
+/// Publish initial sync complete event via MQTT if available.
+async fn publish_initial_sync_complete(
+    mqtt_client: &Option<Arc<MqttClient>>,
+    fs_root_id: &str,
+    files_synced: usize,
+    strategy: &str,
+    duration_ms: u64,
+) {
+    if let Some(mqtt) = mqtt_client {
+        let event = InitialSyncComplete {
+            fs_root_id: fs_root_id.to_string(),
+            files_synced,
+            strategy: strategy.to_string(),
+            duration_ms,
+        };
+        let topic = format!("{}/events/sync/initial-complete", fs_root_id);
+        match serde_json::to_string(&event) {
+            Ok(payload) => {
+                if let Err(e) = mqtt
+                    .publish(&topic, payload.as_bytes(), QoS::AtLeastOnce)
+                    .await
+                {
+                    warn!("Failed to publish initial-sync-complete event: {}", e);
+                } else {
+                    info!("Published initial-sync-complete event to {}", topic);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to serialize initial-sync-complete event: {}", e);
+            }
+        }
+    }
+}
 
 /// Resources created by setup_directory_watchers().
 ///
@@ -670,6 +707,7 @@ async fn main() -> ExitCode {
             args.pull_only,
             args.shadow_dir,
             args.name,
+            None, // No MQTT in standalone exec mode
         )
         .await;
 
@@ -718,6 +756,7 @@ async fn main() -> ExitCode {
                 args.pull_only,
                 args.shadow_dir,
                 args.name,
+                None, // No MQTT in standalone exec mode
             )
             .await
         } else {
@@ -1076,6 +1115,9 @@ async fn run_directory_mode(
     // Derive author from name parameter, defaulting to "sync-client"
     let author = name.unwrap_or_else(|| "sync-client".to_string());
 
+    // Track timing for initial sync event
+    let sync_start = Instant::now();
+
     let mode = if push_only {
         "push-only"
     } else if pull_only {
@@ -1281,6 +1323,16 @@ async fn run_directory_mode(
             );
         }
     }
+
+    // Publish initial-sync-complete event via MQTT
+    publish_initial_sync_complete(
+        &mqtt_client,
+        &fs_root_id,
+        files.len(),
+        &initial_sync_strategy,
+        sync_start.elapsed().as_millis() as u64,
+    )
+    .await;
 
     // Start directory watcher and create shared state
     let WatcherSetup {
@@ -1548,6 +1600,7 @@ async fn run_exec_mode(
     pull_only: bool,
     shadow_dir: String,
     process_name: Option<String>,
+    mqtt_client: Option<Arc<MqttClient>>,
 ) -> Result<u8, Box<dyn std::error::Error>> {
     // Derive author from process_name, defaulting to "sync-client"
     let author = process_name
@@ -1758,6 +1811,16 @@ async fn run_exec_mode(
         file_count,
         sync_start.elapsed().as_millis()
     );
+
+    // Publish initial-sync-complete event via MQTT
+    publish_initial_sync_complete(
+        &mqtt_client,
+        &fs_root_id,
+        synced_count,
+        &initial_sync_strategy,
+        sync_start.elapsed().as_millis() as u64,
+    )
+    .await;
 
     // Start directory watcher and create shared state
     let WatcherSetup {
