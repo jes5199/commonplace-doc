@@ -1321,6 +1321,7 @@ pub async fn handle_shadow_write(
     event: &crate::sync::ShadowWriteEvent,
     inode_tracker: &Arc<tokio::sync::RwLock<crate::sync::InodeTracker>>,
     use_paths: bool,
+    author: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Look up inode state to get commit_id and primary_path
     let (commit_id, identifier, is_binary) = {
@@ -1352,7 +1353,7 @@ pub async fn handle_shadow_write(
 
     // Push update using replace endpoint with old commit as parent
     // This creates a CRDT update that merges with HEAD
-    let replace_url = crate::sync::build_replace_url(server, &identifier, &commit_id, use_paths);
+    let replace_url = crate::sync::build_replace_url(server, &identifier, &commit_id, use_paths, author);
 
     info!(
         "Pushing shadow write for inode {:x}-{:x} (parent: {}, {} bytes)",
@@ -1401,6 +1402,7 @@ pub async fn shadow_write_handler_task(
     mut rx: tokio::sync::mpsc::Receiver<crate::sync::ShadowWriteEvent>,
     inode_tracker: Arc<tokio::sync::RwLock<crate::sync::InodeTracker>>,
     use_paths: bool,
+    author: String,
 ) {
     info!("Shadow write handler started");
 
@@ -1411,7 +1413,7 @@ pub async fn shadow_write_handler_task(
         );
 
         if let Err(e) =
-            handle_shadow_write(&client, &server, &event, &inode_tracker, use_paths).await
+            handle_shadow_write(&client, &server, &event, &inode_tracker, use_paths, &author).await
         {
             error!("Failed to handle shadow write: {}", e);
         }

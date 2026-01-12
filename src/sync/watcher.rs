@@ -729,6 +729,7 @@ pub fn spawn_shadow_tasks(
     server: String,
     tracker: Arc<RwLock<crate::sync::InodeTracker>>,
     use_paths: bool,
+    author: String,
 ) -> (
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<()>,
@@ -750,6 +751,7 @@ pub fn spawn_shadow_tasks(
         shadow_rx,
         tracker.clone(),
         use_paths,
+        author,
     ));
 
     // Start periodic shadow GC task

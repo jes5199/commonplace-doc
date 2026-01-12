@@ -105,6 +105,7 @@ pub async fn upload_task(
     mut rx: mpsc::Receiver<FileEvent>,
     use_paths: bool,
     force_push: bool,
+    author: String,
 ) {
     while let Some(event) = rx.recv().await {
         // Extract captured content from the event
@@ -289,16 +290,23 @@ pub async fn upload_task(
         }
 
         if is_json {
-            let json_upload_succeeded =
-                match push_json_content(&client, &server, &identifier, &content, &state, use_paths)
-                    .await
-                {
-                    Ok(_) => true,
-                    Err(e) => {
-                        error!("JSON upload failed: {}", e);
-                        false
-                    }
-                };
+            let json_upload_succeeded = match push_json_content(
+                &client,
+                &server,
+                &identifier,
+                &content,
+                &state,
+                use_paths,
+                &author,
+            )
+            .await
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    error!("JSON upload failed: {}", e);
+                    false
+                }
+            };
             handle_upload_refresh(
                 &client,
                 &server,
@@ -321,6 +329,7 @@ pub async fn upload_task(
                 &content,
                 &state,
                 use_paths,
+                &author,
             )
             .await
             {
@@ -415,7 +424,8 @@ pub async fn upload_task(
             Some(parent) => {
                 // Normal case: use replace endpoint
                 // For force-push, parent is HEAD's cid so this is a simple replace
-                let replace_url = build_replace_url(&server, &identifier, &parent, use_paths);
+                let replace_url =
+                    build_replace_url(&server, &identifier, &parent, use_paths, &author);
 
                 match client
                     .post(&replace_url)
@@ -480,7 +490,7 @@ pub async fn upload_task(
                 let edit_url = build_edit_url(&server, &identifier, use_paths);
                 let edit_req = EditRequest {
                     update,
-                    author: Some("sync-client".to_string()),
+                    author: Some(author.to_string()),
                     message: Some("Initial sync".to_string()),
                 };
 
@@ -581,6 +591,7 @@ pub async fn upload_task_with_flock(
     use_paths: bool,
     force_push: bool,
     flock_state: FlockSyncState,
+    author: String,
 ) {
     while let Some(event) = rx.recv().await {
         // Extract captured content from the event
@@ -726,10 +737,17 @@ pub async fn upload_task_with_flock(
 
         // Handle JSON/JSONL files separately
         if is_json {
-            let json_upload_succeeded =
-                push_json_content(&client, &server, &identifier, &content, &state, use_paths)
-                    .await
-                    .is_ok();
+            let json_upload_succeeded = push_json_content(
+                &client,
+                &server,
+                &identifier,
+                &content,
+                &state,
+                use_paths,
+                &author,
+            )
+            .await
+            .is_ok();
             if json_upload_succeeded {
                 // Record successful upload in flock state
                 // Note: push_json_content updates state.last_written_cid
@@ -755,10 +773,17 @@ pub async fn upload_task_with_flock(
         }
 
         if is_jsonl {
-            let jsonl_upload_succeeded =
-                push_jsonl_content(&client, &server, &identifier, &content, &state, use_paths)
-                    .await
-                    .is_ok();
+            let jsonl_upload_succeeded = push_jsonl_content(
+                &client,
+                &server,
+                &identifier,
+                &content,
+                &state,
+                use_paths,
+                &author,
+            )
+            .await
+            .is_ok();
             if jsonl_upload_succeeded {
                 // Record successful upload in flock state
                 let cid = state.read().await.last_written_cid.clone();
@@ -842,7 +867,8 @@ pub async fn upload_task_with_flock(
 
         match parent_cid {
             Some(parent) => {
-                let replace_url = build_replace_url(&server, &identifier, &parent, use_paths);
+                let replace_url =
+                    build_replace_url(&server, &identifier, &parent, use_paths, &author);
 
                 match client
                     .post(&replace_url)
@@ -908,7 +934,7 @@ pub async fn upload_task_with_flock(
                 let edit_url = build_edit_url(&server, &identifier, use_paths);
                 let edit_req = EditRequest {
                     update,
-                    author: Some("sync-client".to_string()),
+                    author: Some(author.to_string()),
                     message: Some("Initial sync".to_string()),
                 };
 
@@ -1099,6 +1125,7 @@ pub async fn sync_single_file(
         tokio::sync::RwLock<std::collections::HashMap<String, crate::sync::FileSyncState>>,
     >,
     use_paths: bool,
+    author: &str,
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
     use base64::{engine::general_purpose::STANDARD, Engine};
 
@@ -1133,7 +1160,7 @@ pub async fn sync_single_file(
                     owning.document_id
                 );
                 if let Err(e) =
-                    push_schema_to_server(client, server, &owning.document_id, &json).await
+                    push_schema_to_server(client, server, &owning.document_id, &json, author).await
                 {
                     warn!("Failed to push subdirectory schema: {}", e);
                 } else {
@@ -1200,6 +1227,7 @@ pub async fn sync_single_file(
                     use_paths,
                     file.is_binary,
                     &file.content_type,
+                    author,
                 )
                 .await?;
             } else {
@@ -1297,6 +1325,7 @@ pub async fn sync_single_file(
                             use_paths,
                             file.is_binary,
                             &file.content_type,
+                            author,
                         )
                         .await?;
                     } else {
@@ -1331,6 +1360,7 @@ pub async fn sync_single_file(
                         use_paths,
                         file.is_binary,
                         &file.content_type,
+                        author,
                     )
                     .await?;
                     // Push functions already updated state with new CID, just set content
@@ -1356,6 +1386,7 @@ pub async fn sync_single_file(
                 use_paths,
                 file.is_binary,
                 &file.content_type,
+                author,
             )
             .await?;
         }
@@ -1407,6 +1438,7 @@ pub fn spawn_file_sync_tasks(
     push_only: bool,
     pull_only: bool,
     force_push: bool,
+    author: String,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
 ) -> Vec<JoinHandle<()>> {
     let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
@@ -1424,6 +1456,7 @@ pub fn spawn_file_sync_tasks(
             file_rx,
             use_paths,
             force_push,
+            author,
         )));
     }
 
@@ -1474,6 +1507,7 @@ pub fn spawn_file_sync_tasks_with_flock(
     force_push: bool,
     flock_state: FlockSyncState,
     doc_id: Option<uuid::Uuid>,
+    author: String,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
 ) -> Vec<JoinHandle<()>> {
     let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
@@ -1492,6 +1526,7 @@ pub fn spawn_file_sync_tasks_with_flock(
             use_paths,
             force_push,
             flock_state.clone(),
+            author,
         )));
     }
 

@@ -162,6 +162,7 @@ pub async fn handle_file_created(
     push_only: bool,
     pull_only: bool,
     shared_state_file: Option<&crate::sync::SharedStateFile>,
+    author: &str,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
 ) {
     debug!("Directory event: file created: {}", path.display());
@@ -311,7 +312,7 @@ pub async fn handle_file_created(
                     // Use the owning document's directory and ID
                     if let Ok(json) = scan_directory_to_json(&owning_doc.directory, options) {
                         if let Err(e) =
-                            push_schema_to_server(client, server, &owning_doc.document_id, &json)
+                            push_schema_to_server(client, server, &owning_doc.document_id, &json, author)
                                 .await
                         {
                             warn!("Failed to push updated schema: {}", e);
@@ -339,7 +340,8 @@ pub async fn handle_file_created(
             // Use the owning document's directory and ID
             if let Ok(json) = scan_directory_to_json(&owning_doc.directory, options) {
                 if let Err(e) =
-                    push_schema_to_server(client, server, &owning_doc.document_id, &json).await
+                    push_schema_to_server(client, server, &owning_doc.document_id, &json, author)
+                        .await
                 {
                     warn!("Failed to push updated schema: {}", e);
                 }
@@ -393,6 +395,7 @@ pub async fn handle_file_created(
                 use_paths,
                 is_binary,
                 &content_info.mime_type,
+                author,
             )
             .await
             {
@@ -411,6 +414,7 @@ pub async fn handle_file_created(
             push_only,
             pull_only,
             false, // force_push: directory mode doesn't support force-push
+            author.to_string(),
             #[cfg(unix)]
             inode_tracker.clone(),
         );
@@ -446,6 +450,7 @@ pub async fn handle_file_modified(
     directory: &Path,
     path: &Path,
     options: &ScanOptions,
+    author: &str,
 ) {
     debug!("Directory event: file modified: {}", path.display());
 
@@ -470,7 +475,8 @@ pub async fn handle_file_modified(
     // Just update schema in case metadata changed
     // Use the owning document's directory and ID
     if let Ok(json) = scan_directory_to_json(&owning_doc.directory, options) {
-        if let Err(e) = push_schema_to_server(client, server, &owning_doc.document_id, &json).await
+        if let Err(e) =
+            push_schema_to_server(client, server, &owning_doc.document_id, &json, author).await
         {
             warn!("Failed to push updated schema: {}", e);
         }
@@ -488,6 +494,7 @@ pub async fn handle_file_deleted(
     path: &Path,
     _options: &ScanOptions,
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    author: &str,
 ) {
     debug!("Directory event: file deleted: {}", path.display());
 
@@ -550,7 +557,8 @@ pub async fn handle_file_deleted(
                     file_in_subdir, first_component, subdir_node_id
                 );
                 if let Err(e) =
-                    delete_schema_entry(client, server, &subdir_node_id, file_in_subdir).await
+                    delete_schema_entry(client, server, &subdir_node_id, file_in_subdir, author)
+                        .await
                 {
                     warn!(
                         "Failed to delete schema entry {} from subdirectory {}: {}",
@@ -573,7 +581,7 @@ pub async fn handle_file_deleted(
     }
 
     // Delete from schema (top-level files or files in non-node-backed subdirectories)
-    if let Err(e) = delete_schema_entry(client, server, fs_root_id, &relative_path).await {
+    if let Err(e) = delete_schema_entry(client, server, fs_root_id, &relative_path, author).await {
         warn!("Failed to delete schema entry {}: {}", relative_path, e);
     }
 }

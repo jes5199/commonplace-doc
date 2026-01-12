@@ -339,6 +339,7 @@ pub async fn handle_subdir_new_files(
     push_only: bool,
     pull_only: bool,
     shared_state_file: Option<&crate::sync::SharedStateFile>,
+    author: &str,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Don't pull if push_only mode
@@ -515,6 +516,7 @@ pub async fn handle_subdir_new_files(
                 push_only,
                 pull_only,
                 false, // force_push: directory mode doesn't support force-push
+                author.to_string(),
                 #[cfg(unix)]
                 inode_tracker.clone(),
             );
@@ -648,11 +650,13 @@ pub async fn push_nested_schemas(
     server: &str,
     directory: &Path,
     schema: &FsSchema,
+    author: &str,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut pushed_count = 0;
     if let Some(ref root) = schema.root {
         pushed_count =
-            push_nested_schemas_recursive(client, server, directory, root, directory).await?;
+            push_nested_schemas_recursive(client, server, directory, root, directory, author)
+                .await?;
     }
     if pushed_count > 0 {
         info!("Pushed {} nested schemas to server", pushed_count);
@@ -668,6 +672,7 @@ async fn push_nested_schemas_recursive(
     _base_dir: &Path,
     entry: &Entry,
     current_dir: &Path,
+    author: &str,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut pushed_count = 0;
 
@@ -695,8 +700,14 @@ async fn push_nested_schemas_recursive(
                                 "Pushing nested schema from {:?} to document {}",
                                 nested_schema_path, node_id
                             );
-                            if let Err(e) =
-                                push_schema_to_server(client, server, node_id, &local_schema).await
+                            if let Err(e) = push_schema_to_server(
+                                client,
+                                server,
+                                node_id,
+                                &local_schema,
+                                author,
+                            )
+                            .await
                             {
                                 warn!(
                                     "Failed to push nested schema for {}: {}",
@@ -721,6 +732,7 @@ async fn push_nested_schemas_recursive(
                                                 _base_dir,
                                                 child_entry,
                                                 &child_path,
+                                                author,
                                             )
                                             .await?;
                                         }
@@ -744,6 +756,7 @@ async fn push_nested_schemas_recursive(
                                 _base_dir,
                                 child_entry,
                                 &child_path,
+                                author,
                             )
                             .await?;
                         }
@@ -775,6 +788,7 @@ pub async fn handle_schema_change(
     use_paths: bool,
     push_only: bool,
     pull_only: bool,
+    author: &str,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
     shared_state_file: Option<&crate::sync::SharedStateFile>,
@@ -953,6 +967,7 @@ pub async fn handle_schema_change(
                         push_only,
                         pull_only,
                         false, // force_push: directory mode doesn't support force-push
+                        author.to_string(),
                         #[cfg(unix)]
                         inode_tracker.clone(),
                     )
@@ -1050,6 +1065,7 @@ pub async fn handle_schema_change_with_dedup(
     last_schema_cid: &mut Option<String>,
     push_only: bool,
     pull_only: bool,
+    author: &str,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
     shared_state_file: Option<&crate::sync::SharedStateFile>,
@@ -1114,6 +1130,7 @@ pub async fn handle_schema_change_with_dedup(
         use_paths,
         push_only,
         pull_only,
+        author,
         #[cfg(unix)]
         inode_tracker,
         written_schemas,
@@ -1180,6 +1197,7 @@ pub async fn sync_schema(
     options: &ScanOptions,
     initial_sync_strategy: &str,
     server_has_content: bool,
+    author: &str,
 ) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
     // Scan directory and generate FS schema
     info!("Scanning directory...");
@@ -1201,12 +1219,12 @@ pub async fn sync_schema(
     if should_push_schema {
         // Push schema to fs-root node (with None UUIDs for new entries)
         info!("Pushing filesystem schema to server...");
-        push_schema_to_server(client, server, fs_root_id, &schema_json).await?;
+        push_schema_to_server(client, server, fs_root_id, &schema_json, author).await?;
         info!("Schema pushed successfully");
 
         // Push nested schemas from local subdirectories to their server documents.
         // This restores node-backed directory contents after a server database clear.
-        if let Err(e) = push_nested_schemas(client, server, directory, &schema).await {
+        if let Err(e) = push_nested_schemas(client, server, directory, &schema, author).await {
             warn!("Failed to push nested schemas: {}", e);
         }
 
@@ -1331,6 +1349,7 @@ pub async fn check_server_has_content(client: &Client, server: &str, fs_root_id:
 /// * `base_directory` - The base sync directory path
 /// * `schema_path` - Path to the modified .commonplace.json file
 /// * `content` - New content of the schema file
+/// * `author` - The author string for the commit
 pub async fn handle_schema_modified(
     client: &Client,
     server: &str,
@@ -1338,6 +1357,7 @@ pub async fn handle_schema_modified(
     base_directory: &Path,
     schema_path: &Path,
     content: &str,
+    author: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate the schema content
     let _schema: FsSchema =
@@ -1354,7 +1374,7 @@ pub async fn handle_schema_modified(
     // Check if this is the root schema
     if schema_dir == base_directory {
         info!("Pushing root schema to server (fs_root_id: {})", fs_root_id);
-        push_schema_to_server(client, server, fs_root_id, content).await?;
+        push_schema_to_server(client, server, fs_root_id, content, author).await?;
         return Ok(());
     }
 
@@ -1427,7 +1447,7 @@ pub async fn handle_schema_modified(
         schema_path.display(),
         current_node_id
     );
-    push_schema_to_server(client, server, &current_node_id, content).await?;
+    push_schema_to_server(client, server, &current_node_id, content, author).await?;
 
     Ok(())
 }

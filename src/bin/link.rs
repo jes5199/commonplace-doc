@@ -101,7 +101,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Push schemas to server
     let client = Client::new();
     for (doc_id, schema_json) in &schemas_to_push {
-        match push_schema_to_server(&client, &args.server, doc_id, schema_json).await {
+        match push_schema_to_server(
+            &client,
+            &args.server,
+            doc_id,
+            schema_json,
+            "commonplace-link",
+        )
+        .await
+        {
             Ok(()) => println!("Pushed schema to server ({})", doc_id),
             Err(e) => eprintln!("Warning: Failed to push schema to server: {}", e),
         }

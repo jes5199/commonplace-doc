@@ -58,20 +58,23 @@ pub fn build_replace_url(
     path_or_id: &str,
     parent_cid: &str,
     use_paths: bool,
+    author: &str,
 ) -> String {
     if use_paths {
         format!(
-            "{}/files/{}/replace?parent_cid={}&author=sync-client",
+            "{}/files/{}/replace?parent_cid={}&author={}",
             server,
             encode_path(path_or_id),
-            parent_cid
+            parent_cid,
+            urlencoding::encode(author)
         )
     } else {
         format!(
-            "{}/docs/{}/replace?parent_cid={}&author=sync-client",
+            "{}/docs/{}/replace?parent_cid={}&author={}",
             server,
             encode_node_id(path_or_id),
-            parent_cid
+            parent_cid,
+            urlencoding::encode(author)
         )
     }
 }
@@ -239,16 +242,16 @@ mod tests {
 
         #[test]
         fn test_build_replace_url_with_paths() {
-            let url = build_replace_url(SERVER, "notes/todo.txt", "cid123", true);
+            let url = build_replace_url(SERVER, "notes/todo.txt", "cid123", true, "test-process");
             assert_eq!(
                 url,
-                "http://localhost:5199/files/notes/todo.txt/replace?parent_cid=cid123&author=sync-client"
+                "http://localhost:5199/files/notes/todo.txt/replace?parent_cid=cid123&author=test-process"
             );
         }
 
         #[test]
         fn test_build_replace_url_with_id() {
-            let url = build_replace_url(SERVER, "abc-123", "cid456", false);
+            let url = build_replace_url(SERVER, "abc-123", "cid456", false, "sync-client");
             assert_eq!(
                 url,
                 "http://localhost:5199/docs/abc-123/replace?parent_cid=cid456&author=sync-client"

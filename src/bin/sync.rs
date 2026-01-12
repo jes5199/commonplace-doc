@@ -100,6 +100,7 @@ async fn handle_dir_event(
     push_only: bool,
     pull_only: bool,
     shared_state_file: Option<&SharedStateFile>,
+    author: &str,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<InodeTracker>>>,
     event: DirEvent,
 ) {
@@ -117,13 +118,17 @@ async fn handle_dir_event(
                 push_only,
                 pull_only,
                 shared_state_file,
+                author,
                 #[cfg(unix)]
                 inode_tracker,
             )
             .await;
         }
         DirEvent::Modified(path) => {
-            handle_file_modified(client, server, fs_root_id, directory, &path, options).await;
+            handle_file_modified(
+                client, server, fs_root_id, directory, &path, options, author,
+            )
+            .await;
         }
         DirEvent::Deleted(path) => {
             handle_file_deleted(
@@ -134,13 +139,16 @@ async fn handle_dir_event(
                 &path,
                 options,
                 file_states,
+                author,
             )
             .await;
         }
         DirEvent::SchemaModified(path, content) => {
             info!("User edited schema file: {}", path.display());
-            if let Err(e) =
-                handle_schema_modified(client, server, fs_root_id, directory, &path, &content).await
+            if let Err(e) = handle_schema_modified(
+                client, server, fs_root_id, directory, &path, &content, author,
+            )
+            .await
             {
                 warn!("Failed to push schema change: {}", e);
             }
@@ -322,6 +330,7 @@ async fn resolve_or_create_path(
     server: &str,
     path: &str,
     local_file: &std::path::Path,
+    author: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     // First try to resolve normally
     match resolve_path_to_uuid(client, server, path).await {
@@ -446,7 +455,7 @@ async fn resolve_or_create_path(
     // Push updated schema - this triggers the server-side reconciler
     // which creates the document and assigns a UUID
     let schema_json = serde_json::to_string_pretty(&schema)?;
-    push_schema_to_server(client, server, &parent_id, &schema_json)
+    push_schema_to_server(client, server, &parent_id, &schema_json, author)
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
 
@@ -544,7 +553,11 @@ async fn main() -> ExitCode {
         info!("Resolving path '{}' to UUID...", path);
         if let Some(ref file) = args.file {
             // Single-file mode with --path: create document if it doesn't exist
-            match resolve_or_create_path(&client, &args.server, path, file).await {
+            let author = args
+                .name
+                .clone()
+                .unwrap_or_else(|| "sync-client".to_string());
+            match resolve_or_create_path(&client, &args.server, path, file, &author).await {
                 Ok(id) => {
                     info!("Resolved '{}' -> {}", path, id);
                     id
@@ -722,6 +735,7 @@ async fn main() -> ExitCode {
                 args.shadow_dir,
                 mqtt_client,
                 args.workspace,
+                args.name.clone(),
             )
             .await
             .map(|_| 0u8)
@@ -736,6 +750,7 @@ async fn main() -> ExitCode {
             args.pull_only,
             args.force_push,
             args.shadow_dir,
+            args.name.clone(),
         )
         .await
         .map(|_| 0u8)
@@ -763,7 +778,11 @@ async fn run_file_mode(
     pull_only: bool,
     force_push: bool,
     shadow_dir: String,
+    name: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Derive author from name parameter, defaulting to "sync-client"
+    let author = name.unwrap_or_else(|| "sync-client".to_string());
+
     let mode = if force_push {
         "force-push"
     } else if push_only {
@@ -821,7 +840,7 @@ async fn run_file_mode(
                     String::from_utf8_lossy(&current_content).to_string()
                 };
 
-                let replace_url = build_replace_url(&server, &node_id, last_cid, false);
+                let replace_url = build_replace_url(&server, &node_id, last_cid, false, &author);
                 info!("Pushing offline changes via CRDT merge...");
 
                 match client
@@ -935,6 +954,7 @@ async fn run_file_mode(
             file_rx,
             false, // use_paths: file mode uses ID-based API
             force_push,
+            author.clone(),
         )))
     } else {
         None
@@ -955,6 +975,7 @@ async fn run_file_mode(
                 server.clone(),
                 tracker.clone(),
                 false, // use_paths: file mode uses ID-based API
+                author.clone(),
             );
 
             (Some(watcher), Some(handler), Some(gc))
@@ -1050,7 +1071,11 @@ async fn run_directory_mode(
     shadow_dir: String,
     mqtt_client: Option<Arc<MqttClient>>,
     workspace: String,
+    name: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Derive author from name parameter, defaulting to "sync-client"
+    let author = name.unwrap_or_else(|| "sync-client".to_string());
+
     let mode = if push_only {
         "push-only"
     } else if pull_only {
@@ -1160,6 +1185,7 @@ async fn run_directory_mode(
             use_paths,
             push_only,
             pull_only,
+            &author,
             #[cfg(unix)]
             inode_tracker.clone(),
             Some(&written_schemas),
@@ -1180,6 +1206,7 @@ async fn run_directory_mode(
         &options,
         &initial_sync_strategy,
         server_has_content,
+        &author,
     )
     .await?;
 
@@ -1210,6 +1237,7 @@ async fn run_directory_mode(
             &initial_sync_strategy,
             &file_states,
             use_paths,
+            &author,
         )
         .await
         {
@@ -1233,6 +1261,7 @@ async fn run_directory_mode(
         use_paths,
         push_only,
         pull_only,
+        &author,
         #[cfg(unix)]
         inode_tracker.clone(),
         Some(&written_schemas),
@@ -1288,6 +1317,7 @@ async fn run_directory_mode(
                 use_paths,
                 push_only,
                 pull_only,
+                author.clone(),
                 #[cfg(unix)]
                 inode_tracker.clone(),
                 watched_subdirs.clone(),
@@ -1308,6 +1338,7 @@ async fn run_directory_mode(
                 use_paths,
                 push_only,
                 pull_only,
+                author.clone(),
                 #[cfg(unix)]
                 inode_tracker.clone(),
                 watched_subdirs.clone(),
@@ -1334,6 +1365,7 @@ async fn run_directory_mode(
             push_only,
             pull_only,
             shared_state_file: Some(shared_state_file.clone()),
+            author: author.clone(),
             #[cfg(unix)]
             inode_tracker: inode_tracker.clone(),
             watched_subdirs: watched_subdirs.clone(),
@@ -1376,6 +1408,7 @@ async fn run_directory_mode(
                 false, // force_push: directory mode doesn't support force-push
                 flock_state.clone(),
                 doc_id,
+                author.clone(),
                 #[cfg(unix)]
                 inode_tracker.clone(),
             );
@@ -1397,6 +1430,7 @@ async fn run_directory_mode(
                 server.clone(),
                 tracker.clone(),
                 use_paths,
+                author.clone(),
             );
 
             (Some(watcher), Some(handler), Some(gc))
@@ -1419,6 +1453,7 @@ async fn run_directory_mode(
         let options = options.clone();
         let file_states = file_states.clone();
         let shared_state_file = shared_state_file.clone();
+        let author = author.clone();
         #[cfg(unix)]
         let inode_tracker = inode_tracker.clone();
         async move {
@@ -1434,6 +1469,7 @@ async fn run_directory_mode(
                     push_only,
                     pull_only,
                     Some(&shared_state_file),
+                    &author,
                     #[cfg(unix)]
                     inode_tracker.clone(),
                     event,
@@ -1513,6 +1549,11 @@ async fn run_exec_mode(
     shadow_dir: String,
     process_name: Option<String>,
 ) -> Result<u8, Box<dyn std::error::Error>> {
+    // Derive author from process_name, defaulting to "sync-client"
+    let author = process_name
+        .clone()
+        .unwrap_or_else(|| "sync-client".to_string());
+
     let mode = if push_only {
         "push-only"
     } else if pull_only {
@@ -1624,6 +1665,7 @@ async fn run_exec_mode(
             use_paths,
             push_only,
             pull_only,
+            &author,
             #[cfg(unix)]
             inode_tracker.clone(),
             Some(&written_schemas),
@@ -1644,6 +1686,7 @@ async fn run_exec_mode(
         &options,
         &initial_sync_strategy,
         server_has_content,
+        &author,
     )
     .await?;
 
@@ -1701,6 +1744,7 @@ async fn run_exec_mode(
             &initial_sync_strategy,
             &file_states,
             use_paths,
+            &author,
         )
         .await
         {
@@ -1739,6 +1783,7 @@ async fn run_exec_mode(
             use_paths,
             push_only,
             pull_only,
+            author.clone(),
             #[cfg(unix)]
             inode_tracker.clone(),
             watched_subdirs.clone(),
@@ -1763,6 +1808,7 @@ async fn run_exec_mode(
             push_only,
             pull_only,
             shared_state_file: Some(shared_state_file.clone()),
+            author: author.clone(),
             #[cfg(unix)]
             inode_tracker: inode_tracker.clone(),
             watched_subdirs: watched_subdirs.clone(),
@@ -1796,6 +1842,7 @@ async fn run_exec_mode(
                 false, // force_push: sandbox mode doesn't support force-push
                 flock_state.clone(),
                 doc_id,
+                author.clone(),
                 #[cfg(unix)]
                 inode_tracker.clone(),
             );
@@ -1817,6 +1864,7 @@ async fn run_exec_mode(
                 server.clone(),
                 tracker.clone(),
                 use_paths,
+                author.clone(),
             );
 
             (Some(watcher), Some(handler), Some(gc))
@@ -1839,6 +1887,7 @@ async fn run_exec_mode(
         let options = options.clone();
         let file_states = file_states.clone();
         let shared_state_file = shared_state_file.clone();
+        let author = author.clone();
         #[cfg(unix)]
         let inode_tracker = inode_tracker.clone();
         async move {
@@ -1854,6 +1903,7 @@ async fn run_exec_mode(
                     push_only,
                     pull_only,
                     Some(&shared_state_file),
+                    &author,
                     #[cfg(unix)]
                     inode_tracker.clone(),
                     event,
@@ -1938,6 +1988,7 @@ async fn run_exec_mode(
                                     &server,
                                     &fs_root_id,
                                     &schema_json,
+                                    &author,
                                 )
                                 .await
                                 {

@@ -111,6 +111,7 @@ pub async fn push_schema_to_server(
     server: &str,
     fs_root_id: &str,
     schema_json: &str,
+    author: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let edit_url = build_edit_url(server, fs_root_id, false);
 
@@ -156,7 +157,7 @@ pub async fn push_schema_to_server(
         .map_err(|e| format!("Failed to create JSON update: {}", e))?;
     let edit_req = EditRequest {
         update,
-        author: Some("sync-client".to_string()),
+        author: Some(author.to_string()),
         message: Some("Update filesystem schema".to_string()),
     };
 
@@ -191,6 +192,7 @@ pub async fn delete_schema_entry(
     server: &str,
     fs_root_id: &str,
     entry_name: &str,
+    author: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let edit_url = build_edit_url(server, fs_root_id, false);
 
@@ -210,7 +212,7 @@ pub async fn delete_schema_entry(
 
     let edit_req = EditRequest {
         update,
-        author: Some("sync-client".to_string()),
+        author: Some(author.to_string()),
         message: Some(format!("Delete schema entry: {}", entry_name)),
     };
 
@@ -233,8 +235,12 @@ pub async fn push_json_content(
     content: &str,
     state: &Arc<RwLock<SyncState>>,
     use_paths: bool,
+    author: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    push_json_content_impl(client, server, identifier, content, state, use_paths, false).await
+    push_json_content_impl(
+        client, server, identifier, content, state, use_paths, false, author,
+    )
+    .await
 }
 
 /// Push JSON content with merge semantics (additive, preserves other clients' entries).
@@ -245,8 +251,12 @@ pub async fn push_json_content_merge(
     content: &str,
     state: &Arc<RwLock<SyncState>>,
     use_paths: bool,
+    author: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    push_json_content_impl(client, server, identifier, content, state, use_paths, true).await
+    push_json_content_impl(
+        client, server, identifier, content, state, use_paths, true, author,
+    )
+    .await
 }
 
 /// Internal implementation for pushing JSON content with optional merge mode.
@@ -258,6 +268,7 @@ async fn push_json_content_impl(
     state: &Arc<RwLock<SyncState>>,
     use_paths: bool,
     merge: bool,
+    author: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let head_url = build_head_url(server, identifier, use_paths);
     let edit_url = build_edit_url(server, identifier, use_paths);
@@ -296,7 +307,7 @@ async fn push_json_content_impl(
         };
         let edit_req = EditRequest {
             update,
-            author: Some("sync-client".to_string()),
+            author: Some(author.to_string()),
             message: Some("Sync JSON content".to_string()),
         };
 
@@ -332,6 +343,7 @@ pub async fn push_jsonl_content(
     content: &str,
     state: &Arc<RwLock<SyncState>>,
     use_paths: bool,
+    author: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let head_url = build_head_url(server, identifier, use_paths);
     let edit_url = build_edit_url(server, identifier, use_paths);
@@ -360,7 +372,7 @@ pub async fn push_jsonl_content(
         let update = create_yjs_jsonl_update(content, base_state.as_deref())?;
         let edit_req = EditRequest {
             update,
-            author: Some("sync-client".to_string()),
+            author: Some(author.to_string()),
             message: Some("Sync JSONL content".to_string()),
         };
 
@@ -402,16 +414,26 @@ pub async fn push_content_by_type(
     use_paths: bool,
     is_binary: bool,
     mime_type: &str,
+    author: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let is_json = !is_binary && mime_type == "application/json";
     let is_jsonl = !is_binary && mime_type == "application/x-ndjson";
 
     if is_json {
-        push_json_content(client, server, identifier, content, state, use_paths).await
+        push_json_content(
+            client, server, identifier, content, state, use_paths, author,
+        )
+        .await
     } else if is_jsonl {
-        push_jsonl_content(client, server, identifier, content, state, use_paths).await
+        push_jsonl_content(
+            client, server, identifier, content, state, use_paths, author,
+        )
+        .await
     } else {
-        push_file_content(client, server, identifier, content, state, use_paths).await
+        push_file_content(
+            client, server, identifier, content, state, use_paths, author,
+        )
+        .await
     }
 }
 
@@ -423,12 +445,13 @@ pub async fn push_file_content(
     content: &str,
     state: &Arc<RwLock<SyncState>>,
     use_paths: bool,
+    author: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // First check if there's existing content
     if let Ok(Some(head)) = fetch_head(client, server, identifier, use_paths).await {
         if let Some(parent_cid) = head.cid {
             // Use replace endpoint
-            let replace_url = build_replace_url(server, identifier, &parent_cid, use_paths);
+            let replace_url = build_replace_url(server, identifier, &parent_cid, use_paths, author);
             let resp = client
                 .post(&replace_url)
                 .header("content-type", "text/plain")
@@ -451,7 +474,7 @@ pub async fn push_file_content(
     let edit_url = build_edit_url(server, identifier, use_paths);
     let edit_req = EditRequest {
         update,
-        author: Some("sync-client".to_string()),
+        author: Some(author.to_string()),
         message: Some("Initial file content".to_string()),
     };
 

@@ -42,6 +42,7 @@ pub struct SubdirSpawnParams {
     pub push_only: bool,
     pub pull_only: bool,
     pub shared_state_file: Option<crate::sync::SharedStateFile>,
+    pub author: String,
     #[cfg(unix)]
     pub inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     pub watched_subdirs: Arc<RwLock<HashSet<String>>>,
@@ -92,6 +93,7 @@ pub async fn spawn_subdir_watchers(
                     params.push_only,
                     params.pull_only,
                     params.shared_state_file.clone(),
+                    params.author.clone(),
                     #[cfg(unix)]
                     params.inode_tracker.clone(),
                     params.watched_subdirs.clone(),
@@ -114,6 +116,7 @@ pub async fn spawn_subdir_watchers(
                     params.push_only,
                     params.pull_only,
                     params.shared_state_file.clone(),
+                    params.author.clone(),
                     #[cfg(unix)]
                     params.inode_tracker.clone(),
                     client.clone(),
