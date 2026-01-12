@@ -1189,6 +1189,7 @@ pub async fn ensure_fs_root_exists(
 /// Returns (schema_json, initial_cid) where initial_cid is the CID of the schema
 /// after initial sync. This CID should be passed to subscription tasks to prevent
 /// them from pulling stale server content that predates our push.
+#[allow(clippy::too_many_arguments)]
 pub async fn sync_schema(
     client: &Client,
     server: &str,
