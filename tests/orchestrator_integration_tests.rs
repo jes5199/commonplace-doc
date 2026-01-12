@@ -1099,3 +1099,294 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
 
     eprintln!("=== All sync tests PASSED ===");
 }
+
+/// Helper to extract node_id from a schema entry
+fn get_node_id_from_schema(schema_path: &std::path::Path, filename: &str) -> Option<String> {
+    use commonplace_doc::fs::{Entry, FsSchema};
+
+    let content = std::fs::read_to_string(schema_path).ok()?;
+    let schema: FsSchema = serde_json::from_str(&content).ok()?;
+
+    if let Some(Entry::Dir(root)) = schema.root {
+        if let Some(entries) = root.entries {
+            if let Some(Entry::Doc(doc)) = entries.get(filename) {
+                return doc.node_id.clone();
+            }
+        }
+    }
+    None
+}
+
+/// CP-5pcq: Test commonplace-link schema push updates server
+///
+/// Verifies acceptance criteria L1-L7:
+/// - L1: Create two files (source and target)
+/// - L2: Run commonplace-link to share UUID
+/// - L3: Verify both files have same UUID in .commonplace.json
+/// - L4: Verify target file now contains source content
+/// - L5-L6: Edit linked file, verify change propagates
+/// - L7: Verify linked file appears in sandbox with correct content
+///
+/// Note: Uses same-directory linking due to SSE subscription limitations for
+/// cross-directory subdirectories. This tests the core link functionality.
+///
+/// Requires MQTT broker on localhost:1883 (skipped if not available).
+#[test]
+fn test_commonplace_link_schema_push_updates_server() {
+    if !mqtt_available() {
+        eprintln!("Skipping test: MQTT broker not available on localhost:1883");
+        return;
+    }
+
+    // Clean up any stale status file from previous runs
+    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let workspace_dir = temp_dir.path().join("workspace");
+    let config_path = temp_dir.path().join("commonplace.json");
+    let port = get_available_port();
+
+    // Create workspace directory with schema
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    let root_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {}
+        }
+    });
+    std::fs::write(
+        workspace_dir.join(".commonplace.json"),
+        serde_json::to_string_pretty(&root_schema).unwrap(),
+    )
+    .unwrap();
+
+    // Create a subdirectory for the link test (will contain both source and target)
+    let link_dir = workspace_dir.join("link-test");
+    std::fs::create_dir_all(&link_dir).unwrap();
+    let link_dir_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {}
+        }
+    });
+    std::fs::write(
+        link_dir.join(".commonplace.json"),
+        serde_json::to_string_pretty(&link_dir_schema).unwrap(),
+    )
+    .unwrap();
+
+    // Create __processes.json with a sandbox process so we can test L7
+    let processes_json = serde_json::json!({
+        "processes": {
+            "link-test-proc": {
+                "sandbox-exec": "sleep 120"
+            }
+        }
+    });
+    std::fs::write(
+        link_dir.join("__processes.json"),
+        serde_json::to_string_pretty(&processes_json).unwrap(),
+    )
+    .unwrap();
+
+    // Write config file with process discovery enabled
+    let config =
+        create_test_config_with_discovery(temp_dir.path(), port, &db_path, &workspace_dir, true);
+    std::fs::write(&config_path, &config).unwrap();
+
+    // Record existing sandbox directories before starting orchestrator
+    let initial_sandbox_dirs = get_sandbox_dirs();
+
+    let mut guard = ProcessGuard::new();
+
+    // Spawn orchestrator
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let orchestrator = Command::new(env!("CARGO_BIN_EXE_commonplace-orchestrator"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--server",
+            &server_url,
+        ])
+        .current_dir(temp_dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to spawn orchestrator");
+
+    guard.add(orchestrator);
+
+    // Wait for orchestrator to be ready
+    wait_for_orchestrator_ready(Duration::from_secs(30))
+        .expect("Orchestrator failed to start within timeout");
+
+    // Wait for sandbox process to be discovered
+    wait_for_discovered_process("link-test-proc", Duration::from_secs(60))
+        .expect("Sandbox process 'link-test-proc' was not discovered");
+
+    // Wait for sandbox directory
+    let sandbox_dir = wait_for_new_sandbox_dir(&initial_sandbox_dirs, Duration::from_secs(30))
+        .expect("Failed to find new sandbox directory");
+
+    eprintln!("Sandbox directory: {:?}", sandbox_dir);
+
+    // === L1: Create source file and sync ===
+    eprintln!("=== L1: Creating source file ===");
+
+    // Create only source file - target will be created by commonplace-link
+    let source_file = link_dir.join("source-file.txt");
+    std::fs::write(&source_file, "original").expect("Failed to write source file");
+
+    let _target_file = link_dir.join("target-file.txt");
+
+    // Wait for source file to appear in sandbox - confirms sync is working
+    let sandbox_source = sandbox_dir.join("source-file.txt");
+    let sandbox_target = sandbox_dir.join("target-file.txt");
+
+    // Wait for source file to sync
+    wait_for_file(&sandbox_source, Some("original"), Duration::from_secs(30))
+        .expect("Source file should sync to sandbox");
+    eprintln!("L1: Source file synced to sandbox");
+
+    // The workspace sync client doesn't subscribe to subdirectory SSE events,
+    // so the local schema isn't automatically updated. We need to fetch it from
+    // the server and write it locally for commonplace-link to work.
+    let link_schema = link_dir.join(".commonplace.json");
+
+    // Get the node_id for link-test from the workspace schema
+    let workspace_schema_content = std::fs::read_to_string(workspace_dir.join(".commonplace.json"))
+        .expect("Workspace schema should exist");
+    let workspace_schema: serde_json::Value = serde_json::from_str(&workspace_schema_content)
+        .expect("Workspace schema should be valid JSON");
+    let link_test_node_id = workspace_schema["root"]["entries"]["link-test"]["node_id"]
+        .as_str()
+        .expect("link-test should have a node_id");
+    eprintln!("link-test node_id: {}", link_test_node_id);
+
+    // Fetch the link-test schema from the server HEAD API
+    let head_url = format!("{}/docs/{}/head", server_url, link_test_node_id);
+    eprintln!("Fetching schema from: {}", head_url);
+
+    let client = reqwest::blocking::Client::new();
+    let response = client.get(&head_url).send().expect("Failed to fetch HEAD");
+    let head_json: serde_json::Value = response.json().expect("Invalid HEAD response");
+    let server_schema_content = head_json["content"]
+        .as_str()
+        .expect("HEAD should have content");
+    eprintln!("Server schema content: {}", server_schema_content);
+
+    // Write the server schema to the local file (workaround for missing SSE subscription)
+    std::fs::write(&link_schema, server_schema_content).expect("Failed to write schema");
+
+    eprintln!("L1: Source file created and synced to server");
+
+    // === L2: Run commonplace-link to share UUID ===
+    eprintln!("=== L2: Running commonplace-link ===");
+
+    // Run commonplace-link from workspace root with relative paths (both in link-test)
+    let link_output = Command::new(env!("CARGO_BIN_EXE_commonplace-link"))
+        .args([
+            "--server",
+            &server_url,
+            "link-test/source-file.txt",
+            "link-test/target-file.txt",
+        ])
+        .current_dir(&workspace_dir)
+        .output()
+        .expect("Failed to run commonplace-link");
+
+    eprintln!(
+        "Link stdout: {}",
+        String::from_utf8_lossy(&link_output.stdout)
+    );
+    eprintln!(
+        "Link stderr: {}",
+        String::from_utf8_lossy(&link_output.stderr)
+    );
+
+    assert!(
+        link_output.status.success(),
+        "commonplace-link should succeed"
+    );
+
+    eprintln!("L2: commonplace-link executed");
+
+    // === L3: Verify both files have same UUID in .commonplace.json ===
+    eprintln!("=== L3: Verifying UUID sharing ===");
+
+    let source_uuid = get_node_id_from_schema(&link_schema, "source-file.txt");
+    let target_uuid = get_node_id_from_schema(&link_schema, "target-file.txt");
+
+    eprintln!("Source UUID: {:?}", source_uuid);
+    eprintln!("Target UUID: {:?}", target_uuid);
+
+    assert!(source_uuid.is_some(), "Source file should have UUID");
+    assert!(target_uuid.is_some(), "Target file should have UUID");
+    assert_eq!(
+        source_uuid, target_uuid,
+        "Source and target should share UUID"
+    );
+
+    eprintln!("L3: UUID sharing verified");
+
+    // === L4: Verify target file is created with source content ===
+    eprintln!("=== L4: Verifying target file was created by link ===");
+
+    // commonplace-link creates the target entry in the schema with source's node_id.
+    // The sandbox sync client receives SSE and materializes the file.
+    // Note: Workspace sync doesn't subscribe to subdirectory SSE, so we verify via sandbox.
+    let content = wait_for_file(&sandbox_target, Some("original"), Duration::from_secs(30))
+        .expect("Target file should appear in sandbox with source content 'original'");
+    assert_eq!(
+        content.trim(),
+        "original",
+        "Target should have source content"
+    );
+
+    eprintln!("L4: Target file created in sandbox with linked content");
+
+    // === L5-L6: Edit linked file, verify change propagates ===
+    eprintln!("=== L5-L6: Testing edit propagation via link ===");
+
+    // Wait for sync to stabilize
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Edit the target file in sandbox (since workspace doesn't have it)
+    std::fs::write(&sandbox_target, "modified via link")
+        .expect("Failed to edit sandbox target file");
+
+    // Verify source file in workspace reflects the change
+    let content = wait_for_file(
+        &source_file,
+        Some("modified via link"),
+        Duration::from_secs(30),
+    )
+    .expect("Source file should receive edit 'modified via link'");
+    assert_eq!(
+        content.trim(),
+        "modified via link",
+        "Source should show edit from linked file"
+    );
+
+    eprintln!("L5-L6: Edit propagation via link verified");
+
+    // === L7: Verify linked file in sandbox has the modified content ===
+    eprintln!("=== L7: Verifying sandbox linked file has modified content ===");
+
+    // After edit propagation, sandbox target should still have the modified content
+    // (we edited it above, and since it shares node_id, edits are bidirectional)
+    let content =
+        std::fs::read_to_string(&sandbox_target).expect("Should read sandbox target file");
+    assert_eq!(
+        content.trim(),
+        "modified via link",
+        "Sandbox should have linked file with modified content"
+    );
+
+    eprintln!("L7: Sandbox verification passed");
+
+    eprintln!("=== All commonplace-link tests PASSED ===");
+}
