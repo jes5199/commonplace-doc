@@ -9,7 +9,7 @@ use crate::mqtt::messages::{
     DeleteDocumentResponse, GetContentRequest, GetContentResponse, GetInfoRequest, GetInfoResponse,
 };
 use crate::mqtt::topics::Topic;
-use crate::mqtt::MqttError;
+use crate::mqtt::{encode_json, parse_json, MqttError};
 use rumqttc::QoS;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -42,8 +42,7 @@ impl CommandsHandler {
 
     /// Publish a response to the {workspace}/responses topic.
     async fn publish_response<T: serde::Serialize>(&self, response: &T) -> Result<(), MqttError> {
-        let payload =
-            serde_json::to_vec(response).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+        let payload = encode_json(response)?;
 
         let response_topic = format!("{}/responses", self.workspace);
         self.client
@@ -109,8 +108,7 @@ impl CommandsHandler {
         })?;
 
         // Parse the command message
-        let command: CommandMessage = serde_json::from_slice(payload)
-            .map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+        let command: CommandMessage = parse_json(payload)?;
 
         debug!(
             "Received command '{}' for path: {} from: {:?}",
@@ -128,8 +126,7 @@ impl CommandsHandler {
     /// Handle create-document command.
     /// Topic: {workspace}/commands/create-document
     pub async fn handle_create_document(&self, payload: &[u8]) -> Result<(), MqttError> {
-        let request: CreateDocumentRequest = serde_json::from_slice(payload)
-            .map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+        let request: CreateDocumentRequest = parse_json(payload)?;
 
         debug!(
             "Received create-document command: req={}, content_type={}",
@@ -168,8 +165,7 @@ impl CommandsHandler {
     /// Handle delete-document command.
     /// Topic: {workspace}/commands/delete-document
     pub async fn handle_delete_document(&self, payload: &[u8]) -> Result<(), MqttError> {
-        let request: DeleteDocumentRequest = serde_json::from_slice(payload)
-            .map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+        let request: DeleteDocumentRequest = parse_json(payload)?;
 
         debug!(
             "Received delete-document command: req={}, id={}",
@@ -199,8 +195,7 @@ impl CommandsHandler {
     /// Handle get-content command.
     /// Topic: {workspace}/commands/get-content
     pub async fn handle_get_content(&self, payload: &[u8]) -> Result<(), MqttError> {
-        let request: GetContentRequest = serde_json::from_slice(payload)
-            .map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+        let request: GetContentRequest = parse_json(payload)?;
 
         debug!(
             "Received get-content command: req={}, id={}",
@@ -230,8 +225,7 @@ impl CommandsHandler {
     /// Handle get-info command.
     /// Topic: {workspace}/commands/get-info
     pub async fn handle_get_info(&self, payload: &[u8]) -> Result<(), MqttError> {
-        let request: GetInfoRequest = serde_json::from_slice(payload)
-            .map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+        let request: GetInfoRequest = parse_json(payload)?;
 
         debug!(
             "Received get-info command: req={}, id={}",

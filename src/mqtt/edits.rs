@@ -10,7 +10,7 @@ use crate::document::{resolve_path_to_uuid, DocumentStore};
 use crate::mqtt::client::MqttClient;
 use crate::mqtt::messages::EditMessage;
 use crate::mqtt::topics::{content_type_for_path, Topic};
-use crate::mqtt::MqttError;
+use crate::mqtt::{parse_json, MqttError};
 use crate::store::CommitStore;
 use rumqttc::QoS;
 use std::collections::HashSet;
@@ -101,8 +101,7 @@ impl EditsHandler {
     /// IMPORTANT: Does NOT re-emit. MQTT broker handles fanout.
     pub async fn handle_edit(&self, topic: &Topic, payload: &[u8]) -> Result<(), MqttError> {
         // Parse the edit message
-        let edit_msg: EditMessage = serde_json::from_slice(payload)
-            .map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+        let edit_msg: EditMessage = parse_json(payload)?;
 
         debug!(
             "Received edit for path: {} from author: {}",

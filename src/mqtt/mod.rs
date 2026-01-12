@@ -60,6 +60,22 @@ pub enum MqttError {
     Serialization(#[from] serde_json::Error),
 }
 
+/// Parse JSON from a byte slice, mapping errors to MqttError::InvalidMessage.
+///
+/// This is a convenience wrapper around serde_json::from_slice that provides
+/// consistent error handling across all MQTT handlers.
+pub fn parse_json<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, MqttError> {
+    serde_json::from_slice(payload).map_err(|e| MqttError::InvalidMessage(e.to_string()))
+}
+
+/// Encode a value to JSON bytes, mapping errors to MqttError::InvalidMessage.
+///
+/// This is a convenience wrapper around serde_json::to_vec that provides
+/// consistent error handling across all MQTT handlers.
+pub fn encode_json<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, MqttError> {
+    serde_json::to_vec(value).map_err(|e| MqttError::InvalidMessage(e.to_string()))
+}
+
 /// Configuration for MQTT connection.
 #[derive(Debug, Clone)]
 pub struct MqttConfig {
