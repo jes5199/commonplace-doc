@@ -9,11 +9,10 @@ use crate::sync::state::InodeKey;
 use crate::sync::state_file::compute_content_hash;
 use crate::sync::uuid_map::fetch_node_id_from_schema;
 use crate::sync::{
-    build_edit_url, build_head_url, build_replace_url, create_yjs_text_update, detect_from_path,
-    file_watcher_task, is_binary_content, looks_like_base64_binary, push_json_content,
-    push_jsonl_content, push_schema_to_server, record_upload_result, refresh_from_head, sse_task,
-    EditRequest, EditResponse, FileEvent, FlockSyncState, HeadResponse, ReplaceResponse, SyncState,
-    PENDING_WRITE_TIMEOUT,
+    build_edit_url, build_replace_url, create_yjs_text_update, detect_from_path, file_watcher_task,
+    is_binary_content, looks_like_base64_binary, push_json_content, push_jsonl_content,
+    push_schema_to_server, record_upload_result, refresh_from_head, sse_task, EditRequest,
+    EditResponse, FileEvent, FlockSyncState, ReplaceResponse, SyncState, PENDING_WRITE_TIMEOUT,
 };
 use reqwest::Client;
 use std::path::{Path, PathBuf};
@@ -350,17 +349,10 @@ pub async fn upload_task(
         // This prevents blind overwrites when server has content we don't know about
         let parent_cid = if force_push {
             // Force-push: fetch HEAD's cid to ensure we replace current content
-            let head_url = build_head_url(&server, &identifier, use_paths);
-            match client.get(&head_url).send().await {
-                Ok(resp) if resp.status().is_success() => match resp.json::<HeadResponse>().await {
-                    Ok(head) => head.cid,
-                    Err(e) => {
-                        error!("Force-push: failed to parse HEAD response: {}", e);
-                        continue;
-                    }
-                },
-                Ok(resp) => {
-                    error!("Force-push: HEAD request failed with {}", resp.status());
+            match fetch_head(&client, &server, &identifier, use_paths).await {
+                Ok(Some(head)) => head.cid,
+                Ok(None) => {
+                    error!("Force-push: document not found on server");
                     continue;
                 }
                 Err(e) => {
@@ -377,47 +369,39 @@ pub async fn upload_task(
             // If we don't know the parent, fetch HEAD to check if server has content
             // This prevents blind overwrites when syncing a file the server already has
             if known_parent.is_none() {
-                let head_url = build_head_url(&server, &identifier, use_paths);
-                match client.get(&head_url).send().await {
-                    Ok(resp) if resp.status().is_success() => {
-                        match resp.json::<HeadResponse>().await {
-                            Ok(head) => {
-                                if let Some(cid) = head.cid {
-                                    info!(
-                                        "Server has existing content (cid: {}), syncing from server first",
-                                        &cid[..8.min(cid.len())]
-                                    );
-                                    // Fetch and apply server content before uploading
-                                    let refresh_succeeded = refresh_from_head(
-                                        &client,
-                                        &server,
-                                        &identifier,
-                                        &file_path,
-                                        &state,
-                                        use_paths,
-                                    )
-                                    .await;
-                                    if refresh_succeeded {
-                                        // Now we have the server content, get the new parent
-                                        let s = state.read().await;
-                                        s.last_written_cid.clone()
-                                    } else {
-                                        // Refresh failed, skip this upload
-                                        error!("Failed to sync from server, skipping upload");
-                                        continue;
-                                    }
-                                } else {
-                                    // Server has no content, proceed with initial commit
-                                    None
-                                }
+                match fetch_head(&client, &server, &identifier, use_paths).await {
+                    Ok(Some(head)) => {
+                        if let Some(cid) = head.cid {
+                            info!(
+                                "Server has existing content (cid: {}), syncing from server first",
+                                &cid[..8.min(cid.len())]
+                            );
+                            // Fetch and apply server content before uploading
+                            let refresh_succeeded = refresh_from_head(
+                                &client,
+                                &server,
+                                &identifier,
+                                &file_path,
+                                &state,
+                                use_paths,
+                            )
+                            .await;
+                            if refresh_succeeded {
+                                // Now we have the server content, get the new parent
+                                let s = state.read().await;
+                                s.last_written_cid.clone()
+                            } else {
+                                // Refresh failed, skip this upload
+                                error!("Failed to sync from server, skipping upload");
+                                continue;
                             }
-                            Err(e) => {
-                                debug!("Failed to parse HEAD response: {}", e);
-                                None // Proceed with initial commit
-                            }
+                        } else {
+                            // Server has no content, proceed with initial commit
+                            None
                         }
                     }
-                    Ok(_) | Err(_) => None, // Server has no content or request failed
+                    // Document not found or error - proceed with initial commit
+                    Ok(None) | Err(_) => None,
                 }
             } else {
                 known_parent
@@ -801,17 +785,10 @@ pub async fn upload_task_with_flock(
         // Get parent CID for text file upload
         // CRDT safety: if we don't know the parent, fetch HEAD from server first
         let parent_cid = if force_push {
-            let head_url = build_head_url(&server, &identifier, use_paths);
-            match client.get(&head_url).send().await {
-                Ok(resp) if resp.status().is_success() => match resp.json::<HeadResponse>().await {
-                    Ok(head) => head.cid,
-                    Err(e) => {
-                        error!("Force-push: failed to parse HEAD response: {}", e);
-                        continue;
-                    }
-                },
-                Ok(resp) => {
-                    error!("Force-push: HEAD request failed with {}", resp.status());
+            match fetch_head(&client, &server, &identifier, use_paths).await {
+                Ok(Some(head)) => head.cid,
+                Ok(None) => {
+                    error!("Force-push: document not found on server");
                     continue;
                 }
                 Err(e) => {
@@ -827,43 +804,34 @@ pub async fn upload_task_with_flock(
 
             // If we don't know the parent, fetch HEAD to check if server has content
             if known_parent.is_none() {
-                let head_url = build_head_url(&server, &identifier, use_paths);
-                match client.get(&head_url).send().await {
-                    Ok(resp) if resp.status().is_success() => {
-                        match resp.json::<HeadResponse>().await {
-                            Ok(head) => {
-                                if let Some(cid) = head.cid {
-                                    info!(
-                                        "Server has existing content (cid: {}), syncing from server first",
-                                        &cid[..8.min(cid.len())]
-                                    );
-                                    let refresh_succeeded = refresh_from_head(
-                                        &client,
-                                        &server,
-                                        &identifier,
-                                        &file_path,
-                                        &state,
-                                        use_paths,
-                                    )
-                                    .await;
-                                    if refresh_succeeded {
-                                        let s = state.read().await;
-                                        s.last_written_cid.clone()
-                                    } else {
-                                        error!("Failed to sync from server, skipping upload");
-                                        continue;
-                                    }
-                                } else {
-                                    None
-                                }
+                match fetch_head(&client, &server, &identifier, use_paths).await {
+                    Ok(Some(head)) => {
+                        if let Some(cid) = head.cid {
+                            info!(
+                                "Server has existing content (cid: {}), syncing from server first",
+                                &cid[..8.min(cid.len())]
+                            );
+                            let refresh_succeeded = refresh_from_head(
+                                &client,
+                                &server,
+                                &identifier,
+                                &file_path,
+                                &state,
+                                use_paths,
+                            )
+                            .await;
+                            if refresh_succeeded {
+                                let s = state.read().await;
+                                s.last_written_cid.clone()
+                            } else {
+                                error!("Failed to sync from server, skipping upload");
+                                continue;
                             }
-                            Err(e) => {
-                                debug!("Failed to parse HEAD response: {}", e);
-                                None
-                            }
+                        } else {
+                            None
                         }
                     }
-                    Ok(_) | Err(_) => None,
+                    Ok(None) | Err(_) => None,
                 }
             } else {
                 known_parent
@@ -1206,17 +1174,11 @@ pub async fn sync_single_file(
     };
 
     // Check server state
-    let file_head_url = crate::sync::build_head_url(server, &identifier, use_paths);
-    let file_head_resp = client.get(&file_head_url).send().await;
+    let head_result = fetch_head(client, server, &identifier, use_paths).await;
 
-    if let Ok(resp) = file_head_resp {
-        debug!(
-            "File head response status: {} for {}",
-            resp.status(),
-            identifier
-        );
-        if resp.status().is_success() {
-            let head: crate::sync::HeadResponse = resp.json().await?;
+    match &head_result {
+        Ok(Some(head)) => {
+            debug!("File head response: success for {}", identifier);
             info!(
                 "File head content empty: {}, strategy: {}",
                 head.content.is_empty(),
@@ -1377,12 +1339,13 @@ pub async fn sync_single_file(
                 } else {
                     // No offline edits (skip strategy, content matches) - seed SyncState
                     let mut s = state.write().await;
-                    s.last_written_cid = head.cid;
+                    s.last_written_cid = head.cid.clone();
                     s.last_written_content = file.content.clone();
                 }
             }
-        } else {
-            // Node doesn't exist yet - push content
+        }
+        Ok(None) | Err(_) => {
+            // Node doesn't exist yet (404) or request failed - push content
             info!("Node not ready, will push with retries for: {}", identifier);
             crate::sync::push_content_by_type(
                 client,
