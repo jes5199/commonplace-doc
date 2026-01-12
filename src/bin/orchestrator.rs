@@ -5,7 +5,9 @@
 
 use clap::Parser;
 use commonplace_doc::cli::OrchestratorArgs;
+use commonplace_doc::mqtt::{MqttClient, MqttConfig};
 use commonplace_doc::orchestrator::{DiscoveredProcessManager, OrchestratorConfig, ProcessManager};
+use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
     build_head_url, build_health_url, discover_fs_root, DiscoverFsRootError,
 };
@@ -13,14 +15,17 @@ use fs2::FileExt;
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
+use rumqttc::QoS;
 use std::fs::File;
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 #[cfg(not(unix))]
 use tokio::signal;
 #[cfg(unix)]
 use tokio::signal::unix::{signal as unix_signal, SignalKind};
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -272,6 +277,80 @@ async fn wait_for_sync_initial_push(
         }
 
         tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Wait for sync initial-complete event via MQTT subscription.
+/// Returns the event data on success, or None on timeout.
+async fn wait_for_sync_via_mqtt(
+    mqtt_client: Arc<MqttClient>,
+    fs_root_id: &str,
+    max_wait: Duration,
+) -> Option<InitialSyncComplete> {
+    let topic = format!("{}/events/sync/initial-complete", fs_root_id);
+
+    // Subscribe to the topic
+    if let Err(e) = mqtt_client.subscribe(&topic, QoS::AtLeastOnce).await {
+        tracing::warn!(
+            "[orchestrator] Failed to subscribe to sync-complete event: {}",
+            e
+        );
+        return None;
+    }
+
+    tracing::info!(
+        "[orchestrator] Subscribed to {} (timeout: {:?})",
+        topic,
+        max_wait
+    );
+
+    // Get message receiver
+    let mut receiver = mqtt_client.subscribe_messages();
+
+    // Wait for the event with timeout
+    let result = tokio::time::timeout(max_wait, async {
+        loop {
+            match receiver.recv().await {
+                Ok(msg) if msg.topic == topic => {
+                    // Parse the event - crash on malformed (indicates bug)
+                    let event: InitialSyncComplete = serde_json::from_slice(&msg.payload)
+                        .expect("Malformed initial-sync-complete event from sync");
+                    return Some(event);
+                }
+                Ok(_) => {
+                    // Message for different topic, continue waiting
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Missed some messages, continue
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    tracing::warn!("[orchestrator] MQTT message channel closed");
+                    return None;
+                }
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Some(event)) => {
+            tracing::info!(
+                "[orchestrator] Received initial-sync-complete: {} files in {}ms",
+                event.files_synced,
+                event.duration_ms
+            );
+            Some(event)
+        }
+        Ok(None) => None,
+        Err(_) => {
+            tracing::warn!(
+                "[orchestrator] Timed out waiting for sync-complete event after {:?}",
+                max_wait
+            );
+            None
+        }
     }
 }
 
