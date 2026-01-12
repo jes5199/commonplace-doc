@@ -129,8 +129,9 @@ pub use types::{
     ForkResponse, HeadResponse, ReplaceResponse, ReplaceSummary, SharedStateFile, WrittenSchemas,
 };
 pub use urls::{
-    build_edit_url, build_fork_url, build_head_url, build_info_url, build_replace_url,
-    build_sse_url, encode_node_id, encode_path, normalize_path,
+    build_commits_url, build_edit_url, build_fork_url, build_head_at_commit_url, build_head_url,
+    build_health_url, build_info_url, build_replace_url, build_sse_url, encode_node_id,
+    encode_path, normalize_path,
 };
 pub use watcher::{directory_watcher_task, file_watcher_task, ShadowWriteEvent};
 #[cfg(unix)]

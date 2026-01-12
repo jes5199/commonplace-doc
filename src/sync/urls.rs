@@ -110,6 +110,26 @@ pub fn build_is_ancestor_url(
     )
 }
 
+/// Build URL for getting document commits history
+pub fn build_commits_url(server: &str, uuid: &str) -> String {
+    format!("{}/documents/{}/commits", server, uuid)
+}
+
+/// Build URL for health check endpoint
+pub fn build_health_url(server: &str) -> String {
+    format!("{}/health", server)
+}
+
+/// Build URL for getting document HEAD at a specific commit
+pub fn build_head_at_commit_url(server: &str, node_id: &str, at_commit: &str) -> String {
+    format!(
+        "{}/docs/{}/head?at_commit={}",
+        server,
+        encode_node_id(node_id),
+        at_commit
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +317,36 @@ mod tests {
             assert_eq!(
                 url,
                 "http://localhost:5199/docs/550e8400-e29b-41d4-a716-446655440000/is-ancestor?ancestor=abc123&descendant=def456"
+            );
+        }
+
+        #[test]
+        fn test_build_commits_url() {
+            let url = build_commits_url(SERVER, "abc-123");
+            assert_eq!(url, "http://localhost:5199/documents/abc-123/commits");
+        }
+
+        #[test]
+        fn test_build_health_url() {
+            let url = build_health_url(SERVER);
+            assert_eq!(url, "http://localhost:5199/health");
+        }
+
+        #[test]
+        fn test_build_head_at_commit_url() {
+            let url = build_head_at_commit_url(SERVER, "abc-123", "cid456");
+            assert_eq!(
+                url,
+                "http://localhost:5199/docs/abc-123/head?at_commit=cid456"
+            );
+        }
+
+        #[test]
+        fn test_build_head_at_commit_url_with_special_chars() {
+            let url = build_head_at_commit_url(SERVER, "fs-root:notes/todo.txt", "cid789");
+            assert_eq!(
+                url,
+                "http://localhost:5199/docs/fs-root%3Anotes%2Ftodo.txt/head?at_commit=cid789"
             );
         }
     }

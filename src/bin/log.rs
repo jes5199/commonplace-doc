@@ -11,6 +11,7 @@
 use base64::prelude::*;
 use clap::Parser;
 use commonplace_doc::cli::{compute_diff_stats, ChangeStats, CommitChange, LogArgs};
+use commonplace_doc::sync::{build_commits_url, build_sse_url};
 use commonplace_doc::workspace::{
     format_timestamp, format_timestamp_short, parse_date, resolve_path_to_uuid,
 };
@@ -374,7 +375,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new();
 
     // Fetch commits with Yjs updates (single HTTP request)
-    let url = format!("{}/documents/{}/commits", args.server, uuid);
+    let url = build_commits_url(&args.server, &uuid);
     let resp = client.get(&url).send().await?;
 
     if !resp.status().is_success() {
@@ -446,7 +447,7 @@ async fn follow_commits(
     graph: bool,
     decorate: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sse_url = format!("{}/sse/docs/{}", args.server, uuid);
+    let sse_url = build_sse_url(&args.server, uuid, false);
 
     eprintln!("Watching for new commits... (Ctrl+C to stop)");
 

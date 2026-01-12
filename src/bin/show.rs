@@ -10,6 +10,7 @@ use commonplace_doc::cli::{
     compute_diff_stats, fetch_changes, fetch_head, ChangeStats, CommitChange, HeadResponse,
     ShowArgs,
 };
+use commonplace_doc::sync::build_head_at_commit_url;
 use commonplace_doc::workspace::{format_timestamp, resolve_path_to_uuid};
 use reqwest::Client;
 use serde::Serialize;
@@ -140,10 +141,7 @@ async fn compute_stats(
         if idx > 0 {
             // Get parent commit content
             let parent = &changes.changes[idx - 1];
-            let parent_url = format!(
-                "{}/docs/{}/head?at_commit={}",
-                server, uuid, parent.commit_id
-            );
+            let parent_url = build_head_at_commit_url(server, uuid, &parent.commit_id);
 
             if let Ok(resp) = client.get(&parent_url).send().await {
                 if resp.status().is_success() {

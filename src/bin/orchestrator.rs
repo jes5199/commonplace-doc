@@ -6,7 +6,9 @@
 use clap::Parser;
 use commonplace_doc::cli::OrchestratorArgs;
 use commonplace_doc::orchestrator::{DiscoveredProcessManager, OrchestratorConfig, ProcessManager};
-use commonplace_doc::sync::{discover_fs_root, DiscoverFsRootError};
+use commonplace_doc::sync::{
+    build_head_url, build_health_url, discover_fs_root, DiscoverFsRootError,
+};
 use fs2::FileExt;
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
@@ -210,7 +212,7 @@ async fn wait_for_sync_initial_push(
         }
 
         // Fetch fs-root HEAD
-        let head_url = format!("{}/docs/{}/head", server_url, fs_root_id);
+        let head_url = build_head_url(server_url, fs_root_id, false);
         match client.get(&head_url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(body) = resp.text().await {
@@ -415,7 +417,7 @@ async fn main() {
 
     // Wait for server to be healthy
     let client = reqwest::Client::new();
-    let health_url = format!("{}/health", args.server);
+    let health_url = build_health_url(&args.server);
     tracing::info!("[orchestrator] Waiting for server to be healthy...");
     let mut attempts = 0;
     loop {
