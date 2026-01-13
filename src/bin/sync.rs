@@ -1451,13 +1451,13 @@ async fn run_directory_mode(
             inode_tracker: inode_tracker.clone(),
             watched_subdirs: watched_subdirs.clone(),
         };
-        let transport = if let Some(ref mqtt) = mqtt_client {
-            SubdirTransport::Mqtt {
-                client: mqtt.clone(),
-                workspace: workspace.clone(),
-            }
-        } else {
-            SubdirTransport::Sse
+        // MQTT is required for directory sync (checked above), so we can use it directly
+        let mqtt = mqtt_client
+            .as_ref()
+            .expect("MQTT client should be available - checked at subscription_handle");
+        let transport = SubdirTransport::Mqtt {
+            client: mqtt.clone(),
+            workspace: workspace.clone(),
         };
         let count = spawn_subdir_watchers(&params, transport).await;
         info!("Spawned {} node-backed subdirectory watcher(s)", count);
