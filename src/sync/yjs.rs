@@ -31,7 +31,7 @@ pub fn create_yjs_structured_update(
     content_type: ContentType,
     content: &str,
     base_state: Option<&str>,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     match content_type {
         ContentType::Json | ContentType::JsonArray => create_yjs_json_update(content, base_state),
         ContentType::Jsonl => create_yjs_jsonl_update(content, base_state),
@@ -53,7 +53,7 @@ pub fn create_yjs_structured_update(
 pub fn create_yjs_json_update(
     new_json: &str,
     base_state: Option<&str>,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     create_yjs_json_update_impl(new_json, base_state, false)
 }
 
@@ -62,7 +62,7 @@ pub fn create_yjs_json_update(
 pub fn create_yjs_json_merge(
     new_json: &str,
     base_state: Option<&str>,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     create_yjs_json_update_impl(new_json, base_state, true)
 }
 
@@ -75,7 +75,7 @@ pub fn create_yjs_json_merge(
 pub fn create_yjs_json_delete_key(
     key_path: &str,
     base_state: Option<&str>,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     // Base state is REQUIRED for deletion - without it, we can't find the existing entry
     // to create a proper deletion tombstone
     let state_b64 = base_state
@@ -196,7 +196,7 @@ fn create_yjs_json_update_impl(
     new_json: &str,
     base_state: Option<&str>,
     additive_only: bool,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let new_value: serde_json::Value = serde_json::from_str(new_json)?;
 
     let doc = Doc::with_client_id(1);
@@ -360,7 +360,7 @@ pub fn create_yjs_text_diff_update(
 pub fn create_yjs_jsonl_update(
     content: &str,
     base_state: Option<&str>,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let doc = Doc::with_client_id(1);
 
     // Apply base state if provided
@@ -403,7 +403,9 @@ pub fn create_yjs_jsonl_update(
 }
 
 /// Convert Y.Array content to JSONL format (one JSON object per line).
-pub fn yjs_array_to_jsonl(state_b64: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub fn yjs_array_to_jsonl(
+    state_b64: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let state_bytes = base64_decode(state_b64)?;
 
     let doc = Doc::new();

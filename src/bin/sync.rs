@@ -823,7 +823,7 @@ async fn run_file_mode(
     force_push: bool,
     shadow_dir: String,
     name: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Derive author from name parameter, defaulting to "sync-client"
     let author = name.unwrap_or_else(|| "sync-client".to_string());
 
@@ -1116,7 +1116,7 @@ async fn run_directory_mode(
     mqtt_client: Option<Arc<MqttClient>>,
     workspace: String,
     name: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Derive author from name parameter, defaulting to "sync-client"
     let author = name.unwrap_or_else(|| "sync-client".to_string());
 
@@ -1387,57 +1387,47 @@ async fn run_directory_mode(
     );
 
     // Start subscription task for fs-root (skip if push-only)
-    // Use MQTT if available, otherwise fall back to SSE
+    // MQTT is required for directory sync mode (SSE fallback removed)
     let subscription_handle = if !push_only {
-        if let Some(ref mqtt) = mqtt_client {
-            // Spawn the MQTT event loop in a background task
-            let mqtt_for_loop = mqtt.clone();
-            tokio::spawn(async move {
-                if let Err(e) = mqtt_for_loop.run_event_loop().await {
-                    error!("MQTT event loop error: {}", e);
-                }
-            });
+        let mqtt = mqtt_client
+            .as_ref()
+            .ok_or("MQTT is required for directory sync mode. Please configure --mqtt-broker.")?;
 
-            info!("Using MQTT for directory sync subscriptions");
-            Some(tokio::spawn(directory_mqtt_task(
-                client.clone(),
-                server.clone(),
-                fs_root_id.clone(),
-                directory.clone(),
-                file_states.clone(),
-                use_paths,
-                push_only,
-                pull_only,
-                author.clone(),
-                #[cfg(unix)]
-                inode_tracker.clone(),
-                watched_subdirs.clone(),
-                mqtt.clone(),
-                workspace.clone(),
-                Some(written_schemas.clone()),
-                initial_schema_cid.clone(),
-                Some(shared_state_file.clone()),
-            )))
-        } else {
-            info!("Using SSE for directory sync subscriptions");
-            Some(tokio::spawn(directory_sse_task(
-                client.clone(),
-                server.clone(),
-                fs_root_id.clone(),
-                directory.clone(),
-                file_states.clone(),
-                use_paths,
-                push_only,
-                pull_only,
-                author.clone(),
-                #[cfg(unix)]
-                inode_tracker.clone(),
-                watched_subdirs.clone(),
-                Some(written_schemas.clone()),
-                initial_schema_cid.clone(),
-                Some(shared_state_file.clone()),
-            )))
-        }
+        // Spawn the MQTT event loop in a background task
+        let mqtt_for_loop = mqtt.clone();
+        tokio::spawn(async move {
+            if let Err(e) = mqtt_for_loop.run_event_loop().await {
+                error!("MQTT event loop error: {}", e);
+            }
+        });
+
+        // Extract the uuid_map from Arc for passing to the task
+        let initial_uuid_map: HashMap<String, String> = (*uuid_map).clone();
+
+        info!(
+            "Using MQTT for directory sync subscriptions ({} file UUIDs)",
+            initial_uuid_map.len()
+        );
+        Some(tokio::spawn(directory_mqtt_task(
+            client.clone(),
+            server.clone(),
+            fs_root_id.clone(),
+            directory.clone(),
+            file_states.clone(),
+            use_paths,
+            push_only,
+            pull_only,
+            author.clone(),
+            #[cfg(unix)]
+            inode_tracker.clone(),
+            watched_subdirs.clone(),
+            mqtt.clone(),
+            workspace.clone(),
+            Some(written_schemas.clone()),
+            initial_schema_cid.clone(),
+            Some(shared_state_file.clone()),
+            initial_uuid_map,
+        )))
     } else {
         info!("Push-only mode: skipping subscription");
         None
@@ -1640,7 +1630,7 @@ async fn run_exec_mode(
     shadow_dir: String,
     process_name: Option<String>,
     mqtt_client: Option<Arc<MqttClient>>,
-) -> Result<u8, Box<dyn std::error::Error>> {
+) -> Result<u8, Box<dyn std::error::Error + Send + Sync>> {
     // Derive author from process_name, defaulting to "sync-client"
     let author = process_name
         .clone()

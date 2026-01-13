@@ -1023,7 +1023,7 @@ pub async fn initial_sync(
     node_id: &str,
     file_path: &PathBuf,
     state: &Arc<RwLock<SyncState>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let head = match fetch_head(client, server, node_id, false).await {
         Ok(Some(h)) => h,
         Ok(None) => return Err(format!("Document {} not found", node_id).into()),
@@ -1126,7 +1126,7 @@ pub async fn sync_single_file(
     >,
     use_paths: bool,
     author: &str,
-) -> Result<(String, String), Box<dyn std::error::Error>> {
+) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
     use base64::{engine::general_purpose::STANDARD, Engine};
 
     // Determine identifier

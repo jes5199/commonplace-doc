@@ -77,7 +77,7 @@ pub async fn fork_node(
     server: &str,
     source_node: &str,
     at_commit: Option<&str>,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let fork_url = build_fork_url(server, source_node, at_commit);
 
     let resp = client.post(&fork_url).send().await?;
@@ -112,7 +112,7 @@ pub async fn push_schema_to_server(
     fs_root_id: &str,
     schema_json: &str,
     author: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let edit_url = build_edit_url(server, fs_root_id, false);
 
     // First fetch current server content and state
@@ -193,7 +193,7 @@ pub async fn delete_schema_entry(
     fs_root_id: &str,
     entry_name: &str,
     author: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let edit_url = build_edit_url(server, fs_root_id, false);
 
     // Fetch current server state
@@ -236,7 +236,7 @@ pub async fn push_json_content(
     state: &Arc<RwLock<SyncState>>,
     use_paths: bool,
     author: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     push_json_content_impl(
         client, server, identifier, content, state, use_paths, false, author,
     )
@@ -252,7 +252,7 @@ pub async fn push_json_content_merge(
     state: &Arc<RwLock<SyncState>>,
     use_paths: bool,
     author: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     push_json_content_impl(
         client, server, identifier, content, state, use_paths, true, author,
     )
@@ -270,7 +270,7 @@ async fn push_json_content_impl(
     use_paths: bool,
     merge: bool,
     author: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let head_url = build_head_url(server, identifier, use_paths);
     let edit_url = build_edit_url(server, identifier, use_paths);
     let mut attempts = 0;
@@ -345,7 +345,7 @@ pub async fn push_jsonl_content(
     state: &Arc<RwLock<SyncState>>,
     use_paths: bool,
     author: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let head_url = build_head_url(server, identifier, use_paths);
     let edit_url = build_edit_url(server, identifier, use_paths);
     let mut attempts = 0;
@@ -416,7 +416,7 @@ pub async fn push_content_by_type(
     is_binary: bool,
     mime_type: &str,
     author: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let is_json = !is_binary && mime_type == "application/json";
     let is_jsonl = !is_binary && mime_type == "application/x-ndjson";
 
@@ -447,7 +447,7 @@ pub async fn push_file_content(
     state: &Arc<RwLock<SyncState>>,
     use_paths: bool,
     author: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // First check if there's existing content
     if let Ok(Some(head)) = fetch_head(client, server, identifier, use_paths).await {
         if let Some(parent_cid) = head.cid {
