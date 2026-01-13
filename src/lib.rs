@@ -107,11 +107,16 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
     };
 
     // Initialize MQTT service if configured
-    if let Some(mqtt_config) = config.mqtt {
+    // Capture MQTT client and workspace for DocumentService to publish commits
+    let mqtt_context: Option<(Arc<mqtt::MqttClient>, String)> = if let Some(mqtt_config) =
+        config.mqtt
+    {
+        let workspace = mqtt_config.workspace.clone();
         match mqtt::MqttService::new(mqtt_config, doc_store.clone(), commit_store.clone()).await {
             Ok(mqtt_service) => {
                 tracing::info!("MQTT service connected");
                 let mqtt_service = Arc::new(mqtt_service);
+                let mqtt_client = mqtt_service.client().clone();
 
                 // Initialize fs-root caches on MQTT handlers if fs-root is configured
                 if let Some((ref fs_root_id, ref fs_root_content)) = fs_root_context {
@@ -157,31 +162,56 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
                         tracing::error!("MQTT event loop error: {}", e);
                     }
                 });
+
+                Some((mqtt_client, workspace))
             }
             Err(e) => {
                 tracing::error!("Failed to connect MQTT service: {}", e);
+                None
             }
         }
-    }
+    } else {
+        None
+    };
 
     // Create shared service for handlers
-    let service = Arc::new(
-        if let (Some(reconciler), Some(ref fs_root_id)) = (reconciler, &config.fs_root) {
-            DocumentService::with_reconciler(
+    // DocumentService needs MQTT client to publish commits for real-time sync
+    let service = Arc::new(match (reconciler, &config.fs_root, mqtt_context) {
+        // Reconciler + MQTT
+        (Some(reconciler), Some(ref fs_root_id), Some((mqtt_client, mqtt_workspace))) => {
+            DocumentService::with_reconciler_and_mqtt(
                 doc_store.clone(),
                 commit_store.clone(),
                 commit_broadcaster.clone(),
                 reconciler,
                 fs_root_id.clone(),
+                mqtt_client,
+                mqtt_workspace,
             )
-        } else {
-            DocumentService::new(
-                doc_store.clone(),
-                commit_store.clone(),
-                commit_broadcaster.clone(),
-            )
-        },
-    );
+        }
+        // Reconciler only
+        (Some(reconciler), Some(ref fs_root_id), None) => DocumentService::with_reconciler(
+            doc_store.clone(),
+            commit_store.clone(),
+            commit_broadcaster.clone(),
+            reconciler,
+            fs_root_id.clone(),
+        ),
+        // MQTT only
+        (_, _, Some((mqtt_client, mqtt_workspace))) => DocumentService::with_mqtt(
+            doc_store.clone(),
+            commit_store.clone(),
+            commit_broadcaster.clone(),
+            mqtt_client,
+            mqtt_workspace,
+        ),
+        // Neither
+        _ => DocumentService::new(
+            doc_store.clone(),
+            commit_store.clone(),
+            commit_broadcaster.clone(),
+        ),
+    });
 
     let mut router = Router::new()
         .route("/health", get(health_check))

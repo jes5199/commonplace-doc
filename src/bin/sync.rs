@@ -712,7 +712,8 @@ async fn main() -> ExitCode {
             args.pull_only,
             args.shadow_dir,
             args.name,
-            None, // No MQTT in standalone exec mode
+            mqtt_client,
+            args.workspace,
         )
         .await;
 
@@ -761,7 +762,8 @@ async fn main() -> ExitCode {
                 args.pull_only,
                 args.shadow_dir,
                 args.name,
-                None, // No MQTT in standalone exec mode
+                mqtt_client,
+                args.workspace,
             )
             .await
         } else {
@@ -1630,6 +1632,7 @@ async fn run_exec_mode(
     shadow_dir: String,
     process_name: Option<String>,
     mqtt_client: Option<Arc<MqttClient>>,
+    workspace: String,
 ) -> Result<u8, Box<dyn std::error::Error + Send + Sync>> {
     // Derive author from process_name, defaulting to "sync-client"
     let author = process_name
@@ -1915,31 +1918,62 @@ async fn run_exec_mode(
         written_schemas.clone(),
     );
 
-    // Start SSE task for fs-root (skip if push-only)
-    let sse_handle = if !push_only {
-        Some(tokio::spawn(directory_sse_task(
-            client.clone(),
-            server.clone(),
-            fs_root_id.clone(),
-            directory.clone(),
-            file_states.clone(),
-            use_paths,
-            push_only,
-            pull_only,
-            author.clone(),
-            #[cfg(unix)]
-            inode_tracker.clone(),
-            watched_subdirs.clone(),
-            Some(written_schemas.clone()),
-            initial_schema_cid.clone(),
-            Some(shared_state_file.clone()),
-        )))
+    // Start subscription task for fs-root (skip if push-only)
+    // Use MQTT if available, otherwise fall back to SSE
+    let subscription_handle = if !push_only {
+        if let Some(ref mqtt) = mqtt_client {
+            // Extract uuid_map for MQTT task
+            let initial_uuid_map: HashMap<String, String> = (*uuid_map).clone();
+            info!(
+                "Using MQTT for exec mode subscriptions ({} file UUIDs)",
+                initial_uuid_map.len()
+            );
+            Some(tokio::spawn(directory_mqtt_task(
+                client.clone(),
+                server.clone(),
+                fs_root_id.clone(),
+                directory.clone(),
+                file_states.clone(),
+                use_paths,
+                push_only,
+                pull_only,
+                author.clone(),
+                #[cfg(unix)]
+                inode_tracker.clone(),
+                watched_subdirs.clone(),
+                mqtt.clone(),
+                workspace.clone(),
+                Some(written_schemas.clone()),
+                initial_schema_cid.clone(),
+                Some(shared_state_file.clone()),
+                initial_uuid_map,
+            )))
+        } else {
+            // Fall back to SSE when MQTT not available
+            Some(tokio::spawn(directory_sse_task(
+                client.clone(),
+                server.clone(),
+                fs_root_id.clone(),
+                directory.clone(),
+                file_states.clone(),
+                use_paths,
+                push_only,
+                pull_only,
+                author.clone(),
+                #[cfg(unix)]
+                inode_tracker.clone(),
+                watched_subdirs.clone(),
+                Some(written_schemas.clone()),
+                initial_schema_cid.clone(),
+                Some(shared_state_file.clone()),
+            )))
+        }
     } else {
-        info!("Push-only mode: skipping SSE subscription");
+        info!("Push-only mode: skipping subscription");
         None
     };
 
-    // Start SSE tasks for all node-backed subdirectories (skip if push-only)
+    // Start tasks for all node-backed subdirectories (skip if push-only)
     if !push_only {
         let params = SubdirSpawnParams {
             client: client.clone(),
@@ -1956,7 +1990,15 @@ async fn run_exec_mode(
             inode_tracker: inode_tracker.clone(),
             watched_subdirs: watched_subdirs.clone(),
         };
-        let count = spawn_subdir_watchers(&params, SubdirTransport::Sse).await;
+        let transport = if let Some(ref mqtt) = mqtt_client {
+            SubdirTransport::Mqtt {
+                client: mqtt.clone(),
+                workspace: workspace.clone(),
+            }
+        } else {
+            SubdirTransport::Sse
+        };
+        let count = spawn_subdir_watchers(&params, transport).await;
         info!("Spawned {} node-backed subdirectory watcher(s)", count);
     }
 
@@ -2353,7 +2395,7 @@ async fn run_exec_mode(
     if let Some(handle) = watcher_handle {
         handle.abort();
     }
-    if let Some(handle) = sse_handle {
+    if let Some(handle) = subscription_handle {
         handle.abort();
     }
     dir_event_handle.abort();

@@ -12,9 +12,13 @@ use crate::commit::Commit;
 use crate::document::{ApplyError, ContentType, Document, DocumentStore};
 use crate::events::{CommitBroadcaster, CommitNotification};
 use crate::fs::FilesystemReconciler;
+use crate::mqtt::client::MqttClient;
+use crate::mqtt::messages::EditMessage;
+use crate::mqtt::topics::Topic;
 use crate::store::CommitStore;
 use crate::sync::{base64_decode, create_yjs_structured_update};
 use crate::{b64, diff, replay::CommitReplayer};
+use rumqttc::QoS;
 
 fn preview_text(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
@@ -107,6 +111,10 @@ pub struct DocumentService {
     reconciler: Option<Arc<FilesystemReconciler>>,
     /// Filesystem root document ID (for triggering reconciliation)
     fs_root_id: Option<String>,
+    /// MQTT client for publishing commit notifications
+    mqtt_client: Option<Arc<MqttClient>>,
+    /// MQTT workspace for topic namespacing
+    mqtt_workspace: String,
 }
 
 impl DocumentService {
@@ -122,6 +130,8 @@ impl DocumentService {
             commit_broadcaster,
             reconciler: None,
             fs_root_id: None,
+            mqtt_client: None,
+            mqtt_workspace: String::new(),
         }
     }
 
@@ -139,6 +149,48 @@ impl DocumentService {
             commit_broadcaster,
             reconciler: Some(reconciler),
             fs_root_id: Some(fs_root_id),
+            mqtt_client: None,
+            mqtt_workspace: String::new(),
+        }
+    }
+
+    /// Create a new document service with MQTT publishing.
+    pub fn with_mqtt(
+        doc_store: Arc<DocumentStore>,
+        commit_store: Option<Arc<CommitStore>>,
+        commit_broadcaster: Option<CommitBroadcaster>,
+        mqtt_client: Arc<MqttClient>,
+        mqtt_workspace: String,
+    ) -> Self {
+        Self {
+            doc_store,
+            commit_store,
+            commit_broadcaster,
+            reconciler: None,
+            fs_root_id: None,
+            mqtt_client: Some(mqtt_client),
+            mqtt_workspace,
+        }
+    }
+
+    /// Create a new document service with filesystem reconciler and MQTT.
+    pub fn with_reconciler_and_mqtt(
+        doc_store: Arc<DocumentStore>,
+        commit_store: Option<Arc<CommitStore>>,
+        commit_broadcaster: Option<CommitBroadcaster>,
+        reconciler: Arc<FilesystemReconciler>,
+        fs_root_id: String,
+        mqtt_client: Arc<MqttClient>,
+        mqtt_workspace: String,
+    ) -> Self {
+        Self {
+            doc_store,
+            commit_store,
+            commit_broadcaster,
+            reconciler: Some(reconciler),
+            fs_root_id: Some(fs_root_id),
+            mqtt_client: Some(mqtt_client),
+            mqtt_workspace,
         }
     }
 
@@ -157,6 +209,43 @@ impl DocumentService {
     fn broadcast_commits(&self, doc_id: &str, commits: &[(String, u64)]) {
         for (commit_id, timestamp) in commits {
             self.broadcast_commit(doc_id, commit_id, *timestamp);
+        }
+    }
+
+    /// Publish a commit to MQTT for real-time sync.
+    ///
+    /// This publishes an EditMessage to the `{workspace}/edits/{doc_id}` topic,
+    /// allowing MQTT subscribers to receive document updates.
+    async fn publish_commit_to_mqtt(
+        &self,
+        doc_id: &str,
+        update_b64: &str,
+        parents: &[String],
+        author: &str,
+        message: Option<&str>,
+        timestamp: u64,
+    ) {
+        if let Some(ref mqtt) = self.mqtt_client {
+            let topic = Topic::edits(&self.mqtt_workspace, doc_id).to_topic_string();
+            let edit_msg = EditMessage {
+                update: update_b64.to_string(),
+                parents: parents.to_vec(),
+                author: author.to_string(),
+                message: message.map(String::from),
+                timestamp,
+            };
+            match serde_json::to_vec(&edit_msg) {
+                Ok(payload) => {
+                    if let Err(e) = mqtt.publish(&topic, &payload, QoS::AtLeastOnce).await {
+                        tracing::warn!("Failed to publish commit to MQTT topic {}: {}", topic, e);
+                    } else {
+                        tracing::debug!("Published commit to MQTT topic: {}", topic);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to serialize EditMessage for MQTT: {}", e);
+                }
+            }
         }
     }
 
@@ -288,6 +377,17 @@ impl DocumentService {
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
         self.broadcast_commit(id, &cid, timestamp);
+
+        // Publish to MQTT for real-time sync
+        self.publish_commit_to_mqtt(
+            id,
+            update_b64,
+            &commit.parents,
+            &commit.author,
+            commit.message.as_deref(),
+            timestamp,
+        )
+        .await;
 
         // Trigger filesystem reconciliation if this is the fs-root document
         self.maybe_reconcile(id).await;
@@ -423,6 +523,18 @@ impl DocumentService {
                     .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
                 self.broadcast_commits(id, &notifications);
+
+                // Publish to MQTT for real-time sync (edit commit, no merge needed)
+                self.publish_commit_to_mqtt(
+                    id,
+                    update_b64,
+                    &[parent.clone()],
+                    &author,
+                    message.as_deref(),
+                    edit_timestamp,
+                )
+                .await;
+
                 return Ok(CommitResult {
                     cid: edit_cid,
                     merge_cid: None,
@@ -432,7 +544,7 @@ impl DocumentService {
             let merge_commit = Commit::new(
                 merge_parents,
                 String::new(), // Empty update for merge
-                author,
+                author.clone(),
                 Some("Merge commit".to_string()),
             );
             let merge_timestamp = merge_commit.timestamp;
@@ -455,6 +567,17 @@ impl DocumentService {
                 .set_document_head(id, &merge_cid)
                 .await
                 .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+            // Publish edit commit to MQTT for real-time sync (merge case)
+            self.publish_commit_to_mqtt(
+                id,
+                update_b64,
+                &[parent.clone()],
+                &author,
+                message.as_deref(),
+                edit_timestamp,
+            )
+            .await;
 
             (edit_cid, Some(merge_cid))
         } else {
@@ -482,6 +605,18 @@ impl DocumentService {
                 .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
             notifications.push((cid.clone(), commit_timestamp));
+
+            // Publish to MQTT for real-time sync (simple commit case)
+            self.publish_commit_to_mqtt(
+                id,
+                update_b64,
+                &commit.parents,
+                &commit.author,
+                commit.message.as_deref(),
+                commit_timestamp,
+            )
+            .await;
+
             (cid, None)
         };
 
@@ -843,6 +978,17 @@ impl DocumentService {
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
         self.broadcast_commit(id, &cid, timestamp);
+
+        // Publish to MQTT for real-time sync
+        self.publish_commit_to_mqtt(
+            id,
+            &diff_result.update_b64,
+            &commit.parents,
+            &commit.author,
+            commit.message.as_deref(),
+            timestamp,
+        )
+        .await;
 
         // Trigger filesystem reconciliation if this is the fs-root document
         self.maybe_reconcile(id).await;
