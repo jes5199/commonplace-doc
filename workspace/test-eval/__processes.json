@@ -1,8 +1,1 @@
-{
-  "processes": {
-    "transform": {
-      "evaluate": "transform.ts",
-      "owns": "output.txt"
-    }
-  }
-}
+{}

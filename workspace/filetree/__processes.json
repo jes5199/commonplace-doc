@@ -1,1 +1,1 @@
-{"processes":{"filetree-to-xml":{"restart":"on-failure","owns":"filetree.xml","evaluate":"filetree-to-xml.ts"}}}
+{}
