@@ -141,7 +141,7 @@ pub async fn write_nested_schemas(
     directory: &Path,
     schema: &FsSchema,
     written_schemas: Option<&WrittenSchemas>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(ref root) = schema.root {
         // Track processed node_ids with their content hashes to prevent redundant fetches
         let mut processed_hashes: HashMap<String, String> = HashMap::new();
@@ -172,7 +172,7 @@ async fn write_nested_schemas_recursive(
     current_dir: &Path,
     processed_hashes: &mut HashMap<String, String>,
     written_schemas: Option<&WrittenSchemas>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(
         "write_nested_schemas_recursive: current_dir={:?}, entry_type={:?}",
         current_dir,

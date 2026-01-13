@@ -213,7 +213,7 @@ pub async fn handle_subdir_schema_cleanup(
     subdir_directory: &Path,
     root_directory: &Path,
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Fetch, parse, and validate schema from server
     let fetched = match fetch_and_validate_schema(client, server, subdir_node_id, true).await {
         Some(f) => f,
@@ -341,7 +341,7 @@ pub async fn handle_subdir_new_files(
     shared_state_file: Option<&crate::sync::SharedStateFile>,
     author: &str,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Don't pull if push_only mode
     if push_only {
         return Ok(());
@@ -599,7 +599,7 @@ pub async fn create_subdir_nested_directories(
     server: &str,
     subdir_node_id: &str,
     subdir_directory: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Fetch the subdirectory's schema from server
     let head = match fetch_head(client, server, subdir_node_id, false).await {
         Ok(Some(h)) => h,
@@ -651,7 +651,7 @@ pub async fn push_nested_schemas(
     directory: &Path,
     schema: &FsSchema,
     author: &str,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let mut pushed_count = 0;
     if let Some(ref root) = schema.root {
         pushed_count =
@@ -673,7 +673,7 @@ async fn push_nested_schemas_recursive(
     entry: &Entry,
     current_dir: &Path,
     author: &str,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let mut pushed_count = 0;
 
     if let Entry::Dir(dir) = entry {
@@ -792,7 +792,7 @@ pub async fn handle_schema_change(
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
     shared_state_file: Option<&crate::sync::SharedStateFile>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Fetch, parse, and validate schema from server
     let fetched = match fetch_and_validate_schema(client, server, fs_root_id, true).await {
         Some(f) => f,
@@ -1069,7 +1069,7 @@ pub async fn handle_schema_change_with_dedup(
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
     shared_state_file: Option<&crate::sync::SharedStateFile>,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     // Fetch current schema from server
     let head = match fetch_head(client, server, fs_root_id, false).await {
         Ok(Some(h)) => h,
@@ -1152,7 +1152,7 @@ pub async fn ensure_fs_root_exists(
     client: &Client,
     server: &str,
     fs_root_id: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let doc_url = build_info_url(server, fs_root_id);
     let resp = client.get(&doc_url).send().await?;
     if !resp.status().is_success() {
@@ -1199,7 +1199,7 @@ pub async fn sync_schema(
     initial_sync_strategy: &str,
     server_has_content: bool,
     author: &str,
-) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
+) -> Result<(String, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
     // Scan directory and generate FS schema
     info!("Scanning directory...");
     let schema = scan_directory(directory, options).map_err(|e| format!("Scan error: {}", e))?;
@@ -1359,7 +1359,7 @@ pub async fn handle_schema_modified(
     schema_path: &Path,
     content: &str,
     author: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Validate the schema content
     let _schema: FsSchema =
         serde_json::from_str(content).map_err(|e| format!("Invalid schema JSON: {}", e))?;

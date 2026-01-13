@@ -159,6 +159,30 @@ pub async fn remove_file_state_and_abort(
     }
 }
 
+/// Reverse map from UUID to file paths.
+///
+/// Used to look up which local file(s) to update when we receive an edit
+/// for a file UUID. Multiple paths can map to the same UUID when files
+/// are linked via `commonplace-link`.
+///
+/// Key: UUID (node_id)
+/// Value: List of relative paths that have this UUID
+pub type UuidToPathsMap = HashMap<String, Vec<String>>;
+
+/// Build a reverse map (uuid -> paths) from a forward uuid_map (path -> uuid).
+///
+/// This allows looking up which files to update when we receive an edit for a UUID.
+pub fn build_uuid_to_paths_map(uuid_map: &HashMap<String, String>) -> UuidToPathsMap {
+    let mut reverse_map: UuidToPathsMap = HashMap::new();
+    for (path, uuid) in uuid_map {
+        reverse_map
+            .entry(uuid.clone())
+            .or_default()
+            .push(path.clone());
+    }
+    reverse_map
+}
+
 /// Event published when initial sync completes.
 ///
 /// Published to `{fs_root_id}/events/sync/initial-complete` via MQTT.
@@ -198,5 +222,27 @@ mod tests {
         assert_eq!(parsed.files_synced, 42);
         assert_eq!(parsed.strategy, "local");
         assert_eq!(parsed.duration_ms, 1523);
+    }
+
+    #[test]
+    fn test_build_uuid_to_paths_map() {
+        let mut uuid_map = HashMap::new();
+        uuid_map.insert("file1.txt".to_string(), "uuid-a".to_string());
+        uuid_map.insert("file2.txt".to_string(), "uuid-b".to_string());
+        // Two paths share the same UUID (linked files)
+        uuid_map.insert("linked/file3.txt".to_string(), "uuid-a".to_string());
+
+        let reverse_map = build_uuid_to_paths_map(&uuid_map);
+
+        // uuid-a should have two paths
+        let paths_a = reverse_map.get("uuid-a").unwrap();
+        assert_eq!(paths_a.len(), 2);
+        assert!(paths_a.contains(&"file1.txt".to_string()));
+        assert!(paths_a.contains(&"linked/file3.txt".to_string()));
+
+        // uuid-b should have one path
+        let paths_b = reverse_map.get("uuid-b").unwrap();
+        assert_eq!(paths_b.len(), 1);
+        assert!(paths_b.contains(&"file2.txt".to_string()));
     }
 }

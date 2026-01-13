@@ -125,9 +125,10 @@ pub use sse::{
 pub use state::{hardlink_from_fd, hardlink_from_path, SHADOW_IDLE_TIMEOUT, SHADOW_MIN_LIFETIME};
 pub use state::{InodeKey, InodeState, InodeTracker, PendingWrite, SyncState};
 pub use types::{
-    remove_file_state_and_abort, CommitData, DirEvent, EditEventData, EditRequest, EditResponse,
-    FileEvent, FileSyncState, ForkResponse, HeadResponse, ReplaceResponse, ReplaceSummary,
-    SharedStateFile, WrittenSchemas,
+    build_uuid_to_paths_map, remove_file_state_and_abort, CommitData, DirEvent, EditEventData,
+    EditRequest, EditResponse, FileEvent, FileSyncState, ForkResponse, HeadResponse,
+    InitialSyncComplete, ReplaceResponse, ReplaceSummary, SharedStateFile, UuidToPathsMap,
+    WrittenSchemas,
 };
 pub use urls::{
     build_commits_url, build_edit_url, build_fork_url, build_head_at_commit_url, build_head_url,
