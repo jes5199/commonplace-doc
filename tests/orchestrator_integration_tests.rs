@@ -1116,9 +1116,23 @@ fn wait_for_file(
     timeout: Duration,
 ) -> Result<String, String> {
     let start = std::time::Instant::now();
+    let mut last_content: Option<String> = None;
     loop {
         if start.elapsed() > timeout {
-            return Err(format!("Timeout waiting for file {:?}", path));
+            // Include actual content in error for better debugging
+            return match (expected_content, &last_content) {
+                (Some(expected), Some(actual)) => Err(format!(
+                    "Timeout waiting for file {:?}: expected {:?}, got {:?}",
+                    path,
+                    expected,
+                    actual.trim()
+                )),
+                (Some(_), None) => Err(format!(
+                    "Timeout waiting for file {:?}: file does not exist",
+                    path
+                )),
+                _ => Err(format!("Timeout waiting for file {:?}", path)),
+            };
         }
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(path) {
@@ -1126,6 +1140,7 @@ fn wait_for_file(
                     if content.trim() == expected.trim() {
                         return Ok(content);
                     }
+                    last_content = Some(content);
                 } else {
                     return Ok(content);
                 }
@@ -1308,6 +1323,10 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     let content = wait_for_file(&sandbox_test_file, Some("hello"), Duration::from_secs(10))
         .expect("File should appear in sandbox with content 'hello'");
     assert_eq!(content.trim(), "hello", "Sandbox file content should match");
+
+    // Wait for per-file watcher to be fully set up before editing
+    // The watcher is spawned asynchronously, so we need to give it time to start
+    std::thread::sleep(Duration::from_secs(2));
 
     // === E1-E2: Edit Propagation (workspace -> sandbox) ===
 
@@ -2007,6 +2026,10 @@ fn test_jsonl_file_append_sync_behavior() {
         content
     );
     eprintln!("J2-J3: JSONL file synced to sandbox with correct content");
+
+    // Wait for per-file watcher to be fully set up before editing
+    // The watcher is spawned asynchronously, so we need to give it time to start
+    std::thread::sleep(Duration::from_secs(2));
 
     // === J4: Append second line ===
     eprintln!("=== J4: Appending second line ===");
