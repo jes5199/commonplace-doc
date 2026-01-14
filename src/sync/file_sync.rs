@@ -107,7 +107,7 @@ pub async fn upload_task(
     force_push: bool,
     author: String,
 ) {
-    'event_loop: while let Some(event) = rx.recv().await {
+    while let Some(event) = rx.recv().await {
         // Extract captured content from the event
         // The watcher captures content at notification time to prevent race conditions
         // where SSE might overwrite the file between event dispatch and us reading it.
@@ -787,7 +787,7 @@ pub async fn upload_task_with_flock(
     flock_state: FlockSyncState,
     author: String,
 ) {
-    'event_loop: while let Some(event) = rx.recv().await {
+    while let Some(event) = rx.recv().await {
         // Small delay to allow any concurrent SSE state updates to complete.
         sleep(Duration::from_millis(50)).await;
 
