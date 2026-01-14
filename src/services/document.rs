@@ -528,7 +528,7 @@ impl DocumentService {
                 self.publish_commit_to_mqtt(
                     id,
                     update_b64,
-                    &[parent.clone()],
+                    std::slice::from_ref(&parent),
                     &author,
                     message.as_deref(),
                     edit_timestamp,
@@ -572,7 +572,7 @@ impl DocumentService {
             self.publish_commit_to_mqtt(
                 id,
                 update_b64,
-                &[parent.clone()],
+                std::slice::from_ref(&parent),
                 &author,
                 message.as_deref(),
                 edit_timestamp,
