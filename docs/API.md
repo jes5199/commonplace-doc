@@ -1,138 +1,343 @@
-# API
+# Commonplace API Reference
 
-Base URL (default): `http://127.0.0.1:5199`
+This document describes all HTTP endpoints and MQTT topics available in the commonplace server.
 
-## Health
+Base URL (default): `http://127.0.0.1:3000`
 
-### `GET /health`
+---
 
-- `200 OK`
-- body: `OK`
+## HTTP Endpoints
 
-## Documents
+### Health Check
 
-### `POST /docs`
+#### `GET /health`
+
+Returns `OK` if the server is running.
+
+---
+
+### Document API (ID-based)
+
+All document operations use UUID-based identifiers.
+
+#### `POST /docs`
 
 Creates a blank document based on the request `Content-Type`.
 
-Supported `Content-Type` values:
+**Supported Content-Types:**
+- `application/json` - JSON documents (Y.Map)
+- `application/jsonl` - JSON Lines documents
+- `application/xml` or `text/xml` - XML documents (Y.XmlFragment)
+- `text/plain` - Plain text documents (Y.Text)
 
-- `application/json`
-- `application/xml` (or `text/xml`)
-- `text/plain`
+**Response:** `{"id": "<uuid>"}`
 
-Response:
+**Errors:**
+- `415 Unsupported Media Type` if Content-Type not supported
 
-- `200 OK`
-- `application/json`
-- body: `{"id":"<uuid>"}` (UUIDv4 string)
+#### `GET /docs/:id`
 
-Errors:
+Returns document content with appropriate Content-Type header.
 
-- `415 Unsupported Media Type` if `Content-Type` is not supported.
+**Errors:**
+- `404 Not Found` if document doesn't exist
 
-Example:
+#### `DELETE /docs/:id`
 
-```bash
-curl -X POST http://127.0.0.1:5199/docs -H 'Content-Type: application/json'
+Deletes a document.
+
+**Response:** `204 No Content`
+
+**Errors:**
+- `404 Not Found` if document doesn't exist
+
+#### `GET /docs/:id/info`
+
+Returns document metadata.
+
+**Response:** `{"id": "<uuid>", "content_type": "text/plain"}`
+
+#### `GET /docs/:id/head`
+
+Returns HEAD commit, content, and Yjs state.
+
+**Query Parameters:**
+- `at` - Optional commit ID to get historical state
+
+**Response:**
+```json
+{
+  "cid": "<commit_id>",
+  "content": "<document content>",
+  "state": "<base64 Yjs state>"
+}
 ```
 
-### `GET /docs/:id`
+#### `POST /docs/:id/edit`
 
-Returns the document content and sets the response `Content-Type` to match the document’s type.
+Applies a Yjs update to the document.
 
-Response:
-
-- `200 OK` with body content
-- `404 Not Found` if the ID does not exist
-
-Example:
-
-```bash
-curl -i http://127.0.0.1:5199/docs/<uuid>
+**Request Body:**
+```json
+{
+  "update": "<base64 Yjs update>",
+  "author": "optional",
+  "message": "optional"
+}
 ```
 
-### `DELETE /docs/:id`
+**Response:** `{"cid": "<commit_id>", "timestamp": 1234567890}`
 
-Response:
+#### `POST /docs/:id/replace`
 
-- `204 No Content` if deleted
-- `404 Not Found` if not found
+Replaces document content with automatic diff computation.
 
-## Commits (requires `--database`)
+**Request Body:**
+```json
+{
+  "content": "<new content>",
+  "parent_cid": "optional - required if document has history",
+  "author": "optional"
+}
+```
 
-The commit API persists a content-addressed commit graph (a commit’s CID is a SHA-256 hash of the JSON-serialized commit).
+**Response:**
+```json
+{
+  "cid": "<commit_id>",
+  "edit_cid": "<edit_commit_id>",
+  "chars_inserted": 10,
+  "chars_deleted": 5,
+  "operations": 2
+}
+```
 
-### `POST /docs/:id/commit`
+**Errors:**
+- `428 Precondition Required` if document has history but no parent_cid provided
 
-Requires that the server is started with `--database <path>`. Otherwise:
+#### `POST /docs/:id/commit` (requires `--database`)
 
-- `501 Not Implemented`
+Creates a commit with explicit Yjs update.
 
-Request body (JSON):
-
+**Request Body:**
 ```json
 {
   "verb": "update",
-  "value": "<string>",
-  "author": "optional string (defaults to anonymous)",
-  "message": "optional string",
-  "parent_cid": "optional string"
+  "value": "<base64 Yjs update>",
+  "author": "optional",
+  "message": "optional",
+  "parent_cid": "optional"
 }
 ```
 
-Notes:
+**Response:** `{"cid": "<commit_id>", "merge_cid": "<optional merge commit>"}`
 
-- Only `"verb": "update"` is accepted today.
-- `"value"` is stored as `Commit.update` and is expected to be a base64-encoded Yjs update.
-- For `text/plain`, `application/json`, and `application/xml` documents, the server decodes and applies the update to the in-memory document body.
-- Root types by content type:
-  - `text/plain`: `Y.Text("content")`
-  - `application/json`: `Y.Map("content")`
-  - `application/xml`: `Y.XmlFragment("content")` (rendered under a fixed `<root>...</root>` wrapper)
-- If `parent_cid` is provided and there is an existing document head, the server will create a merge commit and advance the head to the merge.
+**Errors:**
+- `501 Not Implemented` if server started without `--database`
+- `409 Conflict` if commit violates monotonic descent
 
-Response (JSON):
+#### `POST /docs/:id/fork`
 
+Forks a document at HEAD or specific commit.
+
+**Request Body:**
 ```json
 {
-  "cid": "<edit or normal commit cid>",
-  "merge_cid": "<merge cid, only for merge workflow>"
+  "at_commit": "optional commit_id"
 }
 ```
 
-Status codes:
+**Response:** `{"id": "<new_doc_id>", "head": "<head_commit_id>"}`
 
-- `200 OK` on success
-- `404 Not Found` if the document ID does not exist
-- `400 Bad Request` if `verb` is not `"update"`
-- `409 Conflict` if the new commit cannot be added without violating monotonic descent
-- `500 Internal Server Error` on store failures
+#### `GET /docs/:id/is-ancestor`
 
-Example (simple commit):
+Checks if one commit is an ancestor of another.
 
-```bash
-curl -X POST http://127.0.0.1:5199/docs/<uuid>/commit \
-  -H 'Content-Type: application/json' \
-  -d '{"verb":"update","value":"AAEC...","author":"jes","message":"first"}'
+**Query Parameters:**
+- `ancestor` - Potential ancestor commit ID
+- `descendant` - Potential descendant commit ID
+
+**Response:** `{"is_ancestor": true}`
+
+#### `GET /fs-root`
+
+Returns the filesystem root document ID (if configured with `--fs-root`).
+
+**Response:** `{"id": "<fs_root_id>"}`
+
+---
+
+### File API (Path-based)
+
+Path-based access resolves filesystem paths to document IDs via the fs-root schema.
+Requires server to be started with `--fs-root`.
+
+#### `GET /files/*path`
+
+Get file content by path.
+
+#### `GET /files/*path/head`
+
+Get HEAD commit for file.
+
+#### `POST /files/*path/edit`
+
+Apply Yjs update to file. Same body as `/docs/:id/edit`.
+
+#### `POST /files/*path/replace`
+
+Replace file content. Same body as `/docs/:id/replace`.
+
+#### `DELETE /files/*path`
+
+Delete file.
+
+---
+
+### Server-Sent Events (SSE)
+
+Real-time document update streams.
+
+#### `GET /sse/docs/:id`
+
+Stream edits for a document by ID. Emits `commit` events with:
+```json
+{
+  "doc_id": "<uuid>",
+  "commit_id": "<cid>",
+  "timestamp": 1234567890
+}
 ```
 
-Example (merge workflow):
+#### `GET /sse/files/*path`
 
-```bash
-curl -X POST http://127.0.0.1:5199/docs/<uuid>/commit \
-  -H 'Content-Type: application/json' \
-  -d '{"verb":"update","value":"AAEC...","author":"jes","parent_cid":"<some prior cid>"}'
+Stream edits for a document by path.
+
+#### `GET /documents/:id/changes`
+
+Get commit history as JSON array.
+
+#### `GET /documents/:id/commits`
+
+Get commits with full Yjs updates.
+
+#### `GET /documents/:id/stream`
+
+Stream commit changes as SSE.
+
+#### `GET /documents/changes?ids=id1,id2`
+
+Get changes for multiple documents.
+
+#### `GET /documents/stream?ids=id1,id2`
+
+Stream changes for multiple documents.
+
+---
+
+### WebSocket
+
+Real-time Yjs synchronization using WebSocket.
+
+#### `GET /ws/docs/:id`
+
+WebSocket sync by document ID.
+
+#### `GET /ws/files/*path`
+
+WebSocket sync by file path.
+
+**Subprotocols:**
+- `y-websocket` - Standard Yjs protocol (browser compatibility)
+- `commonplace` - Extended protocol with commit metadata
+
+---
+
+### Optional Routes
+
+**Viewer** (requires `--static-dir`):
+- `GET /view/docs/:id` - Document viewer page
+- `GET /view/files/*path` - File viewer page
+- `GET /static/*path` - Static assets
+
+**SDK**:
+- `GET /sdk/*file_path` - TypeScript SDK for Deno imports
+
+---
+
+## MQTT Topics
+
+All MQTT topics follow the pattern: `{workspace}/{port}/{path}[/{qualifier}]`
+
+Default workspace: `commonplace`
+
+### Port Types
+
+| Port | Purpose | QoS | Persistence |
+|------|---------|-----|-------------|
+| `edits` | Yjs document updates | AtLeastOnce (1) | Persistent (blue) |
+| `sync` | Merkle tree synchronization | AtLeastOnce (1) | Persistent (blue) |
+| `events` | Ephemeral broadcasts | AtMostOnce (0) | Ephemeral (red) |
+| `commands` | Store-level operations | AtLeastOnce (1) | Request/Response |
+
+### Edits Port
+
+Persistent Yjs commits for document synchronization.
+
+**Topics:**
+- `{workspace}/edits/{doc_id}` - Single document
+- `{workspace}/edits/#` - All documents (wildcard)
+
+**Message Format (EditMessage):**
+```json
+{
+  "update": "<base64 Yjs update>",
+  "parents": ["<parent_cid>"],
+  "author": "client-name",
+  "message": "optional",
+  "timestamp": 1234567890
+}
 ```
 
-## SSE (placeholder)
+### Sync Port
 
-### `GET /sse/documents/:id`
+Merkle tree synchronization for state reconciliation.
 
-Returns a `text/event-stream` that emits a `heartbeat` event every ~30s.
+**Topics:**
+- `{workspace}/sync/{doc_id}/{client_id}` - Client-specific
 
-Example:
+### Events Port
 
-```bash
-curl -N http://127.0.0.1:5199/sse/documents/<uuid>
-```
+Ephemeral JSON broadcasts.
+
+**Topics:**
+- `{workspace}/events/{doc_id}/{event_name}` - Specific event
+- `{workspace}/events/{doc_id}/#` - All events for doc
+
+### Commands Port
+
+Store-level operations.
+
+**Topics:**
+- `{workspace}/commands/create-document`
+- `{workspace}/commands/delete-document`
+- `{workspace}/commands/get-content`
+- `{workspace}/commands/get-info`
+
+**Responses:** `{workspace}/responses`
+
+---
+
+## Notes
+
+### Document ID Encoding
+
+Document IDs containing `/` must be URL-encoded in HTTP paths.
+Example: `workspace/file.txt` becomes `workspace%2Ffile.txt`
+
+### CRDT Safety
+
+When editing documents with existing history:
+1. Fetch HEAD first to get current state
+2. Include `parent_cid` in edit/replace requests
+3. Server rejects blind edits (returns `428 Precondition Required`)
