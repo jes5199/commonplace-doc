@@ -178,6 +178,14 @@ pub async fn upload_task(
                     s.needs_head_refresh = false;
                     echo_detected = true;
                 } else {
+                    debug!(
+                        "Barrier present but content mismatch (id={}) - file: {:?} (len={}), pending: {:?} (len={})",
+                        pending.write_id,
+                        &content.chars().take(50).collect::<String>(),
+                        content.len(),
+                        &pending.content.chars().take(50).collect::<String>(),
+                        pending.content.len()
+                    );
                     // Content differs from pending - could be:
                     // a) Partial write (we're mid-write or just finished)
                     // b) User edit during our write
@@ -270,6 +278,14 @@ pub async fn upload_task(
                 if content == s.last_written_content {
                     debug!("Ignoring echo: content matches last written");
                     echo_detected = true;
+                } else {
+                    debug!(
+                        "No barrier, content mismatch - file: {:?} (len={}), last_written: {:?} (len={})",
+                        &content.chars().take(50).collect::<String>(),
+                        content.len(),
+                        &s.last_written_content.chars().take(50).collect::<String>(),
+                        s.last_written_content.len()
+                    );
                 }
             }
         }
@@ -419,6 +435,23 @@ pub async fn upload_task(
 
         // Track upload success - only refresh if upload succeeded
         let mut upload_succeeded = false;
+
+        // Final safety check: if our content matches server HEAD, skip upload entirely.
+        // This prevents feedback loops when echo detection fails due to race conditions.
+        // The cost is one extra HEAD fetch, but it's worth it to prevent CRDT duplication.
+        if let Ok(Some(head)) = fetch_head(&client, &server, &identifier, use_paths).await {
+            if head.content == content {
+                debug!(
+                    "Content already matches server HEAD, skipping redundant upload (cid: {:?})",
+                    head.cid.as_ref().map(|c| &c[..8.min(c.len())])
+                );
+                // Update state to reflect server's current CID
+                let mut s = state.write().await;
+                s.last_written_cid = head.cid;
+                s.last_written_content = content;
+                continue;
+            }
+        }
 
         match parent_cid {
             Some(parent) => {
@@ -865,6 +898,21 @@ pub async fn upload_task_with_flock(
 
         let mut upload_succeeded = false;
 
+        // Final safety check: if our content matches server HEAD, skip upload entirely.
+        // This prevents feedback loops when echo detection fails due to race conditions.
+        if let Ok(Some(head)) = fetch_head(&client, &server, &identifier, use_paths).await {
+            if head.content == content {
+                debug!(
+                    "Content already matches server HEAD, skipping redundant upload (cid: {:?})",
+                    head.cid.as_ref().map(|c| &c[..8.min(c.len())])
+                );
+                let mut s = state.write().await;
+                s.last_written_cid = head.cid;
+                s.last_written_content = content;
+                continue;
+            }
+        }
+
         match parent_cid {
             Some(parent) => {
                 let replace_url =
@@ -1072,10 +1120,12 @@ pub async fn initial_sync(
     };
 
     // Update state and persist to state file
+    // Use actual written content for echo detection (important for text files with trailing newlines)
+    let written_content_str = String::from_utf8_lossy(&bytes_written).to_string();
     {
         let mut s = state.write().await;
         s.last_written_cid = head.cid.clone();
-        s.last_written_content = head.content.clone();
+        s.last_written_content = written_content_str;
 
         // Save to state file for offline change detection
         // Use the actual bytes written to disk, not the server response
@@ -1330,19 +1380,24 @@ pub async fn sync_single_file(
                         .await?;
                     } else {
                         // Pull server content to local
-                        if file.is_binary {
+                        // Track the actual content written to file for echo detection
+                        let written_content = if file.is_binary {
                             if let Ok(decoded) = STANDARD.decode(&head.content) {
                                 tokio::fs::write(file_path, &decoded).await?;
+                                head.content.clone() // Binary: store base64
+                            } else {
+                                head.content.clone()
                             }
                         } else {
                             // Ensure text files end with a trailing newline
                             let content_with_newline = ensure_trailing_newline(&head.content);
-                            tokio::fs::write(file_path, content_with_newline).await?;
-                        }
-                        // Seed SyncState with server content after pull
+                            tokio::fs::write(file_path, &content_with_newline).await?;
+                            content_with_newline // Store content WITH newline for echo detection
+                        };
+                        // Seed SyncState with ACTUAL written content for echo detection
                         let mut s = state.write().await;
                         s.last_written_cid = head.cid.clone();
-                        s.last_written_content = head.content.clone();
+                        s.last_written_content = written_content;
                     }
                 } else if initial_sync_strategy == "skip" && file.content != head.content {
                     // Offline edits detected - push local changes to server
