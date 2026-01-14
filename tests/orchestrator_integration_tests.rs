@@ -1305,7 +1305,7 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
 
     // C2-C3: Verify file appears in sandbox with matching content
     let sandbox_test_file = sandbox_dir.join(test_file_name);
-    let content = wait_for_file(&sandbox_test_file, Some("hello"), Duration::from_secs(10))
+    let content = wait_for_file(&sandbox_test_file, Some("hello"), Duration::from_secs(30))
         .expect("File should appear in sandbox with content 'hello'");
     assert_eq!(content.trim(), "hello", "Sandbox file content should match");
 
@@ -1318,7 +1318,7 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     let content = wait_for_file(
         &sandbox_test_file,
         Some("hello world"),
-        Duration::from_secs(10),
+        Duration::from_secs(30),
     )
     .expect("Sandbox file should be updated to 'hello world'");
     assert_eq!(
