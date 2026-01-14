@@ -64,6 +64,32 @@ impl Commit {
     pub fn is_initial(&self) -> bool {
         self.parents.is_empty()
     }
+
+    /// Check if this is a snapshot/compaction commit
+    pub fn is_snapshot(&self) -> bool {
+        self.extensions
+            .get("is_snapshot")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Mark this commit as a snapshot/compaction commit
+    pub fn set_snapshot(&mut self) {
+        self.extensions
+            .insert("is_snapshot".to_string(), serde_json::Value::Bool(true));
+    }
+
+    /// Create a new snapshot commit with compacted state
+    pub fn new_snapshot(parent: String, compacted_update: String, author: String) -> Self {
+        let mut commit = Self::new(
+            vec![parent],
+            compacted_update,
+            author,
+            Some("Compaction snapshot".to_string()),
+        );
+        commit.set_snapshot();
+        commit
+    }
 }
 
 #[cfg(test)]
