@@ -478,7 +478,8 @@ impl<'a> CommitReplayer<'a> {
         }
 
         // Sort by timestamp (oldest first) for proper replay order
-        result.sort_by_key(|(_, c)| c.timestamp);
+        // When timestamps are equal, put snapshots first (they contain prior state)
+        result.sort_by_key(|(_, c)| (c.timestamp, !c.is_snapshot()));
 
         debug!(
             "collect_commits_to_target({}) found {} commits{}",
