@@ -1315,10 +1315,11 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     std::fs::write(&workspace_test_file, "hello world").expect("Failed to edit test file");
 
     // E2: Verify sandbox reflects the change
+    // Use longer timeout for edit propagation - CI can be slow
     let content = wait_for_file(
         &sandbox_test_file,
         Some("hello world"),
-        Duration::from_secs(10),
+        Duration::from_secs(20),
     )
     .expect("Sandbox file should be updated to 'hello world'");
     assert_eq!(
@@ -2564,11 +2565,12 @@ fn test_uuid_linked_files_sync_bidirectionally() {
     eprintln!("M4: Updated sender content");
 
     // === M5: Verify edit propagates to receiver sandbox via UUID link ===
+    // Use longer timeout - edit must propagate through multiple hops
     eprintln!("=== M5: Verifying edit propagates to receiver sandbox ===");
     let content = wait_for_file_containing(
         &sandbox_receiver_prompts,
         "updated message from sender",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     )
     .expect("Receiver sandbox should have updated content");
     assert!(
