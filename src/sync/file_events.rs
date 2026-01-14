@@ -5,7 +5,7 @@
 
 use crate::fs::{Entry, FsSchema};
 use crate::sync::directory::{scan_directory_to_json, ScanOptions};
-use crate::sync::schema_io::SCHEMA_FILENAME;
+use crate::sync::schema_io::{write_schema_file, SCHEMA_FILENAME};
 use crate::sync::state_file::compute_content_hash;
 use crate::sync::uuid_map::{fetch_node_id_from_schema, fetch_subdir_node_id};
 use crate::sync::{
@@ -164,6 +164,7 @@ pub async fn handle_file_created(
     shared_state_file: Option<&crate::sync::SharedStateFile>,
     author: &str,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    written_schemas: Option<&crate::sync::WrittenSchemas>,
 ) {
     debug!("Directory event: file created: {}", path.display());
 
@@ -311,6 +312,12 @@ pub async fn handle_file_created(
                     // Update schema to point to forked node
                     // Use the owning document's directory and ID
                     if let Ok(json) = scan_directory_to_json(&owning_doc.directory, options) {
+                        // Write schema locally and track for echo detection
+                        if let Err(e) =
+                            write_schema_file(&owning_doc.directory, &json, written_schemas).await
+                        {
+                            warn!("Failed to write local schema: {}", e);
+                        }
                         if let Err(e) = push_schema_to_server(
                             client,
                             server,
@@ -344,6 +351,14 @@ pub async fn handle_file_created(
             // Push updated schema FIRST so server reconciler creates the node
             // Use the owning document's directory and ID
             if let Ok(json) = scan_directory_to_json(&owning_doc.directory, options) {
+                // Write schema locally and track for echo detection
+                // This prevents handle_schema_change from deleting the file we just created
+                // if it receives a stale schema update from another client
+                if let Err(e) =
+                    write_schema_file(&owning_doc.directory, &json, written_schemas).await
+                {
+                    warn!("Failed to write local schema: {}", e);
+                }
                 if let Err(e) =
                     push_schema_to_server(client, server, &owning_doc.document_id, &json, author)
                         .await

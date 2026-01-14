@@ -197,7 +197,7 @@ fn create_yjs_json_update_impl(
     base_state: Option<&str>,
     additive_only: bool,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let new_value: serde_json::Value = serde_json::from_str(new_json)?;
+    let mut new_value: serde_json::Value = serde_json::from_str(new_json)?;
 
     let doc = Doc::with_client_id(1);
 
@@ -208,6 +208,21 @@ fn create_yjs_json_update_impl(
                 if let Ok(update) = Update::decode_v1(&state_bytes) {
                     let mut txn = doc.transact_mut();
                     txn.apply_update(update);
+                }
+            }
+        }
+    }
+
+    // For additive merge, deep merge the new JSON with existing content
+    // This preserves entries from other sync clients when multiple clients
+    // push updates to the same schema document
+    if additive_only {
+        let txn = doc.transact();
+        if let Some(map) = txn.get_map(TEXT_ROOT_NAME) {
+            let existing_json = map.to_json(&txn);
+            if let serde_json::Value::Object(existing_obj) = any_to_json_value(existing_json) {
+                if let serde_json::Value::Object(ref mut new_obj) = new_value {
+                    deep_merge_objects(new_obj, &existing_obj);
                 }
             }
         }
@@ -261,6 +276,34 @@ fn create_yjs_json_update_impl(
     };
 
     Ok(base64_encode(&update))
+}
+
+/// Deep merge objects, preserving entries from the existing object when not in new.
+/// This specifically handles schema merges where `root.entries` should combine
+/// entries from multiple sync clients.
+fn deep_merge_objects(
+    new_obj: &mut serde_json::Map<String, serde_json::Value>,
+    existing_obj: &serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, existing_val) in existing_obj {
+        match new_obj.get_mut(key) {
+            Some(new_val) => {
+                // Both have this key - recursively merge if both are objects
+                if let (
+                    serde_json::Value::Object(new_inner),
+                    serde_json::Value::Object(existing_inner),
+                ) = (new_val, existing_val)
+                {
+                    deep_merge_objects(new_inner, existing_inner);
+                }
+                // Otherwise keep the new value (it takes precedence)
+            }
+            None => {
+                // Key only in existing - preserve it
+                new_obj.insert(key.clone(), existing_val.clone());
+            }
+        }
+    }
 }
 
 /// Convert serde_json::Value to yrs::Any

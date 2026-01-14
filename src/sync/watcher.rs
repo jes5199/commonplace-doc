@@ -509,7 +509,7 @@ pub async fn directory_watcher_task(
                 }
             } => {
                 debounce_timer = None;
-                for (_, event) in pending_events.drain() {
+                for (_path, event) in pending_events.drain() {
                     if tx.send(event).await.is_err() {
                         return;
                     }

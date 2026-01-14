@@ -1297,7 +1297,6 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     eprintln!("Sandbox directory: {:?}", sandbox_dir);
 
     // === C1-C3: File Creation Propagation ===
-    eprintln!("=== Testing file creation propagation ===");
 
     // C1: Create a new file in workspace
     let test_file_name = "test-file.txt";
@@ -1309,10 +1308,8 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     let content = wait_for_file(&sandbox_test_file, Some("hello"), Duration::from_secs(10))
         .expect("File should appear in sandbox with content 'hello'");
     assert_eq!(content.trim(), "hello", "Sandbox file content should match");
-    eprintln!("C1-C3: File creation propagation PASSED");
 
     // === E1-E2: Edit Propagation (workspace -> sandbox) ===
-    eprintln!("=== Testing edit propagation: workspace -> sandbox ===");
 
     // E1: Edit file in workspace
     std::fs::write(&workspace_test_file, "hello world").expect("Failed to edit test file");
@@ -1329,10 +1326,8 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
         "hello world",
         "Sandbox file should show edit"
     );
-    eprintln!("E1-E2: Edit propagation (workspace -> sandbox) PASSED");
 
     // === E3-E4: Edit Propagation (sandbox -> workspace) ===
-    eprintln!("=== Testing edit propagation: sandbox -> workspace ===");
 
     // Wait for CRDT states to fully synchronize before making sandbox edit
     // This gives time for all pending sync operations to complete
@@ -1341,8 +1336,6 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     // Verify both sides have the same content before sandbox edit
     let workspace_pre = std::fs::read_to_string(&workspace_test_file).unwrap();
     let sandbox_pre = std::fs::read_to_string(&sandbox_test_file).unwrap();
-    eprintln!("Pre-edit workspace: {:?}", workspace_pre);
-    eprintln!("Pre-edit sandbox: {:?}", sandbox_pre);
     assert_eq!(
         workspace_pre.trim(),
         sandbox_pre.trim(),
@@ -1353,7 +1346,6 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     // Use a completely different content to avoid CRDT merge confusion
     let new_content = "sandbox edit test";
     std::fs::write(&sandbox_test_file, new_content).expect("Failed to edit sandbox file");
-    eprintln!("Sandbox file written: {:?}", new_content);
 
     // E4: Verify workspace reflects the change
     let content = wait_for_file(
@@ -1367,10 +1359,8 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
         new_content,
         "Workspace file should show sandbox edit"
     );
-    eprintln!("E3-E4: Edit propagation (sandbox -> workspace) PASSED");
 
     // === D1-D2: File Deletion Propagation ===
-    eprintln!("=== Testing file deletion propagation ===");
 
     // D1: Delete file in workspace
     std::fs::remove_file(&workspace_test_file).expect("Failed to delete test file");
@@ -1378,9 +1368,6 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     // D2: Verify file is removed from sandbox
     wait_for_file_deleted(&sandbox_test_file, Duration::from_secs(10))
         .expect("Sandbox file should be deleted when workspace file is deleted");
-    eprintln!("D1-D2: File deletion propagation PASSED");
-
-    eprintln!("=== All sync tests PASSED ===");
 }
 
 /// Helper to extract node_id from a schema entry

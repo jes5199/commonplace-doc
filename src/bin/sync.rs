@@ -144,6 +144,7 @@ async fn handle_dir_event(
     shared_state_file: Option<&SharedStateFile>,
     author: &str,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<InodeTracker>>>,
+    written_schemas: Option<&WrittenSchemas>,
     event: DirEvent,
 ) {
     match event {
@@ -163,6 +164,7 @@ async fn handle_dir_event(
                 author,
                 #[cfg(unix)]
                 inode_tracker,
+                written_schemas,
             )
             .await;
         }
@@ -1536,6 +1538,7 @@ async fn run_directory_mode(
         let options = options.clone();
         let file_states = file_states.clone();
         let shared_state_file = shared_state_file.clone();
+        let written_schemas = written_schemas.clone();
         let author = author.clone();
         #[cfg(unix)]
         let inode_tracker = inode_tracker.clone();
@@ -1555,6 +1558,7 @@ async fn run_directory_mode(
                     &author,
                     #[cfg(unix)]
                     inode_tracker.clone(),
+                    Some(&written_schemas),
                     event,
                 )
                 .await;
@@ -1922,6 +1926,14 @@ async fn run_exec_mode(
     // Use MQTT if available, otherwise fall back to SSE
     let subscription_handle = if !push_only {
         if let Some(ref mqtt) = mqtt_client {
+            // Spawn the MQTT event loop in a background task
+            let mqtt_for_loop = mqtt.clone();
+            tokio::spawn(async move {
+                if let Err(e) = mqtt_for_loop.run_event_loop().await {
+                    error!("MQTT event loop error: {}", e);
+                }
+            });
+
             // Extract uuid_map for MQTT task
             let initial_uuid_map: HashMap<String, String> = (*uuid_map).clone();
             info!(
@@ -2072,6 +2084,7 @@ async fn run_exec_mode(
         let options = options.clone();
         let file_states = file_states.clone();
         let shared_state_file = shared_state_file.clone();
+        let written_schemas = written_schemas.clone();
         let author = author.clone();
         #[cfg(unix)]
         let inode_tracker = inode_tracker.clone();
@@ -2091,6 +2104,7 @@ async fn run_exec_mode(
                     &author,
                     #[cfg(unix)]
                     inode_tracker.clone(),
+                    Some(&written_schemas),
                     event,
                 )
                 .await;
