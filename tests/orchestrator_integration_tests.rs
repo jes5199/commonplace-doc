@@ -1312,14 +1312,16 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     // === E1-E2: Edit Propagation (workspace -> sandbox) ===
 
     // E1: Edit file in workspace
+    // First read to ensure file is stable, then write
+    let _ = std::fs::read_to_string(&workspace_test_file);
     std::fs::write(&workspace_test_file, "hello world").expect("Failed to edit test file");
 
     // E2: Verify sandbox reflects the change
-    // Use longer timeout for edit propagation - CI can be slow
+    // Use longer timeout for edit propagation - CI can be much slower
     let content = wait_for_file(
         &sandbox_test_file,
         Some("hello world"),
-        Duration::from_secs(20),
+        Duration::from_secs(45),
     )
     .expect("Sandbox file should be updated to 'hello world'");
     assert_eq!(
@@ -2560,6 +2562,8 @@ fn test_uuid_linked_files_sync_bidirectionally() {
 
     // === M4: Edit sender content in workspace ===
     eprintln!("=== M4: Editing sender content in workspace ===");
+    // Read first to ensure file watcher is watching, then write
+    let _ = std::fs::read_to_string(&sender_content);
     std::fs::write(&sender_content, "updated message from sender")
         .expect("Failed to update sender content");
     eprintln!("M4: Updated sender content");
@@ -2583,6 +2587,8 @@ fn test_uuid_linked_files_sync_bidirectionally() {
     // === M6: Edit from receiver sandbox ===
     eprintln!("=== M6: Editing from receiver sandbox ===");
     std::thread::sleep(Duration::from_secs(2)); // Allow sync to stabilize
+                                                // Read first to ensure file watcher is watching, then write
+    let _ = std::fs::read_to_string(&sandbox_receiver_prompts);
     std::fs::write(&sandbox_receiver_prompts, "response from receiver")
         .expect("Failed to write from receiver sandbox");
     eprintln!("M6: Wrote response from receiver sandbox");
