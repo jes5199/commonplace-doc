@@ -45,7 +45,7 @@ impl CommandsHandler {
     }
 
     /// Handle create-document command.
-    /// Topic: {workspace}/commands/create-document
+    /// Topic: {workspace}/commands/__system/create-document
     pub async fn handle_create_document(&self, payload: &[u8]) -> Result<(), MqttError> {
         let request: CreateDocumentRequest = parse_json(payload)?;
 
@@ -84,7 +84,7 @@ impl CommandsHandler {
     }
 
     /// Handle delete-document command.
-    /// Topic: {workspace}/commands/delete-document
+    /// Topic: {workspace}/commands/__system/delete-document
     pub async fn handle_delete_document(&self, payload: &[u8]) -> Result<(), MqttError> {
         let request: DeleteDocumentRequest = parse_json(payload)?;
 
@@ -114,7 +114,7 @@ impl CommandsHandler {
     }
 
     /// Handle get-content command.
-    /// Topic: {workspace}/commands/get-content
+    /// Topic: {workspace}/commands/__system/get-content
     pub async fn handle_get_content(&self, payload: &[u8]) -> Result<(), MqttError> {
         let request: GetContentRequest = parse_json(payload)?;
 
@@ -144,7 +144,7 @@ impl CommandsHandler {
     }
 
     /// Handle get-info command.
-    /// Topic: {workspace}/commands/get-info
+    /// Topic: {workspace}/commands/__system/get-info
     pub async fn handle_get_info(&self, payload: &[u8]) -> Result<(), MqttError> {
         let request: GetInfoRequest = parse_json(payload)?;
 

@@ -180,7 +180,7 @@ async fn get_doc_content(
         }
     };
 
-    let command_topic = format!("{}/commands/get-content", gateway.workspace);
+    let command_topic = format!("{}/commands/__system/get-content", gateway.workspace);
     if let Err(e) = gateway
         .client
         .publish(&command_topic, &payload, QoS::AtLeastOnce)

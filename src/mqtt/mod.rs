@@ -162,23 +162,27 @@ impl MqttService {
     }
 
     /// Get the store commands topic for create-document.
+    /// Uses `__system` prefix to avoid conflicts with document paths.
     fn create_document_topic(&self) -> String {
-        format!("{}/commands/create-document", self.workspace)
+        format!("{}/commands/__system/create-document", self.workspace)
     }
 
     /// Get the store commands topic for delete-document.
+    /// Uses `__system` prefix to avoid conflicts with document paths.
     fn delete_document_topic(&self) -> String {
-        format!("{}/commands/delete-document", self.workspace)
+        format!("{}/commands/__system/delete-document", self.workspace)
     }
 
     /// Get the store commands topic for get-content.
+    /// Uses `__system` prefix to avoid conflicts with document paths.
     fn get_content_topic(&self) -> String {
-        format!("{}/commands/get-content", self.workspace)
+        format!("{}/commands/__system/get-content", self.workspace)
     }
 
     /// Get the store commands topic for get-info.
+    /// Uses `__system` prefix to avoid conflicts with document paths.
     fn get_info_topic(&self) -> String {
-        format!("{}/commands/get-info", self.workspace)
+        format!("{}/commands/__system/get-info", self.workspace)
     }
 
     /// Subscribe to store-level commands.

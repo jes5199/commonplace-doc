@@ -2,6 +2,7 @@ pub mod api;
 pub mod b64;
 pub mod cbd;
 pub mod cli;
+pub mod commands;
 pub mod commit;
 pub mod content_type;
 pub mod diff;
@@ -174,6 +175,12 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
         None
     };
 
+    // Extract MQTT client and workspace for commands router
+    let (mqtt_client_for_commands, mqtt_workspace_for_commands) = match &mqtt_context {
+        Some((client, workspace)) => (Some(client.clone()), Some(workspace.clone())),
+        None => (None, None),
+    };
+
     // Create shared service for handlers
     // DocumentService needs MQTT client to publish commits for real-time sync
     let service = Arc::new(match (reconciler, &config.fs_root, mqtt_context) {
@@ -249,6 +256,13 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
 
     // Add SDK routes for JS evaluator
     router = router.merge(sdk::router());
+
+    // Add commands routes if MQTT is configured
+    if let Some(commands_router) =
+        commands::router(mqtt_client_for_commands, mqtt_workspace_for_commands)
+    {
+        router = router.merge(commands_router);
+    }
 
     router.layer(CorsLayer::permissive())
 }
