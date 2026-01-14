@@ -5,7 +5,7 @@
   "processes": {
     "server": {
       "command": "/home/jes/commonplace/target/release/commonplace-server",
-      "args": ["--fs-root", "workspace"],
+      "args": ["--fs-root", "workspace", "--static-dir", "./static", "--host", "0.0.0.0"],
       "restart": {
         "policy": "always",
         "backoff_ms": 500,

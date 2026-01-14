@@ -1,6 +1,8 @@
 // Commonplace Document Viewer
 // Displays documents with live WebSocket updates
 
+import * as Y from 'https://esm.sh/yjs@13.6.8';
+
 (function() {
     'use strict';
 
@@ -39,16 +41,27 @@
     // Fetch document content via HTTP
     async function fetchDocument(doc) {
         const url = doc.type === 'id'
-            ? `/docs/${encodeURIComponent(doc.value)}`
-            : `/nodes/${encodeURIComponent(doc.value)}/head`;
+            ? `/docs/${encodeURIComponent(doc.value)}/head`
+            : `/files/${doc.value}/head`;
 
         const response = await fetch(url);
         if (!response.ok) {
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
 
-        contentType = response.headers.get('Content-Type') || 'text/plain';
-        return await response.text();
+        // HEAD endpoint returns JSON with {cid, content, state}
+        const data = await response.json();
+
+        // Guess content type from file extension
+        if (doc.type === 'path') {
+            const ext = doc.value.split('.').pop()?.toLowerCase();
+            if (ext === 'json') contentType = 'application/json';
+            else if (ext === 'xml') contentType = 'application/xml';
+            else if (ext === 'html' || ext === 'htm') contentType = 'text/html';
+            else contentType = 'text/plain';
+        }
+
+        return data.content || '';
     }
 
     // Connect to WebSocket
@@ -78,8 +91,20 @@
             console.error('WebSocket error:', err);
         };
 
-        ws.onmessage = (event) => {
-            handleMessage(new Uint8Array(event.data));
+        ws.onmessage = async (event) => {
+            // On any message, re-fetch content (simpler than applying Yjs updates)
+            try {
+                const content = await fetchDocument(doc);
+                const text = ydoc.getText('content');
+                // Clear and re-insert
+                ydoc.transact(() => {
+                    text.delete(0, text.length);
+                    text.insert(0, content);
+                });
+                renderContent();
+            } catch (e) {
+                console.error('Failed to refresh content:', e);
+            }
         };
     }
 
