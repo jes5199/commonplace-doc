@@ -20,9 +20,13 @@ use axum::{
 use rumqttc::QoS;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::HttpGateway;
-use crate::mqtt::{messages::EditMessage, topics::Topic};
+use crate::mqtt::{
+    messages::{EditMessage, GetContentRequest, GetContentResponse},
+    topics::Topic,
+};
 
 // ============================================================================
 // Error helpers
@@ -142,38 +146,97 @@ async fn send_event(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// GET /docs/{id} - Get current document content via MQTT sync protocol
+/// GET /docs/{id} - Get current document content via MQTT command/response
 ///
-/// Note: This is a simplified implementation. Full content retrieval would
-/// require running the MQTT event loop to receive responses. For now, this
-/// returns a placeholder indicating the gateway doesn't maintain document state.
+/// Sends a get-content command to the server via MQTT and waits for the response.
 async fn get_doc_content(
-    State(_gateway): State<Arc<HttpGateway>>,
+    State(gateway): State<Arc<HttpGateway>>,
     Path(id): Path<String>,
 ) -> Result<Json<DocContentResponse>, (StatusCode, String)> {
-    // The HTTP gateway is stateless - it doesn't maintain document state.
-    // To get document content, clients should:
-    // 1. Subscribe via SSE to receive updates
-    // 2. Use the sync protocol directly via MQTT
-    //
-    // For now, return a response indicating the document ID was received
-    // but content is not available through the stateless gateway.
-    //
-    // TODO: Implement proper sync protocol request/response via MQTT
-    // This would require changes to MqttClient to support per-request
-    // response correlation.
+    // Generate a unique request ID for correlation
+    let req_id = format!("http-{}", uuid::Uuid::new_v4());
 
-    tracing::warn!(
-        "GET /docs/{} - content retrieval not implemented in stateless gateway",
-        id
-    );
+    // Subscribe to responses topic to receive the answer
+    // Use reference-counted subscription so concurrent requests share the subscription
+    let responses_topic = format!("{}/responses", gateway.workspace);
+    gateway
+        .add_subscriber(&responses_topic)
+        .await
+        .map_err(internal_error)?;
 
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        format!(
-            "Content retrieval not available via stateless HTTP gateway. \
-             Subscribe via SSE at /sse/docs/{} to receive updates.",
-            id
-        ),
-    ))
+    // Get a receiver for incoming messages
+    let mut rx = gateway.client.subscribe_messages();
+
+    // Build and send the get-content request
+    let request = GetContentRequest {
+        req: req_id.clone(),
+        id: id.clone(),
+    };
+    let payload = match serde_json::to_vec(&request) {
+        Ok(p) => p,
+        Err(e) => {
+            gateway.remove_subscriber(&responses_topic).await;
+            return Err(bad_request(e));
+        }
+    };
+
+    let command_topic = format!("{}/commands/get-content", gateway.workspace);
+    if let Err(e) = gateway
+        .client
+        .publish(&command_topic, &payload, QoS::AtLeastOnce)
+        .await
+    {
+        gateway.remove_subscriber(&responses_topic).await;
+        return Err(internal_error(e));
+    }
+
+    // Wait for response with timeout
+    let timeout = Duration::from_secs(5);
+    let start = std::time::Instant::now();
+
+    loop {
+        if start.elapsed() > timeout {
+            // Remove our subscription reference before returning
+            gateway.remove_subscriber(&responses_topic).await;
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                "Timeout waiting for response from document store".to_string(),
+            ));
+        }
+
+        match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+            Ok(Ok(msg)) => {
+                if msg.topic == responses_topic {
+                    // Try to parse as GetContentResponse
+                    if let Ok(response) = serde_json::from_slice::<GetContentResponse>(&msg.payload)
+                    {
+                        if response.req == req_id {
+                            // Remove our subscription reference before returning
+                            gateway.remove_subscriber(&responses_topic).await;
+
+                            if let Some(error) = response.error {
+                                return Err((StatusCode::NOT_FOUND, error));
+                            }
+
+                            return Ok(Json(DocContentResponse {
+                                cid: None, // get-content doesn't return cid currently
+                                content: response.content.unwrap_or_default(),
+                            }));
+                        }
+                    }
+                }
+            }
+            Ok(Err(_)) => {
+                // Channel closed, broker disconnected
+                gateway.remove_subscriber(&responses_topic).await;
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "MQTT connection lost".to_string(),
+                ));
+            }
+            Err(_) => {
+                // Timeout on recv, continue loop
+            }
+        }
+    }
 }
