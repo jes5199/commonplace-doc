@@ -1305,14 +1305,11 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
 
     // C2-C3: Verify file appears in sandbox with matching content
     let sandbox_test_file = sandbox_dir.join(test_file_name);
-    let content = wait_for_file(&sandbox_test_file, Some("hello"), Duration::from_secs(30))
+    let content = wait_for_file(&sandbox_test_file, Some("hello"), Duration::from_secs(10))
         .expect("File should appear in sandbox with content 'hello'");
     assert_eq!(content.trim(), "hello", "Sandbox file content should match");
 
     // === E1-E2: Edit Propagation (workspace -> sandbox) ===
-
-    // Wait for sync to stabilize before editing
-    std::thread::sleep(Duration::from_secs(2));
 
     // E1: Edit file in workspace
     std::fs::write(&workspace_test_file, "hello world").expect("Failed to edit test file");
@@ -1321,7 +1318,7 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     let content = wait_for_file(
         &sandbox_test_file,
         Some("hello world"),
-        Duration::from_secs(30),
+        Duration::from_secs(10),
     )
     .expect("Sandbox file should be updated to 'hello world'");
     assert_eq!(
