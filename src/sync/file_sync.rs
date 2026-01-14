@@ -107,7 +107,7 @@ pub async fn upload_task(
     force_push: bool,
     author: String,
 ) {
-    while let Some(event) = rx.recv().await {
+    'event_loop: while let Some(event) = rx.recv().await {
         // Extract captured content from the event
         // The watcher captures content at notification time to prevent race conditions
         // where SSE might overwrite the file between event dispatch and us reading it.
@@ -126,6 +126,14 @@ pub async fn upload_task(
             String::from_utf8_lossy(&raw_content).to_string()
         };
 
+        // Log event received for debugging
+        debug!(
+            "upload_task event: identifier={}, content={:?} (len={})",
+            identifier,
+            &content.chars().take(50).collect::<String>(),
+            content.len()
+        );
+
         // Check for pending write barrier and handle echo detection
         // Track whether we detected an echo and need to refresh from HEAD
         let mut echo_detected = false;
@@ -133,6 +141,12 @@ pub async fn upload_task(
 
         {
             let mut s = state.write().await;
+            debug!(
+                "upload_task state: last_written_content={:?}, last_written_cid={:?}, has_barrier={}",
+                &s.last_written_content.chars().take(50).collect::<String>(),
+                s.last_written_cid.as_ref().map(|c| &c[..8.min(c.len())]),
+                s.pending_write.is_some()
+            );
 
             // Check for pending write (barrier is up)
             if let Some(pending) = s.pending_write.take() {
@@ -275,8 +289,12 @@ pub async fn upload_task(
                 should_refresh = s.needs_head_refresh;
                 s.needs_head_refresh = false;
 
-                if content == s.last_written_content {
-                    debug!("Ignoring echo: content matches last written");
+                // Use trimmed comparison to avoid whitespace differences
+                let content_trimmed = content.trim();
+                let last_written_trimmed = s.last_written_content.trim();
+
+                if content_trimmed == last_written_trimmed {
+                    debug!("Ignoring echo: content matches last written (trimmed)");
                     echo_detected = true;
                 } else {
                     debug!(
@@ -439,10 +457,17 @@ pub async fn upload_task(
         // Final safety check: if our content matches server HEAD, skip upload entirely.
         // This prevents feedback loops when echo detection fails due to race conditions.
         // The cost is one extra HEAD fetch, but it's worth it to prevent CRDT duplication.
+        // Compare with trailing whitespace normalized to handle newline inconsistencies.
+        // CRITICAL: Also update parent_cid from HEAD to prevent stale parent race conditions.
+        // If we determined parent_cid earlier but the server has since moved forward, using
+        // the stale parent would create duplicate CRDT operations.
+        let mut parent_cid = parent_cid; // Make mutable for HEAD update
         if let Ok(Some(head)) = fetch_head(&client, &server, &identifier, use_paths).await {
-            if head.content == content {
+            let head_trimmed = head.content.trim_end();
+            let content_trimmed = content.trim_end();
+            if head_trimmed == content_trimmed {
                 debug!(
-                    "Content already matches server HEAD, skipping redundant upload (cid: {:?})",
+                    "Content matches server HEAD (after normalization), skipping redundant upload (cid: {:?})",
                     head.cid.as_ref().map(|c| &c[..8.min(c.len())])
                 );
                 // Update state to reflect server's current CID
@@ -451,12 +476,142 @@ pub async fn upload_task(
                 s.last_written_content = content;
                 continue;
             }
+            // CRITICAL: Always use HEAD's CID as parent to prevent duplicate operations.
+            // If our cached parent_cid is stale (server moved forward due to SSE), uploading
+            // with the old parent would create a duplicate CRDT operation.
+            if head.cid.is_some() && head.cid != parent_cid {
+                warn!(
+                    "PARENT UPDATE: using HEAD cid {:?} instead of stale parent {:?}",
+                    head.cid.as_ref().map(|c| &c[..8.min(c.len())]),
+                    parent_cid.as_ref().map(|c| &c[..8.min(c.len())])
+                );
+                parent_cid = head.cid;
+            }
         }
 
         match parent_cid {
-            Some(parent) => {
+            Some(mut parent) => {
+                // CRITICAL: Serialize uploads to prevent duplicate CRDT operations.
+                // Wait if another upload is in progress, then re-check HEAD.
+                let content_trimmed = content.trim_end();
+
+                // Wait for any concurrent upload to complete (max 5 seconds)
+                for wait_round in 0..50 {
+                    let in_progress = {
+                        let s = state.read().await;
+                        s.upload_in_progress
+                    };
+                    if !in_progress {
+                        break;
+                    }
+                    if wait_round == 0 {
+                        debug!("Waiting for concurrent upload to complete...");
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+
+                // Set upload_in_progress flag and check HEAD atomically
+                {
+                    let mut s = state.write().await;
+                    // Double-check: if still in progress, someone else is uploading
+                    if s.upload_in_progress {
+                        warn!("Upload still in progress after waiting, skipping to avoid race");
+                        continue;
+                    }
+                    s.upload_in_progress = true;
+                }
+
+                // Now we hold the upload lock - check HEAD multiple times before uploading.
+                // This handles the race condition where another client's upload is in-flight
+                // and we might see stale HEAD. By retrying, we give time for in-flight
+                // commits to complete and be reflected in HEAD.
+                const PRE_UPLOAD_CHECK_COUNT: usize = 5;
+                const PRE_UPLOAD_CHECK_DELAY_MS: u64 = 100;
+                let mut should_skip = false;
+
+                for check_round in 0..PRE_UPLOAD_CHECK_COUNT {
+                    if check_round > 0 {
+                        sleep(Duration::from_millis(PRE_UPLOAD_CHECK_DELAY_MS)).await;
+                    }
+
+                    if let Ok(Some(head)) =
+                        fetch_head(&client, &server, &identifier, use_paths).await
+                    {
+                        let head_trimmed = head.content.trim_end();
+                        if head_trimmed == content_trimmed {
+                            warn!(
+                                "PRE-UPLOAD SKIP (round {}): HEAD matches content, skipping duplicate (head_cid: {:?})",
+                                check_round + 1,
+                                head.cid.as_ref().map(|c| &c[..8.min(c.len())])
+                            );
+                            // Update state and release lock
+                            let mut s = state.write().await;
+                            s.last_written_cid = head.cid;
+                            s.last_written_content = content.clone();
+                            s.upload_in_progress = false;
+                            should_skip = true;
+                            break;
+                        }
+                        // Update parent if HEAD moved
+                        if let Some(head_cid) = &head.cid {
+                            if head_cid != &parent {
+                                warn!(
+                                    "PRE-UPLOAD PARENT UPDATE (round {}): HEAD moved from {} to {}",
+                                    check_round + 1,
+                                    &parent[..8.min(parent.len())],
+                                    &head_cid[..8.min(head_cid.len())]
+                                );
+                                parent = head_cid.clone();
+                            }
+                        }
+                    }
+                }
+
+                if should_skip {
+                    continue;
+                }
+
+                // FINAL STATE CHECK: Re-check state right before upload.
+                // This catches the race where SSE received and wrote content while
+                // we were doing HEAD checks. Without this, we'd upload a redundant
+                // diff that duplicates what workspace already uploaded.
+                {
+                    let s = state.read().await;
+                    let last_trimmed = s.last_written_content.trim_end();
+                    if last_trimmed == content_trimmed {
+                        warn!(
+                            "FINAL STATE CHECK: last_written_content matches, skipping redundant upload"
+                        );
+                        // Clear upload_in_progress and skip
+                        drop(s);
+                        let mut s = state.write().await;
+                        s.upload_in_progress = false;
+                        continue;
+                    }
+                    // Also check pending_write
+                    if let Some(ref pending) = s.pending_write {
+                        let pending_trimmed = pending.content.trim_end();
+                        if pending_trimmed == content_trimmed {
+                            warn!(
+                                "FINAL STATE CHECK: pending_write matches, skipping redundant upload"
+                            );
+                            drop(s);
+                            let mut s = state.write().await;
+                            s.upload_in_progress = false;
+                            continue;
+                        }
+                    }
+                }
+
                 // Normal case: use replace endpoint
-                // For force-push, parent is HEAD's cid so this is a simple replace
+                debug!(
+                    "upload: identifier={}, parent_cid={}, content={:?} (len={})",
+                    identifier,
+                    &parent[..8.min(parent.len())],
+                    &content.chars().take(50).collect::<String>(),
+                    content.len()
+                );
+
                 let replace_url =
                     build_replace_url(&server, &identifier, &parent, use_paths, &author);
 
@@ -514,6 +669,12 @@ pub async fn upload_task(
                     Err(e) => {
                         error!("Upload request failed: {}", e);
                     }
+                }
+
+                // Clear upload_in_progress flag
+                {
+                    let mut s = state.write().await;
+                    s.upload_in_progress = false;
                 }
             }
             None => {
@@ -626,7 +787,10 @@ pub async fn upload_task_with_flock(
     flock_state: FlockSyncState,
     author: String,
 ) {
-    while let Some(event) = rx.recv().await {
+    'event_loop: while let Some(event) = rx.recv().await {
+        // Small delay to allow any concurrent SSE state updates to complete.
+        sleep(Duration::from_millis(50)).await;
+
         // Extract captured content from the event
         let FileEvent::Modified(raw_content) = event;
 
@@ -748,8 +912,12 @@ pub async fn upload_task_with_flock(
                 should_refresh = s.needs_head_refresh;
                 s.needs_head_refresh = false;
 
-                if content == s.last_written_content {
-                    debug!("Ignoring echo: content matches last written");
+                // Use trimmed comparison to avoid whitespace differences
+                let content_trimmed = content.trim();
+                let last_written_trimmed = s.last_written_content.trim();
+
+                if content_trimmed == last_written_trimmed {
+                    debug!("Ignoring echo: content matches last written (trimmed)");
                     echo_detected = true;
                 }
             }
@@ -900,10 +1068,15 @@ pub async fn upload_task_with_flock(
 
         // Final safety check: if our content matches server HEAD, skip upload entirely.
         // This prevents feedback loops when echo detection fails due to race conditions.
+        // Compare with trailing whitespace normalized to handle newline inconsistencies.
+        // CRITICAL: Also update parent_cid from HEAD to prevent stale parent race conditions.
+        let mut parent_cid = parent_cid; // Make mutable for HEAD update
         if let Ok(Some(head)) = fetch_head(&client, &server, &identifier, use_paths).await {
-            if head.content == content {
+            let head_trimmed = head.content.trim_end();
+            let content_trimmed = content.trim_end();
+            if head_trimmed == content_trimmed {
                 debug!(
-                    "Content already matches server HEAD, skipping redundant upload (cid: {:?})",
+                    "Content matches server HEAD (after normalization), skipping redundant upload (cid: {:?})",
                     head.cid.as_ref().map(|c| &c[..8.min(c.len())])
                 );
                 let mut s = state.write().await;
@@ -911,10 +1084,124 @@ pub async fn upload_task_with_flock(
                 s.last_written_content = content;
                 continue;
             }
+            // CRITICAL: Always use HEAD's CID as parent to prevent duplicate operations.
+            if head.cid.is_some() && head.cid != parent_cid {
+                warn!(
+                    "PARENT UPDATE (flock): using HEAD cid {:?} instead of stale parent {:?}",
+                    head.cid.as_ref().map(|c| &c[..8.min(c.len())]),
+                    parent_cid.as_ref().map(|c| &c[..8.min(c.len())])
+                );
+                parent_cid = head.cid;
+            }
         }
 
         match parent_cid {
-            Some(parent) => {
+            Some(mut parent) => {
+                // CRITICAL: Serialize uploads to prevent duplicate CRDT operations.
+                let content_trimmed = content.trim_end();
+
+                // Wait for any concurrent upload to complete
+                for wait_round in 0..50 {
+                    let in_progress = {
+                        let s = state.read().await;
+                        s.upload_in_progress
+                    };
+                    if !in_progress {
+                        break;
+                    }
+                    if wait_round == 0 {
+                        debug!("Waiting for concurrent upload to complete (flock)...");
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+
+                // Set upload_in_progress flag
+                {
+                    let mut s = state.write().await;
+                    if s.upload_in_progress {
+                        warn!("Upload still in progress after waiting (flock), skipping");
+                        continue;
+                    }
+                    s.upload_in_progress = true;
+                }
+
+                // Check HEAD multiple times before uploading (same as upload_task).
+                // This handles the race condition where another client's upload is in-flight.
+                const PRE_UPLOAD_CHECK_COUNT: usize = 5;
+                const PRE_UPLOAD_CHECK_DELAY_MS: u64 = 100;
+                let mut should_skip = false;
+
+                for check_round in 0..PRE_UPLOAD_CHECK_COUNT {
+                    if check_round > 0 {
+                        sleep(Duration::from_millis(PRE_UPLOAD_CHECK_DELAY_MS)).await;
+                    }
+
+                    if let Ok(Some(head)) =
+                        fetch_head(&client, &server, &identifier, use_paths).await
+                    {
+                        let head_trimmed = head.content.trim_end();
+                        if head_trimmed == content_trimmed {
+                            warn!(
+                                "PRE-UPLOAD SKIP (flock round {}): HEAD matches content, skipping duplicate (head_cid: {:?})",
+                                check_round + 1,
+                                head.cid.as_ref().map(|c| &c[..8.min(c.len())])
+                            );
+                            let mut s = state.write().await;
+                            s.last_written_cid = head.cid;
+                            s.last_written_content = content.clone();
+                            s.upload_in_progress = false;
+                            should_skip = true;
+                            break;
+                        }
+                        // Update parent if HEAD moved
+                        if let Some(head_cid) = &head.cid {
+                            if head_cid != &parent {
+                                warn!(
+                                    "PRE-UPLOAD PARENT UPDATE (flock round {}): HEAD moved from {} to {}",
+                                    check_round + 1,
+                                    &parent[..8.min(parent.len())],
+                                    &head_cid[..8.min(head_cid.len())]
+                                );
+                                parent = head_cid.clone();
+                            }
+                        }
+                    }
+                }
+
+                if should_skip {
+                    continue;
+                }
+
+                // FINAL STATE CHECK: Re-check state right before upload.
+                // This catches the race where SSE received and wrote content while
+                // we were doing HEAD checks. Without this, we'd upload a redundant
+                // diff that duplicates what workspace already uploaded.
+                {
+                    let s = state.read().await;
+                    let last_trimmed = s.last_written_content.trim_end();
+                    if last_trimmed == content_trimmed {
+                        warn!(
+                            "FINAL STATE CHECK (flock): last_written_content matches, skipping redundant upload"
+                        );
+                        drop(s);
+                        let mut s = state.write().await;
+                        s.upload_in_progress = false;
+                        continue;
+                    }
+                    if let Some(ref pending) = s.pending_write {
+                        let pending_trimmed = pending.content.trim_end();
+                        if pending_trimmed == content_trimmed {
+                            warn!(
+                                "FINAL STATE CHECK (flock): pending_write matches, skipping redundant upload"
+                            );
+                            drop(s);
+                            let mut s = state.write().await;
+                            s.upload_in_progress = false;
+                            continue;
+                        }
+                    }
+                }
+
                 let replace_url =
                     build_replace_url(&server, &identifier, &parent, use_paths, &author);
 
@@ -974,6 +1261,12 @@ pub async fn upload_task_with_flock(
                     Err(e) => {
                         error!("Upload request failed: {}", e);
                     }
+                }
+
+                // Clear upload_in_progress flag
+                {
+                    let mut s = state.write().await;
+                    s.upload_in_progress = false;
                 }
             }
             None => {

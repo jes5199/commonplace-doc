@@ -439,9 +439,20 @@ pub async fn handle_file_created(
             inode_tracker.clone(),
         );
 
-        // Add to file_states with task handles
+        // Add to file_states with task handles - but check for race condition first
         {
             let mut states = file_states.write().await;
+            if states.contains_key(&relative_path) {
+                // Another task already registered this file - abort our tasks to avoid duplicates
+                warn!(
+                    "Race detected: file {} already registered, aborting duplicate sync tasks",
+                    relative_path
+                );
+                for handle in task_handles {
+                    handle.abort();
+                }
+                return;
+            }
             states.insert(
                 relative_path.clone(),
                 FileSyncState {

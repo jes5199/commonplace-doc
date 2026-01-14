@@ -350,6 +350,7 @@ pub struct PendingWrite {
 /// - **Echo detection**: Prevents re-uploading content we just received from server
 /// - **Write barrier**: Tracks pending server writes to handle concurrent edits
 /// - **State file**: Persists sync state for offline change detection
+/// - **Upload serialization**: Prevents concurrent duplicate uploads
 pub struct SyncState {
     /// CID of the commit we last wrote to the local file
     pub last_written_cid: Option<String>,
@@ -370,6 +371,9 @@ pub struct SyncState {
     pub shared_state_file: Option<SharedStateFile>,
     /// Relative path for this file within the directory (for shared state file updates)
     pub relative_path: Option<String>,
+    /// Flag indicating an upload is currently in progress.
+    /// Other upload_tasks should wait for this to clear before proceeding.
+    pub upload_in_progress: bool,
 }
 
 impl SyncState {
@@ -385,6 +389,7 @@ impl SyncState {
             state_file_path: None,
             shared_state_file: None,
             relative_path: None,
+            upload_in_progress: false,
         }
     }
 
@@ -402,6 +407,7 @@ impl SyncState {
             state_file_path: None,
             shared_state_file: None,
             relative_path: None,
+            upload_in_progress: false,
         }
     }
 
@@ -424,6 +430,7 @@ impl SyncState {
             state_file_path: None,
             shared_state_file: Some(shared_state_file),
             relative_path: Some(relative_path),
+            upload_in_progress: false,
         }
     }
 
@@ -441,6 +448,7 @@ impl SyncState {
             state_file_path: Some(state_file_path),
             shared_state_file: None,
             relative_path: None,
+            upload_in_progress: false,
         }
     }
 

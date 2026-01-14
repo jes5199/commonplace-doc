@@ -522,6 +522,17 @@ pub async fn handle_subdir_new_files(
             );
 
             let mut states = file_states.write().await;
+            // Check for race condition - another task might have registered this file
+            if states.contains_key(root_relative_path) {
+                warn!(
+                    "Race detected: file {} already registered during subdir sync, aborting duplicate tasks",
+                    root_relative_path
+                );
+                for handle in task_handles {
+                    handle.abort();
+                }
+                continue;
+            }
             states.insert(
                 root_relative_path.clone(),
                 FileSyncState {
@@ -975,6 +986,17 @@ pub async fn handle_schema_change(
                     Vec::new()
                 };
                 let mut states = file_states.write().await;
+                // Check for race condition - another task might have registered this file
+                if states.contains_key(path) {
+                    warn!(
+                        "Race detected: file {} already registered during sync, aborting duplicate tasks",
+                        path
+                    );
+                    for handle in task_handles {
+                        handle.abort();
+                    }
+                    continue;
+                }
                 states.insert(
                     path.clone(),
                     FileSyncState {

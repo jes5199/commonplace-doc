@@ -10,9 +10,9 @@ use crate::sync::{
     flock_state::PathState,
 };
 use crate::sync::{
-    ancestry::determine_sync_direction, build_sse_url, detect_from_path, fetch_head,
-    is_binary_content, looks_like_base64_binary, process_pending_inbound_after_confirm,
-    EditEventData, FlockSyncState, PendingWrite, SyncState,
+    ancestry::{determine_sync_direction, SyncDirection},
+    build_sse_url, detect_from_path, fetch_head, is_binary_content, looks_like_base64_binary,
+    process_pending_inbound_after_confirm, EditEventData, FlockSyncState, PendingWrite, SyncState,
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -947,6 +947,14 @@ pub async fn handle_server_edit(
         return;
     }
 
+    // Skip if already in sync - no need to write identical content.
+    // This prevents feedback loops where clients re-write the same content
+    // they just uploaded, triggering unnecessary file watcher events.
+    if matches!(direction, SyncDirection::InSync) {
+        debug!("Already in sync, skipping redundant write");
+        return;
+    }
+
     // Acquire write lock and set up barrier atomically
     let write_id = {
         let mut s = state.write().await;
@@ -1005,6 +1013,13 @@ pub async fn handle_server_edit(
             started_at: std::time::Instant::now(),
         });
 
+        // CRITICAL: Update last_written_* BEFORE releasing lock and writing.
+        // The file watcher may process the inotify event immediately after we write,
+        // before we can update state in a subsequent lock acquisition. By updating
+        // here, we ensure the backup echo detection check always has the correct values.
+        s.last_written_content = head.content.clone();
+        s.last_written_cid = head.cid.clone();
+
         write_id
     };
     // Lock released before I/O
@@ -1061,9 +1076,9 @@ pub async fn handle_server_edit(
         return;
     }
 
-    // DO NOT clear barrier or update last_written_* here!
-    // upload_task will do it when it sees the matching content from file watcher.
-    // This ensures proper echo detection even with stale watcher events.
+    // Note: last_written_content and last_written_cid are now updated BEFORE the write
+    // (in the same lock block as pending_write setup) to prevent race conditions where
+    // the file watcher processes the inotify event before we can update state.
 
     match &head.cid {
         Some(cid) => info!(
@@ -1195,6 +1210,14 @@ pub async fn handle_server_edit_with_tracker(
         return;
     }
 
+    // Skip if already in sync - no need to write identical content.
+    // This prevents feedback loops where clients re-write the same content
+    // they just uploaded, triggering unnecessary file watcher events.
+    if matches!(direction, SyncDirection::InSync) {
+        debug!("Already in sync, skipping redundant write");
+        return;
+    }
+
     // Acquire write lock and set up barrier atomically
     let write_id = {
         let mut s = state.write().await;
@@ -1255,6 +1278,13 @@ pub async fn handle_server_edit_with_tracker(
             started_at: std::time::Instant::now(),
         });
 
+        // CRITICAL: Update last_written_* BEFORE releasing lock and writing.
+        // The file watcher may process the inotify event immediately after we write,
+        // before we can update state in a subsequent lock acquisition. By updating
+        // here, we ensure the backup echo detection check always has the correct values.
+        s.last_written_content = head.content.clone();
+        s.last_written_cid = head.cid.clone();
+
         write_id
     };
     // Lock released before I/O
@@ -1294,6 +1324,9 @@ pub async fn handle_server_edit_with_tracker(
         }
         return;
     }
+
+    // Note: last_written_content and last_written_cid are now updated BEFORE the write
+    // (in the same lock block as pending_write setup) to prevent race conditions.
 
     match &head.cid {
         Some(cid) => info!(
