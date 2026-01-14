@@ -293,9 +293,12 @@ impl MqttService {
                 }
             }
             topics::Port::Commands => {
-                self.commands_handler
-                    .handle_command(&topic, payload)
-                    .await?;
+                // Path-specific commands are not implemented - store-level commands
+                // are handled above via exact topic matching
+                tracing::debug!(
+                    "Ignoring path-specific command on {} - use store-level commands",
+                    topic_str
+                );
             }
             topics::Port::Events => {
                 // Events are outbound only from this doc store - we don't receive them
