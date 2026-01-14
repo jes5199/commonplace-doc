@@ -1311,6 +1311,9 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
 
     // === E1-E2: Edit Propagation (workspace -> sandbox) ===
 
+    // Wait for sync to stabilize before editing
+    std::thread::sleep(Duration::from_secs(2));
+
     // E1: Edit file in workspace
     std::fs::write(&workspace_test_file, "hello world").expect("Failed to edit test file");
 
