@@ -19,6 +19,13 @@ import * as Y from 'https://esm.sh/yjs@13.6.8';
     const statusEl = document.getElementById('status');
     const contentEl = document.getElementById('content');
 
+    // Command bar elements (created dynamically)
+    let commandBarEl = null;
+    let verbInput = null;
+    let payloadInput = null;
+    let sendButton = null;
+    let commandLogEl = null;
+
     // Parse document ID from URL
     function parseDocId() {
         const path = window.location.pathname;
@@ -278,6 +285,110 @@ import * as Y from 'https://esm.sh/yjs@13.6.8';
         contentEl.innerHTML = `<div class="error">${escapeHtml(message)}</div>`;
     }
 
+    // Create command bar UI
+    function createCommandBar() {
+        commandBarEl = document.createElement('footer');
+        commandBarEl.id = 'command-bar';
+        commandBarEl.innerHTML = `
+            <div class="command-input-row">
+                <input type="text" id="verb-input" placeholder="verb" autocomplete="off">
+                <input type="text" id="payload-input" placeholder='{"key": "value"} (optional JSON)' autocomplete="off">
+                <button id="send-button">Send</button>
+            </div>
+            <div id="command-log"></div>
+        `;
+        document.body.appendChild(commandBarEl);
+
+        verbInput = document.getElementById('verb-input');
+        payloadInput = document.getElementById('payload-input');
+        sendButton = document.getElementById('send-button');
+        commandLogEl = document.getElementById('command-log');
+
+        sendButton.addEventListener('click', sendCommand);
+        verbInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') sendCommand();
+        });
+        payloadInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') sendCommand();
+        });
+    }
+
+    // Send command via HTTP
+    async function sendCommand() {
+        const verb = verbInput.value.trim();
+        if (!verb) {
+            logCommand('error', 'Please enter a verb');
+            return;
+        }
+
+        // Parse payload if provided
+        let payload = {};
+        const payloadStr = payloadInput.value.trim();
+        if (payloadStr) {
+            try {
+                payload = JSON.parse(payloadStr);
+            } catch (e) {
+                logCommand('error', `Invalid JSON payload: ${e.message}`);
+                return;
+            }
+        }
+
+        // Build the command URL
+        // Note: docId may contain slashes (paths like "bartleby/history.jsonl")
+        // We encode each segment separately to preserve the path structure
+        const encodedPath = docId.split('/').map(encodeURIComponent).join('/');
+        const commandUrl = `/commands/${encodedPath}/${encodeURIComponent(verb)}`;
+
+        try {
+            sendButton.disabled = true;
+            sendButton.textContent = 'Sending...';
+
+            const response = await fetch(commandUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ payload, source: 'web-viewer' }),
+            });
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`HTTP ${response.status}: ${errorText}`);
+            }
+
+            const result = await response.json();
+            logCommand('success', `Sent: ${verb}`, payload);
+
+            // Clear inputs on success
+            verbInput.value = '';
+            payloadInput.value = '';
+
+        } catch (e) {
+            logCommand('error', `Failed to send command: ${e.message}`);
+        } finally {
+            sendButton.disabled = false;
+            sendButton.textContent = 'Send';
+        }
+    }
+
+    // Log command to the command log area
+    function logCommand(type, message, payload = null) {
+        const entry = document.createElement('div');
+        entry.className = `command-log-entry ${type}`;
+
+        const time = new Date().toLocaleTimeString();
+        let content = `<span class="log-time">[${time}]</span> ${escapeHtml(message)}`;
+        if (payload && Object.keys(payload).length > 0) {
+            content += ` <span class="log-payload">${escapeHtml(JSON.stringify(payload))}</span>`;
+        }
+        entry.innerHTML = content;
+
+        commandLogEl.insertBefore(entry, commandLogEl.firstChild);
+
+        // Keep only last 10 entries
+        while (commandLogEl.children.length > 10) {
+            commandLogEl.removeChild(commandLogEl.lastChild);
+        }
+    }
+
     // Initialize
     async function init() {
         const doc = parseDocId();
@@ -304,6 +415,9 @@ import * as Y from 'https://esm.sh/yjs@13.6.8';
 
             // Render immediately
             renderContent();
+
+            // Create command bar
+            createCommandBar();
 
             // Connect WebSocket for live updates
             connectWebSocket(doc);

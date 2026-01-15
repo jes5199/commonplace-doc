@@ -131,3 +131,108 @@ main {
     padding: 1rem;
     border-radius: 6px;
 }
+
+/* Command bar */
+#command-bar {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: #16213e;
+    border-top: 1px solid #0f3460;
+    padding: 0.5rem 1rem;
+}
+
+.command-input-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+}
+
+#verb-input {
+    width: 120px;
+    padding: 0.5rem;
+    border: 1px solid #0f3460;
+    border-radius: 4px;
+    background: #0d1117;
+    color: #eee;
+    font-family: 'Monaco', 'Menlo', monospace;
+    font-size: 0.875rem;
+}
+
+#payload-input {
+    flex: 1;
+    padding: 0.5rem;
+    border: 1px solid #0f3460;
+    border-radius: 4px;
+    background: #0d1117;
+    color: #eee;
+    font-family: 'Monaco', 'Menlo', monospace;
+    font-size: 0.875rem;
+}
+
+#verb-input::placeholder,
+#payload-input::placeholder {
+    color: #6e7681;
+}
+
+#verb-input:focus,
+#payload-input:focus {
+    outline: none;
+    border-color: #e94560;
+}
+
+#send-button {
+    padding: 0.5rem 1rem;
+    background: #e94560;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: 500;
+    transition: background 0.2s;
+}
+
+#send-button:hover {
+    background: #d63d56;
+}
+
+#send-button:disabled {
+    background: #6e7681;
+    cursor: not-allowed;
+}
+
+/* Command log */
+#command-log {
+    max-height: 100px;
+    overflow-y: auto;
+    margin-top: 0.5rem;
+    font-size: 0.75rem;
+    font-family: 'Monaco', 'Menlo', monospace;
+}
+
+.command-log-entry {
+    padding: 0.25rem 0;
+    border-bottom: 1px solid #0f3460;
+}
+
+.command-log-entry.success {
+    color: #75b798;
+}
+
+.command-log-entry.error {
+    color: #ea868f;
+}
+
+.log-time {
+    color: #6e7681;
+}
+
+.log-payload {
+    color: #8b949e;
+}
+
+/* Adjust main content to make room for command bar */
+main {
+    padding-bottom: 150px;
+}
