@@ -274,14 +274,16 @@ impl DiscoveredProcessManager {
             // Extract host:port from server URL for --allow-net
             let server_host = server.replace("http://", "").replace("https://", "");
 
-            // Import map URL for simplified imports (import { cp } from "cp")
+            // Loader script URL - injects 'commonplace' global then imports user script
+            let loader_url = format!("{}/sdk/loader.ts", server);
+            // Import map URL for simplified imports within the SDK
             let import_map_url = format!("{}/sdk/import-map.json", server);
 
             let mut cmd = Command::new("deno");
             cmd.arg("run")
                 // Force re-fetch script to ensure we run latest version after changes
                 .arg("--reload")
-                // Import map for simplified SDK imports
+                // Import map for SDK internal imports
                 .arg(format!("--import-map={}", import_map_url))
                 // Allow npm registry for package downloads, plus server and broker
                 .arg(format!(
@@ -290,12 +292,15 @@ impl DiscoveredProcessManager {
                 ))
                 // Allow all env for npm package compatibility (readable-stream, etc.)
                 .arg("--allow-env")
-                .arg(&script_url);
+                // Run the loader script (which imports the user script via env var)
+                .arg(&loader_url);
 
             // Set environment variables for the SDK
             cmd.env("COMMONPLACE_SERVER", &server);
             cmd.env("COMMONPLACE_BROKER", &broker);
             cmd.env("COMMONPLACE_CLIENT_ID", &client_id);
+            // Pass the user script URL to the loader
+            cmd.env("COMMONPLACE_SCRIPT", &script_url);
 
             // If this process owns an output file, set COMMONPLACE_OUTPUT
             if let Some(ref output) = config.owns {
@@ -309,10 +314,11 @@ impl DiscoveredProcessManager {
             }
 
             tracing::info!(
-                "[discovery] Starting evaluate process '{}' (script: {}, url: {})",
+                "[discovery] Starting evaluate process '{}' (script: {}, url: {}, loader: {})",
                 name,
                 script,
-                script_url
+                script_url,
+                loader_url
             );
             cmd
         } else if let Some(ref listen_path) = config.log_listener {
