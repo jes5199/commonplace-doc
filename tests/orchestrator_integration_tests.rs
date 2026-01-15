@@ -2652,3 +2652,283 @@ fn test_uuid_linked_files_sync_bidirectionally() {
 
     eprintln!("=== All UUID-linked bidirectional sync tests PASSED ===");
 }
+
+/// Test that evaluate scripts work with global injection (no import required)
+///
+/// This test verifies:
+/// 1. Evaluate processes start correctly with the loader script
+/// 2. The 'commonplace' global is available in user scripts
+/// 3. Command handling works via the SDK
+/// 4. Output file updates work correctly
+///
+/// Requires MQTT broker on localhost:1883 and Deno installed.
+#[test]
+fn test_evaluate_script_with_global_injection() {
+    if !mqtt_available() {
+        eprintln!("Skipping test: MQTT broker not available on localhost:1883");
+        return;
+    }
+
+    // Check if Deno is available
+    let deno_check = std::process::Command::new("deno").arg("--version").output();
+    if deno_check.is_err() || !deno_check.unwrap().status.success() {
+        eprintln!("Skipping test: Deno not available");
+        return;
+    }
+
+    // Clean up any stale status file from previous runs
+    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let workspace_dir = temp_dir.path().join("workspace");
+    let config_path = temp_dir.path().join("commonplace.json");
+    let port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+
+    // Create workspace directory
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+
+    // Copy SDK files to temp dir (server serves from sdk/ relative to cwd)
+    let sdk_src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sdk");
+    let sdk_dest = temp_dir.path().join("sdk");
+    std::fs::create_dir_all(&sdk_dest).unwrap();
+    for entry in std::fs::read_dir(&sdk_src).expect("Failed to read sdk directory") {
+        let entry = entry.unwrap();
+        let dest_path = sdk_dest.join(entry.file_name());
+        std::fs::copy(entry.path(), dest_path).expect("Failed to copy SDK file");
+    }
+
+    // Create workspace .commonplace.json schema
+    let workspace_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "eval-test": {
+                    "type": "dir",
+                    "entries": {}
+                }
+            }
+        }
+    });
+    std::fs::write(
+        workspace_dir.join(".commonplace.json"),
+        serde_json::to_string_pretty(&workspace_schema).unwrap(),
+    )
+    .unwrap();
+
+    // Create eval-test subdirectory
+    let eval_test_dir = workspace_dir.join("eval-test");
+    std::fs::create_dir_all(&eval_test_dir).unwrap();
+
+    // Create eval-test .commonplace.json schema with output file
+    let eval_test_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "output.txt": {
+                    "type": "doc",
+                    "node_id": "11111111-1111-1111-1111-111111111111",
+                    "content_type": "text/plain"
+                },
+                "script.ts": {
+                    "type": "doc",
+                    "node_id": "22222222-2222-2222-2222-222222222222",
+                    "content_type": "text/typescript"
+                },
+                "__processes.json": {
+                    "type": "doc",
+                    "node_id": "33333333-3333-3333-3333-333333333333",
+                    "content_type": "application/json"
+                }
+            }
+        }
+    });
+    std::fs::write(
+        eval_test_dir.join(".commonplace.json"),
+        serde_json::to_string_pretty(&eval_test_schema).unwrap(),
+    )
+    .unwrap();
+
+    // Create the evaluate script that uses the global 'commonplace'
+    // This script uses NO IMPORT - it relies on the loader injecting the global
+    let script_content = r##"// Test evaluate script - uses 'commonplace' global (no import needed)
+
+commonplace.onCommand("*", async (verb: string, payload: unknown) => {
+  const current = await commonplace.output.get() as string;
+  const entry = `[${verb}]: ${JSON.stringify(payload)}\n`;
+  await commonplace.output.set(current + entry);
+  console.log(`Handled command: ${verb}`);
+});
+
+await commonplace.output.set("# Test Output\n\n");
+"##;
+    std::fs::write(eval_test_dir.join("script.ts"), script_content).unwrap();
+
+    // Create initial output file
+    std::fs::write(eval_test_dir.join("output.txt"), "").unwrap();
+
+    // Create __processes.json with evaluate field
+    let processes_json = serde_json::json!({
+        "eval-proc": {
+            "evaluate": "script.ts",
+            "owns": "output.txt"
+        }
+    });
+    std::fs::write(
+        eval_test_dir.join("__processes.json"),
+        serde_json::to_string_pretty(&processes_json).unwrap(),
+    )
+    .unwrap();
+
+    // Create orchestrator config with process discovery enabled
+    let config = create_test_config_with_discovery(
+        temp_dir.path(),
+        port,
+        &db_path,
+        &workspace_dir,
+        true, // enable process discovery
+    );
+    std::fs::write(&config_path, &config).unwrap();
+
+    let mut guard = ProcessGuard::new();
+
+    // Spawn orchestrator
+    let orchestrator = Command::new(env!("CARGO_BIN_EXE_commonplace-orchestrator"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--server",
+            &server_url,
+        ])
+        .current_dir(temp_dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start orchestrator");
+    guard.add(orchestrator);
+
+    // Wait for orchestrator to be ready
+    wait_for_orchestrator_ready(Duration::from_secs(30))
+        .expect("Orchestrator failed to start within timeout");
+
+    eprintln!("=== Evaluate script integration test starting ===");
+
+    // Wait for evaluate process to be discovered and running
+    wait_for_discovered_process("eval-proc", Duration::from_secs(60))
+        .expect("Evaluate process 'eval-proc' was not discovered");
+
+    eprintln!("Evaluate process discovered, waiting for it to initialize...");
+
+    // Give the process time to initialize (connect to MQTT, set up handlers)
+    std::thread::sleep(Duration::from_secs(5));
+
+    // === Test 1: Send a command and verify output is updated ===
+    eprintln!("=== Test 1: Sending command to evaluate process ===");
+
+    let client = reqwest::blocking::Client::new();
+
+    // Send a command to the evaluate process
+    let command_url = format!("{}/commands/eval-test/output.txt/test-cmd", server_url);
+    let command_resp = client
+        .post(&command_url)
+        .header("Content-Type", "application/json")
+        .body(r#"{"payload": {"message": "hello from test"}}"#)
+        .send()
+        .expect("Failed to send command");
+
+    assert!(
+        command_resp.status().is_success(),
+        "Command should be accepted, got status: {}",
+        command_resp.status()
+    );
+    eprintln!("Command sent successfully");
+
+    // Wait for the output file to be updated
+    std::thread::sleep(Duration::from_secs(3));
+
+    // === Test 2: Verify output file contains the command ===
+    eprintln!("=== Test 2: Verifying output file updated ===");
+
+    let output_url = format!("{}/files/eval-test/output.txt", server_url);
+    let mut output_content = String::new();
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(30);
+
+    while start.elapsed() < timeout {
+        let output_resp = client
+            .get(&output_url)
+            .send()
+            .expect("Failed to fetch output");
+
+        if output_resp.status().is_success() {
+            output_content = output_resp.text().unwrap_or_default();
+            if output_content.contains("test-cmd") && output_content.contains("hello from test") {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    assert!(
+        output_content.contains("test-cmd"),
+        "Output should contain command verb 'test-cmd', got: {}",
+        output_content
+    );
+    assert!(
+        output_content.contains("hello from test"),
+        "Output should contain payload message, got: {}",
+        output_content
+    );
+    eprintln!("Output file contains expected command data");
+
+    // === Test 3: Send another command to verify ongoing operation ===
+    eprintln!("=== Test 3: Sending second command ===");
+
+    let command2_url = format!("{}/commands/eval-test/output.txt/second-cmd", server_url);
+    let command2_resp = client
+        .post(&command2_url)
+        .header("Content-Type", "application/json")
+        .body(r#"{"payload": {"count": 42}}"#)
+        .send()
+        .expect("Failed to send second command");
+
+    assert!(
+        command2_resp.status().is_success(),
+        "Second command should be accepted"
+    );
+
+    // Wait and verify
+    std::thread::sleep(Duration::from_secs(3));
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        let output_resp = client
+            .get(&output_url)
+            .send()
+            .expect("Failed to fetch output");
+
+        if output_resp.status().is_success() {
+            output_content = output_resp.text().unwrap_or_default();
+            if output_content.contains("second-cmd") && output_content.contains("42") {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    assert!(
+        output_content.contains("second-cmd"),
+        "Output should contain second command, got: {}",
+        output_content
+    );
+    assert!(
+        output_content.contains("42"),
+        "Output should contain payload count, got: {}",
+        output_content
+    );
+
+    eprintln!("=== All evaluate script integration tests PASSED ===");
+}
