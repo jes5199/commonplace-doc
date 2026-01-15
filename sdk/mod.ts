@@ -147,6 +147,7 @@ const SERVER = Deno.env.get("COMMONPLACE_SERVER") || "http://localhost:3000";
 const BROKER = Deno.env.get("COMMONPLACE_BROKER") || "localhost:1883";
 const OUTPUT_PATH = Deno.env.get("COMMONPLACE_OUTPUT") || "";
 const CLIENT_ID = Deno.env.get("COMMONPLACE_CLIENT_ID") || `cp-${crypto.randomUUID()}`;
+const WORKSPACE = Deno.env.get("COMMONPLACE_WORKSPACE") || "commonplace";
 
 // Track MQTT connection state - subscriptions deferred until started
 let mqttStarted = false;
@@ -346,21 +347,44 @@ class OutputHandleImpl implements OutputHandle {
     // Ensure we have current state before updating
     await this.ensureInitialized();
 
-    // Write value to Yjs doc using correct type (Map/Array/Text) based on content type
-    writeYjsContent(this.doc, this.contentType, value);
+    // Use HTTP API to replace content (handles CRDT internally)
+    const pathEncoded = this.path.split("/").map(encodeURIComponent).join("/");
+    const content = serializeContent(value, this.contentType);
 
-    const update = Y.encodeStateAsUpdate(this.doc);
-    const updateB64 = btoa(String.fromCharCode(...update));
+    // Build URL with parent_cid query param if we have it
+    let url = `${SERVER}/files/${pathEncoded}/replace`;
+    const params = new URLSearchParams();
+    if (this.parentCommit) {
+      params.set("parent_cid", this.parentCommit);
+    }
+    params.set("author", CLIENT_ID);
+    if (params.toString()) {
+      url += `?${params.toString()}`;
+    }
 
-    const editMsg = {
-      update: updateB64,
-      parents: this.parentCommit ? [this.parentCommit] : [],
-      author: CLIENT_ID,
-      message: opts?.message || "SDK update",
-      timestamp: Date.now(),
-    };
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        body: content,
+      });
 
-    publish(`${this.path}/edits`, editMsg);
+      if (!res.ok) {
+        const text = await res.text();
+        console.error(`[cp] Failed to set output: ${res.status} ${text}`);
+      } else {
+        // Update local state to match what we sent
+        writeYjsContent(this.doc, this.contentType, value);
+        this.cachedContent = content;
+        // Get the new commit ID if returned
+        const data = await res.json().catch(() => ({}));
+        if (data.cid) {
+          this.parentCommit = data.cid;
+        }
+      }
+    } catch (e) {
+      console.error(`[cp] Error setting output:`, e);
+    }
   }
 }
 
@@ -399,8 +423,12 @@ export const cp: CommonplaceSDK = {
     mqttStarted = true;
 
     // Subscribe to commands for our output
+    // Topic format: {workspace}/commands/{path}/{verb}
     if (OUTPUT_PATH) {
-      subscribe(`${OUTPUT_PATH}/commands/#`, (topic, payload) => {
+      const pathWithoutLeadingSlash = OUTPUT_PATH.replace(/^\//, '');
+      const commandTopic = `${WORKSPACE}/commands/${pathWithoutLeadingSlash}/#`;
+      console.log(`[cp] Subscribing to commands at: ${commandTopic}`);
+      subscribe(commandTopic, (topic, payload) => {
         const verb = topic.split("/").pop()!;
         const handler = commandHandlers.get(verb);
         if (handler) {

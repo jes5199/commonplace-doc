@@ -1,0 +1,6 @@
+{
+  "echo": {
+    "evaluate": "echo.ts",
+    "owns": "test.txt"
+  }
+}
