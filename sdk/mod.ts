@@ -430,11 +430,16 @@ export const cp: CommonplaceSDK = {
       console.log(`[cp] Subscribing to commands at: ${commandTopic}`);
       subscribe(commandTopic, (topic, payload) => {
         const verb = topic.split("/").pop()!;
-        const handler = commandHandlers.get(verb);
+        const handler = commandHandlers.get(verb) || commandHandlers.get("*");
         if (handler) {
           try {
             const msg = JSON.parse(payload.toString());
-            handler(msg.payload);
+            // For "*" handler, pass verb as first arg; for specific handlers, just payload
+            if (commandHandlers.has(verb)) {
+              handler(msg.payload);
+            } else {
+              (handler as (verb: string, payload: unknown) => void)(verb, msg.payload);
+            }
           } catch (e) {
             console.error(`[cp] Error handling command ${verb}:`, e);
           }

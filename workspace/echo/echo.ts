@@ -3,8 +3,8 @@
 
 import { cp } from "http://localhost:5199/sdk/mod.ts";
 
-// Helper to append a command to output
-async function echoCommand(verb: string, payload: unknown) {
+// Handle any command by appending to output
+cp.onCommand("*", async (verb: string, payload: unknown) => {
   const timestamp = new Date().toISOString();
   const entry = `[${timestamp}] ${verb}: ${JSON.stringify(payload)}\n`;
 
@@ -13,13 +13,7 @@ async function echoCommand(verb: string, payload: unknown) {
   await cp.output.set(current + entry, { message: `echo: ${verb}` });
 
   console.log(`Echoed: ${verb}`);
-}
-
-// Register handlers for common test verbs
-cp.onCommand("hello", (payload) => echoCommand("hello", payload));
-cp.onCommand("test", (payload) => echoCommand("test", payload));
-cp.onCommand("ping", (payload) => echoCommand("ping", payload));
-cp.onCommand("echo", (payload) => echoCommand("echo", payload));
+});
 
 // Initialize output file (uses HTTP, doesn't need MQTT)
 await cp.output.set("# Echo Output\n\n", { message: "initialize" });
