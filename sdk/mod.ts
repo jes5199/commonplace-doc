@@ -151,7 +151,21 @@ const WORKSPACE = Deno.env.get("COMMONPLACE_WORKSPACE") || "commonplace";
 
 // Track MQTT connection state - subscriptions deferred until started
 let mqttStarted = false;
+let autoStartScheduled = false;
 const pendingDocHandles: DocHandleImpl[] = [];
+
+// Schedule auto-start if handlers are registered
+function scheduleAutoStart(): void {
+  if (autoStartScheduled || mqttStarted) return;
+  autoStartScheduled = true;
+  // Use setTimeout(0) so auto-start runs after the script's sync and async init code completes
+  // This allows patterns like: cp.onCommand(...); await cp.output.set(...); // auto-start happens after
+  setTimeout(() => {
+    if (!mqttStarted) {
+      cp.start().catch(e => console.error("[cp] Auto-start failed:", e));
+    }
+  }, 0);
+}
 
 class DocHandleImpl implements DocHandle {
   private doc = new Y.Doc();
@@ -259,6 +273,7 @@ class DocHandleImpl implements DocHandle {
     } else if (!pendingDocHandles.includes(this)) {
       pendingDocHandles.push(this);
     }
+    scheduleAutoStart();
   }
 
   onEvent(name: string, cb: (payload: unknown) => void): void {
@@ -286,6 +301,7 @@ class DocHandleImpl implements DocHandle {
     } else if (!pendingDocHandles.includes(this)) {
       pendingDocHandles.push(this);
     }
+    scheduleAutoStart();
   }
 
   async command(verb: string, payload?: unknown): Promise<void> {
@@ -399,6 +415,7 @@ export const cp: CommonplaceSDK = {
 
   onCommand(verb: string, cb: (payload: unknown) => void): void {
     commandHandlers.set(verb, cb);
+    scheduleAutoStart();
   },
 
   emit(name: string, payload?: unknown): void {
@@ -415,6 +432,11 @@ export const cp: CommonplaceSDK = {
   },
 
   async start(): Promise<void> {
+    // Idempotent - can be called multiple times safely
+    if (mqttStarted) {
+      console.log(`[cp] Already started`);
+      return;
+    }
     console.log(`[cp] Starting with client_id=${CLIENT_ID}`);
     console.log(`[cp] Server: ${SERVER}, Broker: ${BROKER}`);
     console.log(`[cp] Output: ${OUTPUT_PATH}`);

@@ -1,5 +1,6 @@
 // Echo process: receives commands and appends them to output
 // Uses evaluate mode with the commonplace SDK
+// Demonstrates auto-start: no explicit cp.start() needed
 
 import { cp } from "http://localhost:5199/sdk/mod.ts";
 
@@ -18,5 +19,4 @@ cp.onCommand("*", async (verb: string, payload: unknown) => {
 // Initialize output file (uses HTTP, doesn't need MQTT)
 await cp.output.set("# Echo Output\n\n", { message: "initialize" });
 
-// Start the SDK - connects to MQTT and keeps process alive when handlers are registered
-await cp.start();
+// SDK auto-starts after this script completes because onCommand() was called
