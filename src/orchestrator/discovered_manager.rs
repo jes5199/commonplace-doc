@@ -274,10 +274,15 @@ impl DiscoveredProcessManager {
             // Extract host:port from server URL for --allow-net
             let server_host = server.replace("http://", "").replace("https://", "");
 
+            // Import map URL for simplified imports (import { cp } from "cp")
+            let import_map_url = format!("{}/sdk/import-map.json", server);
+
             let mut cmd = Command::new("deno");
             cmd.arg("run")
                 // Force re-fetch script to ensure we run latest version after changes
                 .arg("--reload")
+                // Import map for simplified SDK imports
+                .arg(format!("--import-map={}", import_map_url))
                 // Allow npm registry for package downloads, plus server and broker
                 .arg(format!(
                     "--allow-net={},{},registry.npmjs.org,cdn.jsdelivr.net,esm.sh",

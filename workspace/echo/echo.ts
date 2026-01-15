@@ -2,7 +2,7 @@
 // Uses evaluate mode with the commonplace SDK
 // Demonstrates auto-start: no explicit cp.start() needed
 
-import { cp } from "http://localhost:5199/sdk/mod.ts";
+import { cp } from "cp";
 
 // Handle any command by appending to output
 cp.onCommand("*", async (verb: string, payload: unknown) => {

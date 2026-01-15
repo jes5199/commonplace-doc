@@ -1,0 +1,6 @@
+{
+  "imports": {
+    "cp": "./mod.ts",
+    "@commonplace/sdk": "./mod.ts"
+  }
+}
