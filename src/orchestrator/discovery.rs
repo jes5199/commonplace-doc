@@ -150,6 +150,17 @@ pub struct DiscoveredProcess {
     /// Path is relative to the process directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluate: Option<String>,
+
+    /// Path to listen for stdout/stderr events from another process.
+    /// When set, this process subscribes to events at the given path
+    /// and writes them to the file it owns. Useful for capturing
+    /// ephemeral output to a persistent log.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "log-listener"
+    )]
+    pub log_listener: Option<String>,
 }
 
 /// Command specification - supports both simple string and array formats.

@@ -310,9 +310,33 @@ impl DiscoveredProcessManager {
                 script_url
             );
             cmd
+        } else if let Some(ref listen_path) = config.log_listener {
+            // log-listener: construct commonplace-sync --sandbox --log-listener "<path>"
+            // This process subscribes to stdout/stderr events at the given path
+            // and writes them to the file it owns
+            let sync_path = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("commonplace-sync")))
+                .unwrap_or_else(|| PathBuf::from("commonplace-sync"));
+
+            let mut cmd = Command::new(&sync_path);
+            cmd.args(["--sandbox", "--name", name, "--log-listener", listen_path]);
+
+            // Set cwd if specified
+            if let Some(ref cwd) = config.cwd {
+                cmd.current_dir(cwd);
+            }
+
+            tracing::info!(
+                "[discovery] Starting log-listener process '{}' (path: {}, listens: {})",
+                name,
+                document_path,
+                listen_path
+            );
+            cmd
         } else {
             return Err(format!(
-                "Process '{}' must have 'command', 'sandbox-exec', or 'evaluate'",
+                "Process '{}' must have 'command', 'sandbox-exec', 'evaluate', or 'log-listener'",
                 name
             ));
         };
@@ -1342,6 +1366,7 @@ mod tests {
             owns: Some("test.json".to_string()),
             cwd: Some(PathBuf::from("/tmp")),
             evaluate: None,
+            log_listener: None,
         };
 
         manager.add_process(
@@ -1374,6 +1399,7 @@ mod tests {
             owns: None,
             cwd: Some(PathBuf::from("/tmp")),
             evaluate: None,
+            log_listener: None,
         };
 
         // For directory-attached, document_path is just the directory
@@ -1414,6 +1440,7 @@ mod tests {
             owns: Some("output.json".to_string()),
             cwd: None,
             evaluate: Some("script.js".to_string()),
+            log_listener: None,
         };
 
         manager.add_process(

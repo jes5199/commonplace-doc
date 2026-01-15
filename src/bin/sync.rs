@@ -5,6 +5,7 @@
 //! server changes update local files.
 
 use clap::Parser;
+use commonplace_doc::events::recv_broadcast;
 use commonplace_doc::mqtt::{MqttClient, MqttConfig, Topic};
 use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
 use commonplace_doc::sync::subdir_spawn::{
@@ -295,8 +296,8 @@ struct Args {
 
     /// Run in sandbox mode: creates a temporary directory, syncs content there,
     /// runs the command in isolation, then cleans up on exit.
-    /// Implies --exec and conflicts with --directory (uses temp dir instead).
-    #[arg(long, conflicts_with = "directory", requires = "exec")]
+    /// Requires either --exec or --log-listener. Conflicts with --directory.
+    #[arg(long, conflicts_with = "directory")]
     sandbox: bool,
 
     /// Process name for log file naming in sandbox mode.
@@ -344,6 +345,13 @@ struct Args {
     /// MQTT workspace name for topic namespacing (also reads from COMMONPLACE_WORKSPACE env var)
     #[arg(long, default_value = DEFAULT_WORKSPACE, env = "COMMONPLACE_WORKSPACE")]
     workspace: String,
+
+    /// Path to listen for stdout/stderr events from another process.
+    /// When set, this sync process subscribes to events at the given path
+    /// and writes them to a log file. Requires --sandbox mode.
+    /// Events appear on {workspace}/events/{path}/stdout and /stderr topics.
+    #[arg(long, requires = "sandbox")]
+    log_listener: Option<String>,
 }
 
 /// Resolve a path relative to fs-root to a UUID.
@@ -561,6 +569,12 @@ async fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // Sandbox mode requires either --exec or --log-listener
+    if args.sandbox && args.exec.is_none() && args.log_listener.is_none() {
+        error!("--sandbox requires either --exec or --log-listener");
+        return ExitCode::from(1);
+    }
+
     // Create HTTP client
     let client = Client::new();
 
@@ -688,9 +702,6 @@ async fn main() -> ExitCode {
             ignore_patterns,
         };
 
-        // exec is required by clap when sandbox is set
-        let exec_cmd = args.exec.expect("--sandbox requires --exec");
-
         // Sandbox mode defaults to pulling server content (since local sandbox is empty)
         // User can still override with explicit --initial-sync if needed
         let initial_sync = if args.initial_sync == "skip" {
@@ -699,25 +710,50 @@ async fn main() -> ExitCode {
             args.initial_sync
         };
 
-        let exec_result = run_exec_mode(
-            client,
-            args.server,
-            node_id,
-            sandbox_dir.clone(),
-            scan_options,
-            initial_sync,
-            args.use_paths,
-            exec_cmd,
-            args.exec_args,
-            true, // sandbox mode
-            args.push_only,
-            args.pull_only,
-            args.shadow_dir,
-            args.name,
-            mqtt_client,
-            args.workspace,
-        )
-        .await;
+        let exec_result = if let Some(ref listen_path) = args.log_listener {
+            // Log-listener mode: subscribe to events at another path and write to log file
+            run_log_listener_mode(
+                client,
+                args.server,
+                node_id,
+                sandbox_dir.clone(),
+                scan_options,
+                initial_sync,
+                args.use_paths,
+                args.push_only,
+                args.pull_only,
+                args.shadow_dir,
+                args.name,
+                mqtt_client,
+                args.workspace,
+                listen_path.clone(),
+            )
+            .await
+        } else {
+            // Normal exec mode
+            let exec_cmd = args
+                .exec
+                .expect("--sandbox requires --exec or --log-listener");
+            run_exec_mode(
+                client,
+                args.server,
+                node_id,
+                sandbox_dir.clone(),
+                scan_options,
+                initial_sync,
+                args.use_paths,
+                exec_cmd,
+                args.exec_args,
+                true, // sandbox mode
+                args.push_only,
+                args.pull_only,
+                args.shadow_dir,
+                args.name,
+                mqtt_client,
+                args.workspace,
+            )
+            .await
+        };
 
         // Clean up sandbox directory
         info!("Cleaning up sandbox directory: {}", sandbox_dir.display());
@@ -2464,4 +2500,160 @@ fn cleanup_stale_sandboxes() {
     if cleaned > 0 {
         info!("Cleaned up {} stale sandbox directories", cleaned);
     }
+}
+
+/// Run in log-listener mode: subscribe to stdout/stderr events at another path
+/// and write them to a log file in this sandbox.
+#[allow(clippy::too_many_arguments)]
+async fn run_log_listener_mode(
+    _client: Client,
+    _server: String,
+    _fs_root_id: String,
+    directory: PathBuf,
+    _options: ScanOptions,
+    _initial_sync_strategy: String,
+    _use_paths: bool,
+    _push_only: bool,
+    _pull_only: bool,
+    _shadow_dir: String,
+    process_name: Option<String>,
+    mqtt_client: Option<Arc<MqttClient>>,
+    workspace: String,
+    listen_path: String,
+) -> Result<u8, Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::fs::OpenOptions;
+    use tokio::io::AsyncWriteExt;
+
+    // Derive process name from listen_path if not provided
+    let exec_name = process_name.unwrap_or_else(|| {
+        // Use the last component of the listen path
+        listen_path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .last()
+            .unwrap_or("log-listener")
+            .to_string()
+    });
+
+    info!(
+        "Starting log-listener mode: listening to {} in sandbox {}",
+        listen_path,
+        directory.display()
+    );
+
+    // Set up the log file path
+    let log_file_path = directory.join(format!("{}.log", exec_name));
+
+    // Require MQTT for log-listener mode
+    let mqtt = mqtt_client.ok_or("--log-listener requires --mqtt-broker")?;
+
+    // Subscribe to stdout and stderr events at the listened path
+    let stdout_topic = Topic::events(&workspace, &listen_path, "stdout");
+    let stderr_topic = Topic::events(&workspace, &listen_path, "stderr");
+
+    info!(
+        "Subscribing to events: {} and {}",
+        stdout_topic.to_topic_string(),
+        stderr_topic.to_topic_string()
+    );
+
+    // Subscribe to both topics
+    if let Err(e) = mqtt
+        .subscribe(&stdout_topic.to_topic_string(), QoS::AtLeastOnce)
+        .await
+    {
+        error!("Failed to subscribe to stdout events: {}", e);
+        return Err(format!("Failed to subscribe: {}", e).into());
+    }
+    if let Err(e) = mqtt
+        .subscribe(&stderr_topic.to_topic_string(), QoS::AtLeastOnce)
+        .await
+    {
+        error!("Failed to subscribe to stderr events: {}", e);
+        return Err(format!("Failed to subscribe: {}", e).into());
+    }
+
+    // Spawn the MQTT event loop
+    let mqtt_for_loop = mqtt.clone();
+    tokio::spawn(async move {
+        let _ = mqtt_for_loop.run_event_loop().await;
+    });
+
+    // Get a receiver for incoming messages
+    let mut message_rx = mqtt.subscribe_messages();
+
+    // Open the log file for appending
+    let mut log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_path)
+        .await?;
+
+    info!("Log file: {}", log_file_path.display());
+
+    // Topic prefixes for matching
+    let stdout_prefix = stdout_topic.to_topic_string();
+    let stderr_prefix = stderr_topic.to_topic_string();
+
+    // Process events until signaled to stop
+    let exit_code = tokio::select! {
+        _ = async {
+            while let Some(msg) = recv_broadcast(&mut message_rx, "log-listener").await {
+                // Determine if this is stdout or stderr
+                let stream_type = if msg.topic == stdout_prefix {
+                    "stdout"
+                } else if msg.topic == stderr_prefix {
+                    "stderr"
+                } else {
+                    continue;
+                };
+
+                // Parse the line from payload
+                let line = match String::from_utf8(msg.payload.clone()) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                // Write to log file with timestamp and stream type
+                let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+                let log_line = format!("[{}] [{}] {}\n", timestamp, stream_type, line);
+
+                if let Err(e) = log_file.write_all(log_line.as_bytes()).await {
+                    warn!("Failed to write to log file: {}", e);
+                }
+                if let Err(e) = log_file.flush().await {
+                    warn!("Failed to flush log file: {}", e);
+                }
+
+                // Also print to console for debugging
+                println!("[{}] [{}] {}", listen_path, stream_type, line);
+            }
+        } => {
+            info!("Message stream ended");
+            0
+        }
+        _ = async {
+            // Handle both SIGINT (Ctrl+C) and SIGTERM
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+                let mut sigint = signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
+                tokio::select! {
+                    _ = sigterm.recv() => info!("Received SIGTERM"),
+                    _ = sigint.recv() => info!("Received SIGINT"),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.ok();
+            }
+        } => {
+            info!("Shutting down log-listener...");
+            0
+        }
+    };
+
+    info!("Log-listener stopped");
+    Ok(exit_code)
 }
