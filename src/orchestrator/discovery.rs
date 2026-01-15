@@ -4,15 +4,106 @@
 //! processes discovered from `__processes.json` files in the filesystem.
 //!
 //! For process lifecycle management, see the `discovered_manager` module.
+//!
+//! ## Configuration Format
+//!
+//! The preferred format uses file paths as keys (the file the process owns):
+//!
+//! ```json
+//! {
+//!   "output.txt": {
+//!     "sandbox-exec": "deno run script.ts"
+//!   }
+//! }
+//! ```
+//!
+//! The legacy format with a `processes` wrapper is still supported:
+//!
+//! ```json
+//! {
+//!   "processes": {
+//!     "my-process": {
+//!       "sandbox-exec": "deno run script.ts",
+//!       "owns": "output.txt"
+//!     }
+//!   }
+//! }
+//! ```
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Configuration parsed from `__processes.json` files.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Supports two formats:
+/// 1. New format: Keys are file paths (process identity)
+/// 2. Legacy format: Wrapped in `{"processes": {...}}` with optional `owns` field
+#[derive(Debug, Clone, Serialize)]
 pub struct ProcessesConfig {
     pub processes: HashMap<String, DiscoveredProcess>,
+}
+
+// Custom deserializer to support both new and legacy formats
+impl<'de> Deserialize<'de> for ProcessesConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        // First, deserialize as a generic JSON value
+        let value: serde_json::Value = serde_json::Value::deserialize(deserializer)?;
+
+        let obj = value
+            .as_object()
+            .ok_or_else(|| D::Error::custom("expected JSON object"))?;
+
+        // Check if this is the legacy format (has "processes" key at root)
+        if obj.contains_key("processes") {
+            // Legacy format: { "processes": { "name": {...} } }
+            let legacy: LegacyProcessesConfig = serde_json::from_value(value)
+                .map_err(|e| D::Error::custom(format!("failed to parse legacy format: {}", e)))?;
+
+            let mut processes = HashMap::new();
+            for (name, process) in legacy.processes {
+                // If process has 'owns' field in legacy format, warn about deprecation
+                if process.owns.is_some() {
+                    tracing::warn!(
+                        "Deprecated: process '{}' uses 'owns' field. \
+                         Migrate to new format where the key IS the file path.",
+                        name
+                    );
+                }
+                processes.insert(name, process);
+            }
+            Ok(ProcessesConfig { processes })
+        } else {
+            // New format: keys are file paths
+            // { "output.txt": { "sandbox-exec": "..." } }
+            let mut processes = HashMap::new();
+            for (key, process_value) in obj {
+                let mut process: DiscoveredProcess = serde_json::from_value(process_value.clone())
+                    .map_err(|e| {
+                        D::Error::custom(format!("failed to parse process '{}': {}", key, e))
+                    })?;
+
+                // In new format, the key IS the file path identity
+                // Set 'owns' to the key (the file path)
+                if process.owns.is_none() {
+                    process.owns = Some(key.clone());
+                }
+                processes.insert(key.clone(), process);
+            }
+            Ok(ProcessesConfig { processes })
+        }
+    }
+}
+
+/// Legacy format wrapper (for backwards compatibility parsing)
+#[derive(Deserialize)]
+struct LegacyProcessesConfig {
+    processes: HashMap<String, DiscoveredProcess>,
 }
 
 /// A process discovered from a `__processes.json` file.
@@ -43,8 +134,11 @@ pub struct DiscoveredProcess {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 
-    /// Relative path within same directory that this process owns (file-attached).
-    /// If absent, process is directory-attached.
+    /// File path identity for this process.
+    ///
+    /// In the new format, this is automatically set from the JSON key.
+    /// In the legacy format, this can be explicitly set (deprecated).
+    /// If absent, process is directory-attached (no file ownership).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owns: Option<String>,
 
@@ -315,5 +409,142 @@ mod tests {
         let config = ProcessesConfig::parse(json).unwrap();
         let worker = &config.processes["worker"];
         assert_eq!(worker.comment, None);
+    }
+
+    // =========================================================================
+    // New format tests (key is file path)
+    // =========================================================================
+
+    #[test]
+    fn test_new_format_simple() {
+        // New format: key is the file path identity
+        let json = r#"{
+            "output.txt": {
+                "sandbox-exec": "deno run script.ts"
+            }
+        }"#;
+
+        let config = ProcessesConfig::parse(json).unwrap();
+        assert_eq!(config.processes.len(), 1);
+
+        // Key is "output.txt" - the file path
+        let process = &config.processes["output.txt"];
+        assert_eq!(process.sandbox_exec, Some("deno run script.ts".to_string()));
+        // 'owns' is automatically set to the key
+        assert_eq!(process.owns, Some("output.txt".to_string()));
+    }
+
+    #[test]
+    fn test_new_format_with_evaluate() {
+        let json = r#"{
+            "output.txt": {
+                "evaluate": "transform.ts"
+            }
+        }"#;
+
+        let config = ProcessesConfig::parse(json).unwrap();
+        let process = &config.processes["output.txt"];
+        assert_eq!(process.evaluate, Some("transform.ts".to_string()));
+        assert_eq!(process.owns, Some("output.txt".to_string()));
+    }
+
+    #[test]
+    fn test_new_format_multiple_processes() {
+        let json = r#"{
+            "output.txt": {
+                "evaluate": "script1.ts"
+            },
+            "data.json": {
+                "sandbox-exec": "node processor.js"
+            }
+        }"#;
+
+        let config = ProcessesConfig::parse(json).unwrap();
+        assert_eq!(config.processes.len(), 2);
+
+        assert_eq!(
+            config.processes["output.txt"].owns,
+            Some("output.txt".to_string())
+        );
+        assert_eq!(
+            config.processes["data.json"].owns,
+            Some("data.json".to_string())
+        );
+    }
+
+    #[test]
+    fn test_new_format_nested_path() {
+        // Nested paths like "subdir/output.txt" are supported
+        let json = r#"{
+            "subdir/output.txt": {
+                "evaluate": "transform.ts"
+            }
+        }"#;
+
+        let config = ProcessesConfig::parse(json).unwrap();
+        let process = &config.processes["subdir/output.txt"];
+        assert_eq!(process.owns, Some("subdir/output.txt".to_string()));
+    }
+
+    #[test]
+    fn test_new_format_with_all_fields() {
+        let json = r#"{
+            "results.json": {
+                "comment": "Processes input and writes to results.json",
+                "sandbox-exec": "python process.py",
+                "path": "/custom/path",
+                "cwd": "/app/workdir"
+            }
+        }"#;
+
+        let config = ProcessesConfig::parse(json).unwrap();
+        let process = &config.processes["results.json"];
+        assert_eq!(
+            process.comment,
+            Some("Processes input and writes to results.json".to_string())
+        );
+        assert_eq!(process.sandbox_exec, Some("python process.py".to_string()));
+        assert_eq!(process.path, Some("/custom/path".to_string()));
+        assert_eq!(process.cwd, Some(PathBuf::from("/app/workdir")));
+        assert_eq!(process.owns, Some("results.json".to_string()));
+    }
+
+    #[test]
+    fn test_legacy_format_still_works() {
+        // Ensure legacy format with "processes" wrapper still works
+        let json = r#"{
+            "processes": {
+                "my-process": {
+                    "sandbox-exec": "node app.js",
+                    "owns": "output.txt"
+                }
+            }
+        }"#;
+
+        let config = ProcessesConfig::parse(json).unwrap();
+        assert_eq!(config.processes.len(), 1);
+
+        // In legacy format, key is the process name
+        let process = &config.processes["my-process"];
+        assert_eq!(process.sandbox_exec, Some("node app.js".to_string()));
+        // 'owns' is preserved from the JSON
+        assert_eq!(process.owns, Some("output.txt".to_string()));
+    }
+
+    #[test]
+    fn test_legacy_format_directory_attached() {
+        // Legacy format without 'owns' field = directory-attached
+        let json = r#"{
+            "processes": {
+                "sandbox-process": {
+                    "sandbox-exec": "node app.js"
+                }
+            }
+        }"#;
+
+        let config = ProcessesConfig::parse(json).unwrap();
+        let process = &config.processes["sandbox-process"];
+        // No 'owns' field in JSON, so it's None (directory-attached)
+        assert!(process.owns.is_none());
     }
 }
