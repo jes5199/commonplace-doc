@@ -448,6 +448,12 @@ export const cp: CommonplaceSDK = {
     }
 
     console.log(`[cp] Ready`);
+
+    // Keep process alive if there are command handlers or subscriptions
+    if (commandHandlers.size > 0 || pendingDocHandles.length > 0) {
+      console.log(`[cp] Keeping process alive (${commandHandlers.size} command handlers, ${pendingDocHandles.length} subscriptions)`);
+      await new Promise(() => {}); // Never resolves - keeps process running
+    }
   },
 };
 

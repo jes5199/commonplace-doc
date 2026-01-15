@@ -21,15 +21,8 @@ cp.onCommand("test", (payload) => echoCommand("test", payload));
 cp.onCommand("ping", (payload) => echoCommand("ping", payload));
 cp.onCommand("echo", (payload) => echoCommand("echo", payload));
 
-console.log("Echo process starting...");
-
-// Start the SDK (connects to MQTT, activates subscriptions)
-await cp.start();
-
-// Initialize output file after connecting
+// Initialize output file (uses HTTP, doesn't need MQTT)
 await cp.output.set("# Echo Output\n\n", { message: "initialize" });
 
-console.log("Echo process ready, waiting for commands...");
-
-// Keep process alive
-await new Promise(() => {});
+// Start the SDK - connects to MQTT and keeps process alive when handlers are registered
+await cp.start();
