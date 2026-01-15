@@ -158,6 +158,52 @@ Processes are configured via `__processes.json` files in the workspace. The loca
 
 **CRITICAL: Bartleby must be in the toplevel `workspace/__processes.json`** so he can see the whole workspace (including `bartleby/`, `text-to-telegram/`, `tmux/`, etc.). Never move bartleby to `workspace/bartleby/__processes.json` - this breaks his ability to see other directories.
 
+#### Process Config Fields
+
+Each process in `__processes.json` can use one of these execution modes:
+
+- **`evaluate`** - Deno script execution (preferred for TypeScript/JavaScript)
+  - Takes a script filename (e.g., `"script.ts"`)
+  - Fetches script from server via HTTP (`/files/{path}/{script}`)
+  - Runs with `deno run --reload` and restricted `--allow-net` (server, broker, npm registries)
+  - Auto-sets env vars: `COMMONPLACE_SERVER`, `COMMONPLACE_BROKER`, `COMMONPLACE_CLIENT_ID`
+  - Use with `owns` to set `COMMONPLACE_OUTPUT` for the process's output file
+  ```json
+  {
+    "myprocess": {
+      "evaluate": "script.ts",
+      "owns": "output.txt"
+    }
+  }
+  ```
+
+- **`sandbox-exec`** - General sandbox execution
+  - Runs any command inside a commonplace-sync sandbox
+  - Process sees only files in its directory
+  - Receives commands via MQTT at `commonplace/commands/{path}/#`
+  ```json
+  {
+    "myprocess": {
+      "sandbox-exec": "python worker.py"
+    }
+  }
+  ```
+
+- **`command`** - Direct command execution (no sandbox)
+  - Requires explicit `cwd` (working directory)
+  - No file sync or isolation
+  ```json
+  {
+    "myprocess": {
+      "command": "./run.sh",
+      "cwd": "/path/to/dir"
+    }
+  }
+  ```
+
+- **`log-listener`** - Subscribe to another process's stdout/stderr
+  - Writes captured logs to the file it `owns`
+
 ### CLI Tools
 
 #### commonplace-ps
