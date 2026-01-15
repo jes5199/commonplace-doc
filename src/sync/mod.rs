@@ -8,6 +8,7 @@ use tracing::{error, info};
 
 pub mod ancestry;
 pub mod client;
+pub mod commands;
 pub mod content_type;
 pub mod dir_sync;
 pub mod directory;
@@ -143,3 +144,5 @@ pub use yjs::{
     create_yjs_json_update, create_yjs_jsonl_update, create_yjs_structured_update,
     create_yjs_text_diff_update, create_yjs_text_update, json_value_to_any, TEXT_ROOT_NAME,
 };
+
+pub use commands::{spawn_command_listener, CommandEntry};

@@ -18,9 +18,10 @@ use commonplace_doc::sync::{
     directory_watcher_task, discover_fs_root, ensure_fs_root_exists, file_watcher_task, fork_node,
     handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
     handle_schema_modified, initial_sync, is_binary_content, push_schema_to_server,
-    scan_directory_with_contents, spawn_file_sync_tasks_with_flock, sse_task, sync_schema,
-    sync_single_file, upload_task, DirEvent, FileEvent, FileSyncState, FlockSyncState, InodeKey,
-    InodeTracker, ReplaceResponse, ScanOptions, SharedStateFile, SyncState, SCHEMA_FILENAME,
+    scan_directory_with_contents, spawn_command_listener, spawn_file_sync_tasks_with_flock,
+    sse_task, sync_schema, sync_single_file, upload_task, DirEvent, FileEvent, FileSyncState,
+    FlockSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions, SharedStateFile,
+    SyncState, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -2331,6 +2332,21 @@ async fn run_exec_mode(
                     }
                 }
             });
+        }
+
+        // Spawn command listener for this sandbox process
+        // Commands sent to {workspace}/commands/{path}/# will be written to __commands.jsonl
+        if let Some(ref mqtt) = mqtt_client {
+            info!(
+                "Starting command listener for sandbox process at path: {}",
+                fs_root_id
+            );
+            spawn_command_listener(
+                mqtt.clone(),
+                workspace.clone(),
+                fs_root_id.clone(),
+                directory.clone(),
+            );
         }
     }
 
