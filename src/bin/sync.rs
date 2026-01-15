@@ -5,8 +5,7 @@
 //! server changes update local files.
 
 use clap::Parser;
-use commonplace_doc::fs::{DocEntry, Entry, FsSchema};
-use commonplace_doc::mqtt::{MqttClient, MqttConfig};
+use commonplace_doc::mqtt::{MqttClient, MqttConfig, Topic};
 use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
 use commonplace_doc::sync::subdir_spawn::{
     spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport,
@@ -2137,73 +2136,9 @@ async fn run_exec_mode(
             .to_string()
     });
 
-    // In sandbox mode, add log file entries to schema BEFORE starting exec
-    // This prevents race condition where sync deletes newly created log files
-    if sandbox {
-        let stdout_name = format!("__{}.stdout.txt", exec_name);
-        let stderr_name = format!("__{}.stderr.txt", exec_name);
-
-        // Fetch current schema
-        let head_url = build_head_url(&server, &fs_root_id, false);
-        if let Ok(resp) = client.get(&head_url).send().await {
-            if let Ok(head) = resp.json::<serde_json::Value>().await {
-                if let Some(content) = head.get("content").and_then(|c| c.as_str()) {
-                    if let Ok(mut schema) = serde_json::from_str::<FsSchema>(content) {
-                        // Add log file entries if they don't exist
-                        if let Some(Entry::Dir(ref mut dir)) = schema.root {
-                            let entries = dir.entries.get_or_insert_with(HashMap::new);
-
-                            let mut added = false;
-                            if !entries.contains_key(&stdout_name) {
-                                entries.insert(
-                                    stdout_name.clone(),
-                                    Entry::Doc(DocEntry {
-                                        node_id: None,
-                                        content_type: Some("text/plain".to_string()),
-                                    }),
-                                );
-                                added = true;
-                            }
-                            if !entries.contains_key(&stderr_name) {
-                                entries.insert(
-                                    stderr_name.clone(),
-                                    Entry::Doc(DocEntry {
-                                        node_id: None,
-                                        content_type: Some("text/plain".to_string()),
-                                    }),
-                                );
-                                added = true;
-                            }
-
-                            if added {
-                                // Push updated schema
-                                let schema_json =
-                                    serde_json::to_string_pretty(&schema).unwrap_or_default();
-                                info!(
-                                    "Adding log file entries to schema: {}, {}",
-                                    stdout_name, stderr_name
-                                );
-                                if let Err(e) = push_schema_to_server(
-                                    &client,
-                                    &server,
-                                    &fs_root_id,
-                                    &schema_json,
-                                    &author,
-                                )
-                                .await
-                                {
-                                    warn!("Failed to add log file entries to schema: {}", e);
-                                } else {
-                                    // Wait for reconciler to create the documents
-                                    sleep(Duration::from_millis(200)).await;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Note: stdout/stderr are now emitted as MQTT events instead of being saved to files
+    // Subscribe to {workspace}/events/{path}/stdout and {workspace}/events/{path}/stderr
+    // to receive output lines
 
     info!("Launching: {} {:?}", program, args);
 
@@ -2262,72 +2197,56 @@ async fn run_exec_mode(
         .spawn()
         .map_err(|e| format!("Failed to spawn command '{}': {}", program, e))?;
 
-    // In sandbox mode, spawn tasks to log stdout/stderr to files
+    // In sandbox mode, emit stdout/stderr as MQTT events and spawn command listener
     if sandbox {
-        use tokio::fs::OpenOptions;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::io::{AsyncBufReadExt, BufReader};
 
-        // Stdout logging
+        // Stdout event emission
         if let Some(stdout) = child.stdout.take() {
-            let log_path = directory.join(format!("__{}.stdout.txt", exec_name));
             let exec_name_clone = exec_name.clone();
+            let mqtt_clone = mqtt_client.clone();
+            let workspace_clone = workspace.clone();
+            let path_clone = fs_root_id.clone();
             tokio::spawn(async move {
-                let mut log_file = match OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_path)
-                    .await
-                {
-                    Ok(f) => Some(f),
-                    Err(e) => {
-                        tracing::warn!("Failed to open stdout log file {:?}: {}", log_path, e);
-                        None
-                    }
-                };
-
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     // Print to console (like non-sandbox mode would)
                     println!("[{}] {}", exec_name_clone, line);
-                    // Write to log file
-                    if let Some(ref mut file) = log_file {
-                        let log_line = format!("{}\n", line);
-                        if let Err(e) = file.write_all(log_line.as_bytes()).await {
-                            tracing::warn!("Failed to write to stdout log: {}", e);
+                    // Emit as MQTT event
+                    if let Some(ref mqtt) = mqtt_clone {
+                        let topic = Topic::events(&workspace_clone, &path_clone, "stdout");
+                        if let Err(e) = mqtt
+                            .publish(&topic.to_topic_string(), line.as_bytes(), QoS::AtMostOnce)
+                            .await
+                        {
+                            tracing::debug!("Failed to publish stdout event: {}", e);
                         }
                     }
                 }
             });
         }
 
-        // Stderr logging
+        // Stderr event emission
         if let Some(stderr) = child.stderr.take() {
-            let log_path = directory.join(format!("__{}.stderr.txt", exec_name));
+            let exec_name_clone = exec_name.clone();
+            let mqtt_clone = mqtt_client.clone();
+            let workspace_clone = workspace.clone();
+            let path_clone = fs_root_id.clone();
             tokio::spawn(async move {
-                let mut log_file = match OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_path)
-                    .await
-                {
-                    Ok(f) => Some(f),
-                    Err(e) => {
-                        tracing::warn!("Failed to open stderr log file {:?}: {}", log_path, e);
-                        None
-                    }
-                };
-
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     // Print to console (like non-sandbox mode would)
-                    eprintln!("[{}] {}", exec_name, line);
-                    // Write to log file
-                    if let Some(ref mut file) = log_file {
-                        let log_line = format!("{}\n", line);
-                        if let Err(e) = file.write_all(log_line.as_bytes()).await {
-                            tracing::warn!("Failed to write to stderr log: {}", e);
+                    eprintln!("[{}] {}", exec_name_clone, line);
+                    // Emit as MQTT event
+                    if let Some(ref mqtt) = mqtt_clone {
+                        let topic = Topic::events(&workspace_clone, &path_clone, "stderr");
+                        if let Err(e) = mqtt
+                            .publish(&topic.to_topic_string(), line.as_bytes(), QoS::AtMostOnce)
+                            .await
+                        {
+                            tracing::debug!("Failed to publish stderr event: {}", e);
                         }
                     }
                 }
