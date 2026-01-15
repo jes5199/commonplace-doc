@@ -276,6 +276,8 @@ impl DiscoveredProcessManager {
 
             let mut cmd = Command::new("deno");
             cmd.arg("run")
+                // Force re-fetch script to ensure we run latest version after changes
+                .arg("--reload")
                 // Allow npm registry for package downloads, plus server and broker
                 .arg(format!(
                     "--allow-net={},{},registry.npmjs.org,cdn.jsdelivr.net,esm.sh",
