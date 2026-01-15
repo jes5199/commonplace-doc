@@ -736,7 +736,7 @@ async fn main() -> ExitCode {
                 .expect("--sandbox requires --exec or --log-listener");
             run_exec_mode(
                 client,
-                args.server,
+                args.server.clone(),
                 node_id,
                 sandbox_dir.clone(),
                 scan_options,
@@ -751,6 +751,7 @@ async fn main() -> ExitCode {
                 args.name,
                 mqtt_client,
                 args.workspace,
+                args.path.clone(),
             )
             .await
         };
@@ -802,6 +803,7 @@ async fn main() -> ExitCode {
                 args.name,
                 mqtt_client,
                 args.workspace,
+                args.path.clone(),
             )
             .await
         } else {
@@ -1673,6 +1675,7 @@ async fn run_exec_mode(
     process_name: Option<String>,
     mqtt_client: Option<Arc<MqttClient>>,
     workspace: String,
+    command_path: Option<String>,
 ) -> Result<u8, Box<dyn std::error::Error + Send + Sync>> {
     // Derive author from process_name, defaulting to "sync-client"
     let author = process_name
@@ -2291,15 +2294,21 @@ async fn run_exec_mode(
 
         // Spawn command listener for this sandbox process
         // Commands sent to {workspace}/commands/{path}/# will be written to __commands.jsonl
+        // Use the original path (e.g., "echo") rather than UUID for topic matching
         if let Some(ref mqtt) = mqtt_client {
+            let listener_path = command_path
+                .clone()
+                .unwrap_or_else(|| fs_root_id.clone())
+                .trim_start_matches('/')
+                .to_string();
             info!(
                 "Starting command listener for sandbox process at path: {}",
-                fs_root_id
+                listener_path
             );
             spawn_command_listener(
                 mqtt.clone(),
                 workspace.clone(),
-                fs_root_id.clone(),
+                listener_path,
                 directory.clone(),
             );
         }
