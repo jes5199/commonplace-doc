@@ -138,6 +138,23 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
                         .set_fs_root_path(fs_root_id.clone())
                         .await;
                     tracing::info!("MQTT handlers initialized with fs-root context");
+
+                    // Publish fs-root ID as retained message for client discovery
+                    if let Err(e) = mqtt_client
+                        .publish_retained(
+                            &format!("{}/_system/fs-root", workspace),
+                            fs_root_id.as_bytes(),
+                            mqtt::QoS::AtLeastOnce,
+                        )
+                        .await
+                    {
+                        tracing::warn!("Failed to publish fs-root to MQTT: {}", e);
+                    } else {
+                        tracing::info!(
+                            "Published fs-root ID to MQTT: {}/_system/fs-root",
+                            workspace
+                        );
+                    }
                 }
 
                 // Subscribe to store-level commands (e.g., create-document)

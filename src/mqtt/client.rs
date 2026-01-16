@@ -90,6 +90,28 @@ impl MqttClient {
         Ok(())
     }
 
+    /// Publish a retained message to a topic.
+    ///
+    /// Retained messages are stored by the broker and sent to new subscribers.
+    /// Used for system state like fs-root ID that clients need on connect.
+    pub async fn publish_retained(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+    ) -> Result<(), MqttError> {
+        self.client
+            .publish(topic, qos, true, payload)
+            .await
+            .map_err(|e| MqttError::Publish(e.to_string()))?;
+        debug!(
+            "Published {} bytes (retained) to topic: {}",
+            payload.len(),
+            topic
+        );
+        Ok(())
+    }
+
     /// Get a receiver for incoming messages.
     pub fn subscribe_messages(&self) -> broadcast::Receiver<IncomingMessage> {
         self.message_tx.subscribe()

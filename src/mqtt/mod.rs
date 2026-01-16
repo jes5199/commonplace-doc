@@ -19,7 +19,7 @@ use crate::document::DocumentStore;
 use crate::events::recv_broadcast;
 use crate::store::CommitStore;
 use crate::{DEFAULT_MQTT_BROKER_URL, DEFAULT_WORKSPACE};
-use rumqttc::QoS;
+pub use rumqttc::QoS;
 use std::sync::Arc;
 use thiserror::Error;
 
