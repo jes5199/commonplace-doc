@@ -756,10 +756,28 @@ async fn main() -> ExitCode {
             .await
         };
 
-        // Clean up sandbox directory
-        info!("Cleaning up sandbox directory: {}", sandbox_dir.display());
-        if let Err(e) = std::fs::remove_dir_all(&sandbox_dir) {
-            warn!("Failed to clean up sandbox directory: {}", e);
+        // Clean up sandbox directory only if the command completed successfully (exit code 0)
+        // If we received a signal (SIGTERM/SIGINT), preserve the sandbox for debugging
+        match &exec_result {
+            Ok(0) => {
+                info!("Cleaning up sandbox directory: {}", sandbox_dir.display());
+                if let Err(e) = std::fs::remove_dir_all(&sandbox_dir) {
+                    warn!("Failed to clean up sandbox directory: {}", e);
+                }
+            }
+            Ok(code) => {
+                info!(
+                    "Preserving sandbox directory (exit code {}): {}",
+                    code,
+                    sandbox_dir.display()
+                );
+            }
+            Err(_) => {
+                info!(
+                    "Preserving sandbox directory (error exit): {}",
+                    sandbox_dir.display()
+                );
+            }
         }
 
         exec_result
