@@ -14,6 +14,7 @@ import * as Y from 'https://esm.sh/yjs@13.6.18?dev';
     let ydoc = null;
     let reconnectTimeout = null;
     let reconnectDelay = 1000;
+    let trustedMode = true; // When true, render HTML inline instead of in iframe
 
     // DOM elements
     const titleEl = document.getElementById('title');
@@ -301,6 +302,51 @@ import * as Y from 'https://esm.sh/yjs@13.6.18?dev';
         }
 
         contentEl.innerHTML = html;
+
+        // In trusted mode, wire up forms with data-cp-command after rendering
+        if (trustedMode && (type === 'text/html' || type === 'application/xhtml+xml')) {
+            wireUpCommandForms();
+        }
+    }
+
+    // Wire up forms with data-cp-command attribute (for trusted mode)
+    function wireUpCommandForms() {
+        contentEl.querySelectorAll('form[data-cp-command]').forEach(form => {
+            // Skip if already wired up
+            if (form.dataset.cpWired) return;
+            form.dataset.cpWired = 'true';
+
+            form.addEventListener('submit', async (e) => {
+                e.preventDefault();
+
+                const verb = form.dataset.cpCommand;
+                const formData = new FormData(form);
+                const payload = {};
+
+                formData.forEach((value, key) => {
+                    payload[key] = value;
+                });
+
+                const encodedPath = docId.split('/').map(encodeURIComponent).join('/');
+                const commandUrl = `/commands/${encodedPath}/${encodeURIComponent(verb)}`;
+
+                try {
+                    const response = await fetch(commandUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ payload, source: 'trusted-form' }),
+                    });
+
+                    if (!response.ok) {
+                        console.error('Command failed:', response.status, await response.text());
+                    } else {
+                        form.reset();
+                    }
+                } catch (err) {
+                    console.error('Command error:', err);
+                }
+            });
+        });
     }
 
     // Render JSON with syntax highlighting
@@ -335,9 +381,38 @@ import * as Y from 'https://esm.sh/yjs@13.6.18?dev';
         return `<pre>${highlighted}</pre>`;
     }
 
-    // Render HTML in an iframe with commonplace command support
+    // Render HTML content
     function renderHtml(content) {
-        // Inject script to handle forms with data-cp-command attribute
+        if (trustedMode) {
+            // Trusted mode: render inline, extract body content if present
+            return extractHtmlBody(content);
+        }
+
+        // Sandboxed mode: render in iframe with injected command script
+        return renderHtmlSandboxed(content);
+    }
+
+    // Extract body content from HTML, or return as-is if no body tags
+    function extractHtmlBody(content) {
+        const bodyMatch = content.match(/<body[^>]*>([\s\S]*)<\/body>/i);
+        if (bodyMatch) {
+            return bodyMatch[1];
+        }
+        // No body tags - check if it looks like a full HTML document
+        if (content.match(/<!DOCTYPE|<html/i)) {
+            // Strip doctype, html, head tags but keep content
+            let stripped = content
+                .replace(/<!DOCTYPE[^>]*>/gi, '')
+                .replace(/<\/?html[^>]*>/gi, '')
+                .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, '');
+            return stripped.trim();
+        }
+        // Just a fragment, return as-is
+        return content;
+    }
+
+    // Render HTML in a sandboxed iframe with command support
+    function renderHtmlSandboxed(content) {
         const origin = window.location.origin;
         const commandScript = `
 <script>
@@ -371,7 +446,6 @@ import * as Y from 'https://esm.sh/yjs@13.6.18?dev';
                     if (!response.ok) {
                         console.error('Command failed:', response.status, await response.text());
                     } else {
-                        // Clear form on success
                         form.reset();
                     }
                 } catch (err) {
@@ -395,7 +469,6 @@ import * as Y from 'https://esm.sh/yjs@13.6.18?dev';
 
         const blob = new Blob([modifiedContent], { type: 'text/html' });
         const url = URL.createObjectURL(blob);
-        // allow-same-origin needed for fetch, allow-forms for form submission
         return `<iframe class="html-frame" src="${url}" sandbox="allow-scripts allow-same-origin allow-forms"></iframe>`;
     }
 
