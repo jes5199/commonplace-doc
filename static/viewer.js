@@ -1,7 +1,8 @@
 // Commonplace Document Viewer
 // Displays documents with live WebSocket updates
 
-import * as Y from 'https://esm.sh/yjs@13.6.8';
+// Use a specific yjs version compatible with yrs 0.18
+import * as Y from 'https://esm.sh/yjs@13.6.18?dev';
 
 (function() {
     'use strict';
@@ -45,8 +46,76 @@ import * as Y from 'https://esm.sh/yjs@13.6.8';
         return null;
     }
 
-    // Fetch document content via HTTP
-    async function fetchDocument(doc) {
+    // Decode base64 to Uint8Array
+    function base64ToUint8Array(base64) {
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes;
+    }
+
+    // Decode variable-length unsigned integer from y-websocket protocol
+    // Returns {value, bytesRead} or null on error
+    function decodeVarUint(data, offset = 0) {
+        let value = 0;
+        let shift = 0;
+        let bytesRead = 0;
+        while (offset + bytesRead < data.length) {
+            const byte = data[offset + bytesRead];
+            value |= (byte & 0x7f) << shift;
+            bytesRead++;
+            if ((byte & 0x80) === 0) {
+                return { value, bytesRead };
+            }
+            shift += 7;
+            if (shift > 35) {
+                return null; // Overflow
+            }
+        }
+        return null; // Incomplete
+    }
+
+    // Decode variable-length bytes from y-websocket protocol
+    // Returns {bytes, totalBytesRead} or null on error
+    function decodeVarBytes(data, offset = 0) {
+        const lenResult = decodeVarUint(data, offset);
+        if (!lenResult) return null;
+        const length = lenResult.value;
+        const dataStart = offset + lenResult.bytesRead;
+        if (dataStart + length > data.length) return null;
+        return {
+            bytes: data.subarray(dataStart, dataStart + length),
+            totalBytesRead: lenResult.bytesRead + length
+        };
+    }
+
+    // Encode a variable-length unsigned integer
+    function encodeVarUint(value) {
+        const bytes = [];
+        do {
+            let byte = value & 0x7f;
+            value >>>= 7;
+            if (value > 0) {
+                byte |= 0x80;
+            }
+            bytes.push(byte);
+        } while (value > 0);
+        return new Uint8Array(bytes);
+    }
+
+    // Encode bytes with length prefix (varBytes format)
+    function encodeVarBytes(data) {
+        const lenBytes = encodeVarUint(data.length);
+        const result = new Uint8Array(lenBytes.length + data.length);
+        result.set(lenBytes, 0);
+        result.set(data, lenBytes.length);
+        return result;
+    }
+
+    // Fetch document head (content + Yjs state) via HTTP
+    async function fetchDocumentHead(doc) {
         const url = doc.type === 'id'
             ? `/docs/${encodeURIComponent(doc.value)}/head`
             : `/files/${doc.value}/head`;
@@ -68,7 +137,16 @@ import * as Y from 'https://esm.sh/yjs@13.6.8';
             else contentType = 'text/plain';
         }
 
-        return data.content || '';
+        return {
+            content: data.content || '',
+            state: data.state ? base64ToUint8Array(data.state) : null
+        };
+    }
+
+    // Fetch just content (for re-fetch fallback)
+    async function fetchDocument(doc) {
+        const head = await fetchDocumentHead(doc);
+        return head.content;
     }
 
     // Connect to WebSocket
@@ -99,18 +177,22 @@ import * as Y from 'https://esm.sh/yjs@13.6.8';
         };
 
         ws.onmessage = async (event) => {
-            // On any message, re-fetch content (simpler than applying Yjs updates)
             try {
-                const content = await fetchDocument(doc);
-                const text = ydoc.getText('content');
-                // Clear and re-insert
-                ydoc.transact(() => {
-                    text.delete(0, text.length);
-                    text.insert(0, content);
-                });
-                renderContent();
+                // Convert ArrayBuffer/Blob to Uint8Array
+                let data;
+                if (event.data instanceof ArrayBuffer) {
+                    data = new Uint8Array(event.data);
+                } else if (event.data instanceof Blob) {
+                    const buffer = await event.data.arrayBuffer();
+                    data = new Uint8Array(buffer);
+                } else {
+                    console.warn('Unexpected WebSocket message type:', typeof event.data);
+                    return;
+                }
+
+                handleMessage(data);
             } catch (e) {
-                console.error('Failed to refresh content:', e);
+                console.error('Failed to handle WebSocket message:', e);
             }
         };
     }
@@ -120,7 +202,7 @@ import * as Y from 'https://esm.sh/yjs@13.6.8';
         if (data.length < 1) return;
 
         const messageType = data[0];
-        const payload = data.slice(1);
+        const payload = data.subarray(1);
 
         // y-websocket message types
         const MSG_SYNC = 0;
@@ -138,31 +220,45 @@ import * as Y from 'https://esm.sh/yjs@13.6.8';
         if (data.length < 1) return;
 
         const syncType = data[0];
-        const payload = data.slice(1);
+        // Payload after sync type is length-prefixed (varBytes)
+        const decoded = decodeVarBytes(data, 1);
+        if (!decoded) {
+            console.error('Failed to decode sync payload');
+            return;
+        }
+        const payload = decoded.bytes;
 
         const SYNC_STEP1 = 0;
         const SYNC_STEP2 = 1;
         const SYNC_UPDATE = 2;
 
         if (syncType === SYNC_STEP1) {
-            // Server asking for our state - send empty state vector
-            sendSyncStep2();
-        } else if (syncType === SYNC_STEP2 || syncType === SYNC_UPDATE) {
-            // Apply update
+            // Server sent its state vector, respond with ours
+            sendStateVector();
+        } else if (syncType === SYNC_STEP2) {
+            // Server sent updates we're missing
+            if (payload.length > 0) {
+                applyUpdate(payload);
+            }
+        } else if (syncType === SYNC_UPDATE) {
+            // Incremental update
             applyUpdate(payload);
         }
     }
 
-    // Send SyncStep2 with empty update (we have nothing to send)
-    function sendSyncStep2() {
+    // Send our state vector to the server (SyncStep1 response)
+    function sendStateVector() {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-        // Send our state vector (empty)
+        // Encode our current state vector
         const sv = Y.encodeStateVector(ydoc);
-        const msg = new Uint8Array(2 + sv.length);
+
+        // Build message: [MSG_SYNC, SYNC_STEP1, varBytes(stateVector)]
+        const svEncoded = encodeVarBytes(sv);
+        const msg = new Uint8Array(2 + svEncoded.length);
         msg[0] = 0; // MSG_SYNC
         msg[1] = 0; // SYNC_STEP1
-        msg.set(sv, 2);
+        msg.set(svEncoded, 2);
         ws.send(msg);
     }
 
@@ -172,7 +268,7 @@ import * as Y from 'https://esm.sh/yjs@13.6.8';
             Y.applyUpdate(ydoc, update);
             renderContent();
         } catch (e) {
-            console.error('Failed to apply update:', e);
+            console.error('Failed to apply Yjs update:', e);
         }
     }
 
@@ -463,12 +559,24 @@ import * as Y from 'https://esm.sh/yjs@13.6.8';
         ydoc = new Y.Doc();
 
         try {
-            // Fetch initial content
-            const content = await fetchDocument(doc);
+            // Fetch initial content and Yjs state
+            const head = await fetchDocumentHead(doc);
 
-            // Initialize Yjs text with fetched content
-            const text = ydoc.getText('content');
-            text.insert(0, content);
+            // Apply Yjs state to sync history (enables incremental updates)
+            if (head.state) {
+                try {
+                    Y.applyUpdate(ydoc, head.state);
+                } catch (e) {
+                    console.error('Failed to apply initial Yjs state:', e);
+                    // Fallback to text insert
+                    const text = ydoc.getText('content');
+                    text.insert(0, head.content);
+                }
+            } else {
+                // Fallback: insert content as text (won't sync properly)
+                const text = ydoc.getText('content');
+                text.insert(0, head.content);
+            }
 
             // Render immediately
             renderContent();
