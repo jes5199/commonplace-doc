@@ -2240,12 +2240,19 @@ async fn run_exec_mode(
     if sandbox {
         use tokio::io::{AsyncBufReadExt, BufReader};
 
+        // Use command_path for event topics (path like "/stdio-test"), falling back to UUID
+        let event_path = command_path
+            .clone()
+            .unwrap_or_else(|| fs_root_id.clone())
+            .trim_start_matches('/')
+            .to_string();
+
         // Stdout event emission
         if let Some(stdout) = child.stdout.take() {
             let exec_name_clone = exec_name.clone();
             let mqtt_clone = mqtt_client.clone();
             let workspace_clone = workspace.clone();
-            let path_clone = fs_root_id.clone();
+            let path_clone = event_path.clone();
             tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
@@ -2271,7 +2278,7 @@ async fn run_exec_mode(
             let exec_name_clone = exec_name.clone();
             let mqtt_clone = mqtt_client.clone();
             let workspace_clone = workspace.clone();
-            let path_clone = fs_root_id.clone();
+            let path_clone = event_path.clone();
             tokio::spawn(async move {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
@@ -2294,21 +2301,16 @@ async fn run_exec_mode(
 
         // Spawn command listener for this sandbox process
         // Commands sent to {workspace}/commands/{path}/# will be written to __commands.jsonl
-        // Use the original path (e.g., "echo") rather than UUID for topic matching
+        // Use event_path (e.g., "echo") rather than UUID for topic matching
         if let Some(ref mqtt) = mqtt_client {
-            let listener_path = command_path
-                .clone()
-                .unwrap_or_else(|| fs_root_id.clone())
-                .trim_start_matches('/')
-                .to_string();
             info!(
                 "Starting command listener for sandbox process at path: {}",
-                listener_path
+                event_path
             );
             spawn_command_listener(
                 mqtt.clone(),
                 workspace.clone(),
-                listener_path,
+                event_path,
                 directory.clone(),
             );
         }
@@ -2543,9 +2545,12 @@ async fn run_log_listener_mode(
             .to_string()
     });
 
+    // Normalize listen_path by stripping leading slash (topic paths don't use leading slashes)
+    let normalized_path = listen_path.trim_start_matches('/').to_string();
+
     info!(
         "Starting log-listener mode: listening to {} in sandbox {}",
-        listen_path,
+        normalized_path,
         directory.display()
     );
 
@@ -2556,8 +2561,8 @@ async fn run_log_listener_mode(
     let mqtt = mqtt_client.ok_or("--log-listener requires --mqtt-broker")?;
 
     // Subscribe to stdout and stderr events at the listened path
-    let stdout_topic = Topic::events(&workspace, &listen_path, "stdout");
-    let stderr_topic = Topic::events(&workspace, &listen_path, "stderr");
+    let stdout_topic = Topic::events(&workspace, &normalized_path, "stdout");
+    let stderr_topic = Topic::events(&workspace, &normalized_path, "stderr");
 
     info!(
         "Subscribing to events: {} and {}",
