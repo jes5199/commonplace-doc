@@ -2539,7 +2539,7 @@ async fn run_log_listener_mode(
         listen_path
             .split('/')
             .filter(|s| !s.is_empty())
-            .last()
+            .next_back()
             .unwrap_or("log-listener")
             .to_string()
     });
