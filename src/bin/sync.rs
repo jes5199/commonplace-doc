@@ -2538,8 +2538,7 @@ async fn run_log_listener_mode(
         // Use the last component of the listen path
         listen_path
             .split('/')
-            .filter(|s| !s.is_empty())
-            .next_back()
+            .rfind(|s| !s.is_empty())
             .unwrap_or("log-listener")
             .to_string()
     });
