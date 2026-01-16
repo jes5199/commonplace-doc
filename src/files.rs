@@ -222,6 +222,92 @@ async fn resolve_path(state: &FileApiState, path: &str) -> Result<String, PathRe
     Err(PathResolveError::PathNotFound)
 }
 
+/// Create a new file entry in the parent directory's schema.
+///
+/// This adds an entry with `node_id: null` to the parent schema, which triggers
+/// the filesystem reconciler to create a document and assign a UUID.
+async fn create_file_in_schema(state: &FileApiState, path: &str) -> Result<(), PathResolveError> {
+    let fs_root_id = state.fs_root.as_ref().ok_or(PathResolveError::NoFsRoot)?;
+
+    // Split path into parent and filename
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return Err(PathResolveError::PathNotFound);
+    }
+
+    let filename = segments.last().unwrap();
+    let parent_segments = &segments[..segments.len() - 1];
+
+    // Get parent document ID (fs-root if no parent segments)
+    let parent_id = if parent_segments.is_empty() {
+        fs_root_id.clone()
+    } else {
+        let parent_path = parent_segments.join("/");
+        resolve_path(state, &parent_path).await?
+    };
+
+    // Fetch parent schema via service (for proper HEAD/CID handling)
+    let head = state
+        .service
+        .get_head(&parent_id, None)
+        .await
+        .map_err(|_| PathResolveError::FsRootNotFound)?;
+
+    // Parse and update schema
+    let mut schema: serde_json::Value =
+        serde_json::from_str(&head.content).map_err(|_| PathResolveError::PathNotFound)?;
+
+    // Determine content type from file extension
+    let content_type = match path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
+        "json" => "application/json",
+        "jsonl" => "application/x-ndjson",
+        "xml" => "application/xml",
+        "html" | "htm" => "text/html",
+        "ts" | "tsx" => "text/typescript",
+        "js" | "jsx" | "mjs" => "text/javascript",
+        _ => "text/plain",
+    };
+
+    // Add entry with no node_id (reconciler will assign one)
+    let entries = schema
+        .get_mut("root")
+        .and_then(|r| r.get_mut("entries"))
+        .and_then(|e| e.as_object_mut())
+        .ok_or(PathResolveError::PathNotFound)?;
+
+    entries.insert(
+        filename.to_string(),
+        serde_json::json!({
+            "type": "doc",
+            "node_id": null,
+            "content_type": content_type
+        }),
+    );
+
+    // Save updated schema via service (triggers reconciliation)
+    let updated_schema =
+        serde_json::to_string(&schema).map_err(|_| PathResolveError::PathNotFound)?;
+    state
+        .service
+        .replace_content(
+            &parent_id,
+            &updated_schema,
+            head.cid,
+            Some("create-file".to_string()),
+        )
+        .await
+        .map_err(|_| PathResolveError::PathNotFound)?;
+
+    tracing::info!("Created file entry '{}' in schema {}", filename, parent_id);
+    Ok(())
+}
+
 // ============================================================================
 // Handler implementations
 // ============================================================================
@@ -299,10 +385,22 @@ async fn handle_file_post(
 
         Ok(Json(DocEditResponse { cid: result.cid }).into_response())
     } else if let Some(clean_path) = path.strip_suffix("/replace") {
-        // Handle replace
-        let doc_id = resolve_path(&state, clean_path)
-            .await
-            .map_err(|e| e.into_response())?;
+        // Handle replace - try to resolve, optionally create if missing
+        let doc_id = match resolve_path(&state, clean_path).await {
+            Ok(id) => id,
+            Err(PathResolveError::PathNotFound) if params.create => {
+                // Create the file and retry resolution
+                create_file_in_schema(&state, clean_path)
+                    .await
+                    .map_err(|e| e.into_response())?;
+
+                // Retry resolution after creation
+                resolve_path(&state, clean_path)
+                    .await
+                    .map_err(|e| e.into_response())?
+            }
+            Err(e) => return Err(e.into_response()),
+        };
 
         // Use service for replace
         let result = state

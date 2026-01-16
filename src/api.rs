@@ -344,6 +344,9 @@ pub struct ReplaceParams {
     pub parent_cid: Option<String>,
     #[serde(default)]
     pub author: Option<String>,
+    /// If true and the file doesn't exist, create it (files API only)
+    #[serde(default)]
+    pub create: bool,
 }
 
 /// Response for POST /docs/{id}/replace endpoint.

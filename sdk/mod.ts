@@ -367,12 +367,14 @@ class OutputHandleImpl implements OutputHandle {
     const pathEncoded = this.path.split("/").map(encodeURIComponent).join("/");
     const content = serializeContent(value, this.contentType);
 
-    // Build URL with parent_cid query param if we have it
+    // Build URL with query params
     let url = `${SERVER}/files/${pathEncoded}/replace`;
     const params = new URLSearchParams();
     if (this.parentCommit) {
       params.set("parent_cid", this.parentCommit);
     }
+    // Always set create=true so file is auto-created if missing
+    params.set("create", "true");
     params.set("author", CLIENT_ID);
     if (params.toString()) {
       url += `?${params.toString()}`;
