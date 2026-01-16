@@ -239,11 +239,68 @@ import * as Y from 'https://esm.sh/yjs@13.6.8';
         return `<pre>${highlighted}</pre>`;
     }
 
-    // Render HTML in an iframe
+    // Render HTML in an iframe with commonplace command support
     function renderHtml(content) {
-        const blob = new Blob([content], { type: 'text/html' });
+        // Inject script to handle forms with data-cp-command attribute
+        const origin = window.location.origin;
+        const commandScript = `
+<script>
+(function() {
+    const DOC_PATH = ${JSON.stringify(docId)};
+    const ORIGIN = ${JSON.stringify(origin)};
+
+    document.addEventListener('DOMContentLoaded', function() {
+        document.querySelectorAll('form[data-cp-command]').forEach(function(form) {
+            form.addEventListener('submit', async function(e) {
+                e.preventDefault();
+
+                const verb = form.dataset.cpCommand;
+                const formData = new FormData(form);
+                const payload = {};
+
+                formData.forEach(function(value, key) {
+                    payload[key] = value;
+                });
+
+                const encodedPath = DOC_PATH.split('/').map(encodeURIComponent).join('/');
+                const commandUrl = ORIGIN + '/commands/' + encodedPath + '/' + encodeURIComponent(verb);
+
+                try {
+                    const response = await fetch(commandUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ payload: payload, source: 'xhtml-form' }),
+                    });
+
+                    if (!response.ok) {
+                        console.error('Command failed:', response.status, await response.text());
+                    } else {
+                        // Clear form on success
+                        form.reset();
+                    }
+                } catch (err) {
+                    console.error('Command error:', err);
+                }
+            });
+        });
+    });
+})();
+<\/script>`;
+
+        // Inject before </body> or </html> or at end
+        let modifiedContent = content;
+        if (content.includes('</body>')) {
+            modifiedContent = content.replace('</body>', commandScript + '</body>');
+        } else if (content.includes('</html>')) {
+            modifiedContent = content.replace('</html>', commandScript + '</html>');
+        } else {
+            modifiedContent = content + commandScript;
+        }
+
+        const blob = new Blob([modifiedContent], { type: 'text/html' });
         const url = URL.createObjectURL(blob);
-        return `<iframe class="html-frame" src="${url}" sandbox="allow-scripts"></iframe>`;
+        // allow-same-origin needed for fetch, allow-forms for form submission
+        return `<iframe class="html-frame" src="${url}" sandbox="allow-scripts allow-same-origin allow-forms"></iframe>`;
     }
 
     // Render plain text
