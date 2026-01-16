@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "root": {
+    "type": "dir",
+    "entries": {
+      "index.html": {
+        "type": "doc",
+        "node_id": "f40b9491-a515-4c1e-9edb-ad9e6d4723fc",
+        "content_type": "text/html"
+      },
+      "chat.ts": {
+        "type": "doc",
+        "node_id": "79677fd6-a5b4-4446-862f-c1307599d059",
+        "content_type": "text/typescript"
+      },
+      "messages.jsonl": {
+        "type": "doc",
+        "node_id": "b133ffa7-c8f6-4d0e-8e5e-a2feb66937db",
+        "content_type": "application/x-ndjson"
+      },
+      "__processes.json": {
+        "type": "doc",
+        "node_id": "b0be9be7-4134-4ec5-990e-e9a0e73c3002",
+        "content_type": "application/json"
+      }
+    },
+    "node_id": null,
+    "content_type": null
+  }
+}

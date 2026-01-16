@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>AI Chat</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      max-width: 600px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    h1 {
+      margin: 0 0 20px 0;
+      font-size: 1.5em;
+      color: #333;
+    }
+    #messages {
+      background: white;
+      border-radius: 8px;
+      padding: 16px;
+      min-height: 300px;
+      max-height: 500px;
+      overflow-y: auto;
+      margin-bottom: 16px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .message {
+      margin-bottom: 16px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid #eee;
+    }
+    .message:last-child {
+      margin-bottom: 0;
+      padding-bottom: 0;
+      border-bottom: none;
+    }
+    .user-msg {
+      background: #e3f2fd;
+      padding: 10px 14px;
+      border-radius: 12px;
+      display: inline-block;
+      max-width: 85%;
+    }
+    .reply {
+      margin-top: 8px;
+      margin-left: 20px;
+    }
+    .reply-content {
+      background: #f5f5f5;
+      padding: 10px 14px;
+      border-radius: 12px;
+      display: inline-block;
+      max-width: 85%;
+    }
+    .reply-pending {
+      color: #999;
+      font-style: italic;
+    }
+    .timestamp {
+      font-size: 0.75em;
+      color: #999;
+      margin-top: 4px;
+    }
+    form {
+      display: flex;
+      gap: 8px;
+    }
+    input[type="text"] {
+      flex: 1;
+      padding: 12px 16px;
+      border: 1px solid #ddd;
+      border-radius: 24px;
+      font-size: 1em;
+      outline: none;
+    }
+    input[type="text"]:focus {
+      border-color: #2196f3;
+    }
+    button {
+      padding: 12px 24px;
+      background: #2196f3;
+      color: white;
+      border: none;
+      border-radius: 24px;
+      font-size: 1em;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #1976d2;
+    }
+    button:disabled {
+      background: #ccc;
+      cursor: not-allowed;
+    }
+    .empty {
+      color: #999;
+      text-align: center;
+      padding: 40px;
+    }
+  </style>
+</head>
+<body>
+  <h1>AI Chat</h1>
+  <div id="messages">
+    <div class="empty">No messages yet. Start a conversation!</div>
+  </div>
+  <form id="chat-form">
+    <input type="text" name="message" placeholder="Type a message..." required autocomplete="off">
+    <button type="submit">Send</button>
+  </form>
+
+  <script type="module">
+    const messagesEl = document.getElementById('messages');
+    const form = document.getElementById('chat-form');
+    const input = form.querySelector('input[name="message"]');
+
+    // Get the base path for fetching messages.jsonl
+    // When viewed at /view/chat/index.html, we need /files/chat/messages.jsonl
+    const basePath = window.location.pathname
+      .replace(/^\/view\//, '')
+      .replace(/\/index\.html$/, '')
+      .replace(/\/$/, '');
+
+    let lastContent = '';
+
+    function formatTime(timestamp) {
+      const date = new Date(timestamp);
+      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+
+    function renderMessages(messages) {
+      if (!messages || messages.length === 0) {
+        messagesEl.innerHTML = '<div class="empty">No messages yet. Start a conversation!</div>';
+        return;
+      }
+
+      messagesEl.innerHTML = messages.map(msg => `
+        <div class="message">
+          <div class="user-msg">${escapeHtml(msg.message)}</div>
+          <div class="timestamp">${formatTime(msg.timestamp)}</div>
+          <div class="reply">
+            ${msg.reply !== null
+              ? `<div class="reply-content">${escapeHtml(msg.reply)}</div>`
+              : `<div class="reply-pending">Waiting for reply...</div>`
+            }
+          </div>
+        </div>
+      `).join('');
+
+      // Scroll to bottom
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    async function fetchMessages() {
+      try {
+        const res = await fetch(`/files/${basePath}/messages.jsonl`);
+        if (!res.ok) {
+          if (res.status === 404) {
+            renderMessages([]);
+            return;
+          }
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const content = await res.text();
+
+        // Only re-render if content changed
+        if (content !== lastContent) {
+          lastContent = content;
+          const messages = content.trim()
+            .split('\n')
+            .filter(line => line.trim())
+            .map(line => JSON.parse(line));
+          renderMessages(messages);
+        }
+      } catch (e) {
+        console.error('Failed to fetch messages:', e);
+      }
+    }
+
+    // Initial fetch
+    fetchMessages();
+
+    // Poll for updates every 2 seconds
+    setInterval(fetchMessages, 2000);
+
+    // Handle form submission - send to messages.jsonl command endpoint
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      const message = input.value.trim();
+      if (!message) return;
+
+      try {
+        const response = await fetch(`/commands/${basePath}/messages.jsonl/send`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ payload: { message }, source: 'chat-form' }),
+        });
+
+        if (response.ok) {
+          input.value = '';
+          input.focus();
+          // Fetch immediately to show new message
+          setTimeout(fetchMessages, 100);
+        } else {
+          console.error('Failed to send message:', await response.text());
+        }
+      } catch (err) {
+        console.error('Error sending message:', err);
+      }
+    });
+  </script>
+</body>
+</html>
