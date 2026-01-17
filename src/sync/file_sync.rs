@@ -10,9 +10,10 @@ use crate::sync::state_file::compute_content_hash;
 use crate::sync::uuid_map::fetch_node_id_from_schema;
 use crate::sync::{
     build_edit_url, build_replace_url, create_yjs_text_update, detect_from_path, file_watcher_task,
-    is_binary_content, looks_like_base64_binary, push_json_content, push_jsonl_content,
-    push_schema_to_server, record_upload_result, refresh_from_head, sse_task, EditRequest,
-    EditResponse, FileEvent, FlockSyncState, ReplaceResponse, SyncState, PENDING_WRITE_TIMEOUT,
+    flock_state::record_upload_result, is_binary_content, looks_like_base64_binary,
+    push_json_content, push_jsonl_content, push_schema_to_server, refresh_from_head, sse_task,
+    EditRequest, EditResponse, FileEvent, FlockSyncState, ReplaceResponse, SyncState,
+    PENDING_WRITE_TIMEOUT,
 };
 use reqwest::Client;
 use std::path::{Path, PathBuf};

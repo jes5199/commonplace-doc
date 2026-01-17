@@ -64,8 +64,8 @@ pub fn acquire_sync_lock(directory: &Path) -> io::Result<File> {
 
 pub use client::{
     delete_schema_entry, discover_fs_root, fetch_head, fork_node, push_content_by_type,
-    push_file_content, push_json_content, push_json_content_merge, push_jsonl_content,
-    push_schema_to_server, resolve_path_to_uuid_http, DiscoverFsRootError, FetchHeadError,
+    push_file_content, push_json_content, push_jsonl_content, push_schema_to_server,
+    resolve_path_to_uuid_http, DiscoverFsRootError, FetchHeadError,
 };
 pub use dir_sync::{
     check_server_has_content, ensure_fs_root_exists, handle_schema_change, handle_schema_modified,
@@ -77,7 +77,7 @@ pub use file_events::{
 };
 pub use file_sync::{
     initial_sync, spawn_file_sync_tasks, spawn_file_sync_tasks_with_flock, sync_single_file,
-    upload_task, upload_task_with_flock, BARRIER_RETRY_COUNT, BARRIER_RETRY_DELAY,
+    upload_task, upload_task_with_flock,
 };
 pub use schema_io::{
     fetch_and_validate_schema, write_nested_schemas, write_schema_file, FetchedSchema,
@@ -108,10 +108,9 @@ pub use flock::{
     try_flock_exclusive, try_flock_shared, FlockGuard, FlockResult, FLOCK_RETRY_INTERVAL,
     FLOCK_TIMEOUT,
 };
-pub use flock_state::{
-    process_pending_inbound_after_confirm, record_upload_result, FlockSyncState, InboundWrite,
-    PathState,
-};
+pub use flock_state::FlockSyncState;
+// Note: process_pending_inbound_after_confirm, record_upload_result, InboundWrite, PathState
+// are internal to sync module
 #[cfg(unix)]
 pub use sse::{
     atomic_write_with_shadow, handle_server_edit_with_tracker, handle_shadow_write,
@@ -122,8 +121,8 @@ pub use sse::{
     handle_server_edit, handle_server_edit_with_flock, refresh_from_head, sse_task,
     sse_task_with_flock, PENDING_WRITE_TIMEOUT,
 };
-#[cfg(unix)]
-pub use state::{hardlink_from_fd, hardlink_from_path, SHADOW_IDLE_TIMEOUT, SHADOW_MIN_LIFETIME};
+// Note: hardlink_from_fd, hardlink_from_path, SHADOW_IDLE_TIMEOUT, SHADOW_MIN_LIFETIME
+// are internal to sync module
 pub use state::{InodeKey, InodeState, InodeTracker, PendingWrite, SyncState};
 pub use types::{
     build_uuid_to_paths_map, remove_file_state_and_abort, CommitData, DirEvent, EditEventData,
@@ -136,9 +135,10 @@ pub use urls::{
     build_health_url, build_info_url, build_replace_url, build_sse_url, encode_node_id,
     encode_path, normalize_path,
 };
-pub use watcher::{directory_watcher_task, file_watcher_task, ShadowWriteEvent};
 #[cfg(unix)]
-pub use watcher::{shadow_gc_task, shadow_watcher_task, spawn_shadow_tasks, SHADOW_GC_INTERVAL};
+pub use watcher::spawn_shadow_tasks;
+pub use watcher::{directory_watcher_task, file_watcher_task, ShadowWriteEvent};
+// Note: shadow_gc_task, shadow_watcher_task, SHADOW_GC_INTERVAL are internal
 pub use yjs::{
     base64_decode, base64_encode, create_yjs_json_delete_key, create_yjs_json_merge,
     create_yjs_json_update, create_yjs_jsonl_update, create_yjs_structured_update,

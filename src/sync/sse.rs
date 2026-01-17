@@ -11,8 +11,10 @@ use crate::sync::{
 };
 use crate::sync::{
     ancestry::{determine_sync_direction, SyncDirection},
-    build_sse_url, detect_from_path, fetch_head, is_binary_content, looks_like_base64_binary,
-    process_pending_inbound_after_confirm, EditEventData, FlockSyncState, PendingWrite, SyncState,
+    build_sse_url, detect_from_path, fetch_head,
+    flock_state::process_pending_inbound_after_confirm,
+    is_binary_content, looks_like_base64_binary, EditEventData, FlockSyncState, PendingWrite,
+    SyncState,
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -1467,7 +1469,7 @@ pub async fn atomic_write_with_shadow(
     commit_id: Option<String>,
     inode_tracker: &Arc<tokio::sync::RwLock<crate::sync::InodeTracker>>,
 ) -> std::io::Result<crate::sync::InodeKey> {
-    use crate::sync::{hardlink_from_fd, InodeKey};
+    use crate::sync::{state::hardlink_from_fd, InodeKey};
     use std::fs::File;
     use std::io::Write;
 

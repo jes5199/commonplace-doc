@@ -238,28 +238,12 @@ pub async fn push_json_content(
     author: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     push_json_content_impl(
-        client, server, identifier, content, state, use_paths, false, author,
+        client, server, identifier, content, state, use_paths, author,
     )
     .await
 }
 
-/// Push JSON content with merge semantics (additive, preserves other clients' entries).
-pub async fn push_json_content_merge(
-    client: &Client,
-    server: &str,
-    identifier: &str,
-    content: &str,
-    state: &Arc<RwLock<SyncState>>,
-    use_paths: bool,
-    author: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    push_json_content_impl(
-        client, server, identifier, content, state, use_paths, true, author,
-    )
-    .await
-}
-
-/// Internal implementation for pushing JSON content with optional merge mode.
+/// Internal implementation for pushing JSON content.
 #[allow(clippy::too_many_arguments)]
 async fn push_json_content_impl(
     client: &Client,
@@ -268,7 +252,6 @@ async fn push_json_content_impl(
     content: &str,
     state: &Arc<RwLock<SyncState>>,
     use_paths: bool,
-    merge: bool,
     author: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let head_url = build_head_url(server, identifier, use_paths);
@@ -301,11 +284,7 @@ async fn push_json_content_impl(
             return Ok(());
         }
 
-        let update = if merge {
-            create_yjs_json_merge(content, base_state.as_deref())?
-        } else {
-            create_yjs_json_update(content, base_state.as_deref())?
-        };
+        let update = create_yjs_json_update(content, base_state.as_deref())?;
         let edit_req = EditRequest {
             update,
             author: Some(author.to_string()),

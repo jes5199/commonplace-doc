@@ -167,7 +167,7 @@ mod tests {
     /// Test that shadow_watcher_task detects writes to shadow files.
     #[tokio::test]
     async fn test_shadow_watcher_detects_writes() {
-        use commonplace_doc::sync::shadow_watcher_task;
+        use commonplace_doc::sync::watcher::shadow_watcher_task;
         use tokio::sync::mpsc;
         use tokio::time::{sleep, Duration};
 
