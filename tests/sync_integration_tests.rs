@@ -1016,6 +1016,16 @@ fn test_local_new_subdir_with_file_updates_server_schemas() {
     // 4. Update subdir schema with file entry
     std::thread::sleep(Duration::from_secs(5));
 
+    // Verify: directory and file still exist locally (regression test for CP-4s24)
+    assert!(
+        new_subdir.exists(),
+        "Sync should NOT delete newly created directories"
+    );
+    assert!(
+        new_file.exists(),
+        "Sync should NOT delete files in newly created directories"
+    );
+
     // Verify: fs-root schema should include the new subdirectory
     let resp = client
         .get(format!("{}/docs/{}/head", server_url, fs_root_id))
