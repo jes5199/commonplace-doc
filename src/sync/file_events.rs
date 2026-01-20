@@ -155,6 +155,7 @@ pub fn find_owning_document(
 ///
 /// Returns the deepest directory's node_id (the one that will own the file),
 /// or the fs_root_id if the file is in the root directory.
+#[allow(clippy::too_many_arguments)]
 pub async fn ensure_parent_directories_exist(
     client: &Client,
     server: &str,
@@ -191,17 +192,12 @@ pub async fn ensure_parent_directories_exist(
             if let Ok(schema) = serde_json::from_str::<FsSchema>(&content) {
                 if let Some(Entry::Dir(dir_entry)) = schema.root.as_ref() {
                     if let Some(ref entries) = dir_entry.entries {
-                        if let Some(entry) = entries.get(*dir_name) {
-                            if let Entry::Dir(subdir) = entry {
-                                if let Some(ref node_id) = subdir.node_id {
-                                    // Directory already has a node_id
-                                    needs_creation = false;
-                                    existing_node_id = Some(node_id.clone());
-                                    debug!(
-                                        "Directory '{}' already has node_id {}",
-                                        dir_name, node_id
-                                    );
-                                }
+                        if let Some(Entry::Dir(subdir)) = entries.get(*dir_name) {
+                            if let Some(ref node_id) = subdir.node_id {
+                                // Directory already has a node_id
+                                needs_creation = false;
+                                existing_node_id = Some(node_id.clone());
+                                debug!("Directory '{}' already has node_id {}", dir_name, node_id);
                             }
                         }
                     }
@@ -627,7 +623,7 @@ pub async fn handle_file_created(
                             let filename = owning_doc
                                 .relative_path
                                 .split('/')
-                                .last()
+                                .next_back()
                                 .unwrap_or(&owning_doc.relative_path);
                             if let Some(entry) = entries.get_mut(filename) {
                                 entry["node_id"] = serde_json::Value::String(identifier.clone());

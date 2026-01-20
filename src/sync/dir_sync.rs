@@ -1520,6 +1520,7 @@ pub async fn check_server_has_content(client: &Client, server: &str, fs_root_id:
 /// * `schema_path` - Path to the modified .commonplace.json file
 /// * `content` - New content of the schema file
 /// * `author` - The author string for the commit
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_schema_modified(
     client: &Client,
     server: &str,
