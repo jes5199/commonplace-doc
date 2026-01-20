@@ -412,17 +412,9 @@ fn scan_dir_recursive(
 
             // Always create node-backed directory references
             // Recursively scan the subdirectory to build its schema
-            let sub_entry = scan_dir_recursive(root, &entry_path, options, existing_node_ids)?;
-
-            // Write the subdirectory schema to .commonplace.json
-            let sub_schema = FsSchema {
-                version: 1,
-                root: Some(sub_entry),
-            };
-            let sub_schema_json = serde_json::to_string(&sub_schema)
-                .map_err(|e| ScanError::Serialization(e.to_string()))?;
-            let sub_schema_path = entry_path.join(SCHEMA_FILENAME);
-            fs::write(&sub_schema_path, &sub_schema_json)?;
+            // NOTE: We no longer write .commonplace.json here - that's the caller's responsibility
+            // per RECURSIVE_SYNC_THEORY.md (scan_directory should be non-mutating)
+            let _sub_entry = scan_dir_recursive(root, &entry_path, options, existing_node_ids)?;
 
             // Create node-backed reference in parent
             entries.insert(
@@ -764,22 +756,13 @@ mod tests {
                     "notes should not have inline entries"
                 );
 
-                // Verify nested schema was written to .commonplace.json
+                // Per RECURSIVE_SYNC_THEORY.md: scan_directory should NOT write files.
+                // Nested .commonplace.json files should be written explicitly by callers.
                 let nested_schema_path = temp.path().join("notes").join(".commonplace.json");
                 assert!(
-                    nested_schema_path.exists(),
-                    "Nested .commonplace.json should be created"
+                    !nested_schema_path.exists(),
+                    "scan_directory should NOT create nested .commonplace.json files"
                 );
-
-                // Read and verify the nested schema
-                let nested_content = std::fs::read_to_string(&nested_schema_path).unwrap();
-                let nested_schema: FsSchema = serde_json::from_str(&nested_content).unwrap();
-                if let Some(Entry::Dir(nested_root)) = &nested_schema.root {
-                    let note_entries = nested_root.entries.as_ref().unwrap();
-                    assert!(note_entries.contains_key("idea.md"));
-                } else {
-                    panic!("Expected nested schema root to be a Dir");
-                }
             } else {
                 panic!("Expected notes to be a Dir");
             }
@@ -1504,5 +1487,68 @@ mod tests {
         } else {
             panic!("Expected root to be a Dir");
         }
+    }
+
+    #[test]
+    fn test_scan_directory_does_not_write_files() {
+        // Per RECURSIVE_SYNC_THEORY.md: scan_directory should be a pure read operation.
+        // It should NOT write .commonplace.json files as a side effect.
+        // Writing schemas should be done explicitly by callers through write_schema_file.
+
+        let temp = tempfile::tempdir().unwrap();
+
+        // Create a directory structure with subdirectories
+        fs::create_dir(temp.path().join("subdir1")).unwrap();
+        fs::create_dir(temp.path().join("subdir1/nested")).unwrap();
+        fs::create_dir(temp.path().join("subdir2")).unwrap();
+
+        File::create(temp.path().join("root.txt"))
+            .unwrap()
+            .write_all(b"root file")
+            .unwrap();
+        File::create(temp.path().join("subdir1/file1.txt"))
+            .unwrap()
+            .write_all(b"file in subdir1")
+            .unwrap();
+        File::create(temp.path().join("subdir1/nested/deep.txt"))
+            .unwrap()
+            .write_all(b"deeply nested")
+            .unwrap();
+        File::create(temp.path().join("subdir2/file2.txt"))
+            .unwrap()
+            .write_all(b"file in subdir2")
+            .unwrap();
+
+        // Count files before scan
+        fn count_commonplace_files(dir: &Path) -> usize {
+            let mut count = 0;
+            for entry in fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    count += count_commonplace_files(&path);
+                } else if path.file_name().unwrap() == ".commonplace.json" {
+                    count += 1;
+                }
+            }
+            count
+        }
+
+        let files_before = count_commonplace_files(temp.path());
+        assert_eq!(
+            files_before, 0,
+            "No .commonplace.json files should exist before scan"
+        );
+
+        // Scan the directory
+        let _schema = scan_directory(temp.path(), &ScanOptions::default()).unwrap();
+
+        // Count files after scan - should be the same (no files written)
+        let files_after = count_commonplace_files(temp.path());
+        assert_eq!(
+            files_after, 0,
+            "scan_directory should NOT write any .commonplace.json files (found {})",
+            files_after
+        );
     }
 }
