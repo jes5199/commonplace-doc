@@ -7,7 +7,7 @@ use crate::fs::{Entry, FsSchema};
 use crate::sync::directory::{scan_directory_to_json, ScanOptions};
 use crate::sync::schema_io::{write_schema_file, SCHEMA_FILENAME};
 use crate::sync::state_file::compute_content_hash;
-use crate::sync::uuid_map::{fetch_node_id_from_schema, fetch_subdir_node_id};
+use crate::sync::uuid_map::fetch_subdir_node_id;
 use crate::sync::{
     delete_schema_entry, detect_from_path, fork_node, is_allowed_extension, is_binary_content,
     normalize_path, push_content_by_type, push_schema_to_server, remove_file_state_and_abort,
@@ -142,6 +142,203 @@ pub fn find_owning_document(
     }
 }
 
+/// Ensure all parent directories of a file path exist as node-backed directories.
+///
+/// When a file is created in a new subdirectory (e.g., `newdir/file.txt`), we need to:
+/// 1. Check if `newdir` exists in the parent's schema with a node_id
+/// 2. If not, create a document on the server for it
+/// 3. Update the parent schema to include the directory with its node_id
+///
+/// This function walks from the file's directory up to the root, ensuring each
+/// directory has a node_id assigned. Without this, `find_owning_document` would
+/// fail to find the correct owning document for files in new subdirectories.
+///
+/// Returns the deepest directory's node_id (the one that will own the file),
+/// or the fs_root_id if the file is in the root directory.
+pub async fn ensure_parent_directories_exist(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    root_directory: &Path,
+    relative_file_path: &str,
+    options: &ScanOptions,
+    author: &str,
+    written_schemas: Option<&crate::sync::WrittenSchemas>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    info!(
+        "ensure_parent_directories_exist called for: {}",
+        relative_file_path
+    );
+    let components: Vec<&str> = relative_file_path.split('/').collect();
+
+    // If file is in root (no directory components), nothing to do
+    if components.len() <= 1 {
+        info!("File in root directory, no parent dirs needed");
+        return Ok(());
+    }
+
+    // Walk through each directory component (not the file itself)
+    let mut current_dir = root_directory.to_path_buf();
+    let mut current_parent_id = fs_root_id.to_string();
+
+    for dir_name in components.iter().take(components.len() - 1) {
+        // Check if this directory has a node_id in the parent's schema
+        let schema_path = current_dir.join(SCHEMA_FILENAME);
+        let mut needs_creation = true;
+        let mut existing_node_id: Option<String> = None;
+
+        if let Ok(content) = std::fs::read_to_string(&schema_path) {
+            if let Ok(schema) = serde_json::from_str::<FsSchema>(&content) {
+                if let Some(Entry::Dir(dir_entry)) = schema.root.as_ref() {
+                    if let Some(ref entries) = dir_entry.entries {
+                        if let Some(entry) = entries.get(*dir_name) {
+                            if let Entry::Dir(subdir) = entry {
+                                if let Some(ref node_id) = subdir.node_id {
+                                    // Directory already has a node_id
+                                    needs_creation = false;
+                                    existing_node_id = Some(node_id.clone());
+                                    debug!(
+                                        "Directory '{}' already has node_id {}",
+                                        dir_name, node_id
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if needs_creation {
+            info!(
+                "Creating node-backed directory '{}' (parent: {})",
+                dir_name, current_parent_id
+            );
+
+            // Create a new document on the server for this directory
+            let create_url = format!("{}/docs", server);
+            let create_resp = client
+                .post(&create_url)
+                .json(&serde_json::json!({
+                    "content_type": "application/json"
+                }))
+                .send()
+                .await?;
+
+            if !create_resp.status().is_success() {
+                let status = create_resp.status();
+                let body = create_resp.text().await.unwrap_or_default();
+                return Err(format!(
+                    "Failed to create directory document for '{}': {} - {}",
+                    dir_name, status, body
+                )
+                .into());
+            }
+
+            let resp_body: serde_json::Value = create_resp.json().await?;
+            let new_node_id = resp_body["id"]
+                .as_str()
+                .ok_or("No id in document creation response")?
+                .to_string();
+
+            info!(
+                "Created document {} for directory '{}'",
+                new_node_id, dir_name
+            );
+
+            // Update parent schema to include this directory with its node_id
+            // First, scan the parent directory to get the current schema
+            if let Ok(json) = scan_directory_to_json(&current_dir, options) {
+                // Parse and modify the schema to add node_id
+                let mut schema: serde_json::Value = serde_json::from_str(&json)?;
+                if let Some(entries) = schema
+                    .get_mut("root")
+                    .and_then(|r| r.get_mut("entries"))
+                    .and_then(|e| e.as_object_mut())
+                {
+                    if let Some(dir_entry) = entries.get_mut(*dir_name) {
+                        dir_entry["node_id"] = serde_json::Value::String(new_node_id.clone());
+                    }
+                }
+
+                let updated_json = serde_json::to_string(&schema)?;
+
+                // Write locally
+                if let Err(e) =
+                    write_schema_file(&current_dir, &updated_json, written_schemas).await
+                {
+                    warn!("Failed to write local schema for '{}': {}", dir_name, e);
+                }
+
+                // Push to server
+                if let Err(e) =
+                    push_schema_to_server(client, server, &current_parent_id, &updated_json, author)
+                        .await
+                {
+                    warn!("Failed to push parent schema for '{}': {}", dir_name, e);
+                }
+            }
+
+            // Also initialize the new directory's schema (empty) if it doesn't already exist
+            // We only write an empty schema if there's no existing schema to avoid
+            // overwriting a schema that already has file entries from scan_directory
+            let subdir_path = current_dir.join(dir_name);
+            let subdir_schema_path = subdir_path.join(SCHEMA_FILENAME);
+            let existing_schema = std::fs::read_to_string(&subdir_schema_path).ok();
+
+            // Only write and push schema if no schema exists yet
+            // If a schema exists, it may already have file entries from scan_directory
+            // and will be properly updated and pushed by the later code in handle_file_created
+            if existing_schema.is_none() {
+                let empty_schema = serde_json::json!({
+                    "version": 1,
+                    "root": {
+                        "type": "dir",
+                        "entries": {}
+                    }
+                });
+                let schema_str = serde_json::to_string(&empty_schema)?;
+
+                // Write local schema for the new directory
+                if let Err(e) = write_schema_file(&subdir_path, &schema_str, written_schemas).await
+                {
+                    warn!("Failed to write subdir schema for '{}': {}", dir_name, e);
+                }
+
+                // Push empty schema to server for the new directory
+                if let Err(e) =
+                    push_schema_to_server(client, server, &new_node_id, &schema_str, author).await
+                {
+                    warn!("Failed to push subdir schema for '{}': {}", dir_name, e);
+                }
+            } else {
+                debug!(
+                    "Subdirectory '{}' already has schema, skipping initial write/push",
+                    dir_name
+                );
+            }
+
+            // Wait briefly for server to process
+            sleep(Duration::from_millis(50)).await;
+
+            existing_node_id = Some(new_node_id);
+        }
+
+        // Move to the next directory level
+        current_dir = current_dir.join(dir_name);
+        if let Some(node_id) = existing_node_id {
+            current_parent_id = node_id;
+        }
+
+        debug!(
+            "After processing '{}': current_parent_id = {}",
+            dir_name, current_parent_id
+        );
+    }
+
+    Ok(())
+}
+
 /// Handle a file creation event in directory sync mode.
 ///
 /// This function handles all the logic for syncing a newly created file:
@@ -200,6 +397,27 @@ pub async fn handle_file_created(
             return;
         }
     };
+
+    // Ensure parent directories exist as node-backed directories before finding owner
+    // This handles the case where a file is created in a new subdirectory
+    if let Err(e) = ensure_parent_directories_exist(
+        client,
+        server,
+        fs_root_id,
+        directory,
+        &relative_path,
+        options,
+        author,
+        written_schemas,
+    )
+    .await
+    {
+        warn!(
+            "Failed to ensure parent directories for {}: {}",
+            relative_path, e
+        );
+        // Continue anyway - find_owning_document may still work if some directories exist
+    }
 
     // Find which document owns this file path (may be a node-backed subdirectory)
     let owning_doc = find_owning_document(directory, fs_root_id, &relative_path);
@@ -348,50 +566,99 @@ pub async fn handle_file_created(
 
         // If fork didn't succeed (no match or fork failed), create document normally
         if !forked_successfully {
-            // Push updated schema FIRST so server reconciler creates the node
-            // Use the owning document's directory and ID
+            // Create the document directly on the server (don't rely on reconciler)
+            // This is the same approach used for directories in ensure_parent_directories_exist
+            if !use_paths {
+                let content_info = detect_from_path(path);
+                let content_type = if content_info.is_binary {
+                    "application/octet-stream"
+                } else {
+                    &content_info.mime_type
+                };
+
+                let create_url = format!("{}/docs", server);
+                match client
+                    .post(&create_url)
+                    .json(&serde_json::json!({
+                        "content_type": content_type
+                    }))
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(body) = resp.json::<serde_json::Value>().await {
+                            if let Some(new_id) = body["id"].as_str() {
+                                info!(
+                                    "Created document {} for file '{}'",
+                                    new_id, owning_doc.relative_path
+                                );
+                                identifier = new_id.to_string();
+                            }
+                        }
+                    }
+                    Ok(resp) => {
+                        warn!(
+                            "Failed to create document for '{}': {}",
+                            owning_doc.relative_path,
+                            resp.status()
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to create document for '{}': {}",
+                            owning_doc.relative_path, e
+                        );
+                    }
+                }
+            }
+
+            // Now scan and push the schema with the node_id we created
             if let Ok(json) = scan_directory_to_json(&owning_doc.directory, options) {
+                // If we created a document, update the schema to include the node_id
+                let updated_json = if !use_paths && !identifier.contains(':') {
+                    // identifier is a UUID, update the schema entry with it
+                    if let Ok(mut schema) = serde_json::from_str::<serde_json::Value>(&json) {
+                        if let Some(entries) = schema
+                            .get_mut("root")
+                            .and_then(|r| r.get_mut("entries"))
+                            .and_then(|e| e.as_object_mut())
+                        {
+                            // Get the filename from the relative path
+                            let filename = owning_doc
+                                .relative_path
+                                .split('/')
+                                .last()
+                                .unwrap_or(&owning_doc.relative_path);
+                            if let Some(entry) = entries.get_mut(filename) {
+                                entry["node_id"] = serde_json::Value::String(identifier.clone());
+                            }
+                        }
+                        serde_json::to_string(&schema).unwrap_or(json)
+                    } else {
+                        json
+                    }
+                } else {
+                    json
+                };
+
                 // Write schema locally and track for echo detection
                 // This prevents handle_schema_change from deleting the file we just created
                 // if it receives a stale schema update from another client
                 if let Err(e) =
-                    write_schema_file(&owning_doc.directory, &json, written_schemas).await
+                    write_schema_file(&owning_doc.directory, &updated_json, written_schemas).await
                 {
                     warn!("Failed to write local schema: {}", e);
                 }
-                if let Err(e) =
-                    push_schema_to_server(client, server, &owning_doc.document_id, &json, author)
-                        .await
-                {
-                    warn!("Failed to push updated schema: {}", e);
-                }
-            }
-
-            // Wait briefly for server to reconcile and create the node
-            sleep(Duration::from_millis(100)).await;
-
-            // When not using paths, fetch the UUID from the updated schema
-            // The reconciler assigns UUIDs to new entries, so we need to look them up
-            // Use the owning document's relative path
-            if !use_paths {
-                if let Some(uuid) = fetch_node_id_from_schema(
+                if let Err(e) = push_schema_to_server(
                     client,
                     server,
                     &owning_doc.document_id,
-                    &owning_doc.relative_path,
+                    &updated_json,
+                    author,
                 )
                 .await
                 {
-                    info!(
-                        "Resolved UUID for {}: {} -> {}",
-                        owning_doc.relative_path, identifier, uuid
-                    );
-                    identifier = uuid;
-                } else {
-                    warn!(
-                        "Could not resolve UUID for {}, using derived ID: {}",
-                        owning_doc.relative_path, identifier
-                    );
+                    warn!("Failed to push updated schema: {}", e);
                 }
             }
 

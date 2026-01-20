@@ -1471,6 +1471,10 @@ pub async fn sync_single_file(
     use_paths: bool,
     author: &str,
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!(
+        "=== SYNC_SINGLE_FILE: {} use_paths={} ===",
+        file.relative_path, use_paths
+    );
     use base64::{engine::general_purpose::STANDARD, Engine};
 
     // Determine identifier
@@ -1532,7 +1536,6 @@ pub async fn sync_single_file(
 
         final_identifier
     };
-    info!("Syncing file: {} -> {}", file.relative_path, identifier);
 
     // Reuse existing state if handle_schema_change already created one
     let state = {
@@ -1549,12 +1552,6 @@ pub async fn sync_single_file(
 
     match &head_result {
         Ok(Some(head)) => {
-            debug!("File head response: success for {}", identifier);
-            info!(
-                "File head content empty: {}, strategy: {}",
-                head.content.is_empty(),
-                initial_sync_strategy
-            );
             if head.content.is_empty() || initial_sync_strategy == "local" {
                 // Push local content
                 info!(
@@ -1725,7 +1722,6 @@ pub async fn sync_single_file(
         }
         Ok(None) | Err(_) => {
             // Node doesn't exist yet (404) or request failed - push content
-            info!("Node not ready, will push with retries for: {}", identifier);
             crate::sync::push_content_by_type(
                 client,
                 server,

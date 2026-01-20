@@ -449,7 +449,6 @@ pub async fn push_file_content(
     }
 
     // No existing content, use edit endpoint with retry for node creation
-    debug!("Using edit endpoint for initial content: {}", identifier);
     let update = create_yjs_text_update(content);
     let edit_url = build_edit_url(server, identifier, use_paths);
     let edit_req = EditRequest {

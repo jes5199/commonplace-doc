@@ -191,7 +191,14 @@ async fn handle_dir_event(
         DirEvent::SchemaModified(path, content) => {
             info!("User edited schema file: {}", path.display());
             if let Err(e) = handle_schema_modified(
-                client, server, fs_root_id, directory, &path, &content, author,
+                client,
+                server,
+                fs_root_id,
+                directory,
+                &path,
+                &content,
+                author,
+                written_schemas,
             )
             .await
             {
@@ -1318,7 +1325,6 @@ async fn run_directory_mode(
     .await?;
 
     // Scan files with contents and push each one
-    info!("Syncing file contents...");
     let files = scan_directory_with_contents(&directory, &options)
         .map_err(|e| format!("Scan error: {}", e))?;
 
@@ -1377,11 +1383,10 @@ async fn run_directory_mode(
     let mut failed_count = 0;
     while let Some((path, result)) = futures.next().await {
         if let Err(e) = result {
-            warn!("Failed to sync file {}: {}", path, e);
+            warn!("Sync failed for {}: {}", path, e);
             failed_count += 1;
         }
     }
-
     info!(
         "Initial sync complete: {} files synced ({} failed)",
         file_count - failed_count,
@@ -1416,10 +1421,7 @@ async fn run_directory_mode(
         if let Err(e) = sf.save(&state_file_path).await {
             warn!("Failed to save state file after initial sync: {}", e);
         } else {
-            debug!(
-                "Saved state file after initial sync with {} tracked files",
-                sf.files.len()
-            );
+            debug!("State file saved with {} tracked files", sf.files.len());
         }
     }
 
@@ -2147,6 +2149,7 @@ async fn run_exec_mode(
         let inode_tracker = inode_tracker.clone();
         async move {
             while let Some(event) = dir_rx.recv().await {
+                info!("RECEIVED DIR EVENT (exec mode): {:?}", event);
                 handle_dir_event(
                     &client,
                     &server,

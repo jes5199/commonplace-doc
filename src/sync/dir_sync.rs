@@ -1381,7 +1381,29 @@ pub async fn handle_schema_modified(
     schema_path: &Path,
     content: &str,
     author: &str,
+    written_schemas: Option<&crate::sync::WrittenSchemas>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Check for echo - if we recently wrote to this path, skip pushing
+    // This prevents feedback loops where intermediate writes (e.g., from scan_directory_to_json)
+    // get pushed back to the server and overwrite our correct content.
+    // The key insight: if we wrote to this file recently, we already pushed the correct content.
+    // Any SchemaModified event is likely a stale echo of an intermediate write.
+    if let Some(ws) = written_schemas {
+        let canonical = schema_path
+            .canonicalize()
+            .unwrap_or(schema_path.to_path_buf());
+        let written = ws.read().await;
+        if written.contains_key(&canonical) {
+            // We recently wrote to this path - skip this event entirely
+            // Our write already pushed the correct content to the server
+            tracing::debug!(
+                "Skipping schema push for {} - we recently wrote to this file",
+                schema_path.display()
+            );
+            return Ok(());
+        }
+    }
+
     // Validate the schema content
     let _schema: FsSchema =
         serde_json::from_str(content).map_err(|e| format!("Invalid schema JSON: {}", e))?;

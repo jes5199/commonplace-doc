@@ -72,8 +72,8 @@ pub use dir_sync::{
     push_nested_schemas, sync_schema,
 };
 pub use file_events::{
-    find_owning_document, handle_file_created, handle_file_deleted, handle_file_modified,
-    OwningDocument,
+    ensure_parent_directories_exist, find_owning_document, handle_file_created,
+    handle_file_deleted, handle_file_modified, OwningDocument,
 };
 pub use file_sync::{
     initial_sync, spawn_file_sync_tasks, spawn_file_sync_tasks_with_flock, sync_single_file,

@@ -449,6 +449,30 @@ fn spawn_sync_directory(server_url: &str, directory: &std::path::Path, node_id: 
         .expect("Failed to spawn sync client")
 }
 
+/// Spawn sync client with stderr inherited for debugging
+#[allow(dead_code)]
+fn spawn_sync_directory_debug(
+    server_url: &str,
+    directory: &std::path::Path,
+    node_id: &str,
+) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_commonplace-sync"))
+        .args([
+            "--server",
+            server_url,
+            "--node",
+            node_id,
+            "--directory",
+            directory.to_str().unwrap(),
+            "--push-only", // Skip MQTT requirement for testing
+        ])
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("Failed to spawn sync client")
+}
+
 /// CP-q52x: Test that newly created node-backed subdirectories propagate without restart.
 ///
 /// Scenario:
@@ -774,5 +798,289 @@ fn test_offline_edits_sync_on_reconnect() {
         server_content.contains("Edited while offline"),
         "Server should have received offline edit after sync restart. Got: {}",
         server_content
+    );
+}
+
+/// CP-7dvs: Test that locally created files in existing subdirectories update server schema.
+///
+/// Scenario:
+/// 1. Create a fs-root with a node-backed subdirectory on server
+/// 2. Start sync client
+/// 3. Create a new file locally in the subdirectory
+/// 4. Verify the subdirectory schema on server includes the new file entry
+#[test]
+fn test_local_file_in_existing_subdir_updates_server_schema() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+
+    let mut guard = ProcessGuard::new();
+    let server = spawn_server(port, &db_path);
+    guard.add(server);
+
+    let client = reqwest::blocking::Client::new();
+
+    // Create fs-root document
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let fs_root_id = body["id"].as_str().expect("No id in response");
+
+    // Create a document for the subdirectory
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create subdir document");
+
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let subdir_id = body["id"].as_str().expect("No id in response");
+
+    // Initialize the subdirectory with an empty schema
+    let subdir_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {}
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, subdir_id))
+        .header("Content-Type", "application/json")
+        .body(subdir_schema.to_string())
+        .send()
+        .expect("Failed to set subdir schema");
+    assert!(resp.status().is_success());
+
+    // Update fs-root schema to include the node-backed subdirectory
+    let schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "mysubdir": {
+                    "type": "dir",
+                    "node_id": subdir_id
+                }
+            }
+        }
+    });
+
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(schema.to_string())
+        .send()
+        .expect("Failed to update fs-root schema");
+    assert!(resp.status().is_success());
+
+    // Start sync client (with push-only to skip MQTT requirement in tests)
+    let sync = spawn_sync_directory_debug(&server_url, &sync_dir, fs_root_id);
+    guard.add(sync);
+
+    // Wait for initial sync and watcher setup
+    std::thread::sleep(Duration::from_secs(15));
+
+    // Verify subdirectory was created locally
+    let subdir_path = sync_dir.join("mysubdir");
+    assert!(
+        subdir_path.exists(),
+        "Subdirectory should be created locally"
+    );
+
+    // Create a new file locally in the subdirectory
+    let new_file_path = subdir_path.join("newfile.txt");
+    std::fs::write(&new_file_path, "Hello from local!").expect("Failed to write local file");
+
+    // Wait for sync to push the file and update schema
+    std::thread::sleep(Duration::from_secs(5));
+
+    // Verify: subdirectory schema on server should include the new file
+    let resp = client
+        .get(format!("{}/docs/{}/head", server_url, subdir_id))
+        .send()
+        .expect("Failed to get subdir HEAD");
+    let head: serde_json::Value = resp.json().expect("Failed to parse HEAD");
+    let schema_content = head["content"].as_str().expect("No content in HEAD");
+    let schema: serde_json::Value =
+        serde_json::from_str(schema_content).expect("Failed to parse schema");
+
+    // Check that entries contains newfile.txt with a node_id
+    let entries = schema["root"]["entries"]
+        .as_object()
+        .expect("Schema should have entries object");
+    assert!(
+        entries.contains_key("newfile.txt"),
+        "Server schema should contain newfile.txt entry. Schema: {}",
+        schema_content
+    );
+
+    let file_entry = &entries["newfile.txt"];
+    assert!(
+        file_entry["node_id"].is_string(),
+        "File entry should have node_id. Entry: {}",
+        file_entry
+    );
+
+    // Verify the file document exists and has correct content
+    let file_node_id = file_entry["node_id"].as_str().unwrap();
+    let resp = client
+        .get(format!("{}/docs/{}/head", server_url, file_node_id))
+        .send()
+        .expect("Failed to get file HEAD");
+    let head: serde_json::Value = resp.json().expect("Failed to parse HEAD");
+    let file_content = head["content"].as_str().expect("No content in HEAD");
+    assert!(
+        file_content.contains("Hello from local"),
+        "Server file content should match local. Got: {}",
+        file_content
+    );
+}
+
+/// CP-7dvs: Test that locally created subdirectory with file updates server schemas.
+///
+/// Scenario:
+/// 1. Create a fs-root on server (empty)
+/// 2. Start sync client
+/// 3. Create a new subdirectory locally with a file inside
+/// 4. Verify:
+///    - fs-root schema includes the new subdirectory with node_id
+///    - subdirectory schema includes the file with node_id
+///    - file document has correct content
+#[test]
+fn test_local_new_subdir_with_file_updates_server_schemas() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+
+    let mut guard = ProcessGuard::new();
+    let server = spawn_server(port, &db_path);
+    guard.add(server);
+
+    let client = reqwest::blocking::Client::new();
+
+    // Create fs-root document (empty schema)
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let fs_root_id = body["id"].as_str().expect("No id in response");
+
+    // Start sync client (using debug version to see logs)
+    let sync = spawn_sync_directory_debug(&server_url, &sync_dir, fs_root_id);
+    guard.add(sync);
+
+    // Wait for initial sync to complete and watcher to start
+    // This needs to be long enough for the sync client to:
+    // 1. Start up and parse args
+    // 2. Acquire sync lock
+    // 3. Run initial sync (sync_schema, scan_directory_with_contents, etc.)
+    //    Note: initial sync includes a 30-attempt retry loop (3+ seconds) for files
+    // 4. Start the watcher event loop
+    // Only THEN should we create files so they go through the watcher path
+    // We need at least 10 seconds to ensure watcher is started before file creation
+    std::thread::sleep(Duration::from_secs(15));
+
+    // Create a new subdirectory locally
+    let new_subdir = sync_dir.join("brandnew");
+    std::fs::create_dir_all(&new_subdir).expect("Failed to create subdirectory");
+
+    // Wait a bit for the watcher to register the new subdirectory
+    // The notify crate needs time to add the new directory to its watch list
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Create a file in the new subdirectory
+    let new_file = new_subdir.join("test.txt");
+    std::fs::write(&new_file, "Created locally in new subdir!").expect("Failed to write file");
+
+    // Wait for sync to:
+    // 1. Create subdir document on server
+    // 2. Update fs-root schema with subdir entry
+    // 3. Create file document on server
+    // 4. Update subdir schema with file entry
+    std::thread::sleep(Duration::from_secs(5));
+
+    // Verify: fs-root schema should include the new subdirectory
+    let resp = client
+        .get(format!("{}/docs/{}/head", server_url, fs_root_id))
+        .send()
+        .expect("Failed to get fs-root HEAD");
+    let head: serde_json::Value = resp.json().expect("Failed to parse HEAD");
+    let schema_content = head["content"].as_str().expect("No content in HEAD");
+    let schema: serde_json::Value =
+        serde_json::from_str(schema_content).expect("Failed to parse fs-root schema");
+
+    let entries = schema["root"]["entries"]
+        .as_object()
+        .expect("fs-root schema should have entries");
+    assert!(
+        entries.contains_key("brandnew"),
+        "fs-root schema should contain brandnew subdir. Schema: {}",
+        schema_content
+    );
+
+    let subdir_entry = &entries["brandnew"];
+    assert!(
+        subdir_entry["node_id"].is_string(),
+        "Subdir entry should have node_id. Entry: {}",
+        subdir_entry
+    );
+
+    let subdir_node_id = subdir_entry["node_id"].as_str().unwrap();
+
+    // Verify: subdirectory schema should include the file
+    let resp = client
+        .get(format!("{}/docs/{}/head", server_url, subdir_node_id))
+        .send()
+        .expect("Failed to get subdir HEAD");
+    let head: serde_json::Value = resp.json().expect("Failed to parse HEAD");
+    let subdir_schema_content = head["content"].as_str().expect("No content in subdir HEAD");
+    let subdir_schema: serde_json::Value =
+        serde_json::from_str(subdir_schema_content).expect("Failed to parse subdir schema");
+
+    let subdir_entries = subdir_schema["root"]["entries"]
+        .as_object()
+        .expect("Subdir schema should have entries");
+    assert!(
+        subdir_entries.contains_key("test.txt"),
+        "Subdir schema should contain test.txt. Schema: {}",
+        subdir_schema_content
+    );
+
+    let file_entry = &subdir_entries["test.txt"];
+    assert!(
+        file_entry["node_id"].is_string(),
+        "File entry should have node_id. Entry: {}",
+        file_entry
+    );
+
+    // Verify: file document has correct content
+    let file_node_id = file_entry["node_id"].as_str().unwrap();
+    let resp = client
+        .get(format!("{}/docs/{}/head", server_url, file_node_id))
+        .send()
+        .expect("Failed to get file HEAD");
+    let head: serde_json::Value = resp.json().expect("Failed to parse HEAD");
+    let file_content = head["content"].as_str().expect("No content in file HEAD");
+    assert!(
+        file_content.contains("Created locally in new subdir"),
+        "File content should match local. Got: {}",
+        file_content
     );
 }

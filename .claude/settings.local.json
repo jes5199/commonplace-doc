@@ -54,7 +54,8 @@
       "mcp__plugin_beads_beads__blocked",
       "Bash(gh pr list:*)",
       "Bash(source:*)",
-      "Bash(tee:*)"
+      "Bash(tee:*)",
+      "Bash(bd show:*)"
     ],
     "deny": [],
     "ask": []
