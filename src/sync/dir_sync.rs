@@ -1200,6 +1200,140 @@ pub async fn ensure_fs_root_exists(
     Ok(())
 }
 
+/// Create documents on the server for all schema entries with null node_ids.
+///
+/// Per RECURSIVE_SYNC_THEORY.md: schemas pushed to server must have valid UUIDs.
+/// This function creates documents for any entry missing a node_id and returns
+/// an updated schema with the assigned UUIDs.
+///
+/// This ensures we never push schemas with `node_id: null` to the server.
+///
+/// Also processes nested schemas in subdirectories recursively.
+async fn create_documents_for_null_entries(
+    client: &Client,
+    server: &str,
+    schema: &FsSchema,
+    directory: &Path,
+) -> Result<FsSchema, Box<dyn std::error::Error + Send + Sync>> {
+    let mut updated_schema = schema.clone();
+
+    if let Some(Entry::Dir(ref mut root_dir)) = updated_schema.root {
+        if let Some(ref mut entries) = root_dir.entries {
+            for (name, entry) in entries.iter_mut() {
+                match entry {
+                    Entry::Doc(doc) if doc.node_id.is_none() => {
+                        // Create document for file
+                        let content_type = doc
+                            .content_type
+                            .as_deref()
+                            .unwrap_or("application/octet-stream");
+                        let create_url = format!("{}/docs", server);
+                        let resp = client
+                            .post(&create_url)
+                            .json(&serde_json::json!({ "content_type": content_type }))
+                            .send()
+                            .await?;
+
+                        if resp.status().is_success() {
+                            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                                if let Some(id) = body["id"].as_str() {
+                                    info!("Created document {} for file '{}'", id, name);
+                                    doc.node_id = Some(id.to_string());
+                                }
+                            }
+                        } else {
+                            warn!(
+                                "Failed to create document for '{}': {}",
+                                name,
+                                resp.status()
+                            );
+                        }
+                    }
+                    Entry::Dir(dir) => {
+                        // Create document for directory if needed
+                        if dir.node_id.is_none() {
+                            let create_url = format!("{}/docs", server);
+                            let resp = client
+                                .post(&create_url)
+                                .json(&serde_json::json!({ "content_type": "application/json" }))
+                                .send()
+                                .await?;
+
+                            if resp.status().is_success() {
+                                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                                    if let Some(id) = body["id"].as_str() {
+                                        info!("Created document {} for directory '{}'", id, name);
+                                        dir.node_id = Some(id.to_string());
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    "Failed to create document for directory '{}': {}",
+                                    name,
+                                    resp.status()
+                                );
+                            }
+                        }
+
+                        // Recursively process subdirectory schema if it has a node_id
+                        if let Some(ref node_id) = dir.node_id {
+                            let subdir_path = directory.join(name);
+                            if subdir_path.is_dir() {
+                                // Scan the subdirectory
+                                let options = ScanOptions::default();
+                                if let Ok(sub_schema) = scan_directory(&subdir_path, &options) {
+                                    // Recursively create documents for null entries in subdirectory
+                                    let updated_sub_schema =
+                                        Box::pin(create_documents_for_null_entries(
+                                            client,
+                                            server,
+                                            &sub_schema,
+                                            &subdir_path,
+                                        ))
+                                        .await?;
+
+                                    // Write the updated subdirectory schema to disk
+                                    let sub_schema_json = schema_to_json(&updated_sub_schema)?;
+                                    if let Err(e) =
+                                        write_schema_file(&subdir_path, &sub_schema_json, None)
+                                            .await
+                                    {
+                                        warn!(
+                                            "Failed to write subdirectory schema for '{}': {}",
+                                            name, e
+                                        );
+                                    }
+
+                                    // Push the subdirectory schema to server
+                                    if let Err(e) = push_schema_to_server(
+                                        client,
+                                        server,
+                                        node_id,
+                                        &sub_schema_json,
+                                        "sync-client",
+                                    )
+                                    .await
+                                    {
+                                        warn!(
+                                            "Failed to push subdirectory schema for '{}': {}",
+                                            name, e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        // Entry already has node_id
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(updated_schema)
+}
+
 /// Synchronize schema between local directory and server.
 ///
 /// Based on the initial sync strategy:
@@ -1240,19 +1374,32 @@ pub async fn sync_schema(
     };
 
     if should_push_schema {
-        // Push schema to fs-root node (with None UUIDs for new entries)
+        // Per RECURSIVE_SYNC_THEORY.md: Create documents for null entries BEFORE pushing schema.
+        // This ensures we never push schemas with node_id: null to the server.
+        info!("Creating documents for new entries...");
+        let schema_with_uuids =
+            create_documents_for_null_entries(client, server, &schema, directory).await?;
+        let schema_json_with_uuids = schema_to_json(&schema_with_uuids)?;
+
+        // Push schema with UUIDs (no more nulls)
         info!("Pushing filesystem schema to server...");
-        push_schema_to_server(client, server, fs_root_id, &schema_json, author).await?;
+        push_schema_to_server(client, server, fs_root_id, &schema_json_with_uuids, author).await?;
         info!("Schema pushed successfully");
+
+        // Write the schema with UUIDs to local file
+        if let Err(e) = write_schema_file(directory, &schema_json_with_uuids, None).await {
+            warn!("Failed to write local schema file: {}", e);
+        }
 
         // Push nested schemas from local subdirectories to their server documents.
         // This restores node-backed directory contents after a server database clear.
-        if let Err(e) = push_nested_schemas(client, server, directory, &schema, author).await {
+        if let Err(e) =
+            push_nested_schemas(client, server, directory, &schema_with_uuids, author).await
+        {
             warn!("Failed to push nested schemas: {}", e);
         }
 
-        // Give the server's reconciler a moment to generate UUIDs
-        sleep(Duration::from_millis(100)).await;
+        // No need to wait for reconciler - we already created documents directly
 
         // Fetch the schema back from server (now with server-generated UUIDs)
         // and write to local .commonplace.json files.

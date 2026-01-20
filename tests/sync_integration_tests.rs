@@ -1084,3 +1084,125 @@ fn test_local_new_subdir_with_file_updates_server_schemas() {
         file_content
     );
 }
+
+/// CP-rwaw: Test that initial sync assigns UUIDs directly (not via reconciler).
+///
+/// Per RECURSIVE_SYNC_THEORY.md:
+/// - Schemas pushed to server must have valid UUIDs for all entries
+/// - The sync client creates documents BEFORE referencing them in schemas
+/// - Schemas with node_id: null are never pushed to the server
+///
+/// Scenario:
+/// 1. Create a directory with files and subdirectories BEFORE starting sync
+/// 2. Start sync client
+/// 3. Verify schemas on server have valid UUIDs (not null)
+#[test]
+fn test_initial_sync_creates_documents_before_schema() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+
+    let mut guard = ProcessGuard::new();
+    let server = spawn_server(port, &db_path);
+    guard.add(server);
+
+    let client = reqwest::blocking::Client::new();
+
+    // Create fs-root document (empty)
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let fs_root_id = body["id"].as_str().expect("No id in response");
+
+    // Create files and subdirectory BEFORE starting sync
+    // This forces the initial sync path (not the watcher path)
+    let subdir = sync_dir.join("preexisting");
+    std::fs::create_dir_all(&subdir).expect("Failed to create subdirectory");
+    std::fs::write(sync_dir.join("root_file.txt"), "File in root").expect("Failed to write file");
+    std::fs::write(subdir.join("nested_file.txt"), "File in subdir")
+        .expect("Failed to write nested file");
+
+    // Start sync client
+    let sync = spawn_sync_directory_debug(&server_url, &sync_dir, fs_root_id);
+    guard.add(sync);
+
+    // Wait for initial sync to complete
+    std::thread::sleep(Duration::from_secs(10));
+
+    // Verify: fs-root schema should have valid UUIDs (not null)
+    let resp = client
+        .get(format!("{}/docs/{}/head", server_url, fs_root_id))
+        .send()
+        .expect("Failed to get fs-root HEAD");
+    let head: serde_json::Value = resp.json().expect("Failed to parse HEAD");
+    let schema_content = head["content"].as_str().expect("No content in HEAD");
+    let schema: serde_json::Value =
+        serde_json::from_str(schema_content).expect("Failed to parse schema");
+
+    let entries = schema["root"]["entries"]
+        .as_object()
+        .expect("Schema should have entries");
+
+    // Check root_file.txt has a valid node_id
+    assert!(
+        entries.contains_key("root_file.txt"),
+        "Schema should contain root_file.txt. Schema: {}",
+        schema_content
+    );
+    let file_entry = &entries["root_file.txt"];
+    assert!(
+        file_entry["node_id"].is_string() && !file_entry["node_id"].as_str().unwrap().is_empty(),
+        "root_file.txt should have a non-null, non-empty node_id. Entry: {}",
+        file_entry
+    );
+
+    // Check preexisting subdir has a valid node_id
+    assert!(
+        entries.contains_key("preexisting"),
+        "Schema should contain preexisting subdir. Schema: {}",
+        schema_content
+    );
+    let subdir_entry = &entries["preexisting"];
+    assert!(
+        subdir_entry["node_id"].is_string()
+            && !subdir_entry["node_id"].as_str().unwrap().is_empty(),
+        "preexisting subdir should have a non-null, non-empty node_id. Entry: {}",
+        subdir_entry
+    );
+
+    // Check subdirectory schema also has valid UUIDs
+    let subdir_node_id = subdir_entry["node_id"].as_str().unwrap();
+    let resp = client
+        .get(format!("{}/docs/{}/head", server_url, subdir_node_id))
+        .send()
+        .expect("Failed to get subdir HEAD");
+    let head: serde_json::Value = resp.json().expect("Failed to parse HEAD");
+    let subdir_schema_content = head["content"].as_str().expect("No content in subdir HEAD");
+    let subdir_schema: serde_json::Value =
+        serde_json::from_str(subdir_schema_content).expect("Failed to parse subdir schema");
+
+    let subdir_entries = subdir_schema["root"]["entries"]
+        .as_object()
+        .expect("Subdir schema should have entries");
+
+    assert!(
+        subdir_entries.contains_key("nested_file.txt"),
+        "Subdir schema should contain nested_file.txt. Schema: {}",
+        subdir_schema_content
+    );
+    let nested_file_entry = &subdir_entries["nested_file.txt"];
+    assert!(
+        nested_file_entry["node_id"].is_string()
+            && !nested_file_entry["node_id"].as_str().unwrap().is_empty(),
+        "nested_file.txt should have a non-null, non-empty node_id. Entry: {}",
+        nested_file_entry
+    );
+}
