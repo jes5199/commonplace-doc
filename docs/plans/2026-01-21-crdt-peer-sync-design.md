@@ -241,3 +241,22 @@ No walking up/down the tree. Each directory is responsible for itself.
 6. MQTT for transport (bidirectional pub/sub)
 7. Generate UUIDs locally - no server round-trip for creation
 8. Each directory syncs itself - no recursive logic
+
+## Implementation Status
+
+### Completed
+- State model with head_cid/local_head_cid tracking
+- Per-directory state files (`.commonplace-sync.json`)
+- MQTT transport for publish/subscribe
+- Local UUID generation for new files
+- CID-based echo prevention
+- Merge commit creation with two parents
+- Independent directory sync
+
+### Known Limitations
+**Schema stored as JSON text, not YMap**: The current implementation stores directory schemas as JSON text in a YText "content" field rather than using native Yjs YMap structures. This means concurrent schema edits are last-writer-wins on the whole schema, not per-entry. A future improvement would migrate to proper YMap structures for fine-grained CRDT semantics on schema entries. (See: `src/sync/crdt_new_file.rs:117`)
+
+### Cleanup Pending
+- Legacy HTTP/SSE code paths remain alongside CRDT MQTT paths
+- `pending_write` tracking in non-CRDT paths can be removed
+- RECURSIVE_SYNC_THEORY.md archived to `docs/archive/`
