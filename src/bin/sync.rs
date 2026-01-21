@@ -15,13 +15,12 @@ use commonplace_doc::sync::subdir_spawn::{
 use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
     acquire_sync_lock, build_head_url, build_info_url, build_replace_url, build_uuid_map_recursive,
-    check_server_has_content, detect_from_path, directory_mqtt_task, directory_sse_task,
-    directory_watcher_task, discover_fs_root, ensure_fs_root_exists, file_watcher_task, fork_node,
-    handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
-    handle_schema_modified, initial_sync, is_binary_content, push_schema_to_server,
-    scan_directory_with_contents, spawn_command_listener, spawn_file_sync_tasks_crdt,
-    spawn_file_sync_tasks_with_flock, sse_task, sync_schema, sync_single_file, upload_task,
-    DirEvent, FileEvent, FileSyncState, FlockSyncState, InodeKey, InodeTracker, ReplaceResponse,
+    check_server_has_content, detect_from_path, directory_mqtt_task, directory_watcher_task,
+    discover_fs_root, ensure_fs_root_exists, file_watcher_task, fork_node, handle_file_created,
+    handle_file_deleted, handle_file_modified, handle_schema_change, handle_schema_modified,
+    initial_sync, is_binary_content, push_schema_to_server, scan_directory_with_contents,
+    spawn_command_listener, spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file,
+    upload_task, DirEvent, FileEvent, FileSyncState, InodeKey, InodeTracker, ReplaceResponse,
     ScanOptions, SharedStateFile, SyncState, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
@@ -48,36 +47,34 @@ use tokio::task::JoinHandle;
 /// This limits server load while still providing significant speedup.
 const MAX_CONCURRENT_FILE_SYNCS: usize = 10;
 
-/// Publish initial sync complete event via MQTT if available.
+/// Publish initial sync complete event via MQTT.
 async fn publish_initial_sync_complete(
-    mqtt_client: &Option<Arc<MqttClient>>,
+    mqtt_client: &Arc<MqttClient>,
     fs_root_id: &str,
     files_synced: usize,
     strategy: &str,
     duration_ms: u64,
 ) {
-    if let Some(mqtt) = mqtt_client {
-        let event = InitialSyncComplete {
-            fs_root_id: fs_root_id.to_string(),
-            files_synced,
-            strategy: strategy.to_string(),
-            duration_ms,
-        };
-        let topic = format!("{}/events/sync/initial-complete", fs_root_id);
-        match serde_json::to_string(&event) {
-            Ok(payload) => {
-                if let Err(e) = mqtt
-                    .publish(&topic, payload.as_bytes(), QoS::AtLeastOnce)
-                    .await
-                {
-                    warn!("Failed to publish initial-sync-complete event: {}", e);
-                } else {
-                    info!("Published initial-sync-complete event to {}", topic);
-                }
+    let event = InitialSyncComplete {
+        fs_root_id: fs_root_id.to_string(),
+        files_synced,
+        strategy: strategy.to_string(),
+        duration_ms,
+    };
+    let topic = format!("{}/events/sync/initial-complete", fs_root_id);
+    match serde_json::to_string(&event) {
+        Ok(payload) => {
+            if let Err(e) = mqtt_client
+                .publish(&topic, payload.as_bytes(), QoS::AtLeastOnce)
+                .await
+            {
+                warn!("Failed to publish initial-sync-complete event: {}", e);
+            } else {
+                info!("Published initial-sync-complete event to {}", topic);
             }
-            Err(e) => {
-                warn!("Failed to serialize initial-sync-complete event: {}", e);
-            }
+        }
+        Err(e) => {
+            warn!("Failed to serialize initial-sync-complete event: {}", e);
         }
     }
 }
@@ -93,8 +90,6 @@ struct WatcherSetup {
     watcher_handle: Option<JoinHandle<()>>,
     /// Tracks which subdirectories have subscription tasks.
     watched_subdirs: Arc<RwLock<HashSet<String>>>,
-    /// Shared state for ancestry-based sync coordination.
-    flock_state: FlockSyncState,
 }
 
 /// Set up directory watchers and shared state for sync.
@@ -124,7 +119,6 @@ fn setup_directory_watchers(
         dir_rx,
         watcher_handle,
         watched_subdirs: Arc::new(RwLock::new(HashSet::new())),
-        flock_state: FlockSyncState::new(),
     }
 }
 
@@ -352,11 +346,6 @@ struct Args {
     /// MQTT workspace name for topic namespacing (also reads from COMMONPLACE_WORKSPACE env var)
     #[arg(long, default_value = DEFAULT_WORKSPACE, env = "COMMONPLACE_WORKSPACE")]
     workspace: String,
-
-    /// Disable CRDT peer sync and use legacy HTTP /replace for file changes.
-    /// Not recommended - can cause corruption when multiple sync clients edit the same file.
-    #[arg(long)]
-    no_crdt: bool,
 
     /// Path to listen for stdout/stderr events from another process.
     /// When set, this sync process subscribes to events at the given path
@@ -601,7 +590,7 @@ async fn main() -> ExitCode {
     let mqtt_client = match MqttClient::connect(mqtt_config).await {
         Ok(mqtt) => {
             info!("Connected to MQTT broker, workspace: {}", args.workspace);
-            Some(Arc::new(mqtt))
+            Arc::new(mqtt)
         }
         Err(e) => {
             error!("Failed to connect to MQTT broker: {}", e);
@@ -760,7 +749,6 @@ async fn main() -> ExitCode {
                 mqtt_client,
                 args.workspace,
                 args.path.clone(),
-                !args.no_crdt,
             )
             .await
         };
@@ -831,7 +819,6 @@ async fn main() -> ExitCode {
                 mqtt_client,
                 args.workspace,
                 args.path.clone(),
-                !args.no_crdt,
             )
             .await
         } else {
@@ -850,7 +837,6 @@ async fn main() -> ExitCode {
                 mqtt_client,
                 args.workspace,
                 args.name.clone(),
-                !args.no_crdt,
             )
             .await
             .map(|_| 0u8)
@@ -1184,10 +1170,9 @@ async fn run_directory_mode(
     push_only: bool,
     pull_only: bool,
     shadow_dir: String,
-    mqtt_client: Option<Arc<MqttClient>>,
+    mqtt_client: Arc<MqttClient>,
     workspace: String,
     name: Option<String>,
-    use_crdt: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Derive author from name parameter, defaulting to "sync-client"
     let author = name.unwrap_or_else(|| "sync-client".to_string());
@@ -1445,7 +1430,6 @@ async fn run_directory_mode(
         mut dir_rx,
         watcher_handle,
         watched_subdirs,
-        flock_state,
     } = setup_directory_watchers(
         pull_only,
         directory.clone(),
@@ -1454,14 +1438,9 @@ async fn run_directory_mode(
     );
 
     // Start subscription task for fs-root (skip if push-only)
-    // MQTT is required for directory sync mode (SSE fallback removed)
     let subscription_handle = if !push_only {
-        let mqtt = mqtt_client
-            .as_ref()
-            .ok_or("MQTT is required for directory sync mode. Please configure --mqtt-broker.")?;
-
         // Spawn the MQTT event loop in a background task
-        let mqtt_for_loop = mqtt.clone();
+        let mqtt_for_loop = mqtt_client.clone();
         tokio::spawn(async move {
             if let Err(e) = mqtt_for_loop.run_event_loop().await {
                 error!("MQTT event loop error: {}", e);
@@ -1488,7 +1467,7 @@ async fn run_directory_mode(
             #[cfg(unix)]
             inode_tracker.clone(),
             watched_subdirs.clone(),
-            mqtt.clone(),
+            mqtt_client.clone(),
             workspace.clone(),
             Some(written_schemas.clone()),
             initial_schema_cid.clone(),
@@ -1518,12 +1497,8 @@ async fn run_directory_mode(
             inode_tracker: inode_tracker.clone(),
             watched_subdirs: watched_subdirs.clone(),
         };
-        // MQTT is required for directory sync (checked above), so we can use it directly
-        let mqtt = mqtt_client
-            .as_ref()
-            .expect("MQTT client should be available - checked at subscription_handle");
         let transport = SubdirTransport::Mqtt {
-            client: mqtt.clone(),
+            client: mqtt_client.clone(),
             workspace: workspace.clone(),
         };
         let count = spawn_subdir_watchers(&params, transport).await;
@@ -1531,78 +1506,41 @@ async fn run_directory_mode(
     }
 
     // Start file sync tasks for each file and store handles in FileSyncState
-    // Load/create CRDT state if CRDT mode is enabled
-    let crdt_state = if use_crdt {
-        let schema_node_id = uuid::Uuid::parse_str(&fs_root_id)
-            .map_err(|e| format!("Invalid fs_root_id UUID: {}", e))?;
-        let state = DirectorySyncState::load_or_create(&directory, schema_node_id)
+    // Load/create CRDT state for this directory
+    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id)
+        .map_err(|e| format!("Invalid fs_root_id UUID: {}", e))?;
+    let crdt_state = Arc::new(RwLock::new(
+        DirectorySyncState::load_or_create(&directory, schema_node_id)
             .await
-            .map_err(|e| format!("Failed to load CRDT state: {}", e))?;
-        Some(Arc::new(RwLock::new(state)))
-    } else {
-        None
-    };
+            .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
+    ));
 
     {
         let mut states = file_states.write().await;
         for (relative_path, file_state) in states.iter_mut() {
             let file_path = directory.join(relative_path);
 
-            // Parse doc_id from identifier if using UUID-based API
-            let doc_id = if !file_state.use_paths {
-                uuid::Uuid::parse_str(&file_state.identifier).ok()
-            } else {
-                None
-            };
+            // Parse doc_id from identifier (UUID required for CRDT)
+            let node_id = uuid::Uuid::parse_str(&file_state.identifier)
+                .map_err(|e| format!("Invalid file UUID {}: {}", file_state.identifier, e))?;
 
-            // Spawn sync tasks and store handles in FileSyncState for cleanup on deletion
-            if use_crdt {
-                // Use CRDT upload for local changes via MQTT
-                let mqtt = mqtt_client
-                    .as_ref()
-                    .expect("MQTT client required for CRDT mode");
-                let node_id = doc_id.expect("UUID required for CRDT mode");
-                let crdt_state = crdt_state
-                    .as_ref()
-                    .expect("CRDT state should be loaded")
-                    .clone();
+            // Extract filename from relative_path
+            let filename = std::path::Path::new(relative_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(relative_path)
+                .to_string();
 
-                // Extract filename from relative_path
-                let filename = std::path::Path::new(relative_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(relative_path)
-                    .to_string();
-
-                file_state.task_handles = spawn_file_sync_tasks_crdt(
-                    mqtt.clone(),
-                    workspace.clone(),
-                    node_id,
-                    file_path,
-                    crdt_state,
-                    filename,
-                    pull_only,
-                    author.clone(),
-                );
-            } else {
-                // Use traditional HTTP /replace for local changes
-                file_state.task_handles = spawn_file_sync_tasks_with_flock(
-                    client.clone(),
-                    server.clone(),
-                    file_state.identifier.clone(),
-                    file_path,
-                    file_state.state.clone(),
-                    file_state.use_paths,
-                    push_only,
-                    pull_only,
-                    false, // force_push: directory mode doesn't support force-push
-                    flock_state.clone(),
-                    doc_id,
-                    author.clone(),
-                    #[cfg(unix)]
-                    inode_tracker.clone(),
-                );
-            }
+            file_state.task_handles = spawn_file_sync_tasks_crdt(
+                mqtt_client.clone(),
+                workspace.clone(),
+                node_id,
+                file_path,
+                crdt_state.clone(),
+                filename,
+                pull_only,
+                author.clone(),
+            );
         }
     }
 
@@ -1741,10 +1679,9 @@ async fn run_exec_mode(
     pull_only: bool,
     shadow_dir: String,
     process_name: Option<String>,
-    mqtt_client: Option<Arc<MqttClient>>,
+    mqtt_client: Arc<MqttClient>,
     workspace: String,
     command_path: Option<String>,
-    use_crdt: bool,
 ) -> Result<u8, Box<dyn std::error::Error + Send + Sync>> {
     // Derive author from process_name, defaulting to "sync-client"
     let author = process_name
@@ -2022,7 +1959,6 @@ async fn run_exec_mode(
         mut dir_rx,
         watcher_handle,
         watched_subdirs,
-        flock_state,
     } = setup_directory_watchers(
         pull_only,
         directory.clone(),
@@ -2031,63 +1967,41 @@ async fn run_exec_mode(
     );
 
     // Start subscription task for fs-root (skip if push-only)
-    // Use MQTT if available, otherwise fall back to SSE
     let subscription_handle = if !push_only {
-        if let Some(ref mqtt) = mqtt_client {
-            // Spawn the MQTT event loop in a background task
-            let mqtt_for_loop = mqtt.clone();
-            tokio::spawn(async move {
-                if let Err(e) = mqtt_for_loop.run_event_loop().await {
-                    error!("MQTT event loop error: {}", e);
-                }
-            });
+        // Spawn the MQTT event loop in a background task
+        let mqtt_for_loop = mqtt_client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = mqtt_for_loop.run_event_loop().await {
+                error!("MQTT event loop error: {}", e);
+            }
+        });
 
-            // Extract uuid_map for MQTT task
-            let initial_uuid_map: HashMap<String, String> = (*uuid_map).clone();
-            info!(
-                "Using MQTT for exec mode subscriptions ({} file UUIDs)",
-                initial_uuid_map.len()
-            );
-            Some(tokio::spawn(directory_mqtt_task(
-                client.clone(),
-                server.clone(),
-                fs_root_id.clone(),
-                directory.clone(),
-                file_states.clone(),
-                use_paths,
-                push_only,
-                pull_only,
-                author.clone(),
-                #[cfg(unix)]
-                inode_tracker.clone(),
-                watched_subdirs.clone(),
-                mqtt.clone(),
-                workspace.clone(),
-                Some(written_schemas.clone()),
-                initial_schema_cid.clone(),
-                Some(shared_state_file.clone()),
-                initial_uuid_map,
-            )))
-        } else {
-            // Fall back to SSE when MQTT not available
-            Some(tokio::spawn(directory_sse_task(
-                client.clone(),
-                server.clone(),
-                fs_root_id.clone(),
-                directory.clone(),
-                file_states.clone(),
-                use_paths,
-                push_only,
-                pull_only,
-                author.clone(),
-                #[cfg(unix)]
-                inode_tracker.clone(),
-                watched_subdirs.clone(),
-                Some(written_schemas.clone()),
-                initial_schema_cid.clone(),
-                Some(shared_state_file.clone()),
-            )))
-        }
+        // Extract uuid_map for MQTT task
+        let initial_uuid_map: HashMap<String, String> = (*uuid_map).clone();
+        info!(
+            "Using MQTT for exec mode subscriptions ({} file UUIDs)",
+            initial_uuid_map.len()
+        );
+        Some(tokio::spawn(directory_mqtt_task(
+            client.clone(),
+            server.clone(),
+            fs_root_id.clone(),
+            directory.clone(),
+            file_states.clone(),
+            use_paths,
+            push_only,
+            pull_only,
+            author.clone(),
+            #[cfg(unix)]
+            inode_tracker.clone(),
+            watched_subdirs.clone(),
+            mqtt_client.clone(),
+            workspace.clone(),
+            Some(written_schemas.clone()),
+            initial_schema_cid.clone(),
+            Some(shared_state_file.clone()),
+            initial_uuid_map,
+        )))
     } else {
         info!("Push-only mode: skipping subscription");
         None
@@ -2110,90 +2024,48 @@ async fn run_exec_mode(
             inode_tracker: inode_tracker.clone(),
             watched_subdirs: watched_subdirs.clone(),
         };
-        let transport = if let Some(ref mqtt) = mqtt_client {
-            SubdirTransport::Mqtt {
-                client: mqtt.clone(),
-                workspace: workspace.clone(),
-            }
-        } else {
-            SubdirTransport::Sse
+        let transport = SubdirTransport::Mqtt {
+            client: mqtt_client.clone(),
+            workspace: workspace.clone(),
         };
         let count = spawn_subdir_watchers(&params, transport).await;
         info!("Spawned {} node-backed subdirectory watcher(s)", count);
     }
 
-    // Start file sync tasks for each file
-    // Load/create CRDT state if CRDT mode is enabled
-    let crdt_state = if use_crdt {
-        let schema_node_id = uuid::Uuid::parse_str(&fs_root_id)
-            .map_err(|e| format!("Invalid fs_root_id UUID: {}", e))?;
-        let state = DirectorySyncState::load_or_create(&directory, schema_node_id)
-            .await
-            .map_err(|e| format!("Failed to load CRDT state: {}", e))?;
-        Some(Arc::new(RwLock::new(state)))
-    } else {
-        None
-    };
+    // Start file sync tasks for each file using CRDT mode
+    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id)
+        .map_err(|e| format!("Invalid fs_root_id UUID: {}", e))?;
+    let crdt_state = DirectorySyncState::load_or_create(&directory, schema_node_id)
+        .await
+        .map_err(|e| format!("Failed to load CRDT state: {}", e))?;
+    let crdt_state = Arc::new(RwLock::new(crdt_state));
 
     {
         let mut states = file_states.write().await;
         for (relative_path, file_state) in states.iter_mut() {
             let file_path = directory.join(relative_path);
 
-            // Parse doc_id from identifier if using UUID-based API
-            let doc_id = if !file_state.use_paths {
-                uuid::Uuid::parse_str(&file_state.identifier).ok()
-            } else {
-                None
-            };
+            // Parse doc_id from identifier - UUID required for CRDT mode
+            let node_id = uuid::Uuid::parse_str(&file_state.identifier)
+                .map_err(|e| format!("UUID required for CRDT mode: {}", e))?;
 
-            if use_crdt {
-                // Use CRDT upload for local changes via MQTT
-                let mqtt = mqtt_client
-                    .as_ref()
-                    .expect("MQTT client required for CRDT mode");
-                let node_id = doc_id.expect("UUID required for CRDT mode");
-                let crdt_state = crdt_state
-                    .as_ref()
-                    .expect("CRDT state should be loaded")
-                    .clone();
+            // Extract filename from relative_path
+            let filename = std::path::Path::new(relative_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(relative_path)
+                .to_string();
 
-                // Extract filename from relative_path
-                let filename = std::path::Path::new(relative_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(relative_path)
-                    .to_string();
-
-                file_state.task_handles = spawn_file_sync_tasks_crdt(
-                    mqtt.clone(),
-                    workspace.clone(),
-                    node_id,
-                    file_path,
-                    crdt_state,
-                    filename,
-                    pull_only,
-                    author.clone(),
-                );
-            } else {
-                // Use traditional HTTP /replace for local changes
-                file_state.task_handles = spawn_file_sync_tasks_with_flock(
-                    client.clone(),
-                    server.clone(),
-                    file_state.identifier.clone(),
-                    file_path,
-                    file_state.state.clone(),
-                    file_state.use_paths,
-                    push_only,
-                    pull_only,
-                    false, // force_push: sandbox mode doesn't support force-push
-                    flock_state.clone(),
-                    doc_id,
-                    author.clone(),
-                    #[cfg(unix)]
-                    inode_tracker.clone(),
-                );
-            }
+            file_state.task_handles = spawn_file_sync_tasks_crdt(
+                mqtt_client.clone(),
+                workspace.clone(),
+                node_id,
+                file_path,
+                crdt_state.clone(),
+                filename,
+                pull_only,
+                author.clone(),
+            );
         }
     }
 
@@ -2373,14 +2245,12 @@ async fn run_exec_mode(
                     // Print to console (like non-sandbox mode would)
                     println!("[{}] {}", exec_name_clone, line);
                     // Emit as MQTT event
-                    if let Some(ref mqtt) = mqtt_clone {
-                        let topic = Topic::events(&workspace_clone, &path_clone, "stdout");
-                        if let Err(e) = mqtt
-                            .publish(&topic.to_topic_string(), line.as_bytes(), QoS::AtMostOnce)
-                            .await
-                        {
-                            tracing::debug!("Failed to publish stdout event: {}", e);
-                        }
+                    let topic = Topic::events(&workspace_clone, &path_clone, "stdout");
+                    if let Err(e) = mqtt_clone
+                        .publish(&topic.to_topic_string(), line.as_bytes(), QoS::AtMostOnce)
+                        .await
+                    {
+                        tracing::debug!("Failed to publish stdout event: {}", e);
                     }
                 }
             });
@@ -2399,14 +2269,12 @@ async fn run_exec_mode(
                     // Print to console (like non-sandbox mode would)
                     eprintln!("[{}] {}", exec_name_clone, line);
                     // Emit as MQTT event
-                    if let Some(ref mqtt) = mqtt_clone {
-                        let topic = Topic::events(&workspace_clone, &path_clone, "stderr");
-                        if let Err(e) = mqtt
-                            .publish(&topic.to_topic_string(), line.as_bytes(), QoS::AtMostOnce)
-                            .await
-                        {
-                            tracing::debug!("Failed to publish stderr event: {}", e);
-                        }
+                    let topic = Topic::events(&workspace_clone, &path_clone, "stderr");
+                    if let Err(e) = mqtt_clone
+                        .publish(&topic.to_topic_string(), line.as_bytes(), QoS::AtMostOnce)
+                        .await
+                    {
+                        tracing::debug!("Failed to publish stderr event: {}", e);
                     }
                 }
             });
@@ -2415,18 +2283,16 @@ async fn run_exec_mode(
         // Spawn command listener for this sandbox process
         // Commands sent to {workspace}/commands/{path}/# will be written to __commands.jsonl
         // Use event_path (e.g., "echo") rather than UUID for topic matching
-        if let Some(ref mqtt) = mqtt_client {
-            info!(
-                "Starting command listener for sandbox process at path: {}",
-                event_path
-            );
-            spawn_command_listener(
-                mqtt.clone(),
-                workspace.clone(),
-                event_path,
-                directory.clone(),
-            );
-        }
+        info!(
+            "Starting command listener for sandbox process at path: {}",
+            event_path
+        );
+        spawn_command_listener(
+            mqtt_client.clone(),
+            workspace.clone(),
+            event_path,
+            directory.clone(),
+        );
     }
 
     // Wait for child to exit OR signal
@@ -2641,7 +2507,7 @@ async fn run_log_listener_mode(
     _pull_only: bool,
     _shadow_dir: String,
     process_name: Option<String>,
-    mqtt_client: Option<Arc<MqttClient>>,
+    mqtt_client: Arc<MqttClient>,
     workspace: String,
     listen_path: String,
 ) -> Result<u8, Box<dyn std::error::Error + Send + Sync>> {
@@ -2670,9 +2536,6 @@ async fn run_log_listener_mode(
     // Set up the log file path
     let log_file_path = directory.join(format!("{}.log", exec_name));
 
-    // Require MQTT for log-listener mode
-    let mqtt = mqtt_client.ok_or("--log-listener requires --mqtt-broker")?;
-
     // Subscribe to stdout and stderr events at the listened path
     let stdout_topic = Topic::events(&workspace, &normalized_path, "stdout");
     let stderr_topic = Topic::events(&workspace, &normalized_path, "stderr");
@@ -2684,14 +2547,14 @@ async fn run_log_listener_mode(
     );
 
     // Subscribe to both topics
-    if let Err(e) = mqtt
+    if let Err(e) = mqtt_client
         .subscribe(&stdout_topic.to_topic_string(), QoS::AtLeastOnce)
         .await
     {
         error!("Failed to subscribe to stdout events: {}", e);
         return Err(format!("Failed to subscribe: {}", e).into());
     }
-    if let Err(e) = mqtt
+    if let Err(e) = mqtt_client
         .subscribe(&stderr_topic.to_topic_string(), QoS::AtLeastOnce)
         .await
     {
@@ -2700,13 +2563,13 @@ async fn run_log_listener_mode(
     }
 
     // Spawn the MQTT event loop
-    let mqtt_for_loop = mqtt.clone();
+    let mqtt_for_loop = mqtt_client.clone();
     tokio::spawn(async move {
         let _ = mqtt_for_loop.run_event_loop().await;
     });
 
     // Get a receiver for incoming messages
-    let mut message_rx = mqtt.subscribe_messages();
+    let mut message_rx = mqtt_client.subscribe_messages();
 
     // Open the log file for appending
     let mut log_file = OpenOptions::new()
