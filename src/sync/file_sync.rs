@@ -1593,16 +1593,29 @@ pub async fn sync_single_file(
                         );
                         true
                     } else if local_cid.is_none() {
-                        // No local CID - first sync, trust server unless content differs
-                        if file.content != head.content {
-                            // Local has different content but no CID - push local
+                        // No local CID - first sync
+                        // Check if local content is default/empty - if so, prefer server content
+                        // This fixes a bug where sandbox restarts would push empty files to server
+                        let local_is_default =
+                            is_default_content(&file.content, &file.content_type);
+                        if file.content != head.content && !local_is_default {
+                            // Local has different non-default content but no CID - push local
                             // (This handles the case where local was edited offline before first sync)
                             info!(
-                                "Local has different content but no CID for {}, pushing local",
+                                "Local has different non-default content but no CID for {}, pushing local",
                                 file.relative_path
                             );
                             true
                         } else {
+                            // Either content matches, or local is default - pull from server
+                            if local_is_default
+                                && !is_default_content(&head.content, &file.content_type)
+                            {
+                                info!(
+                                    "Local has default content but server has data for {}, pulling server",
+                                    file.relative_path
+                                );
+                            }
                             false
                         }
                     } else {

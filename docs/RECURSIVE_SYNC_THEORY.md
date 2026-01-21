@@ -1,5 +1,16 @@
 # Theory of Recursive Syncing
 
+> **⚠️ DEPRECATED**: This document describes the legacy "mirror with echo suppression"
+> architecture. The codebase is migrating to a new "CRDT peer" architecture where:
+> - The sync client maintains its own Y.Doc state and merges like any other peer
+> - Echo prevention is via CID checks, not content/path tracking
+> - UUIDs are generated locally (no server round-trip)
+> - Each directory syncs independently (no recursive management)
+>
+> See `docs/plans/2026-01-21-crdt-peer-sync-design.md` for the new design.
+> New code should use the modules in `src/sync/crdt_*.rs` instead of the legacy
+> echo suppression mechanisms described below.
+
 This document establishes the rules and invariants for bidirectional sync between a local filesystem and the commonplace server, with support for arbitrarily nested node-backed directories.
 
 > **Note:** This document describes the *intended* design. The current implementation

@@ -3,6 +3,23 @@
 //! This module contains the `SyncState` struct that tracks synchronization state
 //! between file watchers and SSE tasks, including echo detection and write barriers.
 //!
+//! ## Deprecation Notice
+//!
+//! The echo suppression mechanisms in this module (PendingWrite, write barriers,
+//! last_written_content tracking) are part of the legacy "mirror with echo suppression"
+//! architecture. New code should use the CRDT peer modules instead:
+//!
+//! - `crdt_state.rs` - Per-directory Y.Doc state with CID tracking
+//! - `crdt_publish.rs` - Local changes via Y.Doc diff and MQTT publish
+//! - `crdt_merge.rs` - Remote changes with CID-based deduplication (no echo suppression needed)
+//! - `crdt_new_file.rs` - Local UUID generation (no server round-trip)
+//!
+//! In the CRDT peer architecture, echo prevention happens via CID checks: if we receive
+//! a commit we already know (by CID), we ignore it. This eliminates the need for
+//! content-based or path-based echo detection.
+//!
+//! See: `docs/plans/2026-01-21-crdt-peer-sync-design.md`
+//!
 //! ## Inode Tracking
 //!
 //! When syncing with atomic writes (temp+rename), the inode at the path changes.
@@ -328,6 +345,10 @@ impl InodeTracker {
 /// When the server sends an edit, we write it to the local file. The file watcher
 /// will see this change and try to upload it back. The pending write barrier prevents
 /// this "echo" by tracking what we just wrote.
+///
+/// **Deprecated:** In the CRDT peer architecture (see `crdt_merge.rs`), echo prevention
+/// happens via CID checks - we ignore commits we already know by CID. This struct is
+/// retained for backwards compatibility with the legacy sync paths.
 #[derive(Debug, Clone)]
 pub struct PendingWrite {
     /// Unique token for this write operation

@@ -1,0 +1,426 @@
+//! CRDT peer state management for file synchronization.
+//!
+//! This module implements the "true CRDT peer" architecture where the sync client
+//! maintains its own Y.Doc state and merges with the server like any other peer.
+//!
+//! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io;
+use std::path::{Path, PathBuf};
+use tokio::fs;
+use tracing::{debug, warn};
+use uuid::Uuid;
+use yrs::updates::decoder::Decode;
+use yrs::{Doc, ReadTxn, Transact, Update};
+
+/// State file name for per-directory CRDT state.
+/// Located inside the directory it tracks (not as a sibling).
+pub const CRDT_STATE_FILENAME: &str = ".commonplace-sync.json";
+
+/// CRDT peer state for a single document (file content or schema).
+///
+/// Each tracked entity maintains:
+/// - Its node_id (UUID)
+/// - The server HEAD we've merged (`head_cid`)
+/// - Our latest commit (`local_head_cid`)
+/// - The serialized Y.Doc state
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrdtPeerState {
+    /// UUID for this document
+    pub node_id: Uuid,
+    /// Server HEAD we've merged (last known server commit)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_cid: Option<String>,
+    /// Our latest commit (may be ahead of server)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_head_cid: Option<String>,
+    /// Serialized Y.Doc state (base64 encoded)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub yjs_state: Option<String>,
+}
+
+impl CrdtPeerState {
+    /// Create a new CrdtPeerState with just a node_id.
+    pub fn new(node_id: Uuid) -> Self {
+        Self {
+            node_id,
+            head_cid: None,
+            local_head_cid: None,
+            yjs_state: None,
+        }
+    }
+
+    /// Create CrdtPeerState from an existing Y.Doc.
+    pub fn from_doc(node_id: Uuid, doc: &Doc) -> Self {
+        let txn = doc.transact();
+        // Encode full state from empty state vector to get everything
+        let update = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+        let yjs_state = STANDARD.encode(&update);
+
+        Self {
+            node_id,
+            head_cid: None,
+            local_head_cid: None,
+            yjs_state: Some(yjs_state),
+        }
+    }
+
+    /// Deserialize the Y.Doc state.
+    /// Returns a new Doc with the stored state applied, or an empty Doc if no state.
+    pub fn to_doc(&self) -> Result<Doc, String> {
+        let doc = Doc::new();
+
+        if let Some(ref state_b64) = self.yjs_state {
+            let state_bytes = STANDARD
+                .decode(state_b64)
+                .map_err(|e| format!("Failed to decode yjs_state: {}", e))?;
+
+            let update = Update::decode_v1(&state_bytes)
+                .map_err(|e| format!("Failed to decode Yrs update: {}", e))?;
+
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update);
+        }
+
+        Ok(doc)
+    }
+
+    /// Update the stored Y.Doc state from a Doc.
+    pub fn update_from_doc(&mut self, doc: &Doc) {
+        let txn = doc.transact();
+        // Encode full state from empty state vector to get everything
+        let update = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+        self.yjs_state = Some(STANDARD.encode(&update));
+    }
+
+    /// Check if this commit CID is already known (either as head or local_head).
+    pub fn is_cid_known(&self, cid: &str) -> bool {
+        self.head_cid.as_deref() == Some(cid) || self.local_head_cid.as_deref() == Some(cid)
+    }
+}
+
+/// Sync state for an entire directory.
+///
+/// Each node-backed directory has its own state file containing:
+/// - Schema state (the directory's .commonplace.json as a Y.Doc)
+/// - File states (each file's content as a Y.Doc)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectorySyncState {
+    /// Version for future-proofing migrations
+    pub version: u32,
+    /// State for this directory's schema
+    pub schema: CrdtPeerState,
+    /// State for files in this directory (keyed by filename, not path)
+    #[serde(default)]
+    pub files: HashMap<String, CrdtPeerState>,
+}
+
+impl DirectorySyncState {
+    /// Current state file version.
+    pub const CURRENT_VERSION: u32 = 2;
+
+    /// Create a new DirectorySyncState for a directory with the given node_id.
+    pub fn new(schema_node_id: Uuid) -> Self {
+        Self {
+            version: Self::CURRENT_VERSION,
+            schema: CrdtPeerState::new(schema_node_id),
+            files: HashMap::new(),
+        }
+    }
+
+    /// Get or create state for a file.
+    pub fn get_or_create_file(&mut self, filename: &str, node_id: Uuid) -> &mut CrdtPeerState {
+        self.files
+            .entry(filename.to_string())
+            .or_insert_with(|| CrdtPeerState::new(node_id))
+    }
+
+    /// Get state for a file if it exists.
+    pub fn get_file(&self, filename: &str) -> Option<&CrdtPeerState> {
+        self.files.get(filename)
+    }
+
+    /// Remove state for a file.
+    pub fn remove_file(&mut self, filename: &str) -> Option<CrdtPeerState> {
+        self.files.remove(filename)
+    }
+
+    /// Check if a file is tracked.
+    pub fn has_file(&self, filename: &str) -> bool {
+        self.files.contains_key(filename)
+    }
+
+    /// Get the state file path for a directory.
+    /// The state file is stored inside the directory.
+    pub fn state_file_path(directory: &Path) -> PathBuf {
+        directory.join(CRDT_STATE_FILENAME)
+    }
+
+    /// Load state from file, or return None if it doesn't exist.
+    pub async fn load(directory: &Path) -> io::Result<Option<Self>> {
+        let path = Self::state_file_path(directory);
+        match fs::read_to_string(&path).await {
+            Ok(content) => {
+                let state: Self = serde_json::from_str(&content)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(Some(state))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Save state to file.
+    pub async fn save(&self, directory: &Path) -> io::Result<()> {
+        let path = Self::state_file_path(directory);
+        let content = serde_json::to_string_pretty(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        fs::write(&path, content).await
+    }
+
+    /// Load state or create new if it doesn't exist.
+    pub async fn load_or_create(directory: &Path, schema_node_id: Uuid) -> io::Result<Self> {
+        match Self::load(directory).await? {
+            Some(state) => Ok(state),
+            None => Ok(Self::new(schema_node_id)),
+        }
+    }
+}
+
+/// Migrate from old SyncStateFile format to new DirectorySyncState.
+///
+/// The old format stored:
+/// - server, node_id, last_synced_cid, files (with hash, last_cid, inode_key)
+///
+/// The new format stores:
+/// - schema state with Y.Doc
+/// - file states with Y.Docs
+///
+/// Migration creates empty Y.Docs but preserves CID information.
+pub fn migrate_from_old_state(
+    old_state: &crate::sync::state_file::SyncStateFile,
+) -> Result<DirectorySyncState, String> {
+    // Parse the node_id as UUID
+    let schema_node_id = Uuid::parse_str(&old_state.node_id)
+        .map_err(|e| format!("Invalid node_id in old state: {}", e))?;
+
+    let mut new_state = DirectorySyncState::new(schema_node_id);
+
+    // Preserve the last synced CID as both head_cid and local_head_cid
+    // (we assume they're in sync at migration time)
+    new_state.schema.head_cid = old_state.last_synced_cid.clone();
+    new_state.schema.local_head_cid = old_state.last_synced_cid.clone();
+
+    // Migrate file states
+    for (path, file_state) in &old_state.files {
+        // For files, we don't have the node_id in the old format
+        // We'll need to generate a placeholder or fetch from schema
+        // For now, generate a new UUID (will be updated on first sync)
+        let file_node_id = Uuid::new_v4();
+
+        let mut peer_state = CrdtPeerState::new(file_node_id);
+        peer_state.head_cid = file_state.last_cid.clone();
+        peer_state.local_head_cid = file_state.last_cid.clone();
+        // Y.Doc state will be populated on first sync
+
+        new_state.files.insert(path.clone(), peer_state);
+    }
+
+    debug!(
+        "Migrated old state with {} files to new CRDT state",
+        new_state.files.len()
+    );
+
+    Ok(new_state)
+}
+
+/// Attempt to load state, migrating from old format if necessary.
+pub async fn load_or_migrate(
+    directory: &Path,
+    schema_node_id: Uuid,
+) -> io::Result<DirectorySyncState> {
+    // First try loading new format
+    if let Some(state) = DirectorySyncState::load(directory).await? {
+        return Ok(state);
+    }
+
+    // Check for old format state file (sibling dotfile)
+    let old_state_path = crate::sync::state_file::SyncStateFile::state_file_path(directory);
+    if old_state_path.exists() {
+        if let Some(old_state) =
+            crate::sync::state_file::SyncStateFile::load(&old_state_path).await?
+        {
+            match migrate_from_old_state(&old_state) {
+                Ok(new_state) => {
+                    // Save the migrated state
+                    new_state.save(directory).await?;
+                    warn!(
+                        "Migrated old sync state to new CRDT format: {}",
+                        directory.display()
+                    );
+                    return Ok(new_state);
+                }
+                Err(e) => {
+                    warn!("Failed to migrate old state: {}", e);
+                    // Fall through to create new state
+                }
+            }
+        }
+    }
+
+    // No existing state, create new
+    Ok(DirectorySyncState::new(schema_node_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use yrs::{GetString, Text, WriteTxn};
+
+    #[test]
+    fn test_crdt_peer_state_new() {
+        let node_id = Uuid::new_v4();
+        let state = CrdtPeerState::new(node_id);
+        assert_eq!(state.node_id, node_id);
+        assert!(state.head_cid.is_none());
+        assert!(state.local_head_cid.is_none());
+        assert!(state.yjs_state.is_none());
+    }
+
+    #[test]
+    fn test_crdt_peer_state_from_doc() {
+        let node_id = Uuid::new_v4();
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "hello world");
+        }
+
+        let state = CrdtPeerState::from_doc(node_id, &doc);
+        assert!(state.yjs_state.is_some());
+
+        // Round-trip test
+        let restored_doc = state.to_doc().unwrap();
+        let txn = restored_doc.transact();
+        let text = txn.get_text("content").unwrap();
+        assert_eq!(text.get_string(&txn), "hello world");
+    }
+
+    #[test]
+    fn test_is_cid_known() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+        assert!(!state.is_cid_known("abc123"));
+
+        state.head_cid = Some("abc123".to_string());
+        assert!(state.is_cid_known("abc123"));
+        assert!(!state.is_cid_known("def456"));
+
+        state.local_head_cid = Some("def456".to_string());
+        assert!(state.is_cid_known("abc123"));
+        assert!(state.is_cid_known("def456"));
+    }
+
+    #[test]
+    fn test_directory_sync_state_new() {
+        let schema_node_id = Uuid::new_v4();
+        let state = DirectorySyncState::new(schema_node_id);
+        assert_eq!(state.version, DirectorySyncState::CURRENT_VERSION);
+        assert_eq!(state.schema.node_id, schema_node_id);
+        assert!(state.files.is_empty());
+    }
+
+    #[test]
+    fn test_directory_sync_state_files() {
+        let mut state = DirectorySyncState::new(Uuid::new_v4());
+        let file_node_id = Uuid::new_v4();
+
+        // Get or create
+        let file_state = state.get_or_create_file("test.txt", file_node_id);
+        assert_eq!(file_state.node_id, file_node_id);
+
+        // Has file
+        assert!(state.has_file("test.txt"));
+        assert!(!state.has_file("other.txt"));
+
+        // Get file
+        assert!(state.get_file("test.txt").is_some());
+        assert!(state.get_file("other.txt").is_none());
+
+        // Remove file
+        let removed = state.remove_file("test.txt");
+        assert!(removed.is_some());
+        assert!(!state.has_file("test.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_directory_sync_state_save_load() {
+        let dir = tempdir().unwrap();
+        let schema_node_id = Uuid::new_v4();
+        let file_node_id = Uuid::new_v4();
+
+        let mut state = DirectorySyncState::new(schema_node_id);
+        state.schema.head_cid = Some("abc123".to_string());
+        state.get_or_create_file("test.txt", file_node_id);
+
+        // Save
+        state.save(dir.path()).await.unwrap();
+
+        // Verify file exists
+        let state_path = DirectorySyncState::state_file_path(dir.path());
+        assert!(state_path.exists());
+
+        // Load
+        let loaded = DirectorySyncState::load(dir.path()).await.unwrap().unwrap();
+        assert_eq!(loaded.version, DirectorySyncState::CURRENT_VERSION);
+        assert_eq!(loaded.schema.node_id, schema_node_id);
+        assert_eq!(loaded.schema.head_cid, Some("abc123".to_string()));
+        assert!(loaded.has_file("test.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_load_nonexistent() {
+        let dir = tempdir().unwrap();
+        let result = DirectorySyncState::load(dir.path()).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_serialization_roundtrip() {
+        let schema_node_id = Uuid::new_v4();
+        let mut state = DirectorySyncState::new(schema_node_id);
+
+        // Create a doc with content
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "test content");
+        }
+
+        let file_node_id = Uuid::new_v4();
+        let file_state = state.get_or_create_file("test.txt", file_node_id);
+        file_state.update_from_doc(&doc);
+        file_state.head_cid = Some("cid123".to_string());
+        file_state.local_head_cid = Some("cid456".to_string());
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&state).unwrap();
+        let loaded: DirectorySyncState = serde_json::from_str(&json).unwrap();
+
+        // Verify
+        let loaded_file = loaded.get_file("test.txt").unwrap();
+        assert_eq!(loaded_file.head_cid, Some("cid123".to_string()));
+        assert_eq!(loaded_file.local_head_cid, Some("cid456".to_string()));
+
+        // Verify Y.Doc content
+        let restored_doc = loaded_file.to_doc().unwrap();
+        let txn = restored_doc.transact();
+        let text = txn.get_text("content").unwrap();
+        assert_eq!(text.get_string(&txn), "test content");
+    }
+}

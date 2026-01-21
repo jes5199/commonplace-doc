@@ -62,12 +62,6 @@
         "node_id": "564f1129-7c36-4c3a-ad38-2bfc0689936d",
         "content_type": "application/json"
       },
-      "workspace": {
-        "type": "dir",
-        "entries": null,
-        "node_id": "0ef0503e-04db-4739-adba-b1e4e109e30c",
-        "content_type": "application/json"
-      },
       "__processes.json": {
         "type": "doc",
         "node_id": "ee756345-7204-42e1-b3d4-ff96a9ea9d6d",

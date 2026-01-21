@@ -10,6 +10,10 @@ pub mod ancestry;
 pub mod client;
 pub mod commands;
 pub mod content_type;
+pub mod crdt_merge;
+pub mod crdt_new_file;
+pub mod crdt_publish;
+pub mod crdt_state;
 pub mod dir_sync;
 pub mod directory;
 pub mod file_events;
@@ -146,3 +150,14 @@ pub use yjs::{
 };
 
 pub use commands::{spawn_command_listener, CommandEntry};
+pub use crdt_merge::{parse_edit_message, process_received_edit, MergeResult};
+pub use crdt_new_file::{
+    create_new_file, generate_file_uuid, remove_file_from_schema, NewFileResult,
+};
+pub use crdt_publish::{
+    apply_received_commit, get_text_content, is_commit_known, publish_text_change,
+    publish_yjs_update, PublishResult,
+};
+pub use crdt_state::{
+    load_or_migrate, migrate_from_old_state, CrdtPeerState, DirectorySyncState, CRDT_STATE_FILENAME,
+};
