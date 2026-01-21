@@ -166,6 +166,18 @@ The merkle tree provides consistency guarantees:
 
 These invariants prevent echo loops without explicit "echo suppression" tracking.
 
+## Shadow Hardlinks for Non-Atomic Writes
+
+When we atomic-write a file (temp + rename), we replace the inode. If another process had the old inode open and was writing to it, those writes would be lost.
+
+The shadow hardlink system (see `docs/commonplace-hardlink-sync-spec.md`) solves this:
+- Before replacing, hardlink the old inode to a shadow directory
+- Continue watching the shadow for writes
+- Writes to the old inode become edits against the older commit
+- CRDT merge combines them with the new content
+
+This works because the shadow inode is just another peer - it has its own commit reference, and writes to it create Yjs updates that merge into HEAD. The CRDT model makes this "free."
+
 ## After Merge
 
 When creating a merge commit:
