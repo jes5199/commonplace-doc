@@ -32,6 +32,7 @@ pub mod urls;
 pub mod uuid_map;
 pub mod watcher;
 pub mod yjs;
+pub mod ymap_schema;
 
 /// Lock file name for sync process
 const SYNC_LOCK_FILENAME: &str = ".commonplace-sync.lock";

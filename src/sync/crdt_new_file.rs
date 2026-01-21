@@ -2,22 +2,22 @@
 //!
 //! This module implements local file creation without server round-trips:
 //! - Generate UUIDv4 locally for new files
-//! - Update schema Y.Doc with new file entry
+//! - Update schema Y.Doc with new file entry (using YMap for proper CRDT merge)
 //! - Create and publish commits via MQTT
 //!
 //! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
 
 use crate::commit::Commit;
-use crate::fs::{DirEntry, DocEntry, Entry, FsSchema};
 use crate::mqtt::{EditMessage, MqttClient, Topic};
 use crate::sync::crdt_state::{CrdtPeerState, DirectorySyncState};
+use crate::sync::ymap_schema;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rumqttc::QoS;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
-use yrs::{Doc, GetString, Text, Transact, WriteTxn};
+use yrs::{Doc, ReadTxn, Text, Transact, WriteTxn};
 
 /// Result of creating a new file locally.
 #[derive(Debug)]
@@ -113,40 +113,31 @@ async fn update_schema_with_new_file(
     // Load schema Y.Doc
     let doc = schema_state.to_doc()?;
 
-    // Update schema content
-    // For now, we store schema as JSON text in a "content" field
-    // In a full implementation, this would use Yjs Map/Array types
-    let update_bytes = {
-        let mut txn = doc.transact_mut();
-        let text = txn.get_or_insert_text("content");
-
-        // Get current schema JSON
-        let current_json = text.get_string(&txn);
-        let mut schema: FsSchema = if current_json.is_empty() {
-            FsSchema {
-                version: 1,
-                root: None,
+    // Migrate from JSON text format if needed
+    if ymap_schema::is_json_text_format(&doc) && !ymap_schema::is_ymap_format(&doc) {
+        match ymap_schema::migrate_from_json_text(&doc) {
+            Ok(true) => {
+                info!("Migrated schema from JSON text to YMap format");
             }
-        } else {
-            serde_json::from_str(&current_json)
-                .map_err(|e| format!("Failed to parse schema: {}", e))?
-        };
-
-        // Add new file entry to schema
-        add_file_to_schema(&mut schema, filename, file_uuid);
-
-        // Serialize updated schema
-        let new_json = serde_json::to_string_pretty(&schema)
-            .map_err(|e| format!("Failed to serialize schema: {}", e))?;
-
-        // Update Y.Doc
-        let len = text.len(&txn);
-        if len > 0 {
-            text.remove_range(&mut txn, 0, len);
+            Ok(false) => {
+                // No migration needed (empty or already migrated)
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to migrate schema, will use YMap for new entry: {}",
+                    e
+                );
+            }
         }
-        text.insert(&mut txn, 0, &new_json);
+    }
 
-        txn.encode_update_v1()
+    // Add file using YMap operations (provides proper CRDT merge semantics)
+    ymap_schema::add_file(&doc, filename, file_uuid);
+
+    // Get the update bytes
+    let update_bytes = {
+        let txn = doc.transact();
+        txn.encode_state_as_update_v1(&yrs::StateVector::default())
     };
 
     // Create and publish commit
@@ -198,32 +189,6 @@ async fn update_schema_with_new_file(
     );
 
     Ok(cid)
-}
-
-/// Add a file entry to the schema.
-fn add_file_to_schema(schema: &mut FsSchema, filename: &str, file_uuid: &str) {
-    // Ensure root directory exists
-    if schema.root.is_none() {
-        schema.root = Some(Entry::Dir(DirEntry {
-            node_id: None,
-            entries: Some(std::collections::HashMap::new()),
-            content_type: None,
-        }));
-    }
-
-    // Add file to root entries
-    if let Some(Entry::Dir(ref mut dir)) = schema.root {
-        let entries = dir
-            .entries
-            .get_or_insert_with(std::collections::HashMap::new);
-        entries.insert(
-            filename.to_string(),
-            Entry::Doc(DocEntry {
-                node_id: Some(file_uuid.to_string()),
-                content_type: None,
-            }),
-        );
-    }
 }
 
 /// Publish file content as initial commit.
@@ -295,39 +260,33 @@ pub async fn remove_file_from_schema(
     // Load schema Y.Doc
     let doc = dir_state.schema.to_doc()?;
 
-    // Update schema content
-    let update_bytes = {
-        let mut txn = doc.transact_mut();
-        let text = txn.get_or_insert_text("content");
-
-        // Get current schema JSON
-        let current_json = text.get_string(&txn);
-        let mut schema: FsSchema = if current_json.is_empty() {
-            return Err("Schema is empty, cannot remove file".to_string());
-        } else {
-            serde_json::from_str(&current_json)
-                .map_err(|e| format!("Failed to parse schema: {}", e))?
-        };
-
-        // Remove file from schema
-        if let Some(Entry::Dir(ref mut dir)) = schema.root {
-            if let Some(ref mut entries) = dir.entries {
-                entries.remove(filename);
+    // Migrate from JSON text format if needed
+    if ymap_schema::is_json_text_format(&doc) && !ymap_schema::is_ymap_format(&doc) {
+        match ymap_schema::migrate_from_json_text(&doc) {
+            Ok(true) => {
+                info!("Migrated schema from JSON text to YMap format");
+            }
+            Ok(false) => {
+                // No migration needed
+            }
+            Err(e) => {
+                warn!("Failed to migrate schema: {}", e);
             }
         }
+    }
 
-        // Serialize updated schema
-        let new_json = serde_json::to_string_pretty(&schema)
-            .map_err(|e| format!("Failed to serialize schema: {}", e))?;
+    // Check if entry exists before removing
+    if ymap_schema::get_entry(&doc, filename).is_none() {
+        return Err(format!("File '{}' not found in schema", filename));
+    }
 
-        // Update Y.Doc
-        let len = text.len(&txn);
-        if len > 0 {
-            text.remove_range(&mut txn, 0, len);
-        }
-        text.insert(&mut txn, 0, &new_json);
+    // Remove file using YMap operations (provides proper CRDT merge semantics)
+    ymap_schema::remove_entry(&doc, filename);
 
-        txn.encode_update_v1()
+    // Get the update bytes
+    let update_bytes = {
+        let txn = doc.transact();
+        txn.encode_state_as_update_v1(&yrs::StateVector::default())
     };
 
     // Create and publish commit
@@ -389,13 +348,7 @@ pub async fn remove_file_from_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn new_empty_schema() -> FsSchema {
-        FsSchema {
-            version: 1,
-            root: None,
-        }
-    }
+    use crate::fs::Entry;
 
     #[test]
     fn test_generate_file_uuid() {
@@ -414,55 +367,61 @@ mod tests {
     }
 
     #[test]
-    fn test_add_file_to_schema_empty() {
-        let mut schema = new_empty_schema();
-        add_file_to_schema(&mut schema, "test.txt", "uuid-123");
+    fn test_add_file_to_schema_ymap() {
+        let doc = Doc::new();
+        ymap_schema::add_file(&doc, "test.txt", "uuid-123");
 
-        assert!(schema.root.is_some());
-        if let Some(Entry::Dir(dir)) = &schema.root {
+        let entry = ymap_schema::get_entry(&doc, "test.txt").expect("Entry should exist");
+        assert_eq!(entry.entry_type, ymap_schema::SchemaEntryType::Doc);
+        assert_eq!(entry.node_id, Some("uuid-123".to_string()));
+
+        // Verify it converts to FsSchema correctly
+        let fs_schema = ymap_schema::to_fs_schema(&doc);
+        assert!(fs_schema.root.is_some());
+        if let Some(Entry::Dir(dir)) = &fs_schema.root {
             let entries = dir.entries.as_ref().unwrap();
             assert!(entries.contains_key("test.txt"));
-            if let Some(Entry::Doc(doc)) = entries.get("test.txt") {
-                assert_eq!(doc.node_id, Some("uuid-123".to_string()));
-            } else {
-                panic!("Expected Doc entry");
-            }
         } else {
             panic!("Expected Dir entry");
         }
     }
 
     #[test]
-    fn test_add_file_to_schema_existing() {
-        let mut schema = new_empty_schema();
+    fn test_add_multiple_files_ymap() {
+        let doc = Doc::new();
+        ymap_schema::add_file(&doc, "file1.txt", "uuid-1");
+        ymap_schema::add_file(&doc, "file2.txt", "uuid-2");
 
-        // Add first file
-        add_file_to_schema(&mut schema, "file1.txt", "uuid-1");
+        let entries = ymap_schema::list_entries(&doc);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains_key("file1.txt"));
+        assert!(entries.contains_key("file2.txt"));
+    }
 
-        // Add second file
-        add_file_to_schema(&mut schema, "file2.txt", "uuid-2");
+    #[test]
+    fn test_remove_file_ymap() {
+        let doc = Doc::new();
+        ymap_schema::add_file(&doc, "test.txt", "uuid-123");
+        assert!(ymap_schema::get_entry(&doc, "test.txt").is_some());
 
-        if let Some(Entry::Dir(dir)) = &schema.root {
+        ymap_schema::remove_entry(&doc, "test.txt");
+        assert!(ymap_schema::get_entry(&doc, "test.txt").is_none());
+    }
+
+    #[test]
+    fn test_ymap_to_fs_schema_roundtrip() {
+        let doc = Doc::new();
+        ymap_schema::add_file(&doc, "test.txt", "uuid-123");
+        ymap_schema::add_directory(&doc, "subdir", Some("uuid-456"));
+
+        let fs_schema = ymap_schema::to_fs_schema(&doc);
+        assert!(fs_schema.root.is_some());
+
+        if let Some(Entry::Dir(dir)) = &fs_schema.root {
             let entries = dir.entries.as_ref().unwrap();
             assert_eq!(entries.len(), 2);
-            assert!(entries.contains_key("file1.txt"));
-            assert!(entries.contains_key("file2.txt"));
-        } else {
-            panic!("Expected Dir entry");
-        }
-    }
-
-    #[test]
-    fn test_schema_serialization_roundtrip() {
-        let mut schema = new_empty_schema();
-        add_file_to_schema(&mut schema, "test.txt", "uuid-123");
-
-        let json = serde_json::to_string(&schema).unwrap();
-        let parsed: FsSchema = serde_json::from_str(&json).unwrap();
-
-        if let Some(Entry::Dir(dir)) = &parsed.root {
-            let entries = dir.entries.as_ref().unwrap();
             assert!(entries.contains_key("test.txt"));
+            assert!(entries.contains_key("subdir"));
         } else {
             panic!("Expected Dir entry");
         }
