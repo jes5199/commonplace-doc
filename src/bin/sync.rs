@@ -345,20 +345,18 @@ struct Args {
     )]
     shadow_dir: String,
 
-    /// MQTT broker URL for pub/sub (also reads from COMMONPLACE_MQTT env var)
-    /// When set, uses MQTT subscriptions instead of SSE for real-time updates.
+    /// MQTT broker URL for pub/sub (required, also reads from COMMONPLACE_MQTT env var)
     #[arg(long, env = "COMMONPLACE_MQTT")]
-    mqtt_broker: Option<String>,
+    mqtt_broker: String,
 
     /// MQTT workspace name for topic namespacing (also reads from COMMONPLACE_WORKSPACE env var)
     #[arg(long, default_value = DEFAULT_WORKSPACE, env = "COMMONPLACE_WORKSPACE")]
     workspace: String,
 
-    /// Use CRDT peer sync instead of HTTP /replace for file changes.
-    /// Requires --mqtt-broker to be set. Publishes Yjs updates via MQTT
-    /// which merge correctly when multiple sync clients edit the same file.
-    #[arg(long, requires = "mqtt_broker")]
-    use_crdt: bool,
+    /// Disable CRDT peer sync and use legacy HTTP /replace for file changes.
+    /// Not recommended - can cause corruption when multiple sync clients edit the same file.
+    #[arg(long)]
+    no_crdt: bool,
 
     /// Path to listen for stdout/stderr events from another process.
     /// When set, this sync process subscribes to events at the given path
@@ -592,27 +590,23 @@ async fn main() -> ExitCode {
     // Create HTTP client
     let client = Client::new();
 
-    // Initialize MQTT client if broker URL is provided
-    let mqtt_client = if let Some(ref broker_url) = args.mqtt_broker {
-        info!("Initializing MQTT client for broker: {}", broker_url);
-        let mqtt_config = MqttConfig {
-            broker_url: broker_url.clone(),
-            client_id: format!("sync-{}", uuid::Uuid::new_v4()),
-            workspace: args.workspace.clone(),
-            ..Default::default()
-        };
-        match MqttClient::connect(mqtt_config).await {
-            Ok(mqtt) => {
-                info!("Connected to MQTT broker, workspace: {}", args.workspace);
-                Some(Arc::new(mqtt))
-            }
-            Err(e) => {
-                error!("Failed to connect to MQTT broker: {}", e);
-                return ExitCode::from(1);
-            }
+    // Initialize MQTT client (required)
+    info!("Initializing MQTT client for broker: {}", args.mqtt_broker);
+    let mqtt_config = MqttConfig {
+        broker_url: args.mqtt_broker.clone(),
+        client_id: format!("sync-{}", uuid::Uuid::new_v4()),
+        workspace: args.workspace.clone(),
+        ..Default::default()
+    };
+    let mqtt_client = match MqttClient::connect(mqtt_config).await {
+        Ok(mqtt) => {
+            info!("Connected to MQTT broker, workspace: {}", args.workspace);
+            Some(Arc::new(mqtt))
         }
-    } else {
-        None
+        Err(e) => {
+            error!("Failed to connect to MQTT broker: {}", e);
+            return ExitCode::from(1);
+        }
     };
 
     // Determine the node ID to sync with
@@ -766,7 +760,7 @@ async fn main() -> ExitCode {
                 mqtt_client,
                 args.workspace,
                 args.path.clone(),
-                args.use_crdt,
+                !args.no_crdt,
             )
             .await
         };
@@ -837,7 +831,7 @@ async fn main() -> ExitCode {
                 mqtt_client,
                 args.workspace,
                 args.path.clone(),
-                args.use_crdt,
+                !args.no_crdt,
             )
             .await
         } else {
@@ -856,7 +850,7 @@ async fn main() -> ExitCode {
                 mqtt_client,
                 args.workspace,
                 args.name.clone(),
-                args.use_crdt,
+                !args.no_crdt,
             )
             .await
             .map(|_| 0u8)
