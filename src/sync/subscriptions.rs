@@ -649,23 +649,21 @@ pub async fn directory_mqtt_task(
         } else if let Some(paths) = uuid_to_paths.get(&doc_id) {
             // This is a file content edit - pull and write to local file(s)
             //
-            // IMPORTANT: We only process MQTT file edits for linked files (multiple paths
-            // sharing the same UUID). For single-path files, the existing per-file SSE tasks
-            // handle updates with proper sync state and ancestry checking. Processing MQTT
-            // edits for single-path files would bypass those safeguards and risk data loss.
-            //
-            // Linked files don't have individual SSE tasks (they share a UUID), so MQTT is
-            // the only way for changes to propagate between them.
-            let is_linked_file = paths.len() > 1;
-            if is_linked_file && (pull_only || !push_only) {
+            // We process ALL file edits here, regardless of whether the file appears
+            // "linked" (multiple local paths) or "single-path" from our perspective.
+            // A file may appear single-path locally (e.g., in a sandbox) but actually
+            // be linked to files outside our view. The CRDT receive_task may also
+            // miss messages due to broadcast channel lag, so we handle all edits here
+            // as a reliable fallback.
+            if pull_only || !push_only {
                 debug!(
-                    "MQTT edit received for linked file UUID {}: {} bytes, {} local path(s)",
+                    "MQTT edit received for file UUID {}: {} bytes, {} local path(s)",
                     doc_id,
                     msg.payload.len(),
                     paths.len()
                 );
 
-                // Fetch latest content from server and write to all linked local files
+                // Fetch latest content from server and write to all local files
                 if let Err(e) = handle_file_uuid_edit(
                     &http_client,
                     &server,
@@ -676,17 +674,8 @@ pub async fn directory_mqtt_task(
                 )
                 .await
                 {
-                    warn!(
-                        "Failed to handle linked file UUID edit for {}: {}",
-                        doc_id, e
-                    );
+                    warn!("Failed to handle file UUID edit for {}: {}", doc_id, e);
                 }
-            } else if !is_linked_file {
-                // Single-path file - let the per-file SSE task handle it
-                debug!(
-                    "Ignoring MQTT edit for single-path file UUID {} (handled by SSE)",
-                    doc_id
-                );
             }
         } else {
             // Unknown document ID - might be a subdir schema, ignore
