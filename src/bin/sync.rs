@@ -601,8 +601,35 @@ async fn main() -> ExitCode {
     // Determine the node ID to sync with
     // Priority: --node > --path > --fork-from > --use-paths discovery
     let node_id = if let Some(ref node) = args.node {
-        // Direct UUID provided
-        node.clone()
+        // Check if it's a valid UUID - use directly if so
+        if uuid::Uuid::parse_str(node).is_ok() {
+            node.clone()
+        } else {
+            // Not a UUID - could be "workspace" (fs-root name) or a path
+            // First check if it's a document ID that exists directly
+            let info_url = build_info_url(&args.server, node);
+            match client.get(&info_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    // Document exists with this ID
+                    info!("Using node ID directly: {}", node);
+                    node.clone()
+                }
+                _ => {
+                    // Try to resolve as a path
+                    info!("Resolving node '{}' as path to UUID...", node);
+                    match resolve_path_to_uuid(&client, &args.server, node).await {
+                        Ok(id) => {
+                            info!("Resolved '{}' -> {}", node, id);
+                            id
+                        }
+                        Err(e) => {
+                            error!("Failed to resolve node '{}': {}", node, e);
+                            return ExitCode::from(1);
+                        }
+                    }
+                }
+            }
+        }
     } else if let Some(ref path) = args.path {
         // Path provided - resolve to UUID (or create if using single-file mode)
         info!("Resolving path '{}' to UUID...", path);
@@ -1196,6 +1223,11 @@ async fn run_directory_mode(
         use_paths
     );
 
+    // CRDT mode requires UUID-based identifiers, not path-based
+    if use_paths {
+        return Err("CRDT sync mode requires UUID-based identifiers. Path-based sync (--use-paths) is no longer supported.".into());
+    }
+
     // Verify directory exists
     if !directory.is_dir() {
         error!("Not a directory: {}", directory.display());
@@ -1507,8 +1539,15 @@ async fn run_directory_mode(
 
     // Start file sync tasks for each file and store handles in FileSyncState
     // Load/create CRDT state for this directory
-    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id)
-        .map_err(|e| format!("Invalid fs_root_id UUID: {}", e))?;
+    // Note: If fs_root_id is not a UUID (e.g., "workspace"), use a nil UUID for the schema.
+    // File sync will still work since individual files have proper UUIDs.
+    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id).unwrap_or_else(|_| {
+        warn!(
+            "fs_root_id '{}' is not a UUID, using nil UUID for CRDT schema state",
+            fs_root_id
+        );
+        uuid::Uuid::nil()
+    });
     let crdt_state = Arc::new(RwLock::new(
         DirectorySyncState::load_or_create(&directory, schema_node_id)
             .await
@@ -1703,6 +1742,11 @@ async fn run_exec_mode(
         directory.display(),
         exec_cmd
     );
+
+    // CRDT mode requires UUID-based identifiers, not path-based
+    if use_paths {
+        return Err("CRDT sync mode requires UUID-based identifiers. Path-based sync (--use-paths) is no longer supported.".into());
+    }
 
     // Verify directory exists or create it
     if !directory.exists() {
@@ -2033,8 +2077,15 @@ async fn run_exec_mode(
     }
 
     // Start file sync tasks for each file using CRDT mode
-    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id)
-        .map_err(|e| format!("Invalid fs_root_id UUID: {}", e))?;
+    // Note: If fs_root_id is not a UUID (e.g., "workspace"), use a nil UUID for the schema.
+    // File sync will still work since individual files have proper UUIDs.
+    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id).unwrap_or_else(|_| {
+        warn!(
+            "fs_root_id '{}' is not a UUID, using nil UUID for CRDT schema state",
+            fs_root_id
+        );
+        uuid::Uuid::nil()
+    });
     let crdt_state = DirectorySyncState::load_or_create(&directory, schema_node_id)
         .await
         .map_err(|e| format!("Failed to load CRDT state: {}", e))?;
