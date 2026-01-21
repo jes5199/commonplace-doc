@@ -108,7 +108,73 @@ The sync client generates UUIDs locally (UUIDv4). No server round-trip needed.
 6. Add to local state
 
 **Concurrent creation (same filename, both sides generate different UUIDs):**
-Yjs last-writer-wins on schema entry. One UUID wins, other becomes orphan. Rare edge case, acceptable.
+Yjs last-writer-wins on schema entry. One UUID wins, other becomes orphan. Rare edge case, acceptable. Orphan cleanup is a future TODO.
+
+## File Deletion
+
+**Local file deleted:**
+1. Detect deletion via watcher
+2. Create Yjs update for directory schema: `entries.delete("oldfile.txt")`
+3. Create commit for schema, publish to MQTT
+4. Remove from local `.commonplace-sync.json`
+
+The file's document becomes an orphan on the server (no schema references it). This is fine - orphan cleanup is a separate concern.
+
+**Delete vs edit conflict:** If one peer deletes while another edits, the delete wins (entry removed from schema). The edited content becomes an orphan. This matches filesystem semantics.
+
+## File Rename
+
+**Local file renamed:**
+1. Detect rename via watcher (same inode, different name)
+2. Create Yjs update: `entries.delete("old.txt")` + `entries.set("new.txt", { same node_id })`
+3. The UUID stays the same - it's the same document with a new name
+
+This preserves edit history across renames.
+
+## Cross-Directory Moves
+
+Moving a file between directories requires coordinated schema updates across independent sync units. The filesystem watcher cannot reliably detect this (looks like delete + create).
+
+**Solution:** `commonplace-mv` command for cross-directory moves:
+1. Remove entry from source directory schema (keeps UUID)
+2. Add entry to destination directory schema (same UUID)
+3. Commit both schemas
+
+Without `commonplace-mv`, a cross-directory move looks like delete + create with a new UUID.
+
+## Missed Messages and Recovery
+
+The merkle tree provides consistency guarantees:
+
+**If you miss an MQTT message:**
+- The next commit you receive will have a parent you don't know
+- Request the missing parent(s) via the `sync` port
+- Recursively fetch until you have the full chain
+- Then apply in order
+
+**First sync (no local state):**
+- Fetch HEAD commit from server
+- Fetch full commit chain back to initial commit
+- Build Y.Doc state by replaying updates
+- Save to `.commonplace-sync.json`
+
+## Write Invariants
+
+**No rollback writes:** When writing remote updates to disk, only write if the new state is a descendant of our local state. Never write a commit that would roll back local changes.
+
+**No no-op commits:** The file watcher should detect that a write didn't change content (or changed it to match what we just received) and skip creating a commit.
+
+These invariants prevent echo loops without explicit "echo suppression" tracking.
+
+## After Merge
+
+When creating a merge commit:
+1. Apply both branches to Y.Doc (Yjs merges)
+2. Create merge commit with both parents
+3. Update BOTH `head_cid` AND `local_head_cid` to the merge commit
+4. Publish merge commit
+
+This ensures subsequent local commits branch from the merged state, not the pre-merge state.
 
 ## Nested Node-Backed Directories
 
