@@ -7,6 +7,7 @@
 use clap::Parser;
 use commonplace_doc::events::recv_broadcast;
 use commonplace_doc::mqtt::{MqttClient, MqttConfig, Topic};
+use commonplace_doc::sync::crdt_state::DirectorySyncState;
 use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
 use commonplace_doc::sync::subdir_spawn::{
     spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport,
@@ -18,10 +19,10 @@ use commonplace_doc::sync::{
     directory_watcher_task, discover_fs_root, ensure_fs_root_exists, file_watcher_task, fork_node,
     handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
     handle_schema_modified, initial_sync, is_binary_content, push_schema_to_server,
-    scan_directory_with_contents, spawn_command_listener, spawn_file_sync_tasks_with_flock,
-    sse_task, sync_schema, sync_single_file, upload_task, DirEvent, FileEvent, FileSyncState,
-    FlockSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions, SharedStateFile,
-    SyncState, SCHEMA_FILENAME,
+    scan_directory_with_contents, spawn_command_listener, spawn_file_sync_tasks_crdt,
+    spawn_file_sync_tasks_with_flock, sse_task, sync_schema, sync_single_file, upload_task,
+    DirEvent, FileEvent, FileSyncState, FlockSyncState, InodeKey, InodeTracker, ReplaceResponse,
+    ScanOptions, SharedStateFile, SyncState, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -352,6 +353,12 @@ struct Args {
     /// MQTT workspace name for topic namespacing (also reads from COMMONPLACE_WORKSPACE env var)
     #[arg(long, default_value = DEFAULT_WORKSPACE, env = "COMMONPLACE_WORKSPACE")]
     workspace: String,
+
+    /// Use CRDT peer sync instead of HTTP /replace for file changes.
+    /// Requires --mqtt-broker to be set. Publishes Yjs updates via MQTT
+    /// which merge correctly when multiple sync clients edit the same file.
+    #[arg(long, requires = "mqtt_broker")]
+    use_crdt: bool,
 
     /// Path to listen for stdout/stderr events from another process.
     /// When set, this sync process subscribes to events at the given path
@@ -759,6 +766,7 @@ async fn main() -> ExitCode {
                 mqtt_client,
                 args.workspace,
                 args.path.clone(),
+                args.use_crdt,
             )
             .await
         };
@@ -829,6 +837,7 @@ async fn main() -> ExitCode {
                 mqtt_client,
                 args.workspace,
                 args.path.clone(),
+                args.use_crdt,
             )
             .await
         } else {
@@ -847,6 +856,7 @@ async fn main() -> ExitCode {
                 mqtt_client,
                 args.workspace,
                 args.name.clone(),
+                args.use_crdt,
             )
             .await
             .map(|_| 0u8)
@@ -1183,6 +1193,7 @@ async fn run_directory_mode(
     mqtt_client: Option<Arc<MqttClient>>,
     workspace: String,
     name: Option<String>,
+    use_crdt: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Derive author from name parameter, defaulting to "sync-client"
     let author = name.unwrap_or_else(|| "sync-client".to_string());
@@ -1526,6 +1537,18 @@ async fn run_directory_mode(
     }
 
     // Start file sync tasks for each file and store handles in FileSyncState
+    // Load/create CRDT state if CRDT mode is enabled
+    let crdt_state = if use_crdt {
+        let schema_node_id = uuid::Uuid::parse_str(&fs_root_id)
+            .map_err(|e| format!("Invalid fs_root_id UUID: {}", e))?;
+        let state = DirectorySyncState::load_or_create(&directory, schema_node_id)
+            .await
+            .map_err(|e| format!("Failed to load CRDT state: {}", e))?;
+        Some(Arc::new(RwLock::new(state)))
+    } else {
+        None
+    };
+
     {
         let mut states = file_states.write().await;
         for (relative_path, file_state) in states.iter_mut() {
@@ -1539,22 +1562,53 @@ async fn run_directory_mode(
             };
 
             // Spawn sync tasks and store handles in FileSyncState for cleanup on deletion
-            file_state.task_handles = spawn_file_sync_tasks_with_flock(
-                client.clone(),
-                server.clone(),
-                file_state.identifier.clone(),
-                file_path,
-                file_state.state.clone(),
-                file_state.use_paths,
-                push_only,
-                pull_only,
-                false, // force_push: directory mode doesn't support force-push
-                flock_state.clone(),
-                doc_id,
-                author.clone(),
-                #[cfg(unix)]
-                inode_tracker.clone(),
-            );
+            if use_crdt {
+                // Use CRDT upload for local changes via MQTT
+                let mqtt = mqtt_client
+                    .as_ref()
+                    .expect("MQTT client required for CRDT mode");
+                let node_id = doc_id.expect("UUID required for CRDT mode");
+                let crdt_state = crdt_state
+                    .as_ref()
+                    .expect("CRDT state should be loaded")
+                    .clone();
+
+                // Extract filename from relative_path
+                let filename = std::path::Path::new(relative_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(relative_path)
+                    .to_string();
+
+                file_state.task_handles = spawn_file_sync_tasks_crdt(
+                    mqtt.clone(),
+                    workspace.clone(),
+                    node_id,
+                    file_path,
+                    crdt_state,
+                    filename,
+                    pull_only,
+                    author.clone(),
+                );
+            } else {
+                // Use traditional HTTP /replace for local changes
+                file_state.task_handles = spawn_file_sync_tasks_with_flock(
+                    client.clone(),
+                    server.clone(),
+                    file_state.identifier.clone(),
+                    file_path,
+                    file_state.state.clone(),
+                    file_state.use_paths,
+                    push_only,
+                    pull_only,
+                    false, // force_push: directory mode doesn't support force-push
+                    flock_state.clone(),
+                    doc_id,
+                    author.clone(),
+                    #[cfg(unix)]
+                    inode_tracker.clone(),
+                );
+            }
         }
     }
 
@@ -1696,6 +1750,7 @@ async fn run_exec_mode(
     mqtt_client: Option<Arc<MqttClient>>,
     workspace: String,
     command_path: Option<String>,
+    use_crdt: bool,
 ) -> Result<u8, Box<dyn std::error::Error + Send + Sync>> {
     // Derive author from process_name, defaulting to "sync-client"
     let author = process_name
@@ -2074,6 +2129,18 @@ async fn run_exec_mode(
     }
 
     // Start file sync tasks for each file
+    // Load/create CRDT state if CRDT mode is enabled
+    let crdt_state = if use_crdt {
+        let schema_node_id = uuid::Uuid::parse_str(&fs_root_id)
+            .map_err(|e| format!("Invalid fs_root_id UUID: {}", e))?;
+        let state = DirectorySyncState::load_or_create(&directory, schema_node_id)
+            .await
+            .map_err(|e| format!("Failed to load CRDT state: {}", e))?;
+        Some(Arc::new(RwLock::new(state)))
+    } else {
+        None
+    };
+
     {
         let mut states = file_states.write().await;
         for (relative_path, file_state) in states.iter_mut() {
@@ -2086,22 +2153,53 @@ async fn run_exec_mode(
                 None
             };
 
-            file_state.task_handles = spawn_file_sync_tasks_with_flock(
-                client.clone(),
-                server.clone(),
-                file_state.identifier.clone(),
-                file_path,
-                file_state.state.clone(),
-                file_state.use_paths,
-                push_only,
-                pull_only,
-                false, // force_push: sandbox mode doesn't support force-push
-                flock_state.clone(),
-                doc_id,
-                author.clone(),
-                #[cfg(unix)]
-                inode_tracker.clone(),
-            );
+            if use_crdt {
+                // Use CRDT upload for local changes via MQTT
+                let mqtt = mqtt_client
+                    .as_ref()
+                    .expect("MQTT client required for CRDT mode");
+                let node_id = doc_id.expect("UUID required for CRDT mode");
+                let crdt_state = crdt_state
+                    .as_ref()
+                    .expect("CRDT state should be loaded")
+                    .clone();
+
+                // Extract filename from relative_path
+                let filename = std::path::Path::new(relative_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(relative_path)
+                    .to_string();
+
+                file_state.task_handles = spawn_file_sync_tasks_crdt(
+                    mqtt.clone(),
+                    workspace.clone(),
+                    node_id,
+                    file_path,
+                    crdt_state,
+                    filename,
+                    pull_only,
+                    author.clone(),
+                );
+            } else {
+                // Use traditional HTTP /replace for local changes
+                file_state.task_handles = spawn_file_sync_tasks_with_flock(
+                    client.clone(),
+                    server.clone(),
+                    file_state.identifier.clone(),
+                    file_path,
+                    file_state.state.clone(),
+                    file_state.use_paths,
+                    push_only,
+                    pull_only,
+                    false, // force_push: sandbox mode doesn't support force-push
+                    flock_state.clone(),
+                    doc_id,
+                    author.clone(),
+                    #[cfg(unix)]
+                    inode_tracker.clone(),
+                );
+            }
         }
     }
 

@@ -2,7 +2,12 @@
 //!
 //! This module contains functions for syncing a single file with a server document.
 
+use crate::events::recv_broadcast;
+use crate::mqtt::{MqttClient, Topic};
 use crate::sync::client::fetch_head;
+use crate::sync::crdt_merge::{parse_edit_message, process_received_edit};
+use crate::sync::crdt_publish::publish_text_change;
+use crate::sync::crdt_state::DirectorySyncState;
 use crate::sync::directory::{scan_directory_to_json, ScanOptions};
 use crate::sync::file_events::find_owning_document;
 use crate::sync::state::InodeKey;
@@ -16,6 +21,7 @@ use crate::sync::{
     PENDING_WRITE_TIMEOUT,
 };
 use reqwest::Client;
+use rumqttc::QoS;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +29,7 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 /// Number of retries when content differs during a pending write (handles partial writes)
 pub const BARRIER_RETRY_COUNT: u32 = 5;
@@ -1909,4 +1916,323 @@ pub fn spawn_file_sync_tasks_with_flock(
     }
 
     handles
+}
+
+/// CRDT-aware upload task that publishes local changes via MQTT.
+///
+/// This is the replacement for `upload_task` when using CRDT peer sync.
+/// Instead of HTTP POST /replace (which causes character-level diffs),
+/// this publishes proper Yjs updates via MQTT that merge correctly.
+///
+/// # Arguments
+/// * `mqtt_client` - MQTT client for publishing
+/// * `workspace` - Workspace name for MQTT topics
+/// * `node_id` - Document UUID
+/// * `file_path` - Local file path
+/// * `crdt_state` - Shared CRDT state for this directory
+/// * `filename` - Filename within the directory (for state lookup)
+/// * `rx` - Channel for file modification events
+/// * `author` - Author name for commits
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_task_crdt(
+    mqtt_client: Arc<MqttClient>,
+    workspace: String,
+    node_id: Uuid,
+    file_path: PathBuf,
+    crdt_state: Arc<RwLock<DirectorySyncState>>,
+    filename: String,
+    mut rx: mpsc::Receiver<FileEvent>,
+    author: String,
+) {
+    // Track the last content we saw to compute diffs
+    let mut last_content: Option<String> = None;
+
+    while let Some(event) = rx.recv().await {
+        let FileEvent::Modified(raw_content) = event;
+
+        // Detect if file is binary
+        let content_info = detect_from_path(&file_path);
+        let is_binary = content_info.is_binary || is_binary_content(&raw_content);
+
+        if is_binary {
+            // CRDT sync doesn't support binary files well (yet)
+            // For now, skip and log a warning
+            warn!(
+                "CRDT upload_task skipping binary file: {}",
+                file_path.display()
+            );
+            continue;
+        }
+
+        let new_content = String::from_utf8_lossy(&raw_content).to_string();
+
+        // Get the old content for diff computation
+        let old_content = last_content.clone().unwrap_or_default();
+
+        // Skip if content unchanged
+        if old_content == new_content {
+            debug!(
+                "CRDT upload_task: content unchanged for {}",
+                file_path.display()
+            );
+            continue;
+        }
+
+        // Get or create the CRDT state for this file
+        let mut state_guard = crdt_state.write().await;
+        let file_state = state_guard.get_or_create_file(&filename, node_id);
+
+        // Publish the change via MQTT
+        match publish_text_change(
+            &mqtt_client,
+            &workspace,
+            &node_id.to_string(),
+            file_state,
+            &old_content,
+            &new_content,
+            &author,
+        )
+        .await
+        {
+            Ok(result) => {
+                info!(
+                    "CRDT upload: published commit {} for {} ({} bytes)",
+                    result.cid,
+                    file_path.display(),
+                    result.update_bytes.len()
+                );
+                // Update our last known content
+                last_content = Some(new_content);
+
+                // Save the state to persist CID tracking
+                drop(state_guard);
+                let state_guard = crdt_state.read().await;
+                if let Err(e) = state_guard
+                    .save(file_path.parent().unwrap_or(&file_path))
+                    .await
+                {
+                    warn!("Failed to save CRDT state: {}", e);
+                }
+            }
+            Err(e) => {
+                // "Content unchanged" is not really an error
+                if e != "Content unchanged" {
+                    error!("CRDT upload failed for {}: {}", file_path.display(), e);
+                }
+            }
+        }
+    }
+
+    info!(
+        "CRDT upload_task shutting down for: {}",
+        file_path.display()
+    );
+}
+
+/// Spawn CRDT-aware sync tasks for a single file.
+///
+/// This is the CRDT equivalent of `spawn_file_sync_tasks`.
+/// Uses MQTT publish for local changes instead of HTTP /replace.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_file_sync_tasks_crdt(
+    mqtt_client: Arc<MqttClient>,
+    workspace: String,
+    node_id: Uuid,
+    file_path: PathBuf,
+    crdt_state: Arc<RwLock<DirectorySyncState>>,
+    filename: String,
+    pull_only: bool,
+    author: String,
+) -> Vec<JoinHandle<()>> {
+    let mut handles = Vec::new();
+
+    if !pull_only {
+        let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
+
+        // Spawn file watcher
+        handles.push(tokio::spawn(file_watcher_task(file_path.clone(), file_tx)));
+
+        // Spawn CRDT upload task
+        handles.push(tokio::spawn(upload_task_crdt(
+            mqtt_client.clone(),
+            workspace.clone(),
+            node_id,
+            file_path.clone(),
+            crdt_state.clone(),
+            filename.clone(),
+            file_rx,
+            author.clone(),
+        )));
+    }
+
+    // Spawn CRDT receive task for incoming changes
+    handles.push(tokio::spawn(receive_task_crdt(
+        mqtt_client,
+        workspace,
+        node_id,
+        file_path,
+        crdt_state,
+        filename,
+        author,
+    )));
+
+    handles
+}
+
+/// CRDT receive task that subscribes to MQTT edits and applies them locally.
+///
+/// This handles the "receive" side of CRDT peer sync:
+/// - Subscribe to MQTT edits for this file's UUID
+/// - When an edit arrives, parse and apply via process_received_edit
+/// - If the merge produces content to write, update the local file
+#[allow(clippy::too_many_arguments)]
+pub async fn receive_task_crdt(
+    mqtt_client: Arc<MqttClient>,
+    workspace: String,
+    node_id: Uuid,
+    file_path: PathBuf,
+    crdt_state: Arc<RwLock<DirectorySyncState>>,
+    filename: String,
+    author: String,
+) {
+    let node_id_str = node_id.to_string();
+
+    // Subscribe to edits for this file's UUID
+    let topic = Topic::edits(&workspace, &node_id_str).to_topic_string();
+
+    info!(
+        "CRDT receive_task: subscribing to edits for {} at topic: {}",
+        file_path.display(),
+        topic
+    );
+
+    if let Err(e) = mqtt_client.subscribe(&topic, QoS::AtLeastOnce).await {
+        error!("CRDT receive_task: failed to subscribe to {}: {}", topic, e);
+        return;
+    }
+
+    // Get a receiver for incoming messages
+    let mut message_rx = mqtt_client.subscribe_messages();
+    let context = format!("CRDT receive {}", file_path.display());
+
+    while let Some(msg) = recv_broadcast(&mut message_rx, &context).await {
+        // Check if this message is for our topic
+        if msg.topic != topic {
+            continue;
+        }
+
+        debug!(
+            "CRDT receive_task: got edit for {} ({} bytes)",
+            file_path.display(),
+            msg.payload.len()
+        );
+
+        // Parse the edit message
+        let edit_msg = match parse_edit_message(&msg.payload) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    "CRDT receive_task: failed to parse edit message for {}: {}",
+                    file_path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        // Get or create the CRDT state for this file
+        let mut state_guard = crdt_state.write().await;
+        let file_state = state_guard.get_or_create_file(&filename, node_id);
+
+        // Process the received edit
+        match process_received_edit(
+            Some(&mqtt_client),
+            &workspace,
+            &node_id_str,
+            file_state,
+            &edit_msg,
+            &author,
+        )
+        .await
+        {
+            Ok((result, maybe_content)) => {
+                use crate::sync::crdt_merge::MergeResult;
+
+                match result {
+                    MergeResult::AlreadyKnown => {
+                        debug!(
+                            "CRDT receive_task: commit already known for {}",
+                            file_path.display()
+                        );
+                    }
+                    MergeResult::FastForward { new_head } => {
+                        info!(
+                            "CRDT receive_task: fast-forward to {} for {}",
+                            new_head,
+                            file_path.display()
+                        );
+                    }
+                    MergeResult::Merged {
+                        merge_cid,
+                        remote_cid,
+                    } => {
+                        info!(
+                            "CRDT receive_task: merged {} into {} for {}",
+                            remote_cid,
+                            merge_cid,
+                            file_path.display()
+                        );
+                    }
+                    MergeResult::LocalAhead => {
+                        debug!(
+                            "CRDT receive_task: local is ahead for {}",
+                            file_path.display()
+                        );
+                    }
+                }
+
+                // Write content to file if merge produced new content
+                if let Some(content) = maybe_content {
+                    match tokio::fs::write(&file_path, &content).await {
+                        Ok(()) => {
+                            info!(
+                                "CRDT receive_task: wrote {} bytes to {}",
+                                content.len(),
+                                file_path.display()
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                "CRDT receive_task: failed to write to {}: {}",
+                                file_path.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+
+                // Save the updated state
+                drop(state_guard);
+                let state_guard = crdt_state.read().await;
+                if let Err(e) = state_guard
+                    .save(file_path.parent().unwrap_or(&file_path))
+                    .await
+                {
+                    warn!("CRDT receive_task: failed to save state: {}", e);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "CRDT receive_task: failed to process edit for {}: {}",
+                    file_path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    info!(
+        "CRDT receive_task: shutting down for {}",
+        file_path.display()
+    );
 }
