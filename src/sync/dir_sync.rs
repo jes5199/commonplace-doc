@@ -298,11 +298,32 @@ pub async fn handle_subdir_schema_cleanup(
 
         // Delete files that were removed from server
         for path in &deleted_paths {
+            let file_path = root_directory.join(path);
+
+            // Safety check: don't delete files that were modified very recently (within 10 seconds)
+            // This protects against race conditions where we just created a file via CRDT but
+            // the server schema hasn't been updated yet. Without this check, the cleanup would
+            // see the file isn't in the server schema and delete it prematurely.
+            if file_path.exists() && file_path.is_file() {
+                if let Ok(metadata) = file_path.metadata() {
+                    if let Ok(modified) = metadata.modified() {
+                        if let Ok(elapsed) = modified.elapsed() {
+                            if elapsed.as_secs() < 10 {
+                                debug!(
+                                    "Subdir {} skipping deletion of recently modified file: {} (modified {}s ago)",
+                                    subdir_path, path, elapsed.as_secs()
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
             info!(
                 "Subdir {} removed file: {} - deleting local copy",
                 subdir_path, path
             );
-            let file_path = root_directory.join(path);
 
             // Stop sync tasks and remove from file_states
             remove_file_state_and_abort(file_states, path).await;

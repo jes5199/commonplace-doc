@@ -244,6 +244,11 @@ impl DirectorySyncState {
     /// If the loaded state has a mismatched schema node_id (e.g., nil UUID from
     /// corrupted state), it will be updated to the correct value and the Yjs
     /// state will be cleared to ensure consistency.
+    ///
+    /// When creating new state (or clearing Y.Doc due to mismatch), if a
+    /// `.commonplace.json` file exists in the directory, the Y.Doc will be
+    /// initialized from that schema to prevent data loss when we later write
+    /// the Y.Doc back to disk.
     pub async fn load_or_create(directory: &Path, schema_node_id: Uuid) -> io::Result<Self> {
         match Self::load(directory).await? {
             Some(mut state) => {
@@ -259,10 +264,77 @@ impl DirectorySyncState {
                     state.schema.yjs_state = None;
                     state.schema.head_cid = None;
                     state.schema.local_head_cid = None;
+
+                    // Try to initialize Y.Doc from existing .commonplace.json
+                    Self::initialize_schema_from_local_file(&mut state, directory).await;
                 }
                 Ok(state)
             }
-            None => Ok(Self::new(schema_node_id)),
+            None => {
+                let mut state = Self::new(schema_node_id);
+                // Try to initialize Y.Doc from existing .commonplace.json
+                Self::initialize_schema_from_local_file(&mut state, directory).await;
+                Ok(state)
+            }
+        }
+    }
+
+    /// Initialize the schema Y.Doc from an existing .commonplace.json file.
+    ///
+    /// This preserves existing schema entries when creating a new state or
+    /// recovering from corrupted state, preventing data loss when the Y.Doc
+    /// is later written back to disk.
+    async fn initialize_schema_from_local_file(state: &mut Self, directory: &Path) {
+        use crate::fs::FsSchema;
+        use crate::sync::ymap_schema;
+        use crate::sync::SCHEMA_FILENAME;
+
+        let schema_path = directory.join(SCHEMA_FILENAME);
+        if !schema_path.exists() {
+            debug!(
+                "No existing .commonplace.json at {}, starting with empty Y.Doc",
+                schema_path.display()
+            );
+            return;
+        }
+
+        match fs::read_to_string(&schema_path).await {
+            Ok(content) => match serde_json::from_str::<FsSchema>(&content) {
+                Ok(fs_schema) => {
+                    // Create Y.Doc and initialize from schema
+                    let doc = Doc::new();
+                    ymap_schema::from_fs_schema(&doc, &fs_schema);
+
+                    // Count entries for logging
+                    let entry_count = fs_schema
+                        .root
+                        .as_ref()
+                        .and_then(|e| match e {
+                            crate::fs::Entry::Dir(d) => d.entries.as_ref().map(|e| e.len()),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+
+                    // Update state with the initialized Y.Doc
+                    state.schema.update_from_doc(&doc);
+
+                    tracing::info!(
+                        "Initialized Y.Doc schema from {} with {} entries",
+                        schema_path.display(),
+                        entry_count
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to parse {} as FsSchema: {}",
+                        schema_path.display(),
+                        e
+                    );
+                }
+            },
+            Err(e) => {
+                warn!("Failed to read {}: {}", schema_path.display(), e);
+            }
         }
     }
 }

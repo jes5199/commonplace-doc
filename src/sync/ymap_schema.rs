@@ -280,6 +280,33 @@ pub fn migrate_from_json_text(doc: &Doc) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Initialize a Y.Doc schema from an existing FsSchema.
+///
+/// This is used when creating a new DirectorySyncState for a directory that
+/// already has a .commonplace.json file. It ensures the Y.Doc CRDT state
+/// starts with the existing schema entries, preventing data loss when we
+/// later write the Y.Doc back to .commonplace.json.
+pub fn from_fs_schema(doc: &Doc, schema: &crate::fs::FsSchema) {
+    use crate::fs::Entry;
+
+    if let Some(Entry::Dir(dir)) = &schema.root {
+        if let Some(entries) = &dir.entries {
+            for (name, entry) in entries {
+                match entry {
+                    Entry::Doc(doc_entry) => {
+                        if let Some(node_id) = &doc_entry.node_id {
+                            add_file(doc, name, node_id);
+                        }
+                    }
+                    Entry::Dir(dir_entry) => {
+                        add_directory(doc, name, dir_entry.node_id.as_deref());
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Convert YMap schema back to FsSchema for compatibility with existing code.
 pub fn to_fs_schema(doc: &Doc) -> crate::fs::FsSchema {
     use crate::fs::{DirEntry, DocEntry, Entry, FsSchema};

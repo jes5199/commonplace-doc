@@ -20,9 +20,10 @@ use commonplace_doc::sync::{
     find_owning_document, fork_node, handle_file_created, handle_file_deleted,
     handle_file_modified, handle_schema_change, handle_schema_modified, initial_sync,
     is_binary_content, push_schema_to_server, remove_file_from_schema,
-    scan_directory_with_contents, spawn_command_listener, spawn_file_sync_tasks_crdt, sse_task,
-    sync_schema, sync_single_file, upload_task, DirEvent, FileEvent, FileSyncState, InodeKey,
-    InodeTracker, ReplaceResponse, ScanOptions, SharedStateFile, SyncState, SCHEMA_FILENAME,
+    scan_directory_with_contents, schema_to_json, spawn_command_listener,
+    spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file, upload_task,
+    write_schema_file, ymap_schema, DirEvent, FileEvent, FileSyncState, InodeKey, InodeTracker,
+    ReplaceResponse, ScanOptions, SharedStateFile, SyncState, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -293,13 +294,27 @@ async fn handle_file_created_crdt(
     }
 
     // Calculate relative path from root directory
-    let relative_path = match path.strip_prefix(directory) {
+    // Canonicalize both paths to ensure prefix stripping works correctly
+    // when path is absolute and directory is relative (from --directory arg)
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical_directory = directory
+        .canonicalize()
+        .unwrap_or_else(|_| directory.to_path_buf());
+
+    let relative_path = match canonical_path.strip_prefix(&canonical_directory) {
         Ok(rel) => rel.to_string_lossy().to_string().replace('\\', "/"),
-        Err(_) => filename.clone(),
+        Err(_) => {
+            warn!(
+                "Could not strip directory prefix: path={}, directory={}",
+                canonical_path.display(),
+                canonical_directory.display()
+            );
+            filename.clone()
+        }
     };
 
     // Find which document owns this file (may be a node-backed subdirectory)
-    let owning_doc = find_owning_document(directory, fs_root_id, &relative_path);
+    let owning_doc = find_owning_document(&canonical_directory, fs_root_id, &relative_path);
     info!(
         "CRDT file created: {} owned by document {} (relative: {})",
         relative_path, owning_doc.document_id, owning_doc.relative_path
@@ -387,13 +402,70 @@ async fn handle_file_created_crdt(
                     new_file.file_cid
                 );
 
-                // Save the subdirectory state
+                // Save the subdirectory state (.commonplace-sync.json)
                 if let Err(e) = subdir_state.save(&owning_doc.directory).await {
                     warn!(
                         "Failed to save subdirectory state for {}: {}",
                         owning_doc.directory.display(),
                         e
                     );
+                }
+
+                // Also write the local schema file (.commonplace.json) so it reflects the new file
+                // Convert the Y.Doc schema to FsSchema and write to disk
+                debug!(
+                    "Writing local schema for subdirectory {} (dir: {})",
+                    owning_doc.document_id,
+                    owning_doc.directory.display()
+                );
+                match subdir_state.schema.to_doc() {
+                    Ok(doc) => {
+                        let fs_schema = ymap_schema::to_fs_schema(&doc);
+                        debug!(
+                            "Converted Y.Doc to FsSchema for {}",
+                            owning_doc.directory.display()
+                        );
+                        match schema_to_json(&fs_schema) {
+                            Ok(schema_json) => {
+                                debug!(
+                                    "Serialized schema JSON ({} bytes) for {}",
+                                    schema_json.len(),
+                                    owning_doc.directory.display()
+                                );
+                                match write_schema_file(&owning_doc.directory, &schema_json, None)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        info!(
+                                            "Successfully wrote local schema for {}",
+                                            owning_doc.directory.display()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to write local schema for {}: {}",
+                                            owning_doc.directory.display(),
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to serialize schema for {}: {}",
+                                    owning_doc.directory.display(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to convert schema state to Y.Doc for {}: {}",
+                            owning_doc.directory.display(),
+                            e
+                        );
+                    }
                 }
 
                 // Spawn CRDT sync tasks for the new file using a new state Arc
@@ -559,13 +631,27 @@ async fn handle_file_deleted_crdt(
     }
 
     // Calculate relative path from root directory
-    let relative_path = match path.strip_prefix(directory) {
+    // Canonicalize both paths to ensure prefix stripping works correctly
+    // when path is absolute and directory is relative (from --directory arg)
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical_directory = directory
+        .canonicalize()
+        .unwrap_or_else(|_| directory.to_path_buf());
+
+    let relative_path = match canonical_path.strip_prefix(&canonical_directory) {
         Ok(rel) => rel.to_string_lossy().to_string().replace('\\', "/"),
-        Err(_) => filename.clone(),
+        Err(_) => {
+            warn!(
+                "Could not strip directory prefix (delete): path={}, directory={}",
+                canonical_path.display(),
+                canonical_directory.display()
+            );
+            filename.clone()
+        }
     };
 
     // Find which document owns this file (may be a node-backed subdirectory)
-    let owning_doc = find_owning_document(directory, fs_root_id, &relative_path);
+    let owning_doc = find_owning_document(&canonical_directory, fs_root_id, &relative_path);
     info!(
         "CRDT file deleted: {} owned by document {} (relative: {})",
         relative_path, owning_doc.document_id, owning_doc.relative_path
