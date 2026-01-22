@@ -67,8 +67,10 @@ fn get_or_create_entries<'a>(txn: &mut TransactionMut<'a>) -> MapRef {
     let content = txn.get_or_insert_map("content");
 
     // Ensure version is set
+    // Use Any::BigInt explicitly to ensure integer serialization (1 not 1.0)
+    // When i64 converts to Any, it becomes Any::Number (float) for values within safe range
     if content.get(txn, "version").is_none() {
-        content.insert(txn, "version", 1_i64);
+        content.insert(txn, "version", Any::BigInt(1));
     }
 
     // Get or create "root" map
@@ -320,6 +322,7 @@ pub fn to_fs_schema(doc: &Doc) -> crate::fs::FsSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yrs::types::ToJson;
     use yrs::updates::decoder::Decode;
 
     #[test]
@@ -480,6 +483,94 @@ mod tests {
             assert!(entries.contains_key("subdir"));
         } else {
             panic!("Expected Dir entry");
+        }
+    }
+
+    /// Test that YMap schema structure produces valid FsSchema JSON when server calls to_json().
+    ///
+    /// This is the critical integration test: the server reads JSON content by calling
+    /// `map.to_json()` on the YMap at "content" root. This test verifies that our YMap
+    /// structure produces JSON that parses as a valid FsSchema.
+    #[test]
+    fn test_ymap_to_json_produces_valid_fs_schema() {
+        use crate::fs::FsSchema;
+
+        let doc = Doc::new();
+        add_file(&doc, "test.txt", "uuid-123");
+        add_directory(&doc, "mydir", Some("uuid-456"));
+
+        // Get the "content" YMap (same as server does for JSON content type)
+        let txn = doc.transact();
+        let content = txn.get_map("content").expect("content map should exist");
+
+        // Convert to JSON (same as server does in document.rs:200)
+        let any = content.to_json(&txn);
+        let json_str = serde_json::to_string(&any).expect("to_json result should be serializable");
+
+        // Parse as FsSchema (proves server can read it correctly)
+        let schema: FsSchema =
+            serde_json::from_str(&json_str).expect("JSON should parse as FsSchema");
+
+        // Verify structure
+        assert_eq!(schema.version, 1);
+        assert!(schema.root.is_some());
+
+        if let Some(crate::fs::Entry::Dir(dir)) = &schema.root {
+            let entries = dir.entries.as_ref().expect("should have entries");
+            assert_eq!(entries.len(), 2, "should have 2 entries");
+
+            // Check file entry
+            let file_entry = entries.get("test.txt").expect("test.txt should exist");
+            if let crate::fs::Entry::Doc(doc_entry) = file_entry {
+                assert_eq!(doc_entry.node_id, Some("uuid-123".to_string()));
+            } else {
+                panic!("test.txt should be a Doc entry");
+            }
+
+            // Check dir entry
+            let dir_entry = entries.get("mydir").expect("mydir should exist");
+            if let crate::fs::Entry::Dir(sub_dir) = dir_entry {
+                assert_eq!(sub_dir.node_id, Some("uuid-456".to_string()));
+            } else {
+                panic!("mydir should be a Dir entry");
+            }
+        } else {
+            panic!("Expected Dir root entry");
+        }
+    }
+
+    /// Test that empty schema produces valid empty FsSchema JSON.
+    #[test]
+    fn test_empty_ymap_to_json() {
+        use crate::fs::FsSchema;
+
+        let doc = Doc::new();
+        // Trigger creation of the FsSchema structure without adding entries
+        {
+            let mut txn = doc.transact_mut();
+            let _ = get_or_create_entries(&mut txn);
+        }
+
+        // Get the "content" YMap
+        let txn = doc.transact();
+        let content = txn.get_map("content").expect("content map should exist");
+
+        // Convert to JSON
+        let any = content.to_json(&txn);
+        let json_str = serde_json::to_string(&any).expect("should serialize");
+
+        // Parse as FsSchema
+        let schema: FsSchema = serde_json::from_str(&json_str).expect("should parse as FsSchema");
+
+        assert_eq!(schema.version, 1);
+        assert!(schema.root.is_some());
+
+        if let Some(crate::fs::Entry::Dir(dir)) = &schema.root {
+            // Empty entries map
+            let entries = dir.entries.as_ref().expect("should have entries");
+            assert!(entries.is_empty(), "entries should be empty");
+        } else {
+            panic!("Expected Dir root entry");
         }
     }
 }
