@@ -253,6 +253,7 @@ No walking up/down the tree. Each directory is responsible for itself.
 - Merge commit creation with two parents
 - Independent directory sync
 - **YMap-based schema storage** (`src/sync/ymap_schema.rs`): Directory schemas now use native YMap structures for per-entry CRDT merge semantics. Concurrent file additions from different peers merge correctly. Includes automatic migration from legacy JSON text format.
+- **CRDT file event handling** (`src/bin/sync.rs`): File creation and deletion events can now use the CRDT/MQTT path via `handle_file_created_crdt` and `handle_file_deleted_crdt`. These functions call `create_new_file` and `remove_file_from_schema` to generate local UUIDs and publish schema updates via MQTT.
 
 ### Cleanup Pending
 - Legacy HTTP/SSE code paths remain alongside CRDT MQTT paths
