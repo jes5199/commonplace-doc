@@ -4,15 +4,22 @@
 //! JSON text. YMap provides proper CRDT semantics: concurrent file additions
 //! merge correctly instead of one overwriting the other.
 //!
-//! Schema structure:
+//! Schema structure (matches FsSchema JSON format for server compatibility):
 //! ```text
-//! YMap "root" {
-//!   "entries": YMap {
-//!     "foo.txt": YMap { "type": "doc", "node_id": "uuid-1" }
-//!     "subdir": YMap { "type": "dir", "node_id": "uuid-2" }
+//! YMap "content" {
+//!   "version": 1
+//!   "root": YMap {
+//!     "type": "dir"
+//!     "entries": YMap {
+//!       "foo.txt": YMap { "type": "doc", "node_id": "uuid-1" }
+//!       "subdir": YMap { "type": "dir", "node_id": "uuid-2" }
+//!     }
 //!   }
 //! }
 //! ```
+//!
+//! The "content" root name matches what the server expects for JSON content type.
+//! When the server calls `map.to_json()`, it produces valid FsSchema JSON.
 //!
 //! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
 
@@ -51,30 +58,49 @@ pub struct SchemaEntry {
     pub node_id: Option<String>,
 }
 
-/// Get the "entries" YMap from a schema Y.Doc, creating it if needed.
+/// Get the "entries" YMap from a schema Y.Doc, creating full structure if needed.
+///
+/// Creates the FsSchema-compatible structure:
+/// content -> { version: 1, root: { type: "dir", entries: {...} } }
 fn get_or_create_entries<'a>(txn: &mut TransactionMut<'a>) -> MapRef {
-    let root = txn.get_or_insert_map("root");
+    // Get or create "content" (the root name server expects for JSON docs)
+    let content = txn.get_or_insert_map("content");
 
-    // Check if entries exists
-    if root.get(txn, "entries").is_none() {
-        // Create entries map
-        root.insert(txn, "entries", yrs::MapPrelim::<Any>::new())
-    } else {
-        // Get existing entries - we need to handle the Any -> Map conversion
-        match root.get(txn, "entries") {
-            Some(yrs::Value::YMap(map)) => map,
-            _ => {
-                // Unexpected type, recreate
-                root.insert(txn, "entries", yrs::MapPrelim::<Any>::new())
-            }
+    // Ensure version is set
+    if content.get(txn, "version").is_none() {
+        content.insert(txn, "version", 1_i64);
+    }
+
+    // Get or create "root" map
+    let schema_root = match content.get(txn, "root") {
+        Some(yrs::Value::YMap(map)) => map,
+        _ => {
+            let root_map = content.insert(txn, "root", yrs::MapPrelim::<Any>::new());
+            root_map.insert(txn, "type", "dir");
+            root_map
         }
+    };
+
+    // Ensure root has type="dir"
+    if schema_root.get(txn, "type").is_none() {
+        schema_root.insert(txn, "type", "dir");
+    }
+
+    // Get or create "entries" map
+    match schema_root.get(txn, "entries") {
+        Some(yrs::Value::YMap(map)) => map,
+        _ => schema_root.insert(txn, "entries", yrs::MapPrelim::<Any>::new()),
     }
 }
 
 /// Get the "entries" YMap from a schema Y.Doc (read-only).
 fn get_entries<T: ReadTxn>(txn: &T) -> Option<MapRef> {
-    let root = txn.get_map("root")?;
-    match root.get(txn, "entries") {
+    let content = txn.get_map("content")?;
+    let schema_root = match content.get(txn, "root") {
+        Some(yrs::Value::YMap(map)) => map,
+        _ => return None,
+    };
+    match schema_root.get(txn, "entries") {
         Some(yrs::Value::YMap(map)) => Some(map),
         _ => None,
     }
@@ -175,13 +201,18 @@ pub fn list_entries(doc: &Doc) -> HashMap<String, SchemaEntry> {
     result
 }
 
-/// Check if the doc uses the new YMap format (has "root" map).
+/// Check if the doc uses the new YMap format (has YMap at "content" with "root" submap).
 pub fn is_ymap_format(doc: &Doc) -> bool {
     let txn = doc.transact();
-    txn.get_map("root").is_some()
+    // Check for YMap at "content" with "root" submap (new format)
+    if let Some(content) = txn.get_map("content") {
+        matches!(content.get(&txn, "root"), Some(yrs::Value::YMap(_)))
+    } else {
+        false
+    }
 }
 
-/// Check if the doc uses the old JSON text format (has "content" text).
+/// Check if the doc uses the old JSON text format (has YText at "content").
 pub fn is_json_text_format(doc: &Doc) -> bool {
     let txn = doc.transact();
     txn.get_text("content").is_some()
@@ -338,14 +369,17 @@ mod tests {
     #[test]
     fn test_concurrent_adds_merge() {
         // Simulate two clients adding files concurrently
-        // Both clients start from the same initial state (empty schema with root/entries structure)
+        // Both clients start from the same initial state (empty schema with content/root/entries structure)
 
-        // Create initial doc with the root structure
+        // Create initial doc with the FsSchema-compatible structure
         let initial_doc = Doc::new();
         {
             let mut txn = initial_doc.transact_mut();
-            let root = txn.get_or_insert_map("root");
-            root.insert(&mut txn, "entries", yrs::MapPrelim::<Any>::new());
+            let content = txn.get_or_insert_map("content");
+            content.insert(&mut txn, "version", 1_i64);
+            let schema_root = content.insert(&mut txn, "root", yrs::MapPrelim::<Any>::new());
+            schema_root.insert(&mut txn, "type", "dir");
+            schema_root.insert(&mut txn, "entries", yrs::MapPrelim::<Any>::new());
         }
         let initial_state = {
             let txn = initial_doc.transact();
