@@ -1991,6 +1991,29 @@ pub async fn upload_task_crdt(
             continue;
         }
 
+        // Skip if new content is empty but old content exists.
+        // This is almost always a transient state during a non-atomic file write
+        // (file truncated before content is written). We don't want to publish
+        // a DELETE operation for transient states.
+        if new_content.is_empty() && !old_content.is_empty() {
+            debug!(
+                "CRDT upload_task: skipping transient empty state for {} (old_len={})",
+                file_path.display(),
+                old_content.len()
+            );
+            continue;
+        }
+
+        // DEBUG: Log the diff being computed
+        info!(
+            "CRDT upload_task: computing diff for {} - old_len={}, new_len={}, old_preview={:?}, new_preview={:?}",
+            file_path.display(),
+            old_content.len(),
+            new_content.len(),
+            old_content.chars().take(50).collect::<String>(),
+            new_content.chars().take(50).collect::<String>()
+        );
+
         // Get or create the CRDT state for this file
         let mut state_guard = crdt_state.write().await;
         let file_state = state_guard.get_or_create_file(&filename, node_id);
@@ -2321,15 +2344,29 @@ pub async fn receive_task_crdt(
                         .await
                         .unwrap_or_default();
 
+                    info!(
+                        "CRDT receive_task: merge produced content for {} - existing={} bytes ({:?}), new={} bytes ({:?})",
+                        file_path.display(),
+                        existing_content.len(),
+                        existing_content.chars().take(40).collect::<String>(),
+                        content.len(),
+                        content.chars().take(40).collect::<String>()
+                    );
+
+                    // Determine if this is a rollback write that would lose data
+                    // We use a threshold to distinguish legitimate edits from merge conflicts:
+                    // - Legitimate edits may shorten content (deleting text)
+                    // - Merge conflicts often produce drastically shorter content (50%+ reduction)
                     let is_rollback = if content.is_empty() && !existing_content.is_empty() {
                         // Writing empty content when file has content is a rollback
                         true
                     } else if !content.is_empty()
                         && !existing_content.is_empty()
-                        && existing_content.starts_with(&content)
-                        && content != existing_content
+                        && content.len() < existing_content.len() / 2
                     {
-                        // New content is a strict prefix of existing - rollback
+                        // Content reduced by more than 50% - likely a merge conflict, not an edit.
+                        // This prevents sync loops where clients flip-flop between versions
+                        // while still allowing legitimate edits that shorten content.
                         true
                     } else {
                         false
