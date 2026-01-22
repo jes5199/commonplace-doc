@@ -426,4 +426,247 @@ mod tests {
             panic!("Expected Dir entry");
         }
     }
+
+    // ==========================================================================
+    // Integration Tests for New File Creation and Deletion
+    // ==========================================================================
+
+    /// Test that new file creation with local UUID propagates to other peers.
+    ///
+    /// Scenario:
+    /// 1. Client A creates a new file with local UUID
+    /// 2. Client A's schema update is sent to Client B
+    /// 3. Client B sees the new file with the same UUID
+    #[test]
+    fn test_new_file_creation_propagates() {
+        use yrs::updates::decoder::Decode;
+        use yrs::{Transact, Update};
+
+        // Client A creates a new file with local UUID
+        let doc_a = Doc::with_client_id(1);
+        let file_uuid = generate_file_uuid();
+        ymap_schema::add_file(&doc_a, "newfile.txt", &file_uuid.to_string());
+
+        // Get update from Client A
+        let update_a = {
+            let txn = doc_a.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+
+        // Client B applies the update
+        let doc_b = Doc::with_client_id(2);
+        {
+            let update = Update::decode_v1(&update_a).expect("Should decode update");
+            let mut txn = doc_b.transact_mut();
+            txn.apply_update(update);
+        }
+
+        // Client B should see the new file with the same UUID
+        let entry = ymap_schema::get_entry(&doc_b, "newfile.txt").expect("Entry should exist");
+        assert_eq!(entry.entry_type, ymap_schema::SchemaEntryType::Doc);
+        assert_eq!(entry.node_id, Some(file_uuid.to_string()));
+
+        // Verify UUID is valid v4
+        assert_eq!(file_uuid.get_version_num(), 4);
+    }
+
+    /// Test that file deletion propagates to other peers via schema update.
+    ///
+    /// Scenario:
+    /// 1. Both clients have a file in schema
+    /// 2. Client A deletes the file (removes from schema)
+    /// 3. Client B receives the update
+    /// 4. Client B no longer sees the file in schema
+    #[test]
+    fn test_file_deletion_propagates_via_schema() {
+        use yrs::updates::decoder::Decode;
+        use yrs::{Transact, Update};
+
+        // Initial state: both clients have a file
+        let initial_doc = Doc::with_client_id(0);
+        ymap_schema::add_file(&initial_doc, "deleteme.txt", "uuid-to-delete");
+
+        // Sync initial state to Client A
+        let initial_update = {
+            let txn = initial_doc.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+
+        let doc_a = Doc::with_client_id(1);
+        {
+            let update = Update::decode_v1(&initial_update).expect("Should decode");
+            let mut txn = doc_a.transact_mut();
+            txn.apply_update(update);
+        }
+
+        // Sync initial state to Client B
+        let doc_b = Doc::with_client_id(2);
+        {
+            let update = Update::decode_v1(&initial_update).expect("Should decode");
+            let mut txn = doc_b.transact_mut();
+            txn.apply_update(update);
+        }
+
+        // Verify both clients have the file
+        assert!(ymap_schema::get_entry(&doc_a, "deleteme.txt").is_some());
+        assert!(ymap_schema::get_entry(&doc_b, "deleteme.txt").is_some());
+
+        // Client A deletes the file
+        ymap_schema::remove_entry(&doc_a, "deleteme.txt");
+
+        // Get delta update from Client A (what changed since initial state)
+        let delete_update = {
+            let txn = doc_a.transact();
+            // Encode only the changes since initial state
+            let initial_sv = {
+                let initial_txn = initial_doc.transact();
+                initial_txn.state_vector()
+            };
+            txn.encode_state_as_update_v1(&initial_sv)
+        };
+
+        // Client B applies the deletion update
+        {
+            let update = Update::decode_v1(&delete_update).expect("Should decode");
+            let mut txn = doc_b.transact_mut();
+            txn.apply_update(update);
+        }
+
+        // Client B should no longer see the file
+        assert!(
+            ymap_schema::get_entry(&doc_b, "deleteme.txt").is_none(),
+            "File should be deleted in Client B's schema"
+        );
+
+        // Client A should also not see it
+        assert!(
+            ymap_schema::get_entry(&doc_a, "deleteme.txt").is_none(),
+            "File should be deleted in Client A's schema"
+        );
+    }
+
+    /// Test concurrent file creation with different UUIDs (CRDT merge behavior).
+    ///
+    /// When two clients create a file with the same name concurrently,
+    /// CRDT last-writer-wins applies and one UUID should win.
+    #[test]
+    fn test_concurrent_file_creation_same_name() {
+        use yrs::updates::decoder::Decode;
+        use yrs::{Transact, Update};
+
+        // Client A creates "conflict.txt" with UUID A
+        let doc_a = Doc::with_client_id(1);
+        let uuid_a = generate_file_uuid();
+        ymap_schema::add_file(&doc_a, "conflict.txt", &uuid_a.to_string());
+
+        // Client B creates "conflict.txt" with UUID B (concurrently)
+        let doc_b = Doc::with_client_id(2);
+        let uuid_b = generate_file_uuid();
+        ymap_schema::add_file(&doc_b, "conflict.txt", &uuid_b.to_string());
+
+        // Get updates from both clients
+        let update_a = {
+            let txn = doc_a.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+        let update_b = {
+            let txn = doc_b.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+
+        // Client A receives Client B's update
+        {
+            let update = Update::decode_v1(&update_b).expect("Should decode");
+            let mut txn = doc_a.transact_mut();
+            txn.apply_update(update);
+        }
+
+        // Client B receives Client A's update
+        {
+            let update = Update::decode_v1(&update_a).expect("Should decode");
+            let mut txn = doc_b.transact_mut();
+            txn.apply_update(update);
+        }
+
+        // Both should have the file with the same UUID (CRDT convergence)
+        let entry_a = ymap_schema::get_entry(&doc_a, "conflict.txt").expect("Should exist");
+        let entry_b = ymap_schema::get_entry(&doc_b, "conflict.txt").expect("Should exist");
+
+        // Both clients should converge to the same UUID
+        assert_eq!(
+            entry_a.node_id, entry_b.node_id,
+            "Both clients should converge to same UUID after merge"
+        );
+
+        // The UUID should be one of the two original UUIDs
+        let final_uuid = entry_a.node_id.as_ref().unwrap();
+        assert!(
+            final_uuid == &uuid_a.to_string() || final_uuid == &uuid_b.to_string(),
+            "Final UUID should be one of the original UUIDs"
+        );
+    }
+
+    /// Test that DirectorySyncState properly tracks file creation.
+    #[test]
+    fn test_directory_sync_state_tracks_new_file() {
+        use crate::sync::crdt_state::DirectorySyncState;
+
+        let mut dir_state = DirectorySyncState::new(Uuid::new_v4());
+
+        // Generate UUID and create file state
+        let file_uuid = generate_file_uuid();
+        let file_state = dir_state.get_or_create_file("newfile.txt", file_uuid);
+
+        // Verify file is tracked
+        assert_eq!(file_state.node_id, file_uuid);
+        assert!(dir_state.has_file("newfile.txt"));
+
+        // Verify UUID is valid v4
+        assert_eq!(file_uuid.get_version_num(), 4);
+
+        // Update schema Y.Doc
+        let doc = dir_state.schema.to_doc().unwrap();
+        ymap_schema::add_file(&doc, "newfile.txt", &file_uuid.to_string());
+        dir_state.schema.update_from_doc(&doc);
+
+        // Verify schema reflects the file
+        let restored_doc = dir_state.schema.to_doc().unwrap();
+        let entry =
+            ymap_schema::get_entry(&restored_doc, "newfile.txt").expect("File should be in schema");
+        assert_eq!(entry.node_id, Some(file_uuid.to_string()));
+    }
+
+    /// Test that DirectorySyncState properly tracks file deletion.
+    #[test]
+    fn test_directory_sync_state_tracks_file_deletion() {
+        use crate::sync::crdt_state::DirectorySyncState;
+
+        let mut dir_state = DirectorySyncState::new(Uuid::new_v4());
+
+        // Create a file first
+        let file_uuid = generate_file_uuid();
+        dir_state.get_or_create_file("deleteme.txt", file_uuid);
+
+        // Add to schema
+        let doc = dir_state.schema.to_doc().unwrap();
+        ymap_schema::add_file(&doc, "deleteme.txt", &file_uuid.to_string());
+        dir_state.schema.update_from_doc(&doc);
+
+        // Verify file exists
+        assert!(dir_state.has_file("deleteme.txt"));
+
+        // Delete the file
+        let removed = dir_state.remove_file("deleteme.txt");
+        assert!(removed.is_some());
+        assert!(!dir_state.has_file("deleteme.txt"));
+
+        // Update schema to remove file
+        let doc = dir_state.schema.to_doc().unwrap();
+        ymap_schema::remove_entry(&doc, "deleteme.txt");
+        dir_state.schema.update_from_doc(&doc);
+
+        // Verify schema no longer has the file
+        let restored_doc = dir_state.schema.to_doc().unwrap();
+        assert!(ymap_schema::get_entry(&restored_doc, "deleteme.txt").is_none());
+    }
 }

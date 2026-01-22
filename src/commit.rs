@@ -65,6 +65,27 @@ impl Commit {
         self.parents.is_empty()
     }
 
+    /// Create a commit with an explicit timestamp.
+    ///
+    /// Used when reconstructing a commit from a received message to calculate
+    /// the CID (which depends on the original timestamp, not current time).
+    pub fn with_timestamp(
+        parents: Vec<String>,
+        update: String,
+        author: String,
+        message: Option<String>,
+        timestamp: u64,
+    ) -> Self {
+        Self {
+            parents,
+            timestamp,
+            update,
+            author,
+            message,
+            extensions: HashMap::new(),
+        }
+    }
+
     /// Check if this is a snapshot/compaction commit
     pub fn is_snapshot(&self) -> bool {
         self.extensions
