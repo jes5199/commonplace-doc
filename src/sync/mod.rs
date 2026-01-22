@@ -81,9 +81,9 @@ pub use file_events::{
     handle_file_deleted, handle_file_modified, OwningDocument,
 };
 pub use file_sync::{
-    initial_sync, spawn_file_sync_tasks, spawn_file_sync_tasks_crdt,
-    spawn_file_sync_tasks_with_flock, sync_single_file, upload_task, upload_task_crdt,
-    upload_task_with_flock,
+    initial_sync, initialize_crdt_state_from_server, spawn_file_sync_tasks,
+    spawn_file_sync_tasks_crdt, spawn_file_sync_tasks_with_flock, sync_single_file, upload_task,
+    upload_task_crdt, upload_task_with_flock,
 };
 pub use schema_io::{
     fetch_and_validate_schema, write_nested_schemas, write_schema_file, FetchedSchema,

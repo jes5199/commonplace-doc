@@ -1944,8 +1944,21 @@ pub async fn upload_task_crdt(
     mut rx: mpsc::Receiver<FileEvent>,
     author: String,
 ) {
-    // Track the last content we saw to compute diffs
-    let mut last_content: Option<String> = None;
+    // Initialize last_content from current file content.
+    // This is critical to prevent the first diff from being computed against
+    // empty content, which would create spurious INSERT operations that conflict
+    // with the server's existing state.
+    let mut last_content: Option<String> = tokio::fs::read_to_string(&file_path)
+        .await
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    if last_content.is_some() {
+        debug!(
+            "CRDT upload_task initialized with existing content for {}",
+            file_path.display()
+        );
+    }
 
     while let Some(event) = rx.recv().await {
         let FileEvent::Modified(raw_content) = event;
@@ -2027,6 +2040,115 @@ pub async fn upload_task_crdt(
         "CRDT upload_task shutting down for: {}",
         file_path.display()
     );
+}
+
+/// Initialize CRDT state for a file from the server's HEAD.
+///
+/// This is critical for CRDT sync to work correctly. Without initializing from
+/// the server's Yjs state, each sync client would create its own independent
+/// operation history. This causes merge failures where:
+/// - Client A deletes text (delete operation references A's operations)
+/// - Client B has different history (different client ID, different operation IDs)
+/// - B receives the delete but can't find operations to delete (different origin)
+/// - B's content is restored, triggering a loop
+///
+/// By fetching the server's Yjs state and using it to initialize our local state,
+/// all clients share the same operation history and merges work correctly.
+///
+/// # Arguments
+/// * `client` - HTTP client for fetching from server
+/// * `server` - Server URL
+/// * `node_id` - UUID of the document
+/// * `crdt_state` - Shared CRDT state to initialize
+/// * `filename` - Filename within the directory (for state lookup)
+pub async fn initialize_crdt_state_from_server(
+    client: &Client,
+    server: &str,
+    node_id: Uuid,
+    crdt_state: &Arc<RwLock<DirectorySyncState>>,
+    filename: &str,
+    file_path: &Path,
+) -> Result<(), String> {
+    // Check if we need initialization
+    {
+        let state = crdt_state.read().await;
+        if let Some(file_state) = state.get_file(filename) {
+            if !file_state.needs_server_init() {
+                debug!(
+                    "CRDT state already initialized for {}, skipping server fetch",
+                    filename
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    // Fetch HEAD from server
+    let identifier = node_id.to_string();
+    match fetch_head(client, server, &identifier, false).await {
+        Ok(Some(head)) => {
+            if let (Some(ref state_b64), Some(ref cid)) = (&head.state, &head.cid) {
+                // Initialize CRDT state
+                let mut state = crdt_state.write().await;
+                let file_state = state.get_or_create_file(filename, node_id);
+                file_state.initialize_from_server(state_b64, cid);
+
+                // CRITICAL: Also write the server's content to the local file.
+                // This prevents the upload task from computing a diff against
+                // empty/stale local content and publishing deletes that wipe
+                // out the server state.
+                if !head.content.is_empty() {
+                    // Read current local content
+                    let local_content = tokio::fs::read_to_string(file_path)
+                        .await
+                        .unwrap_or_default();
+
+                    // Only write if local differs from server
+                    if local_content != head.content {
+                        if let Err(e) = tokio::fs::write(file_path, &head.content).await {
+                            warn!(
+                                "Failed to write server content to {}: {}",
+                                file_path.display(),
+                                e
+                            );
+                        } else {
+                            info!(
+                                "Wrote server content to {} ({} bytes)",
+                                file_path.display(),
+                                head.content.len()
+                            );
+                        }
+                    }
+                }
+
+                info!(
+                    "Initialized CRDT state for {} from server HEAD {}",
+                    filename, cid
+                );
+                Ok(())
+            } else {
+                // Server has no state yet (empty document) - that's fine
+                debug!(
+                    "Server has no Yjs state for {} yet, starting fresh",
+                    filename
+                );
+                Ok(())
+            }
+        }
+        Ok(None) => {
+            // Document doesn't exist on server yet - that's fine
+            debug!("Document {} doesn't exist on server yet", identifier);
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                "Failed to fetch HEAD for CRDT initialization of {}: {:?}",
+                filename, e
+            );
+            // Don't fail - we can still try to sync, just might have issues
+            Ok(())
+        }
+    }
 }
 
 /// Spawn CRDT-aware sync tasks for a single file.
@@ -2193,20 +2315,50 @@ pub async fn receive_task_crdt(
 
                 // Write content to file if merge produced new content
                 if let Some(content) = maybe_content {
-                    match tokio::fs::write(&file_path, &content).await {
-                        Ok(()) => {
-                            info!(
-                                "CRDT receive_task: wrote {} bytes to {}",
-                                content.len(),
-                                file_path.display()
-                            );
-                        }
-                        Err(e) => {
-                            error!(
-                                "CRDT receive_task: failed to write to {}: {}",
-                                file_path.display(),
-                                e
-                            );
+                    // Check for rollback writes - don't write if it would truncate existing content
+                    // This enforces the "no rollback writes" invariant from the CRDT design spec
+                    let existing_content = tokio::fs::read_to_string(&file_path)
+                        .await
+                        .unwrap_or_default();
+
+                    let is_rollback = if content.is_empty() && !existing_content.is_empty() {
+                        // Writing empty content when file has content is a rollback
+                        true
+                    } else if !content.is_empty()
+                        && !existing_content.is_empty()
+                        && existing_content.starts_with(&content)
+                        && content != existing_content
+                    {
+                        // New content is a strict prefix of existing - rollback
+                        true
+                    } else {
+                        false
+                    };
+
+                    if is_rollback {
+                        warn!(
+                            "CRDT receive_task: refusing rollback write for {} (existing {} bytes, new {} bytes)",
+                            file_path.display(),
+                            existing_content.len(),
+                            content.len()
+                        );
+                        // Don't write - continue processing other messages
+                    } else {
+                        match tokio::fs::write(&file_path, &content).await {
+                            Ok(()) => {
+                                info!(
+                                    "CRDT receive_task: wrote {} bytes to {}",
+                                    content.len(),
+                                    file_path.display()
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    "CRDT receive_task: failed to write to {}: {}",
+                                    file_path.display(),
+                                    e
+                                );
+                            }
                         }
                     }
                 }

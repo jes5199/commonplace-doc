@@ -284,6 +284,42 @@ async fn handle_file_created_crdt(
         return;
     }
 
+    // Check if file is already being tracked - don't create duplicate UUIDs.
+    // This prevents the case where a file modification triggers a "Created" event
+    // (e.g., from inotify) and we incorrectly try to create a new UUID for an
+    // existing file that's already being synced.
+    //
+    // We need to check both:
+    // 1. file_states (tracks files by relative path, populated during schema sync)
+    // 2. crdt_state.files (tracks CRDT state by filename, populated when tasks spawn)
+    {
+        // First check file_states by relative path
+        let relative_path = match path.strip_prefix(directory) {
+            Ok(rel) => rel.to_string_lossy().to_string(),
+            Err(_) => filename.clone(),
+        };
+
+        let states = file_states.read().await;
+        if states.contains_key(&relative_path) {
+            debug!(
+                "File '{}' already in file_states, skipping create_new_file",
+                relative_path
+            );
+            return;
+        }
+        drop(states);
+
+        // Also check CRDT state by filename
+        let state = crdt.crdt_state.read().await;
+        if state.files.contains_key(&filename) {
+            debug!(
+                "File '{}' already in CRDT state, skipping create_new_file",
+                filename
+            );
+            return;
+        }
+    }
+
     // Read file content
     let content = match tokio::fs::read_to_string(path).await {
         Ok(c) => c,
@@ -1798,6 +1834,25 @@ async fn run_directory_mode(
                 .unwrap_or(relative_path)
                 .to_string();
 
+            // Initialize CRDT state from server before spawning tasks.
+            // This ensures all sync clients share the same Yjs operation history,
+            // which is critical for merges to work correctly (especially deletions).
+            if let Err(e) = commonplace_doc::sync::initialize_crdt_state_from_server(
+                &client,
+                &server,
+                node_id,
+                &crdt_state,
+                &filename,
+                &file_path,
+            )
+            .await
+            {
+                warn!(
+                    "Failed to initialize CRDT state for {}: {}",
+                    relative_path, e
+                );
+            }
+
             file_state.task_handles = spawn_file_sync_tasks_crdt(
                 mqtt_client.clone(),
                 workspace.clone(),
@@ -2341,6 +2396,25 @@ async fn run_exec_mode(
                 .and_then(|n| n.to_str())
                 .unwrap_or(relative_path)
                 .to_string();
+
+            // Initialize CRDT state from server before spawning tasks.
+            // This ensures all sync clients share the same Yjs operation history,
+            // which is critical for merges to work correctly (especially deletions).
+            if let Err(e) = commonplace_doc::sync::initialize_crdt_state_from_server(
+                &client,
+                &server,
+                node_id,
+                &crdt_state,
+                &filename,
+                &file_path,
+            )
+            .await
+            {
+                warn!(
+                    "Failed to initialize CRDT state for {}: {}",
+                    relative_path, e
+                );
+            }
 
             file_state.task_handles = spawn_file_sync_tasks_crdt(
                 mqtt_client.clone(),

@@ -100,6 +100,35 @@ impl CrdtPeerState {
     pub fn is_cid_known(&self, cid: &str) -> bool {
         self.head_cid.as_deref() == Some(cid) || self.local_head_cid.as_deref() == Some(cid)
     }
+
+    /// Initialize this state from server's Yjs state.
+    ///
+    /// This is critical for CRDT sync to work correctly. Without shared history,
+    /// different clients would create independent operation histories that don't
+    /// merge properly - deletions from one client wouldn't affect content created
+    /// by another client with a different client ID.
+    ///
+    /// # Arguments
+    /// * `server_state_b64` - Base64-encoded Yjs state from server's HEAD
+    /// * `server_cid` - The CID of the server's HEAD commit
+    pub fn initialize_from_server(&mut self, server_state_b64: &str, server_cid: &str) {
+        self.yjs_state = Some(server_state_b64.to_string());
+        self.head_cid = Some(server_cid.to_string());
+        self.local_head_cid = Some(server_cid.to_string());
+        debug!(
+            "Initialized CRDT state from server: cid={}, state_len={}",
+            server_cid,
+            server_state_b64.len()
+        );
+    }
+
+    /// Check if this state needs initialization from server.
+    ///
+    /// Returns true if we have no Yjs state, meaning we haven't synced
+    /// with the server yet and need to fetch its state to share history.
+    pub fn needs_server_init(&self) -> bool {
+        self.yjs_state.is_none()
+    }
 }
 
 /// Sync state for an entire directory.
@@ -422,5 +451,109 @@ mod tests {
         let txn = restored_doc.transact();
         let text = txn.get_text("content").unwrap();
         assert_eq!(text.get_string(&txn), "test content");
+    }
+
+    #[test]
+    fn test_needs_server_init() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // New state needs init
+        assert!(state.needs_server_init());
+
+        // After adding yjs_state, no longer needs init
+        state.yjs_state = Some("some_state".to_string());
+        assert!(!state.needs_server_init());
+    }
+
+    #[test]
+    fn test_initialize_from_server() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+        assert!(state.needs_server_init());
+
+        // Initialize from server
+        state.initialize_from_server("server_yjs_state_b64", "server_cid_123");
+
+        // Verify state is set
+        assert!(!state.needs_server_init());
+        assert_eq!(state.yjs_state, Some("server_yjs_state_b64".to_string()));
+        assert_eq!(state.head_cid, Some("server_cid_123".to_string()));
+        assert_eq!(state.local_head_cid, Some("server_cid_123".to_string()));
+    }
+
+    /// Test that initializing from server preserves Yjs operations.
+    ///
+    /// This is the critical fix for the CRDT sync loop bug: by initializing
+    /// from the server's state, our Y.Doc shares the same operation history
+    /// as the server and other clients.
+    #[test]
+    fn test_initialize_from_server_preserves_operations() {
+        // Create a "server" doc with some content
+        let server_doc = Doc::with_client_id(1);
+        let server_update = {
+            let mut txn = server_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "server content");
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+        let server_state_b64 = STANDARD.encode(&server_update);
+
+        // Create client state and initialize from server
+        let mut client_state = CrdtPeerState::new(Uuid::new_v4());
+        client_state.initialize_from_server(&server_state_b64, "server_cid");
+
+        // Verify client doc has the server's content
+        let client_doc = client_state.to_doc().unwrap();
+        let txn = client_doc.transact();
+        let text = txn.get_text("content").unwrap();
+        assert_eq!(text.get_string(&txn), "server content");
+    }
+
+    /// Test that a client initialized from server can correctly merge a delete.
+    ///
+    /// This test verifies the fix for CP-f2fu: when a client starts from the
+    /// server's state, it can correctly apply delete operations because it
+    /// shares the same operation history.
+    #[test]
+    fn test_initialized_client_can_merge_deletes() {
+        use yrs::updates::decoder::Decode;
+        use yrs::Update;
+
+        // Server creates content "hello"
+        let server_doc = Doc::with_client_id(1);
+        {
+            let mut txn = server_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "hello");
+        }
+        let server_state = {
+            let txn = server_doc.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+        let server_state_b64 = STANDARD.encode(&server_state);
+
+        // Client initializes from server state (the fix!)
+        let mut client_state = CrdtPeerState::new(Uuid::new_v4());
+        client_state.initialize_from_server(&server_state_b64, "cid1");
+        let client_doc = client_state.to_doc().unwrap();
+
+        // Server deletes content
+        let delete_update = {
+            let mut txn = server_doc.transact_mut();
+            let text = txn.get_text("content").unwrap();
+            text.remove_range(&mut txn, 0, 5); // Delete "hello"
+            txn.encode_update_v1()
+        };
+
+        // Client applies the delete
+        {
+            let update = Update::decode_v1(&delete_update).unwrap();
+            let mut txn = client_doc.transact_mut();
+            txn.apply_update(update);
+        }
+
+        // Verify client doc is now empty
+        let txn = client_doc.transact();
+        let text = txn.get_text("content").unwrap();
+        assert_eq!(text.get_string(&txn), "");
     }
 }
