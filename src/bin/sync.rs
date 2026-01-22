@@ -15,13 +15,14 @@ use commonplace_doc::sync::subdir_spawn::{
 use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
     acquire_sync_lock, build_head_url, build_info_url, build_replace_url, build_uuid_map_recursive,
-    check_server_has_content, detect_from_path, directory_mqtt_task, directory_watcher_task,
-    discover_fs_root, ensure_fs_root_exists, file_watcher_task, fork_node, handle_file_created,
-    handle_file_deleted, handle_file_modified, handle_schema_change, handle_schema_modified,
-    initial_sync, is_binary_content, push_schema_to_server, scan_directory_with_contents,
-    spawn_command_listener, spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file,
-    upload_task, DirEvent, FileEvent, FileSyncState, InodeKey, InodeTracker, ReplaceResponse,
-    ScanOptions, SharedStateFile, SyncState, SCHEMA_FILENAME,
+    check_server_has_content, create_new_file, detect_from_path, directory_mqtt_task,
+    directory_watcher_task, discover_fs_root, ensure_fs_root_exists, file_watcher_task, fork_node,
+    handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
+    handle_schema_modified, initial_sync, is_binary_content, push_schema_to_server,
+    remove_file_from_schema, scan_directory_with_contents, spawn_command_listener,
+    spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file, upload_task, DirEvent,
+    FileEvent, FileSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions,
+    SharedStateFile, SyncState, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -122,10 +123,19 @@ fn setup_directory_watchers(
     }
 }
 
+/// Optional CRDT parameters for handling directory events via MQTT instead of HTTP.
+struct CrdtEventParams {
+    mqtt_client: Arc<MqttClient>,
+    workspace: String,
+    crdt_state: Arc<RwLock<DirectorySyncState>>,
+}
+
 /// Handle a single directory event by dispatching to the appropriate handler.
 ///
 /// This consolidates the repeated DirEvent match blocks used in both
 /// `run_directory_mode` and `run_exec_mode`.
+///
+/// When `crdt_params` is provided, file creation uses MQTT/CRDT path instead of HTTP.
 #[allow(clippy::too_many_arguments)]
 async fn handle_dir_event(
     client: &Client,
@@ -141,28 +151,43 @@ async fn handle_dir_event(
     author: &str,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<InodeTracker>>>,
     written_schemas: Option<&WrittenSchemas>,
+    crdt_params: Option<&CrdtEventParams>,
     event: DirEvent,
 ) {
     match event {
         DirEvent::Created(path) => {
-            handle_file_created(
-                client,
-                server,
-                fs_root_id,
-                directory,
-                &path,
-                options,
-                file_states,
-                use_paths,
-                push_only,
-                pull_only,
-                shared_state_file,
-                author,
-                #[cfg(unix)]
-                inode_tracker,
-                written_schemas,
-            )
-            .await;
+            // Use CRDT path if available
+            if let Some(crdt) = crdt_params {
+                handle_file_created_crdt(
+                    &path,
+                    directory,
+                    options,
+                    file_states,
+                    author,
+                    crdt,
+                    pull_only,
+                )
+                .await;
+            } else {
+                handle_file_created(
+                    client,
+                    server,
+                    fs_root_id,
+                    directory,
+                    &path,
+                    options,
+                    file_states,
+                    use_paths,
+                    push_only,
+                    pull_only,
+                    shared_state_file,
+                    author,
+                    #[cfg(unix)]
+                    inode_tracker,
+                    written_schemas,
+                )
+                .await;
+            }
         }
         DirEvent::Modified(path) => {
             handle_file_modified(
@@ -171,17 +196,22 @@ async fn handle_dir_event(
             .await;
         }
         DirEvent::Deleted(path) => {
-            handle_file_deleted(
-                client,
-                server,
-                fs_root_id,
-                directory,
-                &path,
-                options,
-                file_states,
-                author,
-            )
-            .await;
+            // Use CRDT path if available
+            if let Some(crdt) = crdt_params {
+                handle_file_deleted_crdt(&path, directory, options, author, crdt).await;
+            } else {
+                handle_file_deleted(
+                    client,
+                    server,
+                    fs_root_id,
+                    directory,
+                    &path,
+                    options,
+                    file_states,
+                    author,
+                )
+                .await;
+            }
         }
         DirEvent::SchemaModified(path, content) => {
             info!("User edited schema file: {}", path.display());
@@ -199,6 +229,204 @@ async fn handle_dir_event(
             {
                 warn!("Failed to push schema change: {}", e);
             }
+        }
+    }
+}
+
+/// Handle file creation via CRDT/MQTT path.
+async fn handle_file_created_crdt(
+    path: &std::path::Path,
+    directory: &std::path::Path,
+    options: &ScanOptions,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    author: &str,
+    crdt: &CrdtEventParams,
+    pull_only: bool,
+) {
+    // Get filename from path
+    let filename = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            warn!("Could not get filename from path: {}", path.display());
+            return;
+        }
+    };
+
+    // Check ignore patterns
+    let should_ignore = options.ignore_patterns.iter().any(|pattern| {
+        if pattern == &filename {
+            true
+        } else if pattern.contains('*') {
+            let parts: Vec<&str> = pattern.split('*').collect();
+            if parts.len() == 2 {
+                filename.starts_with(parts[0]) && filename.ends_with(parts[1])
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    });
+    if should_ignore {
+        debug!("Ignoring new file (matches ignore pattern): {}", filename);
+        return;
+    }
+
+    // Skip hidden files unless configured
+    if !options.include_hidden && filename.starts_with('.') {
+        debug!("Ignoring hidden file: {}", filename);
+        return;
+    }
+
+    // Skip if pull-only mode
+    if pull_only {
+        debug!("Skipping file creation in pull-only mode: {}", filename);
+        return;
+    }
+
+    // Read file content
+    let content = match tokio::fs::read_to_string(path).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to read new file {}: {}", path.display(), e);
+            return;
+        }
+    };
+
+    // Create file via CRDT
+    let result = {
+        let mut state = crdt.crdt_state.write().await;
+        create_new_file(
+            &crdt.mqtt_client,
+            &crdt.workspace,
+            &mut state,
+            &filename,
+            &content,
+            author,
+        )
+        .await
+    };
+
+    match result {
+        Ok(new_file) => {
+            info!(
+                "Created file '{}' via CRDT: uuid={}, schema_cid={}, file_cid={}",
+                filename, new_file.uuid, new_file.schema_cid, new_file.file_cid
+            );
+
+            // Calculate relative path
+            let relative_path = match path.strip_prefix(directory) {
+                Ok(rel) => rel.to_string_lossy().to_string(),
+                Err(_) => filename.clone(),
+            };
+
+            // Spawn CRDT sync tasks for the new file
+            let file_path = path.to_path_buf();
+            let handles = spawn_file_sync_tasks_crdt(
+                crdt.mqtt_client.clone(),
+                crdt.workspace.clone(),
+                new_file.uuid,
+                file_path,
+                crdt.crdt_state.clone(),
+                filename.clone(),
+                false, // pull_only = false for new files
+                author.to_string(),
+            );
+
+            // Add to file_states
+            let mut states = file_states.write().await;
+            // Create a minimal SyncState for compatibility with existing code
+            let state = Arc::new(RwLock::new(SyncState::new()));
+            // Compute content hash for fork detection
+            let content_hash = compute_content_hash(content.as_bytes());
+
+            states.insert(
+                relative_path.clone(),
+                FileSyncState {
+                    relative_path,
+                    identifier: new_file.uuid.to_string(),
+                    state,
+                    task_handles: handles,
+                    use_paths: false, // CRDT mode uses UUIDs, not paths
+                    content_hash: Some(content_hash),
+                },
+            );
+        }
+        Err(e) => {
+            warn!("Failed to create file '{}' via CRDT: {}", filename, e);
+        }
+    }
+}
+
+/// Handle file deletion via CRDT/MQTT path.
+async fn handle_file_deleted_crdt(
+    path: &std::path::Path,
+    _directory: &std::path::Path,
+    options: &ScanOptions,
+    author: &str,
+    crdt: &CrdtEventParams,
+) {
+    // Get filename from path
+    let filename = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            warn!("Could not get filename from path: {}", path.display());
+            return;
+        }
+    };
+
+    // Check ignore patterns (same as creation)
+    let should_ignore = options.ignore_patterns.iter().any(|pattern| {
+        if pattern == &filename {
+            true
+        } else if pattern.contains('*') {
+            let parts: Vec<&str> = pattern.split('*').collect();
+            if parts.len() == 2 {
+                filename.starts_with(parts[0]) && filename.ends_with(parts[1])
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    });
+    if should_ignore {
+        debug!(
+            "Ignoring deleted file (matches ignore pattern): {}",
+            filename
+        );
+        return;
+    }
+
+    // Skip hidden files unless configured
+    if !options.include_hidden && filename.starts_with('.') {
+        debug!("Ignoring hidden file deletion: {}", filename);
+        return;
+    }
+
+    // Remove file from schema via CRDT
+    let result = {
+        let mut state = crdt.crdt_state.write().await;
+        remove_file_from_schema(
+            &crdt.mqtt_client,
+            &crdt.workspace,
+            &mut state,
+            &filename,
+            author,
+        )
+        .await
+    };
+
+    match result {
+        Ok(cid) => {
+            info!(
+                "Removed file '{}' from schema via CRDT: cid={}",
+                filename, cid
+            );
+        }
+        Err(e) => {
+            // File might not be in schema (e.g., temp file, already deleted)
+            debug!("Could not remove file '{}' from schema: {}", filename, e);
         }
     }
 }
@@ -1625,6 +1853,12 @@ async fn run_directory_mode(
         let author = author.clone();
         #[cfg(unix)]
         let inode_tracker = inode_tracker.clone();
+        // Create CRDT params for the event handler
+        let crdt_params = CrdtEventParams {
+            mqtt_client: mqtt_client.clone(),
+            workspace: workspace.clone(),
+            crdt_state: crdt_state.clone(),
+        };
         async move {
             while let Some(event) = dir_rx.recv().await {
                 handle_dir_event(
@@ -1642,6 +1876,7 @@ async fn run_directory_mode(
                     #[cfg(unix)]
                     inode_tracker.clone(),
                     Some(&written_schemas),
+                    Some(&crdt_params),
                     event,
                 )
                 .await;
@@ -2162,6 +2397,12 @@ async fn run_exec_mode(
         let author = author.clone();
         #[cfg(unix)]
         let inode_tracker = inode_tracker.clone();
+        // Create CRDT params for the event handler
+        let crdt_params = CrdtEventParams {
+            mqtt_client: mqtt_client.clone(),
+            workspace: workspace.clone(),
+            crdt_state: crdt_state.clone(),
+        };
         async move {
             while let Some(event) = dir_rx.recv().await {
                 info!("RECEIVED DIR EVENT (exec mode): {:?}", event);
@@ -2180,6 +2421,7 @@ async fn run_exec_mode(
                     #[cfg(unix)]
                     inode_tracker.clone(),
                     Some(&written_schemas),
+                    Some(&crdt_params),
                     event,
                 )
                 .await;
