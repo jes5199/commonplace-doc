@@ -374,7 +374,7 @@ The following integration tests in `tests/` must pass for acceptance:
 
 ### CRDT Peer Sync Tests (`tests/crdt_peer_sync_tests.rs`)
 
-- [ ] **IT1**: `test_server_persists_edits_via_http` - Server persists edits via HTTP
-- [ ] **IT2**: `test_sync_client_edit_persisted_by_server_via_mqtt` - Sync client edits are persisted by server via MQTT
+- [x] **IT1**: `test_server_persists_edits_via_http` - Server persists edits via HTTP
+- [x] **IT2**: `test_sync_client_edit_persisted_by_server_via_mqtt` - Sync client edits are persisted by server via MQTT
 
-**Current Status:** IT2 is failing. The test verifies that when a sync client publishes an edit via MQTT, the server receives and persists the commit. This is a critical path for CRDT peer sync.
+**Current Status:** Both tests pass. Run with `cargo test --release --test crdt_peer_sync_tests`.
