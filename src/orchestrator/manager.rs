@@ -3,6 +3,7 @@ use super::spawn::spawn_managed_process;
 use super::status::OrchestratorStatus;
 use super::{OrchestratorConfig, ProcessConfig, RestartMode};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 
@@ -29,15 +30,18 @@ pub struct ProcessManager {
     mqtt_broker_override: Option<String>,
     disabled: Vec<String>,
     workspace: String,
+    status_file_path: PathBuf,
 }
 
 impl ProcessManager {
     pub fn new(
         config: OrchestratorConfig,
+        config_path: &std::path::Path,
         mqtt_broker_override: Option<String>,
         disabled: Vec<String>,
     ) -> Self {
         let workspace = config.workspace.clone();
+        let status_file_path = OrchestratorConfig::status_file_path(config_path);
         let processes = config
             .processes
             .iter()
@@ -61,6 +65,7 @@ impl ProcessManager {
             mqtt_broker_override,
             disabled,
             workspace,
+            status_file_path,
         }
     }
 
@@ -95,9 +100,14 @@ impl ProcessManager {
         }
 
         // Merge with existing status (preserving discovered processes) and write
-        if let Err(e) = status.merge_and_write(true) {
+        if let Err(e) = status.merge_and_write(&self.status_file_path, true) {
             tracing::warn!("[orchestrator] Failed to write status file: {}", e);
         }
+    }
+
+    /// Get the status file path
+    pub fn status_file_path(&self) -> &std::path::Path {
+        &self.status_file_path
     }
 
     pub async fn spawn_process(&mut self, name: &str) -> Result<(), String> {
@@ -527,7 +537,7 @@ impl ProcessManager {
         }
 
         // Remove status file on shutdown
-        if let Err(e) = OrchestratorStatus::remove() {
+        if let Err(e) = OrchestratorStatus::remove(&self.status_file_path) {
             tracing::warn!("[orchestrator] Failed to remove status file: {}", e);
         }
 

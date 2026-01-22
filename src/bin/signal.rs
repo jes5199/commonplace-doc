@@ -7,9 +7,10 @@
 
 use clap::Parser;
 use commonplace_doc::cli::SignalArgs;
-use commonplace_doc::orchestrator::OrchestratorStatus;
+use commonplace_doc::orchestrator::{OrchestratorConfig, OrchestratorStatus};
 use commonplace_doc::workspace::is_process_running;
 use serde::Serialize;
+use std::path::PathBuf;
 
 #[derive(Serialize)]
 struct SignalResult {
@@ -19,14 +20,47 @@ struct SignalResult {
     document_path: Option<String>,
 }
 
+/// Find any orchestrator status file in /tmp.
+/// Returns the first valid status file found, or None if none exist.
+fn find_status_file() -> Option<PathBuf> {
+    let temp_dir = std::env::temp_dir();
+    if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("commonplace-orchestrator-") && name.ends_with(".status.json") {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = SignalArgs::parse();
 
-    let status = match OrchestratorStatus::read() {
+    // Try to find status file:
+    // 1. First, try the config-scoped path (for explicit --config or when in right directory)
+    // 2. Fall back to scanning /tmp for any status file (for convenience)
+    let status_file_path = OrchestratorConfig::status_file_path(&args.config);
+
+    let status = match OrchestratorStatus::read(&status_file_path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("Orchestrator is not running (no status file found)");
-            std::process::exit(1);
+            // Try to find any status file in /tmp
+            if let Some(found_path) = find_status_file() {
+                match OrchestratorStatus::read(&found_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Found status file but failed to read: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                eprintln!("Orchestrator is not running (no status file found)");
+                std::process::exit(1);
+            }
         }
         Err(e) => {
             eprintln!("Failed to read orchestrator status: {}", e);

@@ -186,6 +186,11 @@ pub struct PsArgs {
     /// Output in JSON format
     #[clap(long)]
     pub json: bool,
+
+    /// Path to orchestrator config file (to identify which orchestrator)
+    /// If not specified, searches for active orchestrator status files
+    #[clap(short, long, default_value = "commonplace.json")]
+    pub config: PathBuf,
 }
 
 /// CLI arguments for commonplace-replay (view/replay file edits)
@@ -331,6 +336,10 @@ pub struct SignalArgs {
     /// Output in JSON format
     #[clap(long)]
     pub json: bool,
+
+    /// Path to orchestrator config file (to identify which orchestrator)
+    #[clap(short, long, default_value = "commonplace.json")]
+    pub config: PathBuf,
 }
 
 /// Response from /docs/:id/head or /files/*path/head endpoints.

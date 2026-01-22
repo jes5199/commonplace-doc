@@ -3,11 +3,11 @@
 //! These tests verify that the orchestrator correctly starts and manages
 //! the server and sync processes.
 //!
-//! NOTE: These tests must run serially (--test-threads=1) because they share
-//! the orchestrator status file at /tmp/commonplace-orchestrator-status.json.
-//!
 //! NOTE: These tests require MQTT broker (mosquitto) running on localhost:1883.
 //! They are skipped automatically if MQTT is not available.
+//!
+//! NOTE: Each test creates its own temp directory and config file, so the
+//! status file is scoped to that test's config path.
 
 use std::collections::HashSet;
 use std::net::TcpStream;
@@ -28,6 +28,23 @@ fn mqtt_available() -> bool {
 fn get_available_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
+}
+
+/// Compute status file path from config path (matching OrchestratorConfig::status_file_path)
+fn status_file_path(config_path: &std::path::Path) -> std::path::PathBuf {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let canonical = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
+
+    let mut hasher = DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let hash_str = format!("{:012x}", hash & 0xffffffffffff);
+    std::env::temp_dir().join(format!("commonplace-orchestrator-{}.status.json", hash_str))
 }
 
 /// Clean up child processes on drop
@@ -76,8 +93,7 @@ impl Drop for ProcessGuard {
                 }
             }
         }
-        // Clean up the status file
-        let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+        // Status file cleanup is handled by each test's config-scoped path
     }
 }
 

@@ -113,6 +113,30 @@ impl OrchestratorConfig {
         std::env::temp_dir().join(format!("commonplace-orchestrator-{}.lock", hash_str))
     }
 
+    /// Compute a scoped status file path based on the config file path.
+    /// This allows multiple orchestrators to run with different configs without
+    /// interfering with each other's status files.
+    /// The status file name is derived from a hash of the canonical config path.
+    pub fn status_file_path(config_path: &std::path::Path) -> PathBuf {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        // Use canonical path for consistency across relative/absolute paths
+        let canonical = config_path
+            .canonicalize()
+            .unwrap_or_else(|_| config_path.to_path_buf());
+
+        // Hash the path to create a unique but short identifier
+        let mut hasher = DefaultHasher::new();
+        canonical.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        // Use first 12 hex chars of hash for readability
+        let hash_str = format!("{:012x}", hash & 0xffffffffffff);
+
+        std::env::temp_dir().join(format!("commonplace-orchestrator-{}.status.json", hash_str))
+    }
+
     /// Resolve the HTTP server URL with fallback chain:
     /// 1. Parse --port from http process args
     /// 2. Use http_server config field

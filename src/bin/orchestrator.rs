@@ -456,6 +456,7 @@ async fn main() {
     // This ensures the server is running before we try to discover processes
     let mut base_manager = ProcessManager::new(
         config.clone(),
+        &args.config,
         args.mqtt_broker.clone(),
         args.disable.clone(),
     );
@@ -613,8 +614,11 @@ async fn main() {
     }
 
     // Now we can start recursive discovery
-    let mut discovered_manager =
-        DiscoveredProcessManager::new(broker_raw.to_string(), args.server.clone());
+    let mut discovered_manager = DiscoveredProcessManager::new(
+        broker_raw.to_string(),
+        args.server.clone(),
+        base_manager.status_file_path().to_path_buf(),
+    );
 
     tracing::info!(
         "[orchestrator] Starting recursive discovery with fs-root: {}",

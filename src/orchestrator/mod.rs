@@ -12,4 +12,4 @@ pub use discovered_manager::{
 };
 pub use discovery::{CommandSpec, DiscoveredProcess, ProcessesConfig};
 pub use manager::{ManagedProcess, ProcessManager, ProcessState};
-pub use status::{get_process_cwd, OrchestratorStatus, ProcessStatus, STATUS_FILE_PATH};
+pub use status::{get_process_cwd, OrchestratorStatus, ProcessStatus, LEGACY_STATUS_FILE_PATH};

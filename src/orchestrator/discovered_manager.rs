@@ -63,6 +63,8 @@ pub struct DiscoveredProcessManager {
     max_backoff_ms: u64,
     /// Time in seconds after which to reset failure count
     reset_after_secs: u64,
+    /// Path to the status file (scoped to config)
+    status_file_path: PathBuf,
 }
 
 /// Result of recursive discovery - includes both __processes.json files and all schema node_ids.
@@ -80,7 +82,7 @@ type ScriptWatchMap = HashMap<String, Vec<String>>;
 
 impl DiscoveredProcessManager {
     /// Create a new discovered process manager.
-    pub fn new(mqtt_broker: String, server_url: String) -> Self {
+    pub fn new(mqtt_broker: String, server_url: String, status_file_path: PathBuf) -> Self {
         Self {
             mqtt_broker,
             server_url,
@@ -88,6 +90,7 @@ impl DiscoveredProcessManager {
             initial_backoff_ms: 500,
             max_backoff_ms: 10_000,
             reset_after_secs: 30,
+            status_file_path,
         }
     }
 
@@ -132,7 +135,7 @@ impl DiscoveredProcessManager {
         }
 
         // Merge with existing status (preserving base processes) and write
-        if let Err(e) = status.merge_and_write(false) {
+        if let Err(e) = status.merge_and_write(&self.status_file_path, false) {
             tracing::warn!("[discovery] Failed to write status file: {}", e);
         }
     }
@@ -1337,7 +1340,7 @@ impl DiscoveredProcessManager {
         }
 
         // Remove status file on shutdown
-        if let Err(e) = OrchestratorStatus::remove() {
+        if let Err(e) = OrchestratorStatus::remove(&self.status_file_path) {
             tracing::warn!("[discovery] Failed to remove status file: {}", e);
         }
 
@@ -1356,6 +1359,7 @@ mod tests {
         let manager = DiscoveredProcessManager::new(
             "localhost:1883".to_string(),
             "http://localhost:5199".to_string(),
+            PathBuf::from("/tmp/test-status.json"),
         );
         assert_eq!(manager.mqtt_broker(), "localhost:1883");
         assert_eq!(manager.server_url(), "http://localhost:5199");
@@ -1367,6 +1371,7 @@ mod tests {
         let mut manager = DiscoveredProcessManager::new(
             "localhost:1883".to_string(),
             "http://localhost:5199".to_string(),
+            PathBuf::from("/tmp/test-status.json"),
         );
 
         let config = DiscoveredProcess {
@@ -1400,6 +1405,7 @@ mod tests {
         let mut manager = DiscoveredProcessManager::new(
             "localhost:1883".to_string(),
             "http://localhost:5199".to_string(),
+            PathBuf::from("/tmp/test-status.json"),
         );
 
         let config = DiscoveredProcess {
@@ -1431,6 +1437,7 @@ mod tests {
         let manager = DiscoveredProcessManager::new(
             "localhost:1883".to_string(),
             "http://localhost:5199".to_string(),
+            PathBuf::from("/tmp/test-status.json"),
         );
 
         assert_eq!(manager.server_url(), "http://localhost:5199");
@@ -1441,6 +1448,7 @@ mod tests {
         let mut manager = DiscoveredProcessManager::new(
             "localhost:1883".to_string(),
             "http://localhost:5199".to_string(),
+            PathBuf::from("/tmp/test-status.json"),
         );
 
         let config = DiscoveredProcess {

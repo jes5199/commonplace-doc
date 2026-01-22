@@ -1,15 +1,17 @@
 //! Status file for orchestrator process information.
 //!
 //! Writes a JSON file to /tmp that can be read by commonplace-ps.
+//! The status file path is scoped to the config file to allow multiple
+//! orchestrators to run with different configs.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::SystemTime;
 
-/// Path to the orchestrator status file
-pub const STATUS_FILE_PATH: &str = "/tmp/commonplace-orchestrator-status.json";
+/// Legacy path for backwards compatibility (used by commonplace-ps when no config specified)
+pub const LEGACY_STATUS_FILE_PATH: &str = "/tmp/commonplace-orchestrator-status.json";
 
 /// Information about a single managed process
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,25 +57,20 @@ impl OrchestratorStatus {
     }
 
     /// Write status to the status file
-    pub fn write(&self) -> io::Result<()> {
+    pub fn write(&self, path: &Path) -> io::Result<()> {
         let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-        fs::write(STATUS_FILE_PATH, json)
+        fs::write(path, json)
     }
 
     /// Read status from the status file
-    pub fn read() -> io::Result<Self> {
-        let content = fs::read_to_string(STATUS_FILE_PATH)?;
+    pub fn read(path: &Path) -> io::Result<Self> {
+        let content = fs::read_to_string(path)?;
         serde_json::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
-    /// Get the status file path
-    pub fn path() -> PathBuf {
-        PathBuf::from(STATUS_FILE_PATH)
-    }
-
     /// Remove the status file
-    pub fn remove() -> io::Result<()> {
-        match fs::remove_file(STATUS_FILE_PATH) {
+    pub fn remove(path: &Path) -> io::Result<()> {
+        match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
@@ -87,9 +84,9 @@ impl OrchestratorStatus {
     ///
     /// - `is_base_process`: if true, merge base processes (source_path is None)
     /// - `is_base_process`: if false, merge discovered processes (source_path is Some)
-    pub fn merge_and_write(&self, is_base_process: bool) -> io::Result<()> {
+    pub fn merge_and_write(&self, path: &Path, is_base_process: bool) -> io::Result<()> {
         // Read existing status, or start fresh if not found
-        let mut merged = match Self::read() {
+        let mut merged = match Self::read(path) {
             Ok(existing) => existing,
             Err(e) if e.kind() == io::ErrorKind::NotFound => Self::new(),
             Err(e) => return Err(e),
@@ -116,7 +113,7 @@ impl OrchestratorStatus {
         // Sort by name for consistent output
         merged.processes.sort_by(|a, b| a.name.cmp(&b.name));
 
-        merged.write()
+        merged.write(path)
     }
 }
 

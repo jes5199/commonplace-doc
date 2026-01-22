@@ -80,8 +80,8 @@ impl Drop for ProcessGuard {
                 }
             }
         }
-        // Clean up the status file
-        let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+        // Note: Status file cleanup is handled by TempDir since the config-scoped status
+        // file hash is based on the temp config path
     }
 }
 
@@ -126,10 +126,30 @@ fn create_test_config(
     .to_string()
 }
 
+/// Compute status file path from config path (matching OrchestratorConfig::status_file_path)
+fn status_file_path(config_path: &std::path::Path) -> std::path::PathBuf {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let canonical = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
+
+    let mut hasher = DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let hash_str = format!("{:012x}", hash & 0xffffffffffff);
+    std::env::temp_dir().join(format!("commonplace-orchestrator-{}.status.json", hash_str))
+}
+
 /// Wait for the orchestrator status file to exist and have the expected processes
-fn wait_for_orchestrator_ready(timeout: Duration) -> Result<serde_json::Value, String> {
+fn wait_for_orchestrator_ready(
+    config_path: &std::path::Path,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
     let start = std::time::Instant::now();
-    let status_path = "/tmp/commonplace-orchestrator-status.json";
+    let status_path = status_file_path(config_path);
 
     loop {
         if start.elapsed() > timeout {
@@ -137,7 +157,7 @@ fn wait_for_orchestrator_ready(timeout: Duration) -> Result<serde_json::Value, S
         }
 
         // Check if status file exists
-        if let Ok(content) = std::fs::read_to_string(status_path) {
+        if let Ok(content) = std::fs::read_to_string(&status_path) {
             if let Ok(status) = serde_json::from_str::<serde_json::Value>(&content) {
                 // Check if we have both server and sync running
                 if let Some(processes) = status.get("processes").and_then(|p| p.as_array()) {
@@ -250,9 +270,6 @@ fn test_sync_client_edit_persisted_by_server_via_mqtt() {
         return;
     }
 
-    // Clean up any stale status file from previous runs
-    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
-
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
     let workspace_dir = temp_dir.path().join("workspace");
@@ -314,7 +331,7 @@ fn test_sync_client_edit_persisted_by_server_via_mqtt() {
     guard.add(orchestrator);
 
     // Wait for orchestrator to be ready
-    wait_for_orchestrator_ready(Duration::from_secs(30))
+    wait_for_orchestrator_ready(&config_path, Duration::from_secs(30))
         .expect("Orchestrator failed to start within timeout");
 
     // Give sync client time to fully initialize and sync
@@ -405,9 +422,6 @@ fn test_server_persists_edits_via_http() {
         return;
     }
 
-    // Clean up any stale status file from previous runs
-    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
-
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
     let workspace_dir = temp_dir.path().join("workspace");
@@ -453,7 +467,7 @@ fn test_server_persists_edits_via_http() {
     guard.add(orchestrator);
 
     // Wait for orchestrator to be ready
-    wait_for_orchestrator_ready(Duration::from_secs(30))
+    wait_for_orchestrator_ready(&config_path, Duration::from_secs(30))
         .expect("Orchestrator failed to start within timeout");
 
     // Create a document via HTTP
