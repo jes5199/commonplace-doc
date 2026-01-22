@@ -367,3 +367,14 @@ Check if the database file is locked by another process. The server requires exc
 
 ### Empty `__processes.json` after restart
 If the server restarts without database persistence, it loses all data. When sync reconnects, it may pull empty content from the server and overwrite local files. Always ensure the `database` field is set in `commonplace.json`.
+
+## Integration Tests
+
+The following integration tests in `tests/` must pass for acceptance:
+
+### CRDT Peer Sync Tests (`tests/crdt_peer_sync_tests.rs`)
+
+- [ ] **IT1**: `test_server_persists_edits_via_http` - Server persists edits via HTTP
+- [ ] **IT2**: `test_sync_client_edit_persisted_by_server_via_mqtt` - Sync client edits are persisted by server via MQTT
+
+**Current Status:** IT2 is failing. The test verifies that when a sync client publishes an edit via MQTT, the server receives and persists the commit. This is a critical path for CRDT peer sync.
