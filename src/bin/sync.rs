@@ -16,13 +16,13 @@ use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
     acquire_sync_lock, build_head_url, build_info_url, build_replace_url, build_uuid_map_recursive,
     check_server_has_content, create_new_file, detect_from_path, directory_mqtt_task,
-    directory_watcher_task, discover_fs_root, ensure_fs_root_exists, file_watcher_task, fork_node,
-    handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
-    handle_schema_modified, initial_sync, is_binary_content, push_schema_to_server,
-    remove_file_from_schema, scan_directory_with_contents, spawn_command_listener,
-    spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file, upload_task, DirEvent,
-    FileEvent, FileSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions,
-    SharedStateFile, SyncState, SCHEMA_FILENAME,
+    directory_watcher_task, discover_fs_root, ensure_fs_root_exists, file_watcher_task,
+    find_owning_document, fork_node, handle_file_created, handle_file_deleted,
+    handle_file_modified, handle_schema_change, handle_schema_modified, initial_sync,
+    is_binary_content, push_schema_to_server, remove_file_from_schema,
+    scan_directory_with_contents, spawn_command_listener, spawn_file_sync_tasks_crdt, sse_task,
+    sync_schema, sync_single_file, upload_task, DirEvent, FileEvent, FileSyncState, InodeKey,
+    InodeTracker, ReplaceResponse, ScanOptions, SharedStateFile, SyncState, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -161,6 +161,7 @@ async fn handle_dir_event(
                 handle_file_created_crdt(
                     &path,
                     directory,
+                    fs_root_id,
                     options,
                     file_states,
                     author,
@@ -198,7 +199,7 @@ async fn handle_dir_event(
         DirEvent::Deleted(path) => {
             // Use CRDT path if available
             if let Some(crdt) = crdt_params {
-                handle_file_deleted_crdt(&path, directory, options, author, crdt).await;
+                handle_file_deleted_crdt(&path, directory, fs_root_id, options, author, crdt).await;
             } else {
                 handle_file_deleted(
                     client,
@@ -234,9 +235,16 @@ async fn handle_dir_event(
 }
 
 /// Handle file creation via CRDT/MQTT path.
+///
+/// This function properly handles files in node-backed subdirectories by:
+/// 1. Finding the owning document (could be root or a subdirectory)
+/// 2. Loading the appropriate DirectorySyncState for that directory
+/// 3. Creating the file in the correct schema
+#[allow(clippy::too_many_arguments)]
 async fn handle_file_created_crdt(
     path: &std::path::Path,
     directory: &std::path::Path,
+    fs_root_id: &str,
     options: &ScanOptions,
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
     author: &str,
@@ -284,37 +292,26 @@ async fn handle_file_created_crdt(
         return;
     }
 
-    // Check if file is already being tracked - don't create duplicate UUIDs.
-    // This prevents the case where a file modification triggers a "Created" event
-    // (e.g., from inotify) and we incorrectly try to create a new UUID for an
-    // existing file that's already being synced.
-    //
-    // We need to check both:
-    // 1. file_states (tracks files by relative path, populated during schema sync)
-    // 2. crdt_state.files (tracks CRDT state by filename, populated when tasks spawn)
-    {
-        // First check file_states by relative path
-        let relative_path = match path.strip_prefix(directory) {
-            Ok(rel) => rel.to_string_lossy().to_string(),
-            Err(_) => filename.clone(),
-        };
+    // Calculate relative path from root directory
+    let relative_path = match path.strip_prefix(directory) {
+        Ok(rel) => rel.to_string_lossy().to_string().replace('\\', "/"),
+        Err(_) => filename.clone(),
+    };
 
+    // Find which document owns this file (may be a node-backed subdirectory)
+    let owning_doc = find_owning_document(directory, fs_root_id, &relative_path);
+    info!(
+        "CRDT file created: {} owned by document {} (relative: {})",
+        relative_path, owning_doc.document_id, owning_doc.relative_path
+    );
+
+    // Check if file is already being tracked - don't create duplicate UUIDs.
+    {
         let states = file_states.read().await;
         if states.contains_key(&relative_path) {
             debug!(
                 "File '{}' already in file_states, skipping create_new_file",
                 relative_path
-            );
-            return;
-        }
-        drop(states);
-
-        // Also check CRDT state by filename
-        let state = crdt.crdt_state.read().await;
-        if state.files.contains_key(&filename) {
-            debug!(
-                "File '{}' already in CRDT state, skipping create_new_file",
-                filename
             );
             return;
         }
@@ -329,75 +326,196 @@ async fn handle_file_created_crdt(
         }
     };
 
-    // Create file via CRDT
-    let result = {
-        let mut state = crdt.crdt_state.write().await;
-        create_new_file(
+    // Determine which DirectorySyncState to use
+    // If the file is in a subdirectory, we need to load that subdirectory's state
+    let is_subdirectory = owning_doc.document_id != fs_root_id;
+
+    if is_subdirectory {
+        // Load or create state for the subdirectory
+        let subdir_node_id = match uuid::Uuid::parse_str(&owning_doc.document_id) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(
+                    "Invalid subdirectory node_id '{}': {}",
+                    owning_doc.document_id, e
+                );
+                return;
+            }
+        };
+
+        let mut subdir_state =
+            match DirectorySyncState::load_or_create(&owning_doc.directory, subdir_node_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        "Failed to load state for subdirectory {}: {}",
+                        owning_doc.directory.display(),
+                        e
+                    );
+                    return;
+                }
+            };
+
+        // Check if already tracked in subdirectory state
+        if subdir_state.files.contains_key(&owning_doc.relative_path) {
+            debug!(
+                "File '{}' already in subdirectory CRDT state, skipping",
+                owning_doc.relative_path
+            );
+            return;
+        }
+
+        // Create file via CRDT using subdirectory state
+        let result = create_new_file(
             &crdt.mqtt_client,
             &crdt.workspace,
-            &mut state,
-            &filename,
+            &mut subdir_state,
+            &owning_doc.relative_path,
             &content,
             author,
         )
-        .await
-    };
+        .await;
 
-    match result {
-        Ok(new_file) => {
-            info!(
-                "Created file '{}' via CRDT: uuid={}, schema_cid={}, file_cid={}",
-                filename, new_file.uuid, new_file.schema_cid, new_file.file_cid
-            );
+        match result {
+            Ok(new_file) => {
+                info!(
+                    "Created file '{}' via CRDT in subdir {}: uuid={}, schema_cid={}, file_cid={}",
+                    owning_doc.relative_path,
+                    owning_doc.document_id,
+                    new_file.uuid,
+                    new_file.schema_cid,
+                    new_file.file_cid
+                );
 
-            // Calculate relative path
-            let relative_path = match path.strip_prefix(directory) {
-                Ok(rel) => rel.to_string_lossy().to_string(),
-                Err(_) => filename.clone(),
-            };
+                // Save the subdirectory state
+                if let Err(e) = subdir_state.save(&owning_doc.directory).await {
+                    warn!(
+                        "Failed to save subdirectory state for {}: {}",
+                        owning_doc.directory.display(),
+                        e
+                    );
+                }
 
-            // Spawn CRDT sync tasks for the new file
-            let file_path = path.to_path_buf();
-            let handles = spawn_file_sync_tasks_crdt(
-                crdt.mqtt_client.clone(),
-                crdt.workspace.clone(),
-                new_file.uuid,
-                file_path,
-                crdt.crdt_state.clone(),
-                filename.clone(),
-                false, // pull_only = false for new files
-                author.to_string(),
-            );
+                // Spawn CRDT sync tasks for the new file using a new state Arc
+                let subdir_state_arc = Arc::new(RwLock::new(subdir_state));
+                let file_path = path.to_path_buf();
+                let handles = spawn_file_sync_tasks_crdt(
+                    crdt.mqtt_client.clone(),
+                    crdt.workspace.clone(),
+                    new_file.uuid,
+                    file_path,
+                    subdir_state_arc,
+                    owning_doc.relative_path.clone(),
+                    false, // pull_only = false for new files
+                    author.to_string(),
+                );
 
-            // Add to file_states
-            let mut states = file_states.write().await;
-            // Create a minimal SyncState for compatibility with existing code
-            let state = Arc::new(RwLock::new(SyncState::new()));
-            // Compute content hash for fork detection
-            let content_hash = compute_content_hash(content.as_bytes());
+                // Add to file_states
+                let mut states = file_states.write().await;
+                let state = Arc::new(RwLock::new(SyncState::new()));
+                let content_hash = compute_content_hash(content.as_bytes());
 
-            states.insert(
-                relative_path.clone(),
-                FileSyncState {
-                    relative_path,
-                    identifier: new_file.uuid.to_string(),
-                    state,
-                    task_handles: handles,
-                    use_paths: false, // CRDT mode uses UUIDs, not paths
-                    content_hash: Some(content_hash),
-                },
-            );
+                states.insert(
+                    relative_path.clone(),
+                    FileSyncState {
+                        relative_path,
+                        identifier: new_file.uuid.to_string(),
+                        state,
+                        task_handles: handles,
+                        use_paths: false,
+                        content_hash: Some(content_hash),
+                    },
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to create file '{}' via CRDT in subdir: {}",
+                    owning_doc.relative_path, e
+                );
+            }
         }
-        Err(e) => {
-            warn!("Failed to create file '{}' via CRDT: {}", filename, e);
+    } else {
+        // File is in the root directory - use the existing crdt_state
+        // Check if already tracked in root CRDT state
+        {
+            let state = crdt.crdt_state.read().await;
+            if state.files.contains_key(&filename) {
+                debug!(
+                    "File '{}' already in root CRDT state, skipping create_new_file",
+                    filename
+                );
+                return;
+            }
+        }
+
+        // Create file via CRDT using root state
+        let result = {
+            let mut state = crdt.crdt_state.write().await;
+            create_new_file(
+                &crdt.mqtt_client,
+                &crdt.workspace,
+                &mut state,
+                &filename,
+                &content,
+                author,
+            )
+            .await
+        };
+
+        match result {
+            Ok(new_file) => {
+                info!(
+                    "Created file '{}' via CRDT: uuid={}, schema_cid={}, file_cid={}",
+                    filename, new_file.uuid, new_file.schema_cid, new_file.file_cid
+                );
+
+                // Spawn CRDT sync tasks for the new file
+                let file_path = path.to_path_buf();
+                let handles = spawn_file_sync_tasks_crdt(
+                    crdt.mqtt_client.clone(),
+                    crdt.workspace.clone(),
+                    new_file.uuid,
+                    file_path,
+                    crdt.crdt_state.clone(),
+                    filename.clone(),
+                    false, // pull_only = false for new files
+                    author.to_string(),
+                );
+
+                // Add to file_states
+                let mut states = file_states.write().await;
+                let state = Arc::new(RwLock::new(SyncState::new()));
+                let content_hash = compute_content_hash(content.as_bytes());
+
+                states.insert(
+                    relative_path.clone(),
+                    FileSyncState {
+                        relative_path,
+                        identifier: new_file.uuid.to_string(),
+                        state,
+                        task_handles: handles,
+                        use_paths: false,
+                        content_hash: Some(content_hash),
+                    },
+                );
+            }
+            Err(e) => {
+                warn!("Failed to create file '{}' via CRDT: {}", filename, e);
+            }
         }
     }
 }
 
 /// Handle file deletion via CRDT/MQTT path.
+///
+/// This function properly handles files in node-backed subdirectories by:
+/// 1. Finding the owning document (could be root or a subdirectory)
+/// 2. Loading the appropriate DirectorySyncState for that directory
+/// 3. Removing the file from the correct schema
 async fn handle_file_deleted_crdt(
     path: &std::path::Path,
-    _directory: &std::path::Path,
+    directory: &std::path::Path,
+    fs_root_id: &str,
     options: &ScanOptions,
     author: &str,
     crdt: &CrdtEventParams,
@@ -440,29 +558,107 @@ async fn handle_file_deleted_crdt(
         return;
     }
 
-    // Remove file from schema via CRDT
-    let result = {
-        let mut state = crdt.crdt_state.write().await;
-        remove_file_from_schema(
-            &crdt.mqtt_client,
-            &crdt.workspace,
-            &mut state,
-            &filename,
-            author,
-        )
-        .await
+    // Calculate relative path from root directory
+    let relative_path = match path.strip_prefix(directory) {
+        Ok(rel) => rel.to_string_lossy().to_string().replace('\\', "/"),
+        Err(_) => filename.clone(),
     };
 
-    match result {
-        Ok(cid) => {
-            info!(
-                "Removed file '{}' from schema via CRDT: cid={}",
-                filename, cid
-            );
+    // Find which document owns this file (may be a node-backed subdirectory)
+    let owning_doc = find_owning_document(directory, fs_root_id, &relative_path);
+    info!(
+        "CRDT file deleted: {} owned by document {} (relative: {})",
+        relative_path, owning_doc.document_id, owning_doc.relative_path
+    );
+
+    // Determine which DirectorySyncState to use
+    let is_subdirectory = owning_doc.document_id != fs_root_id;
+
+    if is_subdirectory {
+        // Load state for the subdirectory
+        let subdir_node_id = match uuid::Uuid::parse_str(&owning_doc.document_id) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(
+                    "Invalid subdirectory node_id '{}': {}",
+                    owning_doc.document_id, e
+                );
+                return;
+            }
+        };
+
+        let mut subdir_state =
+            match DirectorySyncState::load_or_create(&owning_doc.directory, subdir_node_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        "Failed to load state for subdirectory {}: {}",
+                        owning_doc.directory.display(),
+                        e
+                    );
+                    return;
+                }
+            };
+
+        // Remove file from subdirectory schema via CRDT
+        let result = remove_file_from_schema(
+            &crdt.mqtt_client,
+            &crdt.workspace,
+            &mut subdir_state,
+            &owning_doc.relative_path,
+            author,
+        )
+        .await;
+
+        match result {
+            Ok(cid) => {
+                info!(
+                    "Removed file '{}' from subdirectory {} schema via CRDT: cid={}",
+                    owning_doc.relative_path, owning_doc.document_id, cid
+                );
+
+                // Save the subdirectory state
+                if let Err(e) = subdir_state.save(&owning_doc.directory).await {
+                    warn!(
+                        "Failed to save subdirectory state for {}: {}",
+                        owning_doc.directory.display(),
+                        e
+                    );
+                }
+            }
+            Err(e) => {
+                // File might not be in schema (e.g., temp file, already deleted)
+                debug!(
+                    "Could not remove file '{}' from subdirectory schema: {}",
+                    owning_doc.relative_path, e
+                );
+            }
         }
-        Err(e) => {
-            // File might not be in schema (e.g., temp file, already deleted)
-            debug!("Could not remove file '{}' from schema: {}", filename, e);
+    } else {
+        // File is in the root directory - use the existing crdt_state
+        let result = {
+            let mut state = crdt.crdt_state.write().await;
+            remove_file_from_schema(
+                &crdt.mqtt_client,
+                &crdt.workspace,
+                &mut state,
+                &filename,
+                author,
+            )
+            .await
+        };
+
+        match result {
+            Ok(cid) => {
+                info!(
+                    "Removed file '{}' from schema via CRDT: cid={}",
+                    filename, cid
+                );
+            }
+            Err(e) => {
+                // File might not be in schema (e.g., temp file, already deleted)
+                debug!("Could not remove file '{}' from schema: {}", filename, e);
+            }
         }
     }
 }

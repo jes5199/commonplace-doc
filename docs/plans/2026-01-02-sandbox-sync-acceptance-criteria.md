@@ -94,7 +94,7 @@ The orchestrator is configured via `commonplace.json` in the project root:
     },
     "sync": {
       "command": "./target/release/commonplace-sync",
-      "args": ["--server", "http://localhost:3000", "--node", "workspace", "--directory", "./workspace", "--initial-sync", "local"],
+      "args": ["--server", "http://localhost:5199", "--node", "workspace", "--directory", "./workspace", "--initial-sync", "local"],
       "restart": { "policy": "always", "backoff_ms": 500, "max_backoff_ms": 10000 },
       "depends_on": ["server"]
     }
@@ -357,7 +357,7 @@ Check if the database file is locked by another process. The server requires exc
 
 ### Processes not discovered
 1. Verify `__processes.json` exists and has valid JSON
-2. Check that the file is synced to server: `curl http://localhost:3000/docs/<uuid>/head`
+2. Check that the file is synced to server: `curl http://localhost:5199/docs/<uuid>/head`
 3. Check orchestrator logs for discovery errors
 
 ### Sandbox files not syncing

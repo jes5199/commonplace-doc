@@ -240,9 +240,28 @@ impl DirectorySyncState {
     }
 
     /// Load state or create new if it doesn't exist.
+    ///
+    /// If the loaded state has a mismatched schema node_id (e.g., nil UUID from
+    /// corrupted state), it will be updated to the correct value and the Yjs
+    /// state will be cleared to ensure consistency.
     pub async fn load_or_create(directory: &Path, schema_node_id: Uuid) -> io::Result<Self> {
         match Self::load(directory).await? {
-            Some(state) => Ok(state),
+            Some(mut state) => {
+                // Fix corrupted node_id if it doesn't match expected value
+                if state.schema.node_id != schema_node_id {
+                    tracing::warn!(
+                        "DirectorySyncState: fixing schema node_id mismatch: {} -> {}",
+                        state.schema.node_id,
+                        schema_node_id
+                    );
+                    state.schema.node_id = schema_node_id;
+                    // Clear Yjs state since we're now tracking a different document
+                    state.schema.yjs_state = None;
+                    state.schema.head_cid = None;
+                    state.schema.local_head_cid = None;
+                }
+                Ok(state)
+            }
             None => Ok(Self::new(schema_node_id)),
         }
     }
