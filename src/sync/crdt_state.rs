@@ -14,7 +14,7 @@ use tokio::fs;
 use tracing::{debug, warn};
 use uuid::Uuid;
 use yrs::updates::decoder::Decode;
-use yrs::{Doc, ReadTxn, Transact, Update};
+use yrs::{Doc, ReadTxn, Transact, Update, WriteTxn};
 
 /// State file name for per-directory CRDT state.
 /// Located inside the directory it tracks (not as a sibling).
@@ -70,8 +70,15 @@ impl CrdtPeerState {
 
     /// Deserialize the Y.Doc state.
     /// Returns a new Doc with the stored state applied, or an empty Doc if no state.
+    /// The "content" text root is always ensured to exist.
     pub fn to_doc(&self) -> Result<Doc, String> {
         let doc = Doc::new();
+
+        // Ensure the "content" text root exists
+        {
+            let mut txn = doc.transact_mut();
+            txn.get_or_insert_text("content");
+        }
 
         if let Some(ref state_b64) = self.yjs_state {
             let state_bytes = STANDARD

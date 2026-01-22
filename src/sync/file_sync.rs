@@ -2334,6 +2334,11 @@ pub async fn receive_task_crdt(
                             file_path.display()
                         );
                     }
+                    MergeResult::NeedsMerge { .. } => {
+                        // NeedsMerge is only used internally by determine_merge_strategy
+                        // and is converted to Merged by process_received_edit
+                        unreachable!("process_received_edit should not return NeedsMerge")
+                    }
                 }
 
                 // Write content to file if merge produced new content

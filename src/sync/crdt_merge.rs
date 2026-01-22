@@ -31,8 +31,14 @@ pub enum MergeResult {
     },
     /// Commit required a merge (we had local changes)
     Merged {
-        /// The merge commit CID
+        /// The merge commit CID (the actual CID of the published commit)
         merge_cid: String,
+        /// The remote commit that triggered the merge
+        remote_cid: String,
+    },
+    /// Merge is needed but hasn't been created yet
+    /// (used internally by determine_merge_strategy)
+    NeedsMerge {
         /// The remote commit that triggered the merge
         remote_cid: String,
     },
@@ -86,18 +92,20 @@ pub async fn process_received_edit(
     // Load current Y.Doc
     let doc = state.to_doc()?;
 
-    // Apply the update
+    // Apply the update (merges with our local state)
     {
         let mut txn = doc.transact_mut();
         txn.apply_update(update);
     }
 
     // Determine merge strategy
-    let result = determine_merge_strategy(state, &received_cid, &edit_msg.parents);
+    let strategy = determine_merge_strategy(state, &received_cid, &edit_msg.parents);
 
-    match &result {
+    // Process based on strategy and track actual result
+    let final_result = match strategy {
         MergeResult::AlreadyKnown => {
             // Shouldn't happen here, but handle gracefully
+            MergeResult::AlreadyKnown
         }
         MergeResult::FastForward { new_head } => {
             // Simple case: remote is a descendant of our state
@@ -111,36 +119,55 @@ pub async fn process_received_edit(
             }
             state.update_from_doc(&doc);
             info!("Fast-forward to commit {}", new_head);
+            MergeResult::FastForward { new_head }
         }
-        MergeResult::Merged {
-            merge_cid,
-            remote_cid,
-        } => {
-            // We had local changes, need to create a merge commit
-            if let Some(mqtt) = mqtt_client {
-                // Create merge commit with two parents
-                let merge_update = create_merge_update(&doc)?;
-                let local_cid = state.local_head_cid.clone().unwrap_or_default();
+        MergeResult::NeedsMerge { remote_cid } => {
+            // We had local changes, need to create a merge commit.
+            // The merge update contains the full merged state from an empty state vector.
+            // This is safe because Yjs operations are idempotent - peers receiving this
+            // will dedupe any operations they already have.
+            //
+            // Note: We previously tried delta encoding relative to pre-merge state,
+            // but that was computing the wrong delta (remote ops instead of local ops).
+            // Full state encoding is simpler and works correctly.
+            let merge_update = create_merge_update(&doc)?;
+            let local_cid = state.local_head_cid.clone().unwrap_or_default();
 
+            // Create the merge commit to get the ACTUAL CID
+            let actual_merge_cid = if let Some(mqtt) = mqtt_client {
                 publish_merge_commit(
                     mqtt,
                     workspace,
                     node_id,
                     &local_cid,
-                    remote_cid,
+                    &remote_cid,
                     &merge_update,
                     author,
                 )
-                .await?;
-            }
+                .await?
+            } else {
+                // No MQTT client - compute what the CID would be
+                let parents = vec![local_cid.clone(), remote_cid.clone()];
+                let update_b64 = STANDARD.encode(&merge_update);
+                let commit = Commit::new(parents, update_b64, author.to_string(), None);
+                commit.calculate_cid()
+            };
 
-            state.head_cid = Some(merge_cid.clone());
-            state.local_head_cid = Some(merge_cid.clone());
+            state.head_cid = Some(actual_merge_cid.clone());
+            state.local_head_cid = Some(actual_merge_cid.clone());
             state.update_from_doc(&doc);
             info!(
                 "Created merge commit {} (local + remote {})",
-                merge_cid, remote_cid
+                actual_merge_cid, remote_cid
             );
+            MergeResult::Merged {
+                merge_cid: actual_merge_cid,
+                remote_cid,
+            }
+        }
+        MergeResult::Merged { .. } => {
+            // This variant is not returned by determine_merge_strategy
+            unreachable!("determine_merge_strategy should not return Merged")
         }
         MergeResult::LocalAhead => {
             // We have local changes that aren't on the server yet
@@ -148,19 +175,23 @@ pub async fn process_received_edit(
             state.head_cid = Some(received_cid.clone());
             state.update_from_doc(&doc);
             debug!("Applied remote commit {} but local is ahead", received_cid);
+            MergeResult::LocalAhead
         }
-    }
+    };
 
     // Get the current content for writing to disk
     let content = get_doc_text_content(&doc);
 
     // Only return content if we should write to disk
     let should_write = matches!(
-        result,
+        final_result,
         MergeResult::FastForward { .. } | MergeResult::Merged { .. }
     );
 
-    Ok((result, if should_write { Some(content) } else { None }))
+    Ok((
+        final_result,
+        if should_write { Some(content) } else { None },
+    ))
 }
 
 /// Determine the merge strategy based on current state and received commit.
@@ -201,9 +232,7 @@ fn determine_merge_strategy(
             // Check if received commit is based on server_head
             if is_ancestor(&server_head.map(String::from), received_parents) {
                 // Server moved forward, we need to merge
-                let merge_cid = compute_merge_cid(local, received_cid);
-                return MergeResult::Merged {
-                    merge_cid,
+                return MergeResult::NeedsMerge {
                     remote_cid: received_cid.to_string(),
                 };
             }
@@ -222,19 +251,15 @@ fn is_ancestor(cid: &Option<String>, parents: &[String]) -> bool {
     }
 }
 
-/// Compute a CID for a merge commit.
-fn compute_merge_cid(local_cid: &str, remote_cid: &str) -> String {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(b"merge:");
-    hasher.update(local_cid.as_bytes());
-    hasher.update(b":");
-    hasher.update(remote_cid.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-/// Create a Yjs update representing the current merged state.
+/// Create a Yjs update representing the full merged state.
+///
+/// We encode from an empty state vector to get all operations. This is safe
+/// because Yjs operations are idempotent - applying the same operation twice
+/// is a no-op. Peers receiving this merge commit will dedupe any operations
+/// they already have.
+///
+/// This approach is simpler and more robust than delta encoding, which
+/// requires careful tracking of what operations each peer has.
 fn create_merge_update(doc: &Doc) -> Result<Vec<u8>, String> {
     let txn = doc.transact();
     Ok(txn.encode_state_as_update_v1(&yrs::StateVector::default()))
@@ -349,17 +374,7 @@ mod tests {
         state.local_head_cid = Some("local_head".to_string());
 
         let result = determine_merge_strategy(&state, "new_remote", &["server_head".to_string()]);
-        assert!(matches!(result, MergeResult::Merged { .. }));
-    }
-
-    #[test]
-    fn test_compute_merge_cid() {
-        let cid1 = compute_merge_cid("local123", "remote456");
-        let cid2 = compute_merge_cid("local123", "remote456");
-        assert_eq!(cid1, cid2); // Deterministic
-
-        let cid3 = compute_merge_cid("different", "remote456");
-        assert_ne!(cid1, cid3); // Different inputs = different output
+        assert!(matches!(result, MergeResult::NeedsMerge { .. }));
     }
 
     #[test]

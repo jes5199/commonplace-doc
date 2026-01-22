@@ -253,9 +253,20 @@ impl MqttService {
         });
 
         // Process incoming messages and dispatch to handlers
+        tracing::info!("MQTT event loop starting message processing");
+        let mut msg_count = 0u64;
         while let Some(msg) = recv_broadcast(&mut message_rx, "MQTT message receiver").await {
+            msg_count += 1;
+            tracing::info!(
+                "MQTT received message #{} on topic: {} ({} bytes)",
+                msg_count,
+                msg.topic,
+                msg.payload.len()
+            );
             if let Err(e) = self.dispatch_message(&msg.topic, &msg.payload).await {
-                tracing::warn!("Error dispatching MQTT message: {}", e);
+                tracing::warn!("Error dispatching MQTT message to {}: {}", msg.topic, e);
+            } else {
+                tracing::info!("MQTT dispatched message #{} successfully", msg_count);
             }
         }
 
