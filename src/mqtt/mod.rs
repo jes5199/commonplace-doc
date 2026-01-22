@@ -222,6 +222,15 @@ impl MqttService {
         Ok(())
     }
 
+    /// Subscribe to ALL edits in the workspace.
+    ///
+    /// This uses the wildcard pattern `{workspace}/edits/#` to receive all
+    /// CRDT commits from sync clients. The server should call this on startup
+    /// to persist all edits to the commit store.
+    pub async fn subscribe_all_edits(&self) -> Result<(), MqttError> {
+        self.edits_handler.subscribe_all_edits().await
+    }
+
     /// Unsubscribe from a path.
     pub async fn unsubscribe_path(&self, path: &str) -> Result<(), MqttError> {
         self.edits_handler.unsubscribe_path(path).await?;

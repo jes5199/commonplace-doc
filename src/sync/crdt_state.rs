@@ -161,10 +161,32 @@ impl DirectorySyncState {
     }
 
     /// Get or create state for a file.
+    ///
+    /// If the file already exists in state but has a different node_id (e.g., because
+    /// the schema was updated), the node_id is updated to match the authoritative value.
+    /// This ensures sync tasks subscribe to the correct MQTT topics.
     pub fn get_or_create_file(&mut self, filename: &str, node_id: Uuid) -> &mut CrdtPeerState {
-        self.files
+        let state = self
+            .files
             .entry(filename.to_string())
-            .or_insert_with(|| CrdtPeerState::new(node_id))
+            .or_insert_with(|| CrdtPeerState::new(node_id));
+
+        // Update node_id if it changed (schema may have been updated on server)
+        if state.node_id != node_id {
+            tracing::warn!(
+                "CRDT state: updating node_id for '{}' from {} to {} (schema updated)",
+                filename,
+                state.node_id,
+                node_id
+            );
+            state.node_id = node_id;
+            // Clear stale Yjs state since we're now tracking a different document
+            state.yjs_state = None;
+            state.head_cid = None;
+            state.local_head_cid = None;
+        }
+
+        state
     }
 
     /// Get state for a file if it exists.

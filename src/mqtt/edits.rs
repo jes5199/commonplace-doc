@@ -77,6 +77,20 @@ impl EditsHandler {
         Ok(())
     }
 
+    /// Subscribe to ALL edits in the workspace using wildcard.
+    ///
+    /// This subscribes to `{workspace}/edits/#` which matches all document UUIDs.
+    /// Use this when the server should receive and persist all CRDT commits.
+    pub async fn subscribe_all_edits(&self) -> Result<(), MqttError> {
+        let topic_str = Topic::edits_wildcard(&self.workspace);
+
+        // Use QoS 1 (at least once) for edits - important not to lose them
+        self.client.subscribe(&topic_str, QoS::AtLeastOnce).await?;
+
+        debug!("Subscribed to all edits: {}", topic_str);
+        Ok(())
+    }
+
     /// Unsubscribe from edits for a path.
     pub async fn unsubscribe_path(&self, path: &str) -> Result<(), MqttError> {
         let topic = Topic::edits(&self.workspace, path);
@@ -116,8 +130,13 @@ impl EditsHandler {
 
         // Resolve path to document ID:
         // - For fs-root: the path IS the document ID
+        // - If path is a UUID: use it directly (from wildcard subscription)
         // - For other documents: resolve via fs-root content
         let document_id = if is_fs_root_edit {
+            topic.path.clone()
+        } else if uuid::Uuid::parse_str(&topic.path).is_ok() {
+            // Path is already a UUID - use it directly
+            // This happens when subscribing to the wildcard edits topic
             topic.path.clone()
         } else {
             let fs_root = self.fs_root_content.read().await;
