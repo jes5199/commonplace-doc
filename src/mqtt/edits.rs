@@ -197,15 +197,30 @@ impl EditsHandler {
             .await;
 
         // Decode the base64 update and apply it to the document
-        let update_bytes = crate::b64::decode_with_context(&commit.update, "update")
-            .map_err(MqttError::InvalidMessage)?;
+        // (skip empty updates - e.g., merge commits just record parent CIDs)
+        if !commit.update.is_empty() {
+            let update_bytes = crate::b64::decode_with_context(&commit.update, "update")
+                .map_err(MqttError::InvalidMessage)?;
 
-        self.document_store
-            .apply_yjs_update(&document_id, &update_bytes)
-            .await
-            .map_err(|e| {
-                MqttError::InvalidMessage(format!("Failed to apply Yjs update: {:?}", e))
-            })?;
+            if !update_bytes.is_empty() {
+                self.document_store
+                    .apply_yjs_update(&document_id, &update_bytes)
+                    .await
+                    .map_err(|e| {
+                        MqttError::InvalidMessage(format!("Failed to apply Yjs update: {:?}", e))
+                    })?;
+            } else {
+                debug!(
+                    "Skipping empty update for document {} (merge commit)",
+                    document_id
+                );
+            }
+        } else {
+            debug!(
+                "Skipping empty update for document {} (merge commit)",
+                document_id
+            );
+        }
 
         debug!(
             "Applied edit to document {} (path: {}, cid: {:?})",

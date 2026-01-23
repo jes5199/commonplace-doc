@@ -81,21 +81,28 @@ pub async fn process_received_edit(
         return Ok((MergeResult::AlreadyKnown, None));
     }
 
-    // Decode the update
-    let update_bytes = STANDARD
-        .decode(&edit_msg.update)
-        .map_err(|e| format!("Failed to decode update: {}", e))?;
-
-    let update = Update::decode_v1(&update_bytes)
-        .map_err(|e| format!("Failed to decode Yjs update: {}", e))?;
-
     // Load current Y.Doc
     let doc = state.to_doc()?;
 
-    // Apply the update (merges with our local state)
-    {
-        let mut txn = doc.transact_mut();
-        txn.apply_update(update);
+    // Decode and apply the update (if non-empty)
+    // Merge commits have empty updates - they just record parent CIDs
+    if !edit_msg.update.is_empty() {
+        let update_bytes = STANDARD
+            .decode(&edit_msg.update)
+            .map_err(|e| format!("Failed to decode update: {}", e))?;
+
+        if !update_bytes.is_empty() {
+            let update = Update::decode_v1(&update_bytes)
+                .map_err(|e| format!("Failed to decode Yjs update: {}", e))?;
+
+            // Apply the update (merges with our local state)
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update);
+        } else {
+            debug!("Received merge commit {} with empty update", received_cid);
+        }
+    } else {
+        debug!("Received merge commit {} with empty update", received_cid);
     }
 
     // Determine merge strategy
@@ -251,18 +258,19 @@ fn is_ancestor(cid: &Option<String>, parents: &[String]) -> bool {
     }
 }
 
-/// Create a Yjs update representing the full merged state.
+/// Create an empty Yjs update for merge commits.
 ///
-/// We encode from an empty state vector to get all operations. This is safe
-/// because Yjs operations are idempotent - applying the same operation twice
-/// is a no-op. Peers receiving this merge commit will dedupe any operations
-/// they already have.
+/// Merge commits don't need to carry any content - they just record that
+/// two branches have been reconciled. Any peer can reconstruct the merged
+/// state by replaying all ancestor commits (which Yjs handles correctly
+/// due to its CRDT properties).
 ///
-/// This approach is simpler and more robust than delta encoding, which
-/// requires careful tracking of what operations each peer has.
-fn create_merge_update(doc: &Doc) -> Result<Vec<u8>, String> {
-    let txn = doc.transact();
-    Ok(txn.encode_state_as_update_v1(&yrs::StateVector::default()))
+/// Using empty merge updates avoids feedback loops where peers keep
+/// re-sending full state to each other.
+fn create_merge_update(_doc: &Doc) -> Result<Vec<u8>, String> {
+    // Empty update - the merge is recorded by the commit's parent CIDs,
+    // and state is reconstructed by replaying ancestors
+    Ok(Vec::new())
 }
 
 /// Publish a merge commit via MQTT.

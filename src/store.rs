@@ -176,7 +176,19 @@ impl CommitStore {
                 continue;
             }
 
-            let commit = self.get_commit(&cid).await?;
+            // Try to get the commit, but skip if not found (broken DAG link)
+            let commit = match self.get_commit(&cid).await {
+                Ok(c) => c,
+                Err(StoreError::CommitNotFound(_)) => {
+                    tracing::warn!(
+                        "Commit {} not found while traversing DAG for doc {}, skipping",
+                        cid,
+                        doc_id
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             if commit.timestamp >= since {
                 commits.push((cid.clone(), commit.clone()));
