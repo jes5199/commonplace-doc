@@ -14,7 +14,7 @@ use tokio::fs;
 use tracing::{debug, warn};
 use uuid::Uuid;
 use yrs::updates::decoder::Decode;
-use yrs::{Doc, ReadTxn, Transact, Update, WriteTxn};
+use yrs::{Doc, ReadTxn, Transact, Update};
 
 /// State file name for per-directory CRDT state.
 /// Located inside the directory it tracks (not as a sibling).

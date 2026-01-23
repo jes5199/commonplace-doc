@@ -1,14 +1,14 @@
 {
   "server": "http://localhost:3000",
   "node_id": "4e966429-b8fd-4461-9034-8a656510f1e3",
-  "last_synced_cid": "19933af3419d6a2e83c00bec6b69068c8b16a390644cb684c0e4b386fb004b0e",
-  "last_synced_at": "2026-01-21T17:26:33.665755725+00:00",
+  "last_synced_cid": "7d75c5f45fa8259c429c05a49dcb4c8c7289a6ac09d589e4962df93c7d391b7e",
+  "last_synced_at": "2026-01-22T22:03:22.349307739+00:00",
   "files": {
     "issues.jsonl": {
-      "hash": "9eb7ebdf79571f5988890d458a50a7c2c500dc0a0bb4146dec3e9e341778683d",
-      "last_modified": "2026-01-21T17:26:33.665762087+00:00",
-      "last_cid": "19933af3419d6a2e83c00bec6b69068c8b16a390644cb684c0e4b386fb004b0e",
-      "inode_key": "fd01-4fca7"
+      "hash": "3b0e555f8ca60b51e6553b41effd66d6a0dfc8968760aec33298ee2bc004c0b5",
+      "last_modified": "2026-01-22T22:03:22.349314517+00:00",
+      "last_cid": "7d75c5f45fa8259c429c05a49dcb4c8c7289a6ac09d589e4962df93c7d391b7e",
+      "inode_key": "fd01-4fafa"
     }
   },
   "directories": []

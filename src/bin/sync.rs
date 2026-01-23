@@ -413,21 +413,38 @@ async fn handle_file_created_crdt(
 
                 // Also write the local schema file (.commonplace.json) so it reflects the new file
                 // Convert the Y.Doc schema to FsSchema and write to disk
-                debug!(
-                    "Writing local schema for subdirectory {} (dir: {})",
+                info!(
+                    "Converting Y.Doc schema for subdirectory {} (dir: {}), yjs_state len: {}",
                     owning_doc.document_id,
-                    owning_doc.directory.display()
+                    owning_doc.directory.display(),
+                    subdir_state
+                        .schema
+                        .yjs_state
+                        .as_ref()
+                        .map(|s| s.len())
+                        .unwrap_or(0)
                 );
                 match subdir_state.schema.to_doc() {
                     Ok(doc) => {
                         let fs_schema = ymap_schema::to_fs_schema(&doc);
-                        debug!(
-                            "Converted Y.Doc to FsSchema for {}",
-                            owning_doc.directory.display()
+                        let entry_count = fs_schema
+                            .root
+                            .as_ref()
+                            .and_then(|e| match e {
+                                commonplace_doc::fs::Entry::Dir(d) => {
+                                    d.entries.as_ref().map(|e| e.len())
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        info!(
+                            "Converted Y.Doc to FsSchema for {}: {} entries",
+                            owning_doc.directory.display(),
+                            entry_count
                         );
                         match schema_to_json(&fs_schema) {
                             Ok(schema_json) => {
-                                debug!(
+                                info!(
                                     "Serialized schema JSON ({} bytes) for {}",
                                     schema_json.len(),
                                     owning_doc.directory.display()

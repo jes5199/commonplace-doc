@@ -1,1 +1,9 @@
-{"version":1,"root":{"type":"dir","entries":{"chat.ts":{"type":"doc","node_id":"72589ca6-f13f-48f2-891d-73037a775332","content_type":"text/typescript"},"__processes.json":{"type":"doc","node_id":"87088178-899e-4d27-bbd1-9f0cabe6201f","content_type":"application/json"},"messages.jsonl":{"type":"doc","node_id":"1ff32d97-9e7c-4908-986c-e507f14c8a0a","content_type":"application/x-ndjson"}},"node_id":null,"content_type":null}}
+{
+  "version": 1,
+  "root": {
+    "type": "dir",
+    "entries": {},
+    "node_id": null,
+    "content_type": null
+  }
+}

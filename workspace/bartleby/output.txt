@@ -1,2 +1,0 @@
-Test message from debug/typing
-Hello! What can I do for you?

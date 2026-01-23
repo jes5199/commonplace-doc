@@ -1,1 +1,0 @@
-{"processes":{"text-to-telegram":{"sandbox-exec":"/home/jes/.local/bin/uv run --project /home/jes/text-to-telegram python -m text_to_telegram --config /home/jes/text-to-telegram/config.json"}}}

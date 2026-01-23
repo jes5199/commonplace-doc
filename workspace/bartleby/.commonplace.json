@@ -1,1 +1,45 @@
-{"root":{"content_type":null,"entries":{"__processes.json":{"content_type":"application/json","node_id":"8cdf17c5-b8c2-4f11-9f66-6970ac5c2936","type":"doc"},"history.jsonl":{"content_type":"application/x-ndjson","node_id":"d3cc2fbb-6a08-4581-b1b4-cc386e9aafc8","type":"doc"},"input.txt":{"content_type":"text/plain","node_id":"0ca210d0-434f-43ec-aed9-5a538dc3bb57","type":"doc"},"output.txt":{"content_type":"text/plain","node_id":"43f2a874-7863-4bbf-ad60-8a2b4285d5a2","type":"doc"},"prompts.txt":{"content_type":"text/plain","node_id":"25db491f-dd4d-48e7-a755-b3fee4223a02","type":"doc"},"system_prompt.txt":{"content_type":"text/plain","node_id":"bfbe76a8-8a0b-42db-a50f-a225ce73659a","type":"doc"},"test-note.txt":{"content_type":"text/plain","node_id":"e05452b0-d4da-45b5-be17-56d82155a997","type":"doc"}},"node_id":null,"type":"dir"},"version":1}
+{
+  "version": 1,
+  "root": {
+    "type": "dir",
+    "entries": {
+      "input.txt": {
+        "type": "doc",
+        "node_id": "0ca210d0-434f-43ec-aed9-5a538dc3bb57",
+        "content_type": "text/plain"
+      },
+      "debug-test.txt": {
+        "type": "doc",
+        "node_id": "d2eb15c9-d618-4547-845d-d4807c32e86f",
+        "content_type": "text/plain"
+      },
+      "trigger-test.txt": {
+        "type": "doc",
+        "node_id": "604553e1-d64c-42b8-a49a-318cf9cfde19",
+        "content_type": "text/plain"
+      },
+      "test-note.txt": {
+        "type": "doc",
+        "node_id": "b1fb3ac2-cc4d-4d50-b077-47aa0bf45be4",
+        "content_type": "text/plain"
+      },
+      "trace-test.txt": {
+        "type": "doc",
+        "node_id": "466c7a36-55a3-4385-8bc7-cca8171042ce",
+        "content_type": "text/plain"
+      },
+      "debug-final.txt": {
+        "type": "doc",
+        "node_id": "d4480d9a-9609-4292-8d26-8551ccaf335d",
+        "content_type": "text/plain"
+      },
+      "schema-test.txt": {
+        "type": "doc",
+        "node_id": "d79eafa2-3d68-42f2-ac63-6faa460afa7d",
+        "content_type": "text/plain"
+      }
+    },
+    "node_id": null,
+    "content_type": null
+  }
+}

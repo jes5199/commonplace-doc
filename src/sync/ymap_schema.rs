@@ -601,3 +601,58 @@ mod tests {
         }
     }
 }
+
+/// Test that root_refs() finds YMap after applying update.
+#[test]
+fn test_root_refs_after_update() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use yrs::updates::decoder::Decode;
+    use yrs::{types::ToJson, ReadTxn, Update};
+
+    // This is the sync client update
+    let sync_update_b64 = "CQKajuDcDQAhAJmEvqcFAw5kZWJ1Zy10ZXN0LnR4dAEAAgLn4YWyCwAhAJmEvqcFAw5jbGVhbi10ZXN0LnR4dAEAAgLPo+6wCwAhAJmEvqcFAw5maW5hbC10ZXN0LnR4dAEAAgPW07jGCgAnAJmEvqcFAw50b3BpYy10ZXN0LnR4dAEoANbTuMYKAAR0eXBlAXcDZG9jKADW07jGCgAHbm9kZV9pZAF3JDY5OTJiNjA1LWFiYTgtNDMyMC1iZjY3LWI0NDViNTRmOTVmOAKohNHiCAAhAJmEvqcFAw9tcXR0LWNyZWF0ZS50eHQBAAICs7merggAIQCZhL6nBQMPc2VydmVyLXRlc3QudHh0AQACD5mEvqcFACgBB2NvbnRlbnQHdmVyc2lvbgF6AAAAAAAAAAEnAQdjb250ZW50BHJvb3QBKACZhL6nBQEEdHlwZQF3A2RpcicAmYS+pwUBB2VudHJpZXMBJwCZhL6nBQMNdGVzdC1ub3RlLnR4dAEoAJmEvqcFBAR0eXBlAXcDZG9jKACZhL6nBQQHbm9kZV9pZAF3JGIxZmIzYWMyLWNjNGQtNGQ1MC1iMDc3LTQ3YWEwYmY0NWJlNCcAmYS+pwUDDnRyYWNlLXRlc3QudHh0ASgAmYS+pwUHBHR5cGUBdwNkb2MoAJmEvqcFBwdub2RlX2lkAXckNDY2YzdhMzYtNTVhMy00Mzg1LThiYzctY2NhODE3MTA0MmNlIQCZhL6nBQMQdHJpZ2dlci10ZXN0LnR4dAEAAicAmYS+pwUDCWlucHV0LnR4dAEoAJmEvqcFDQR0eXBlAXcDZG9jKACZhL6nBQ0Hbm9kZV9pZAF3JDBjYTIxMGQwLTQzNGYtNDNlYy1hZWQ5LTVhNTM4ZGMzYmI1NwO00POTBQAnAJmEvqcFAw9zY2hlbWEtdGVzdC50eHQBKAC00POTBQAEdHlwZQF3A2RvYygAtNDzkwUAB25vZGVfaWQBdyQ5OWRiYWNlMy0zMDIzLTRkZmEtYWEwMy0xMWZhM2NmNzA5MWIC8a6q1gMAIQCZhL6nBQMObXF0dC10cmFjZS50eHQBAAIHqITR4ggBAAPxrqrWAwEAA5mEvqcFAQoDs7merggBAAOajuDcDQEAA8+j7rALAQAD5+GFsgsBAAM=";
+
+    let update_bytes = STANDARD.decode(sync_update_b64).expect("decode b64");
+
+    // Simulate server: pre-create empty YMap
+    let doc = Doc::with_client_id(1);
+    {
+        let mut txn = doc.transact_mut();
+        txn.get_or_insert_map("content");
+    }
+
+    // Apply update
+    {
+        let update = Update::decode_v1(&update_bytes).expect("decode update");
+        let mut txn = doc.transact_mut();
+        txn.apply_update(update);
+    }
+
+    // Now check root_refs
+    let txn = doc.transact();
+    let roots: Vec<_> = txn.root_refs().collect();
+    eprintln!("root_refs count: {}", roots.len());
+    for (name, value) in &roots {
+        eprintln!("  root '{}': {:?}", name, value);
+    }
+
+    // Find "content" specifically
+    let content_root = txn
+        .root_refs()
+        .find(|(name, _)| *name == "content")
+        .map(|(_, value)| value);
+
+    match content_root {
+        Some(yrs::types::Value::YMap(map)) => {
+            let any = map.to_json(&txn);
+            let json = serde_json::to_string_pretty(&any).unwrap();
+            eprintln!("Found YMap, JSON:\n{}", &json[..json.len().min(500)]);
+        }
+        Some(other) => {
+            eprintln!("Found non-YMap: {:?}", other);
+        }
+        None => {
+            eprintln!("No 'content' root found!");
+        }
+    }
+}

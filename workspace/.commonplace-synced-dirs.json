@@ -1,14 +1,14 @@
 [
-  "workspace/tmux/0/4-bash",
-  "workspace/tmux/0/8-beepboopyoucad.com",
-  "workspace/tmux/0/3-bash/0",
-  "workspace/tmux/0/3-bash",
-  "workspace/tmux/0",
-  "workspace/tmux/0/0-commonplace/0",
   "workspace/tmux/0/0-commonplace",
-  "workspace/tmux/0/1-codex",
+  "workspace/tmux/0/4-bash",
   "workspace/tmux/0/4-bash/0",
-  "workspace/tmux",
   "workspace/tmux/0/8-beepboopyoucad.com/0",
-  "workspace/tmux/0/1-codex/0"
+  "workspace/tmux/0/8-beepboopyoucad.com",
+  "workspace/tmux/0/3-bash",
+  "workspace/tmux/0/3-bash/0",
+  "workspace/tmux/0/1-codex",
+  "workspace/tmux/0",
+  "workspace/tmux",
+  "workspace/tmux/0/1-codex/0",
+  "workspace/tmux/0/0-commonplace/0"
 ]

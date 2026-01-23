@@ -6,7 +6,7 @@
 //! IMPORTANT: The doc store does NOT re-emit edits. MQTT broker handles fanout.
 
 use crate::commit::Commit;
-use crate::document::{resolve_path_to_uuid, DocumentStore};
+use crate::document::{resolve_path_to_uuid, ContentType, DocumentStore};
 use crate::mqtt::client::MqttClient;
 use crate::mqtt::messages::EditMessage;
 use crate::mqtt::topics::{content_type_for_path, Topic};
@@ -190,7 +190,23 @@ impl EditsHandler {
         };
 
         // Get the content type and ensure document exists
-        let content_type = content_type_for_path(&topic.path)?;
+        // If path is a UUID (from wildcard subscription), check if document exists first
+        // and use its existing content type, or default to JSON for new schema documents
+        let content_type = if uuid::Uuid::parse_str(&topic.path).is_ok() {
+            // Path is a UUID - try to get existing document's content type
+            if let Some(existing_doc) = self.document_store.get_document(&document_id).await {
+                existing_doc.content_type
+            } else {
+                // New document via UUID path - default to JSON (schema documents)
+                ContentType::Json
+            }
+        } else {
+            content_type_for_path(&topic.path)?
+        };
+        debug!(
+            "handle_edit: path={}, document_id={}, content_type={:?}",
+            topic.path, document_id, content_type
+        );
         let _doc = self
             .document_store
             .get_or_create_with_id(&document_id, content_type)
