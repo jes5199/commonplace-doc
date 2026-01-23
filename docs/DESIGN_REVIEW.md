@@ -353,7 +353,7 @@ Status key:
 | HTTP server API | Partial | Manual use, some handler tests | Response inconsistencies |
 | HTTP gateway (MQTT bridge) | Unvalidated | No dedicated tests | Timeout/coupling risk |
 | WebSocket transport | Partial | Manual use | Protocol alignment gaps |
-| CRDT merge + publish | Partial | Unit tests in crdt_merge/crdt_publish | Echo suppression removal pending (CP-qqgi) |
+| CRDT merge + publish | Partial | Unit tests in crdt_merge/crdt_publish; Stage0 CRDT harness in tests/sync_harness.rs | Echo suppression removal pending (CP-qqgi) |
 | File watcher pipeline | Unvalidated | No stability tests | Early-read race (CP-gz0p) |
 | Subscription/receive pipeline | Unvalidated | Failing sandbox test | Lag resync (CP-oah1) |
 | Schema + UUID mapping | Partial | Tests in ymap_schema/crdt_new_file | Inline vs node-backed mismatch |
@@ -378,6 +378,7 @@ Stage 0: Define invariants and test harness (CP-xp5h)
   - MQTT transport invariants tests (CP-xp5h.2)
   - Watcher stability tests (CP-xp5h.3)
   - Receive pipeline no-echo tests (CP-xp5h.4)
+- Status: CRDT invariants tests implemented in tests/sync_harness.rs
 - Exit criteria: invariants documented, harness exists, each test runs
   deterministically and fails with a single-component root cause.
 
