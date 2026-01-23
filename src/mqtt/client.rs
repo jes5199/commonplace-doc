@@ -35,6 +35,8 @@ impl MqttClient {
         let mut options = MqttOptions::new(&config.client_id, host, port);
         options.set_keep_alive(Duration::from_secs(config.keep_alive_secs));
         options.set_clean_session(config.clean_session);
+        // Allow large packets for syncing files up to 10MB (beads issues.jsonl can be 1MB+)
+        options.set_max_packet_size(10 * 1024 * 1024, 10 * 1024 * 1024);
 
         // Create client and event loop
         let (client, event_loop) = AsyncClient::new(options, 256);
