@@ -9,9 +9,11 @@ Last updated: 2026-01-23.
 2. System Components Overview
 3. Module-by-Module Analysis
 4. Alignment Ratings
-5. Recommendations
-6. Specific Exceptions to Design Principles
-7. Conclusion
+5. Component Validation Status
+6. Sync/Sandbox Recovery Plan
+7. Recommendations
+8. Specific Exceptions to Design Principles
+9. Conclusion
 
 ---
 
@@ -333,6 +335,75 @@ Concerns:
 | Sync Client (sync) | 6/10 | Feature-rich, complex state machine |
 | Orchestrator | 6/10 | Useful but broad scope |
 | SDK/Viewer | 7.5/10 | Simple and stable |
+
+---
+
+## Component Validation Status
+
+Status key:
+- Unvalidated: Not yet tested in isolation for sync correctness
+- Partial: Some tests or behavior verified, but gaps remain
+- Validated: Explicit tests cover invariants; known issues resolved
+
+| Component | Status | Evidence | Known Issues |
+|-----------|--------|----------|--------------|
+| Commit DAG + replay | Partial | Unit tests in commit/replay | CID determinism (CP-dj22) |
+| DocumentStore + apply_yjs_update | Partial | Unit tests in document.rs | Type migration complexity |
+| MQTT transport (edits/sync) | Partial | Manual use, no full invariant tests | Init race (CP-hykz), QoS/retain strategy (CP-w41r) |
+| HTTP server API | Partial | Manual use, some handler tests | Response inconsistencies |
+| HTTP gateway (MQTT bridge) | Unvalidated | No dedicated tests | Timeout/coupling risk |
+| WebSocket transport | Partial | Manual use | Protocol alignment gaps |
+| CRDT merge + publish | Partial | Unit tests in crdt_merge/crdt_publish | Echo suppression removal pending (CP-qqgi) |
+| File watcher pipeline | Unvalidated | No stability tests | Early-read race (CP-gz0p) |
+| Subscription/receive pipeline | Unvalidated | Failing sandbox test | Lag resync (CP-oah1) |
+| Schema + UUID mapping | Partial | Tests in ymap_schema/crdt_new_file | Inline vs node-backed mismatch |
+| Sandbox exec integration | Unvalidated | Flaky integration test | CP-1ual, CP-dkqk |
+
+---
+
+## Sync/Sandbox Recovery Plan
+
+Goal: validate components in isolation, then integrate in controlled stages until
+the sandbox sync test is stable and reproducible.
+
+Stage 0: Define invariants and test harness (CP-xp5h)
+- Invariants (must hold everywhere):
+  - Idempotent apply: applying the same update twice yields identical state.
+  - No echo publishes: inbound edits do not trigger outbound publishes.
+  - Convergence: concurrent edits converge to the same content across peers.
+  - Monotonic ancestry: head never advances if required parents are missing.
+  - Stable reads: watcher reads only stable file content (no empty/partial reads).
+- Harness outline (tests/sync_harness.rs):
+  - CRDT invariants tests (CP-xp5h.1)
+  - MQTT transport invariants tests (CP-xp5h.2)
+  - Watcher stability tests (CP-xp5h.3)
+  - Receive pipeline no-echo tests (CP-xp5h.4)
+- Exit criteria: invariants documented, harness exists, each test runs
+  deterministically and fails with a single-component root cause.
+
+Stage 1: CRDT core validation
+- Validate crdt_merge, crdt_publish, and crdt_state with isolated unit tests.
+- Required exit criteria: concurrent edits converge; delete merges are correct.
+
+Stage 2: Transport validation (MQTT)
+- Validate edit publish/subscribe flow, retain/QoS behavior, and resync on lag.
+- Required exit criteria: new subscribers reach correct state from retained edits
+  and/or sync backfill without missing updates.
+
+Stage 3: File watcher + local write pipeline
+- Validate that watcher events read stable content and do not emit echo updates.
+- Required exit criteria: create/modify events publish the correct content once.
+
+Stage 4: Receive pipeline + disk writes
+- Validate inbound edits apply to CRDT and write to disk without republish loops.
+- Required exit criteria: remote edits update local files and do not re-emit.
+
+Stage 5: End-to-end sandbox sync
+- Run the flaky test with tracing enabled; verify timeline of publish/receive,
+  schema updates, and file writes in both workspace and sandbox.
+- Required exit criteria: create/edit/delete sequence passes repeatedly.
+
+Update this section after each stage with evidence and remaining gaps.
 
 ---
 
