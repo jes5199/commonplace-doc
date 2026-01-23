@@ -622,6 +622,9 @@ pub async fn directory_mqtt_task(
                         &workspace,
                         &mut subscribed_uuids,
                         &mut uuid_to_paths,
+                        &directory,
+                        use_paths,
+                        &file_states,
                     )
                     .await;
 
@@ -678,58 +681,147 @@ pub async fn directory_mqtt_task(
         } else if let Some(paths) = uuid_to_paths.get(&doc_id) {
             // This is a file content edit - pull and write to local file(s)
             //
-            // We process ALL file edits here, regardless of whether the file appears
-            // "linked" (multiple local paths) or "single-path" from our perspective.
-            // A file may appear single-path locally (e.g., in a sandbox) but actually
-            // be linked to files outside our view. The CRDT receive_task may also
-            // miss messages due to broadcast channel lag, so we handle all edits here
-            // as a reliable fallback.
+            // We process ALL file edits here for ALL paths, regardless of CRDT status.
+            // This is necessary because CRDT receive_task may miss messages due to
+            // broadcast channel timing when tasks are spawned.
+            //
+            // For CRDT-managed files, we apply the MQTT message directly using CRDT merge.
+            // For non-CRDT files, we fetch from server as a fallback.
             if pull_only || !push_only {
-                let (paths_with_crdt, paths_without_crdt) = {
-                    let states = file_states.read().await;
-                    let mut with_crdt = Vec::new();
-                    let mut without_crdt = Vec::new();
-                    for path in paths {
-                        if states
-                            .get(path)
-                            .and_then(|state| state.crdt_last_content.as_ref())
-                            .is_some()
-                        {
-                            with_crdt.push(path.clone());
-                        } else {
-                            without_crdt.push(path.clone());
-                        }
-                    }
-                    (with_crdt, without_crdt)
-                };
-
                 debug!(
-                    "MQTT edit received for file UUID {}: {} bytes, {} path(s) ({} CRDT-managed)",
+                    "MQTT edit received for file UUID {}: {} bytes, {} path(s)",
                     doc_id,
                     msg.payload.len(),
-                    paths.len(),
-                    paths_with_crdt.len()
+                    paths.len()
                 );
 
-                if !paths_without_crdt.is_empty() {
-                    // Fetch latest content from server and write to non-CRDT-managed files
+                // Try to apply the edit directly via CRDT merge if we have CRDT context
+                // AND the file's CRDT state is initialized. Without initialization,
+                // the CRDT merge would apply updates to an empty doc and produce wrong results.
+                let crdt_handled = if let Some(ref ctx) = crdt_context {
+                    if let Ok(edit_msg) = crate::sync::crdt_merge::parse_edit_message(&msg.payload)
+                    {
+                        // Apply to CRDT state and get content
+                        let node_id = match uuid::Uuid::parse_str(&doc_id) {
+                            Ok(id) => id,
+                            Err(_) => {
+                                debug!(
+                                    "Non-UUID document {}, falling back to server fetch",
+                                    doc_id
+                                );
+                                uuid::Uuid::nil() // Skip CRDT handling
+                            }
+                        };
+
+                        if !node_id.is_nil() {
+                            // Get the filename from the first path
+                            let filename = paths
+                                .first()
+                                .and_then(|p| std::path::Path::new(p).file_name())
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(&doc_id)
+                                .to_string();
+
+                            let mut state_guard = ctx.crdt_state.write().await;
+                            let file_state = state_guard.get_or_create_file(&filename, node_id);
+
+                            // Skip CRDT merge if state isn't initialized from server yet.
+                            // Without proper initialization, merging would produce wrong results.
+                            if file_state.needs_server_init() {
+                                debug!(
+                                    "CRDT state for {} not initialized, falling back to server fetch",
+                                    filename
+                                );
+                                drop(state_guard);
+                                false
+                            } else {
+                                match crate::sync::crdt_merge::process_received_edit(
+                                    Some(&ctx.mqtt_client),
+                                    &ctx.workspace,
+                                    &doc_id,
+                                    file_state,
+                                    &edit_msg,
+                                    &author,
+                                )
+                                .await
+                                {
+                                    Ok((result, maybe_content)) => {
+                                        drop(state_guard); // Release lock before file I/O
+
+                                        if let Some(content) = maybe_content {
+                                            // Write to all paths
+                                            for rel_path in paths {
+                                                let file_path = directory.join(rel_path);
+
+                                                // Update shared_last_content before writing
+                                                {
+                                                    let states = file_states.read().await;
+                                                    if let Some(state) = states.get(rel_path) {
+                                                        if let Some(ref slc) =
+                                                            state.crdt_last_content
+                                                        {
+                                                            let mut shared = slc.write().await;
+                                                            *shared = Some(content.clone());
+                                                        }
+                                                    }
+                                                }
+
+                                                if let Some(parent) = file_path.parent() {
+                                                    let _ = tokio::fs::create_dir_all(parent).await;
+                                                }
+                                                if let Err(e) =
+                                                    tokio::fs::write(&file_path, &content).await
+                                                {
+                                                    warn!("Failed to write {}: {}", rel_path, e);
+                                                } else {
+                                                    debug!(
+                                                        "CRDT edit applied to {} ({} bytes, {:?})",
+                                                        rel_path,
+                                                        content.len(),
+                                                        result
+                                                    );
+                                                }
+                                            }
+                                            true // Handled via CRDT
+                                        } else {
+                                            debug!(
+                                                "CRDT merge returned no content (already known)"
+                                            );
+                                            true // Handled (no-op)
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("CRDT merge failed for {}: {}", doc_id, e);
+                                        false // Fall back to server fetch
+                                    }
+                                }
+                            } // Close the else block for needs_server_init check
+                        } else {
+                            false
+                        }
+                    } else {
+                        debug!("Failed to parse MQTT message for {}", doc_id);
+                        false // Fall back to server fetch
+                    }
+                } else {
+                    false // No CRDT context, use server fetch
+                };
+
+                // Fallback: fetch from server for non-CRDT paths or if CRDT handling failed
+                if !crdt_handled {
                     if let Err(e) = handle_file_uuid_edit(
                         &http_client,
                         &server,
                         &doc_id,
-                        &paths_without_crdt,
+                        paths,
                         &directory,
                         use_paths,
+                        &file_states,
                     )
                     .await
                     {
                         warn!("Failed to handle file UUID edit for {}: {}", doc_id, e);
                     }
-                } else {
-                    debug!(
-                        "Skipping UUID edit write for {} - all paths managed by CRDT tasks",
-                        doc_id
-                    );
                 }
             }
         } else {
@@ -851,6 +943,9 @@ async fn sync_uuid_subscriptions(
     workspace: &str,
     subscribed_uuids: &mut HashSet<String>,
     uuid_to_paths: &mut crate::sync::UuidToPathsMap,
+    directory: &std::path::Path,
+    use_paths: bool,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
 ) {
     // Fetch the current UUID map from the schema, with status to detect failures
     let (new_uuid_map, fetch_succeeded) =
@@ -897,8 +992,37 @@ async fn sync_uuid_subscriptions(
         }
     }
 
-    // Update the reverse map
+    // Update the reverse map BEFORE fetching content (so we have path info)
     *uuid_to_paths = new_uuid_to_paths;
+
+    // Fetch and write initial content for newly added UUIDs.
+    // This is critical because the content edit may have been broadcast before
+    // we subscribed, so we need to fetch the current state.
+    if !to_add.is_empty() {
+        info!(
+            "Fetching initial content for {} newly subscribed UUIDs",
+            to_add.len()
+        );
+        for uuid in &to_add {
+            if let Some(paths) = uuid_to_paths.get(uuid) {
+                if let Err(e) = handle_file_uuid_edit(
+                    http_client,
+                    server,
+                    uuid,
+                    paths,
+                    directory,
+                    use_paths,
+                    file_states,
+                )
+                .await
+                {
+                    warn!("Failed to fetch initial content for UUID {}: {}", uuid, e);
+                } else {
+                    debug!("Fetched initial content for UUID {}", uuid);
+                }
+            }
+        }
+    }
 
     if !to_add.is_empty() || !to_remove.is_empty() {
         info!(
@@ -911,6 +1035,9 @@ async fn sync_uuid_subscriptions(
 }
 
 /// Handle a file UUID edit by fetching content from server and writing to local files.
+///
+/// Also updates shared_last_content for CRDT-managed files to prevent echo publishes
+/// when the file watcher detects the write.
 async fn handle_file_uuid_edit(
     http_client: &Client,
     server: &str,
@@ -918,6 +1045,7 @@ async fn handle_file_uuid_edit(
     paths: &[String],
     directory: &Path,
     use_paths: bool,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::sync::fetch_head;
 
@@ -925,6 +1053,19 @@ async fn handle_file_uuid_edit(
     let head = fetch_head(http_client, server, uuid, use_paths)
         .await?
         .ok_or_else(|| format!("Document {} not found", uuid))?;
+
+    // Decode if binary (base64)
+    let content_bytes = if crate::sync::looks_like_base64_binary(&head.content) {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        match STANDARD.decode(&head.content) {
+            Ok(decoded) if crate::sync::is_binary_content(&decoded) => decoded,
+            _ => head.content.as_bytes().to_vec(),
+        }
+    } else {
+        head.content.as_bytes().to_vec()
+    };
+
+    let content_string = String::from_utf8_lossy(&content_bytes).to_string();
 
     // Write content to all local paths that share this UUID
     for rel_path in paths {
@@ -935,16 +1076,18 @@ async fn handle_file_uuid_edit(
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Decode if binary (base64)
-        let content_bytes = if crate::sync::looks_like_base64_binary(&head.content) {
-            use base64::{engine::general_purpose::STANDARD, Engine};
-            match STANDARD.decode(&head.content) {
-                Ok(decoded) if crate::sync::is_binary_content(&decoded) => decoded,
-                _ => head.content.as_bytes().to_vec(),
+        // Update shared_last_content BEFORE writing to prevent echo publishes
+        // This is critical for CRDT-managed files where upload_task_crdt is watching
+        {
+            let states = file_states.read().await;
+            if let Some(state) = states.get(rel_path) {
+                if let Some(ref shared_last_content) = state.crdt_last_content {
+                    let mut shared = shared_last_content.write().await;
+                    *shared = Some(content_string.clone());
+                    debug!("Updated shared_last_content for {} before write", rel_path);
+                }
             }
-        } else {
-            head.content.as_bytes().to_vec()
-        };
+        }
 
         tokio::fs::write(&file_path, &content_bytes).await?;
         debug!("Wrote {} bytes to {}", content_bytes.len(), rel_path);
