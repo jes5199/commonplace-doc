@@ -191,26 +191,37 @@ impl EditsHandler {
 
         // Get the content type and ensure document exists
         // If path is a UUID (from wildcard subscription), check if document exists first
-        // and use its existing content type, or default to JSON for new schema documents
-        let content_type = if uuid::Uuid::parse_str(&topic.path).is_ok() {
+        // and use its existing content type, or default to Text for new documents
+        // (we use Text instead of Json because file content uses YText, not YMap)
+        let is_uuid_path = uuid::Uuid::parse_str(&topic.path).is_ok();
+        let (content_type, is_new_via_uuid) = if is_uuid_path {
             // Path is a UUID - try to get existing document's content type
             if let Some(existing_doc) = self.document_store.get_document(&document_id).await {
-                existing_doc.content_type
+                (existing_doc.content_type, false)
             } else {
-                // New document via UUID path - default to JSON (schema documents)
-                ContentType::Json
+                // New document via UUID path - default to Text for file content
+                // Schema documents will get their content type detected from the Y.Doc structure
+                (ContentType::Text, true)
             }
         } else {
-            content_type_for_path(&topic.path)?
+            (content_type_for_path(&topic.path)?, false)
         };
         debug!(
-            "handle_edit: path={}, document_id={}, content_type={:?}",
-            topic.path, document_id, content_type
+            "handle_edit: path={}, document_id={}, content_type={:?}, is_new_via_uuid={}",
+            topic.path, document_id, content_type, is_new_via_uuid
         );
-        let _doc = self
-            .document_store
-            .get_or_create_with_id(&document_id, content_type)
-            .await;
+
+        // For new documents received via UUID path, use uninit to avoid pre-creating
+        // a root type that conflicts with the incoming CRDT update
+        let _doc = if is_new_via_uuid {
+            self.document_store
+                .get_or_create_with_id_uninit(&document_id, content_type)
+                .await
+        } else {
+            self.document_store
+                .get_or_create_with_id(&document_id, content_type)
+                .await
+        };
 
         // Decode the base64 update and apply it to the document
         // (skip empty updates - e.g., merge commits just record parent CIDs)

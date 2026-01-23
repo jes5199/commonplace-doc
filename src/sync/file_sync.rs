@@ -17,8 +17,8 @@ use crate::sync::{
     build_edit_url, build_replace_url, create_yjs_text_update, detect_from_path, file_watcher_task,
     flock_state::record_upload_result, is_binary_content, looks_like_base64_binary,
     push_json_content, push_jsonl_content, push_schema_to_server, refresh_from_head, sse_task,
-    EditRequest, EditResponse, FileEvent, FlockSyncState, ReplaceResponse, SyncState,
-    PENDING_WRITE_TIMEOUT,
+    EditRequest, EditResponse, FileEvent, FlockSyncState, ReplaceResponse, SharedLastContent,
+    SyncState, PENDING_WRITE_TIMEOUT,
 };
 use reqwest::Client;
 use rumqttc::QoS;
@@ -1779,6 +1779,7 @@ pub async fn sync_single_file(
                 task_handles: Vec::new(),
                 use_paths,
                 content_hash: Some(content_hash.clone()),
+                crdt_last_content: None,
             },
         );
     }
@@ -1941,23 +1942,26 @@ pub async fn upload_task_crdt(
     file_path: PathBuf,
     crdt_state: Arc<RwLock<DirectorySyncState>>,
     filename: String,
+    shared_last_content: SharedLastContent,
     mut rx: mpsc::Receiver<FileEvent>,
     author: String,
 ) {
-    // Initialize last_content from current file content.
-    // This is critical to prevent the first diff from being computed against
-    // empty content, which would create spurious INSERT operations that conflict
-    // with the server's existing state.
-    let mut last_content: Option<String> = tokio::fs::read_to_string(&file_path)
-        .await
-        .ok()
-        .filter(|s| !s.is_empty());
-
-    if last_content.is_some() {
-        debug!(
-            "CRDT upload_task initialized with existing content for {}",
-            file_path.display()
-        );
+    // Initialize shared last_content from current file content (if unset).
+    // This prevents the first diff from being computed against empty content.
+    {
+        let mut shared = shared_last_content.write().await;
+        if shared.is_none() {
+            *shared = tokio::fs::read_to_string(&file_path)
+                .await
+                .ok()
+                .filter(|s| !s.is_empty());
+            if shared.is_some() {
+                debug!(
+                    "CRDT upload_task initialized with existing content for {}",
+                    file_path.display()
+                );
+            }
+        }
     }
 
     while let Some(event) = rx.recv().await {
@@ -1980,7 +1984,10 @@ pub async fn upload_task_crdt(
         let new_content = String::from_utf8_lossy(&raw_content).to_string();
 
         // Get the old content for diff computation
-        let old_content = last_content.clone().unwrap_or_default();
+        let old_content = {
+            let shared = shared_last_content.read().await;
+            shared.clone().unwrap_or_default()
+        };
 
         // Skip if content unchanged
         if old_content == new_content {
@@ -2038,7 +2045,8 @@ pub async fn upload_task_crdt(
                     result.update_bytes.len()
                 );
                 // Update our last known content
-                last_content = Some(new_content);
+                let mut shared = shared_last_content.write().await;
+                *shared = Some(new_content);
 
                 // Save the state to persist CID tracking
                 drop(state_guard);
@@ -2186,6 +2194,7 @@ pub fn spawn_file_sync_tasks_crdt(
     file_path: PathBuf,
     crdt_state: Arc<RwLock<DirectorySyncState>>,
     filename: String,
+    shared_last_content: SharedLastContent,
     pull_only: bool,
     author: String,
 ) -> Vec<JoinHandle<()>> {
@@ -2205,6 +2214,7 @@ pub fn spawn_file_sync_tasks_crdt(
             file_path.clone(),
             crdt_state.clone(),
             filename.clone(),
+            shared_last_content.clone(),
             file_rx,
             author.clone(),
         )));
@@ -2218,6 +2228,7 @@ pub fn spawn_file_sync_tasks_crdt(
         file_path,
         crdt_state,
         filename,
+        shared_last_content,
         author,
     )));
 
@@ -2238,6 +2249,7 @@ pub async fn receive_task_crdt(
     file_path: PathBuf,
     crdt_state: Arc<RwLock<DirectorySyncState>>,
     filename: String,
+    shared_last_content: SharedLastContent,
     author: String,
 ) {
     let node_id_str = node_id.to_string();
@@ -2386,6 +2398,14 @@ pub async fn receive_task_crdt(
                         );
                         // Don't write - continue processing other messages
                     } else {
+                        // Update shared last_content BEFORE writing to avoid echo publishes.
+                        let previous_content = {
+                            let mut shared = shared_last_content.write().await;
+                            let prev = shared.clone();
+                            *shared = Some(content.clone());
+                            prev
+                        };
+
                         match tokio::fs::write(&file_path, &content).await {
                             Ok(()) => {
                                 info!(
@@ -2395,6 +2415,9 @@ pub async fn receive_task_crdt(
                                 );
                             }
                             Err(e) => {
+                                // Restore previous content marker on failure.
+                                let mut shared = shared_last_content.write().await;
+                                *shared = previous_content;
                                 error!(
                                     "CRDT receive_task: failed to write to {}: {}",
                                     file_path.display(),

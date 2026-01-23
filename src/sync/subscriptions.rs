@@ -10,7 +10,10 @@ use crate::sync::dir_sync::{
     handle_subdir_schema_cleanup,
 };
 use crate::sync::subdir_spawn::{spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport};
-use crate::sync::{encode_node_id, FileSyncState};
+use crate::sync::{
+    encode_node_id, initialize_crdt_state_from_server, spawn_file_sync_tasks_crdt, FileSyncState,
+    SharedLastContent,
+};
 use futures::StreamExt;
 use reqwest::{Client, StatusCode};
 use reqwest_eventsource::{Error as SseError, Event as SseEvent, EventSource};
@@ -22,6 +25,15 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+
+/// Context for spawning CRDT file sync tasks from MQTT schema updates.
+#[derive(Clone)]
+pub struct CrdtFileSyncContext {
+    pub mqtt_client: Arc<MqttClient>,
+    pub workspace: String,
+    pub crdt_state: Arc<RwLock<crate::sync::DirectorySyncState>>,
+}
 
 // ============================================================================
 // Shared Helpers
@@ -512,6 +524,7 @@ pub async fn directory_mqtt_task(
     initial_schema_cid: Option<String>,
     shared_state_file: Option<crate::sync::SharedStateFile>,
     initial_uuid_map: HashMap<String, String>,
+    crdt_context: Option<CrdtFileSyncContext>,
 ) {
     // Subscribe to edits for the fs-root document (schema changes)
     let fs_root_topic = Topic::edits(&workspace, &fs_root_id).to_topic_string();
@@ -611,6 +624,22 @@ pub async fn directory_mqtt_task(
                         &mut uuid_to_paths,
                     )
                     .await;
+
+                    if let Some(ref context) = crdt_context {
+                        if let Err(e) = ensure_crdt_tasks_for_files(
+                            &http_client,
+                            &server,
+                            &directory,
+                            &file_states,
+                            pull_only,
+                            &author,
+                            context,
+                        )
+                        .await
+                        {
+                            warn!("MQTT: Failed to ensure CRDT tasks: {}", e);
+                        }
+                    }
                 }
                 Ok(false) => {
                     debug!("MQTT: Schema unchanged, skipped processing");
@@ -656,25 +685,51 @@ pub async fn directory_mqtt_task(
             // miss messages due to broadcast channel lag, so we handle all edits here
             // as a reliable fallback.
             if pull_only || !push_only {
+                let (paths_with_crdt, paths_without_crdt) = {
+                    let states = file_states.read().await;
+                    let mut with_crdt = Vec::new();
+                    let mut without_crdt = Vec::new();
+                    for path in paths {
+                        if states
+                            .get(path)
+                            .and_then(|state| state.crdt_last_content.as_ref())
+                            .is_some()
+                        {
+                            with_crdt.push(path.clone());
+                        } else {
+                            without_crdt.push(path.clone());
+                        }
+                    }
+                    (with_crdt, without_crdt)
+                };
+
                 debug!(
-                    "MQTT edit received for file UUID {}: {} bytes, {} local path(s)",
+                    "MQTT edit received for file UUID {}: {} bytes, {} path(s) ({} CRDT-managed)",
                     doc_id,
                     msg.payload.len(),
-                    paths.len()
+                    paths.len(),
+                    paths_with_crdt.len()
                 );
 
-                // Fetch latest content from server and write to all local files
-                if let Err(e) = handle_file_uuid_edit(
-                    &http_client,
-                    &server,
-                    &doc_id,
-                    paths,
-                    &directory,
-                    use_paths,
-                )
-                .await
-                {
-                    warn!("Failed to handle file UUID edit for {}: {}", doc_id, e);
+                if !paths_without_crdt.is_empty() {
+                    // Fetch latest content from server and write to non-CRDT-managed files
+                    if let Err(e) = handle_file_uuid_edit(
+                        &http_client,
+                        &server,
+                        &doc_id,
+                        &paths_without_crdt,
+                        &directory,
+                        use_paths,
+                    )
+                    .await
+                    {
+                        warn!("Failed to handle file UUID edit for {}: {}", doc_id, e);
+                    }
+                } else {
+                    debug!(
+                        "Skipping UUID edit write for {} - all paths managed by CRDT tasks",
+                        doc_id
+                    );
                 }
             }
         } else {
@@ -684,6 +739,101 @@ pub async fn directory_mqtt_task(
     }
 
     info!("MQTT directory message channel closed");
+}
+
+/// Ensure files discovered via schema changes are upgraded to CRDT tasks.
+async fn ensure_crdt_tasks_for_files(
+    http_client: &Client,
+    server: &str,
+    directory: &Path,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    pull_only: bool,
+    author: &str,
+    context: &CrdtFileSyncContext,
+) -> Result<(), String> {
+    let pending: Vec<(String, String)> = {
+        let states = file_states.read().await;
+        states
+            .iter()
+            .filter(|(_, state)| state.crdt_last_content.is_none() && !state.use_paths)
+            .map(|(path, state)| (path.clone(), state.identifier.clone()))
+            .collect()
+    };
+
+    for (relative_path, identifier) in pending {
+        let node_id = match Uuid::parse_str(&identifier) {
+            Ok(id) => id,
+            Err(_) => {
+                debug!(
+                    "Skipping CRDT task spawn for {} (non-UUID identifier {})",
+                    relative_path, identifier
+                );
+                continue;
+            }
+        };
+
+        let file_path = directory.join(&relative_path);
+        let filename = Path::new(&relative_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&relative_path)
+            .to_string();
+
+        if let Err(e) = initialize_crdt_state_from_server(
+            http_client,
+            server,
+            node_id,
+            &context.crdt_state,
+            &filename,
+            &file_path,
+        )
+        .await
+        {
+            warn!(
+                "Failed to initialize CRDT state for {}: {}",
+                relative_path, e
+            );
+        }
+
+        let initial_content = tokio::fs::read_to_string(&file_path)
+            .await
+            .ok()
+            .filter(|s| !s.is_empty());
+        let shared_last_content: SharedLastContent = Arc::new(RwLock::new(initial_content));
+
+        let old_handles = {
+            let mut states = file_states.write().await;
+            if let Some(state) = states.get_mut(&relative_path) {
+                std::mem::take(&mut state.task_handles)
+            } else {
+                Vec::new()
+            }
+        };
+
+        for handle in old_handles {
+            handle.abort();
+        }
+
+        let handles = spawn_file_sync_tasks_crdt(
+            context.mqtt_client.clone(),
+            context.workspace.clone(),
+            node_id,
+            file_path,
+            context.crdt_state.clone(),
+            filename,
+            shared_last_content.clone(),
+            pull_only,
+            author.to_string(),
+        );
+
+        let mut states = file_states.write().await;
+        if let Some(state) = states.get_mut(&relative_path) {
+            state.task_handles = handles;
+            state.crdt_last_content = Some(shared_last_content);
+        }
+    }
+
+    Ok(())
 }
 
 /// Sync UUID subscriptions after a schema change.

@@ -28,6 +28,9 @@ pub type WrittenSchemas = Arc<RwLock<HashMap<PathBuf, String>>>;
 /// ancestry checking after restart.
 pub type SharedStateFile = Arc<RwLock<crate::sync::state_file::SyncStateFile>>;
 
+/// Shared last-content marker for CRDT file tasks.
+pub type SharedLastContent = Arc<RwLock<Option<String>>>;
+
 /// Response from GET /docs/:id/head
 #[derive(Debug, Deserialize)]
 pub struct HeadResponse {
@@ -136,6 +139,8 @@ pub struct FileSyncState {
     pub use_paths: bool,
     /// Content hash for fork detection (SHA-256 hex)
     pub content_hash: Option<String>,
+    /// Shared last-content marker for CRDT tasks (used for echo suppression)
+    pub crdt_last_content: Option<SharedLastContent>,
 }
 
 /// Remove a file state from the map and abort its associated tasks.

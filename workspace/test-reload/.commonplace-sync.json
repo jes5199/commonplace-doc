@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "schema": {
+    "node_id": "1112f7f2-c2b8-4b06-9819-5d03aa44fa3f",
+    "local_head_cid": "56e858411080284b1ec7d9a06b36566f765bb4f78e087e99f0856989ce379826",
+    "yjs_state": "Agat69a5CwAoAQdjb250ZW50B3ZlcnNpb24BegAAAAAAAAABJwEHY29udGVudARyb290ASgArevWuQsBBHR5cGUBdwNkaXInAK3r1rkLAQdlbnRyaWVzASEArevWuQsDEF9fcHJvY2Vzc2VzLmpzb24BAAIDuKSXrgkAp63r1rkLBAEoALikl64JAAR0eXBlAXcDZG9jKAC4pJeuCQAHbm9kZV9pZAF3JDRkMzAwYzU5LTAwZGItNDBmNy1iYmY5LWNhYjNmMTk4YWFmZgGt69a5CwEEAw=="
+  },
+  "files": {
+    "__processes.json": {
+      "node_id": "4d300c59-00db-40f7-bbf9-cab3f198aaff",
+      "local_head_cid": "c0505ec44c21179c07cbecbdae11a81b40b679af2a2a0f96c9e44f6fe4f55bb4",
+      "yjs_state": "AQHqmIfLDgAEAQdjb250ZW50Ant9AA=="
+    }
+  }
+}

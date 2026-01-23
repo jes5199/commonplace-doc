@@ -8,6 +8,7 @@
 //! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
 
 use crate::commit::Commit;
+use crate::diff;
 use crate::mqtt::{EditMessage, MqttClient, Topic};
 use crate::sync::crdt_state::CrdtPeerState;
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -16,7 +17,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 use yrs::updates::decoder::Decode;
-use yrs::{GetString, ReadTxn, Text, Transact, Update, WriteTxn};
+use yrs::{Doc, GetString, ReadTxn, Transact, Update};
 
 /// Result of publishing a local change.
 #[derive(Debug)]
@@ -47,36 +48,42 @@ pub async fn publish_text_change(
     new_content: &str,
     author: &str,
 ) -> Result<PublishResult, String> {
-    // Skip if content unchanged
-    if old_content == new_content {
-        debug!("Content unchanged, skipping publish for {}", node_id);
-        return Err("Content unchanged".to_string());
-    }
-
     // Load or create Y.Doc
     let doc = state.to_doc()?;
 
-    // Get or create the text root
-    let update_bytes = {
-        let mut txn = doc.transact_mut();
-        let text = txn.get_or_insert_text("content");
+    // Compute a minimal update against the current Y.Doc state.
+    let current_content = get_doc_text_content(&doc);
+    if old_content != current_content {
+        debug!(
+            "CRDT publish content mismatch for {} (file_len={}, ydoc_len={})",
+            node_id,
+            old_content.len(),
+            current_content.len()
+        );
+    }
+    if current_content == new_content {
+        debug!(
+            "Content unchanged after doc load, skipping publish for {}",
+            node_id
+        );
+        return Err("Content unchanged".to_string());
+    }
 
-        // Clear existing content and set new content
-        // This is a simple approach; could be optimized with diff
-        let current = text.get_string(&txn);
-        if current != new_content {
-            // Delete all existing content
-            let len = text.len(&txn);
-            if len > 0 {
-                text.remove_range(&mut txn, 0, len);
-            }
-            // Insert new content
-            text.insert(&mut txn, 0, new_content);
+    let update_bytes = match compute_text_update(&doc, &current_content, new_content)? {
+        Some(update) => update,
+        None => {
+            debug!("No-op update for {}, skipping publish", node_id);
+            return Err("Content unchanged".to_string());
         }
-
-        // Get the update
-        txn.encode_update_v1()
     };
+
+    // Apply the update to our local doc state
+    {
+        let update =
+            Update::decode_v1(&update_bytes).map_err(|e| format!("Invalid Yjs update: {}", e))?;
+        let mut txn = doc.transact_mut();
+        txn.apply_update(update);
+    }
 
     // Create commit
     let parents = match &state.local_head_cid {
@@ -266,6 +273,42 @@ pub fn get_text_content(state: &CrdtPeerState) -> Result<String, String> {
     }
 }
 
+/// Get the current text content from a Y.Doc.
+fn get_doc_text_content(doc: &Doc) -> String {
+    let txn = doc.transact();
+    match txn.get_text("content") {
+        Some(text) => text.get_string(&txn),
+        None => String::new(),
+    }
+}
+
+/// Compute a minimal text update using the current Y.Doc state as base.
+///
+/// Returns None when no changes are detected.
+fn compute_text_update(
+    doc: &Doc,
+    old_content: &str,
+    new_content: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    if old_content == new_content {
+        return Ok(None);
+    }
+
+    let base_state = {
+        let txn = doc.transact();
+        txn.encode_state_as_update_v1(&yrs::StateVector::default())
+    };
+
+    let diff = diff::compute_diff_update_with_base(&base_state, old_content, new_content)
+        .map_err(|e| format!("Diff computation failed: {}", e))?;
+
+    if diff.summary.chars_inserted == 0 && diff.summary.chars_deleted == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(diff.update_bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +363,95 @@ mod tests {
         // Applying same commit again should be a no-op
         let result2 = apply_received_commit(&mut state, "cid123", &update_b64, &[]).unwrap();
         assert!(!result2);
+    }
+
+    #[test]
+    fn test_compute_text_update_noop() {
+        use yrs::{Doc, Text, WriteTxn};
+
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "hello");
+        }
+
+        let current = get_doc_text_content(&doc);
+        let update = compute_text_update(&doc, &current, "hello").unwrap();
+        assert!(update.is_none());
+    }
+
+    #[test]
+    fn test_compute_text_update_apply_insert() {
+        use yrs::{Doc, Text, Update, WriteTxn};
+
+        let base_doc = Doc::new();
+        {
+            let mut txn = base_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "hello");
+        }
+
+        let current = get_doc_text_content(&base_doc);
+        let update = compute_text_update(&base_doc, &current, "hello world")
+            .unwrap()
+            .expect("expected update");
+
+        // Apply base state then update to a fresh doc
+        let base_state = {
+            let txn = base_doc.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+        let apply_doc = Doc::new();
+        {
+            let update = Update::decode_v1(&base_state).unwrap();
+            let mut txn = apply_doc.transact_mut();
+            txn.apply_update(update);
+        }
+        {
+            let update = Update::decode_v1(&update).unwrap();
+            let mut txn = apply_doc.transact_mut();
+            txn.apply_update(update);
+        }
+
+        let content = get_doc_text_content(&apply_doc);
+        assert_eq!(content, "hello world");
+    }
+
+    #[test]
+    fn test_compute_text_update_apply_delete() {
+        use yrs::{Doc, Text, Update, WriteTxn};
+
+        let base_doc = Doc::new();
+        {
+            let mut txn = base_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "hello world");
+        }
+
+        let current = get_doc_text_content(&base_doc);
+        let update = compute_text_update(&base_doc, &current, "hello")
+            .unwrap()
+            .expect("expected update");
+
+        // Apply base state then update to a fresh doc
+        let base_state = {
+            let txn = base_doc.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+        let apply_doc = Doc::new();
+        {
+            let update = Update::decode_v1(&base_state).unwrap();
+            let mut txn = apply_doc.transact_mut();
+            txn.apply_update(update);
+        }
+        {
+            let update = Update::decode_v1(&update).unwrap();
+            let mut txn = apply_doc.transact_mut();
+            txn.apply_update(update);
+        }
+
+        let content = get_doc_text_content(&apply_doc);
+        assert_eq!(content, "hello");
     }
 }

@@ -725,6 +725,7 @@ pub async fn handle_file_created(
                     task_handles,
                     use_paths,
                     content_hash: Some(content_hash),
+                    crdt_last_content: None,
                 },
             );
         }

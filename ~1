@@ -1,0 +1,9 @@
+---
+active: true
+iteration: 1
+max_iterations: 20
+completion_promise: "PERFECT ACCEPTANCE HAS BEEN ACHIEVED"
+started_at: "2026-01-22T19:52:10Z"
+---
+
+Run through docs/plans/2026-01-02-sandbox-sync-acceptance-criteria.md from the top until you find a bug. File that bug as a bead and then fix it. Use a local codex review loop. When you are done, start again from the top until you can do the whole thing without finding any new bugs.

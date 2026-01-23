@@ -16,14 +16,15 @@ use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
     acquire_sync_lock, build_head_url, build_info_url, build_replace_url, build_uuid_map_recursive,
     check_server_has_content, create_new_file, detect_from_path, directory_mqtt_task,
-    directory_watcher_task, discover_fs_root, ensure_fs_root_exists, file_watcher_task,
-    find_owning_document, fork_node, handle_file_created, handle_file_deleted,
-    handle_file_modified, handle_schema_change, handle_schema_modified, initial_sync,
-    is_binary_content, push_schema_to_server, remove_file_from_schema,
-    scan_directory_with_contents, schema_to_json, spawn_command_listener,
+    directory_watcher_task, discover_fs_root, ensure_fs_root_exists,
+    ensure_parent_directories_exist, file_watcher_task, find_owning_document, fork_node,
+    handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
+    handle_schema_modified, initial_sync, is_binary_content, push_schema_to_server,
+    remove_file_from_schema, scan_directory_with_contents, schema_to_json, spawn_command_listener,
     spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file, upload_task,
-    write_schema_file, ymap_schema, DirEvent, FileEvent, FileSyncState, InodeKey, InodeTracker,
-    ReplaceResponse, ScanOptions, SharedStateFile, SyncState, SCHEMA_FILENAME,
+    write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent, FileEvent, FileSyncState,
+    InodeKey, InodeTracker, ReplaceResponse, ScanOptions, SharedStateFile, SyncState,
+    SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -160,6 +161,8 @@ async fn handle_dir_event(
             // Use CRDT path if available
             if let Some(crdt) = crdt_params {
                 handle_file_created_crdt(
+                    client,
+                    server,
                     &path,
                     directory,
                     fs_root_id,
@@ -168,6 +171,7 @@ async fn handle_dir_event(
                     author,
                     crdt,
                     pull_only,
+                    written_schemas,
                 )
                 .await;
             } else {
@@ -238,11 +242,14 @@ async fn handle_dir_event(
 /// Handle file creation via CRDT/MQTT path.
 ///
 /// This function properly handles files in node-backed subdirectories by:
-/// 1. Finding the owning document (could be root or a subdirectory)
-/// 2. Loading the appropriate DirectorySyncState for that directory
-/// 3. Creating the file in the correct schema
+/// 1. Ensuring parent directories exist as node-backed directories
+/// 2. Finding the owning document (could be root or a subdirectory)
+/// 3. Loading the appropriate DirectorySyncState for that directory
+/// 4. Creating the file in the correct schema
 #[allow(clippy::too_many_arguments)]
 async fn handle_file_created_crdt(
+    client: &Client,
+    server: &str,
     path: &std::path::Path,
     directory: &std::path::Path,
     fs_root_id: &str,
@@ -251,7 +258,17 @@ async fn handle_file_created_crdt(
     author: &str,
     crdt: &CrdtEventParams,
     pull_only: bool,
+    written_schemas: Option<&WrittenSchemas>,
 ) {
+    // Skip directories - they will be created via ensure_parent_directories_exist
+    // when a file inside them is created
+    if path.is_dir() {
+        debug!(
+            "Skipping directory in handle_file_created_crdt: {}",
+            path.display()
+        );
+        return;
+    }
     // Get filename from path
     let filename = match path.file_name().and_then(|n| n.to_str()) {
         Some(n) => n.to_string(),
@@ -312,6 +329,27 @@ async fn handle_file_created_crdt(
             filename.clone()
         }
     };
+
+    // Ensure parent directories exist as node-backed directories
+    // This handles the case where a file is created in a new subdirectory
+    if let Err(e) = ensure_parent_directories_exist(
+        client,
+        server,
+        fs_root_id,
+        directory,
+        &relative_path,
+        options,
+        author,
+        written_schemas,
+    )
+    .await
+    {
+        warn!(
+            "Failed to ensure parent directories for {}: {}",
+            relative_path, e
+        );
+        // Continue anyway - find_owning_document may still work if some directories exist
+    }
 
     // Find which document owns this file (may be a node-backed subdirectory)
     let owning_doc = find_owning_document(&canonical_directory, fs_root_id, &relative_path);
@@ -488,6 +526,7 @@ async fn handle_file_created_crdt(
                 // Spawn CRDT sync tasks for the new file using a new state Arc
                 let subdir_state_arc = Arc::new(RwLock::new(subdir_state));
                 let file_path = path.to_path_buf();
+                let shared_last_content = Arc::new(RwLock::new(Some(content.clone())));
                 let handles = spawn_file_sync_tasks_crdt(
                     crdt.mqtt_client.clone(),
                     crdt.workspace.clone(),
@@ -495,6 +534,7 @@ async fn handle_file_created_crdt(
                     file_path,
                     subdir_state_arc,
                     owning_doc.relative_path.clone(),
+                    shared_last_content.clone(),
                     false, // pull_only = false for new files
                     author.to_string(),
                 );
@@ -513,6 +553,7 @@ async fn handle_file_created_crdt(
                         task_handles: handles,
                         use_paths: false,
                         content_hash: Some(content_hash),
+                        crdt_last_content: Some(shared_last_content),
                     },
                 );
             }
@@ -560,6 +601,7 @@ async fn handle_file_created_crdt(
 
                 // Spawn CRDT sync tasks for the new file
                 let file_path = path.to_path_buf();
+                let shared_last_content = Arc::new(RwLock::new(Some(content.clone())));
                 let handles = spawn_file_sync_tasks_crdt(
                     crdt.mqtt_client.clone(),
                     crdt.workspace.clone(),
@@ -567,6 +609,7 @@ async fn handle_file_created_crdt(
                     file_path,
                     crdt.crdt_state.clone(),
                     filename.clone(),
+                    shared_last_content.clone(),
                     false, // pull_only = false for new files
                     author.to_string(),
                 );
@@ -585,6 +628,7 @@ async fn handle_file_created_crdt(
                         task_handles: handles,
                         use_paths: false,
                         content_hash: Some(content_hash),
+                        crdt_last_content: Some(shared_last_content),
                     },
                 );
             }
@@ -2032,6 +2076,26 @@ async fn run_directory_mode(
         written_schemas.clone(),
     );
 
+    // Load/create CRDT state early so subscription tasks can use it.
+    // Note: If fs_root_id is not a UUID (e.g., "workspace"), use a nil UUID for the schema.
+    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id).unwrap_or_else(|_| {
+        warn!(
+            "fs_root_id '{}' is not a UUID, using nil UUID for CRDT schema state",
+            fs_root_id
+        );
+        uuid::Uuid::nil()
+    });
+    let crdt_state = Arc::new(RwLock::new(
+        DirectorySyncState::load_or_create(&directory, schema_node_id)
+            .await
+            .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
+    ));
+    let crdt_context = Some(CrdtFileSyncContext {
+        mqtt_client: mqtt_client.clone(),
+        workspace: workspace.clone(),
+        crdt_state: crdt_state.clone(),
+    });
+
     // Start subscription task for fs-root (skip if push-only)
     let subscription_handle = if !push_only {
         // Spawn the MQTT event loop in a background task
@@ -2068,6 +2132,7 @@ async fn run_directory_mode(
             initial_schema_cid.clone(),
             Some(shared_state_file.clone()),
             initial_uuid_map,
+            crdt_context.clone(),
         )))
     } else {
         info!("Push-only mode: skipping subscription");
@@ -2101,21 +2166,6 @@ async fn run_directory_mode(
     }
 
     // Start file sync tasks for each file and store handles in FileSyncState
-    // Load/create CRDT state for this directory
-    // Note: If fs_root_id is not a UUID (e.g., "workspace"), use a nil UUID for the schema.
-    // File sync will still work since individual files have proper UUIDs.
-    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id).unwrap_or_else(|_| {
-        warn!(
-            "fs_root_id '{}' is not a UUID, using nil UUID for CRDT schema state",
-            fs_root_id
-        );
-        uuid::Uuid::nil()
-    });
-    let crdt_state = Arc::new(RwLock::new(
-        DirectorySyncState::load_or_create(&directory, schema_node_id)
-            .await
-            .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
-    ));
 
     {
         let mut states = file_states.write().await;
@@ -2152,6 +2202,8 @@ async fn run_directory_mode(
                 );
             }
 
+            let shared_last_content = Arc::new(RwLock::new(None));
+            file_state.crdt_last_content = Some(shared_last_content.clone());
             file_state.task_handles = spawn_file_sync_tasks_crdt(
                 mqtt_client.clone(),
                 workspace.clone(),
@@ -2159,6 +2211,7 @@ async fn run_directory_mode(
                 file_path,
                 crdt_state.clone(),
                 filename,
+                shared_last_content,
                 pull_only,
                 author.clone(),
             );
@@ -2599,6 +2652,26 @@ async fn run_exec_mode(
         written_schemas.clone(),
     );
 
+    // Load/create CRDT state early so subscription tasks can use it.
+    // Note: If fs_root_id is not a UUID (e.g., "workspace"), use a nil UUID for the schema.
+    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id).unwrap_or_else(|_| {
+        warn!(
+            "fs_root_id '{}' is not a UUID, using nil UUID for CRDT schema state",
+            fs_root_id
+        );
+        uuid::Uuid::nil()
+    });
+    let crdt_state = Arc::new(RwLock::new(
+        DirectorySyncState::load_or_create(&directory, schema_node_id)
+            .await
+            .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
+    ));
+    let crdt_context = Some(CrdtFileSyncContext {
+        mqtt_client: mqtt_client.clone(),
+        workspace: workspace.clone(),
+        crdt_state: crdt_state.clone(),
+    });
+
     // Start subscription task for fs-root (skip if push-only)
     let subscription_handle = if !push_only {
         // Spawn the MQTT event loop in a background task
@@ -2634,6 +2707,7 @@ async fn run_exec_mode(
             initial_schema_cid.clone(),
             Some(shared_state_file.clone()),
             initial_uuid_map,
+            crdt_context.clone(),
         )))
     } else {
         info!("Push-only mode: skipping subscription");
@@ -2666,19 +2740,6 @@ async fn run_exec_mode(
     }
 
     // Start file sync tasks for each file using CRDT mode
-    // Note: If fs_root_id is not a UUID (e.g., "workspace"), use a nil UUID for the schema.
-    // File sync will still work since individual files have proper UUIDs.
-    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id).unwrap_or_else(|_| {
-        warn!(
-            "fs_root_id '{}' is not a UUID, using nil UUID for CRDT schema state",
-            fs_root_id
-        );
-        uuid::Uuid::nil()
-    });
-    let crdt_state = DirectorySyncState::load_or_create(&directory, schema_node_id)
-        .await
-        .map_err(|e| format!("Failed to load CRDT state: {}", e))?;
-    let crdt_state = Arc::new(RwLock::new(crdt_state));
 
     {
         let mut states = file_states.write().await;
@@ -2715,6 +2776,8 @@ async fn run_exec_mode(
                 );
             }
 
+            let shared_last_content = Arc::new(RwLock::new(None));
+            file_state.crdt_last_content = Some(shared_last_content.clone());
             file_state.task_handles = spawn_file_sync_tasks_crdt(
                 mqtt_client.clone(),
                 workspace.clone(),
@@ -2722,6 +2785,7 @@ async fn run_exec_mode(
                 file_path,
                 crdt_state.clone(),
                 filename,
+                shared_last_content,
                 pull_only,
                 author.clone(),
             );

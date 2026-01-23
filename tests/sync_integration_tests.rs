@@ -6,15 +6,54 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
 
+/// Helper to spawn mosquitto MQTT broker on a given port
+fn spawn_mqtt_broker(port: u16) -> Child {
+    let child = Command::new("mosquitto")
+        .args(["-p", &port.to_string(), "-v"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn mosquitto");
+
+    // Wait for mosquitto to be ready by checking if port is open
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed() > Duration::from_secs(5) {
+            panic!("Mosquitto failed to start within 5 seconds");
+        }
+        if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    child
+}
+
 /// Helper to spawn the server and wait for it to be ready
 fn spawn_server(port: u16, db_path: &std::path::Path) -> Child {
+    spawn_server_with_mqtt(port, db_path, None)
+}
+
+fn spawn_server_with_mqtt(
+    port: u16,
+    db_path: &std::path::Path,
+    mqtt_broker: Option<&str>,
+) -> Child {
+    let mut args = vec![
+        "--port".to_string(),
+        port.to_string(),
+        "--database".to_string(),
+        db_path.to_str().unwrap().to_string(),
+    ];
+
+    if let Some(broker) = mqtt_broker {
+        args.push("--mqtt-broker".to_string());
+        args.push(broker.to_string());
+    }
+
     let child = Command::new(env!("CARGO_BIN_EXE_commonplace-server"))
-        .args([
-            "--port",
-            &port.to_string(),
-            "--database",
-            db_path.to_str().unwrap(),
-        ])
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -40,11 +79,18 @@ fn spawn_server(port: u16, db_path: &std::path::Path) -> Child {
 }
 
 /// Helper to spawn sync client in file mode
-fn spawn_sync_file(server_url: &str, file_path: &std::path::Path, node_id: &str) -> Child {
+fn spawn_sync_file(
+    server_url: &str,
+    mqtt_broker: &str,
+    file_path: &std::path::Path,
+    node_id: &str,
+) -> Child {
     Command::new(env!("CARGO_BIN_EXE_commonplace-sync"))
         .args([
             "--server",
             server_url,
+            "--mqtt-broker",
+            mqtt_broker,
             "--node",
             node_id,
             "--file",
@@ -136,10 +182,14 @@ fn test_sync_client_pulls_content_to_local_file() {
     let db_path = temp_dir.path().join("test.redb");
     let sync_file = temp_dir.path().join("synced.txt");
     let port = get_available_port();
+    let mqtt_port = get_available_port();
     let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
 
     let mut guard = ProcessGuard::new();
-    let server = spawn_server(port, &db_path);
+    let mqtt = spawn_mqtt_broker(mqtt_port);
+    guard.add(mqtt);
+    let server = spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker));
     guard.add(server);
 
     let client = reqwest::blocking::Client::new();
@@ -165,7 +215,7 @@ fn test_sync_client_pulls_content_to_local_file() {
     assert!(resp.status().is_success(), "Failed to replace content");
 
     // Start sync client pointing at this document
-    let sync = spawn_sync_file(&server_url, &sync_file, doc_id);
+    let sync = spawn_sync_file(&server_url, &mqtt_broker, &sync_file, doc_id);
     guard.add(sync);
 
     // Wait for sync to create file (give it a few seconds)
@@ -197,10 +247,14 @@ fn test_local_content_survives_restart_with_default_server_content() {
     let db_path = temp_dir.path().join("test.redb");
     let sync_file = temp_dir.path().join("data.json");
     let port = get_available_port();
+    let mqtt_port = get_available_port();
     let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
 
     let mut guard = ProcessGuard::new();
-    let server = spawn_server(port, &db_path);
+    let mqtt = spawn_mqtt_broker(mqtt_port);
+    guard.add(mqtt);
+    let server = spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker));
     guard.add(server);
 
     let client = reqwest::blocking::Client::new();
@@ -226,7 +280,7 @@ fn test_local_content_survives_restart_with_default_server_content() {
     assert!(resp.status().is_success(), "Failed to replace content");
 
     // Start sync client - it should pull the initial content
-    let sync = spawn_sync_file(&server_url, &sync_file, doc_id);
+    let sync = spawn_sync_file(&server_url, &mqtt_broker, &sync_file, doc_id);
     guard.add(sync);
 
     // Wait for sync to create file
@@ -277,7 +331,7 @@ fn test_local_content_survives_restart_with_default_server_content() {
     );
 
     // Restart sync client - with the fix, it should NOT overwrite local content
-    let sync = spawn_sync_file(&server_url, &sync_file, doc_id);
+    let sync = spawn_sync_file(&server_url, &mqtt_broker, &sync_file, doc_id);
     guard.add(sync);
 
     // Wait for sync client to connect and potentially process server content
@@ -313,10 +367,14 @@ fn test_cid_persistence_survives_sync_restart() {
     let sync_file = temp_dir.path().join("data.txt");
     let state_file = temp_dir.path().join(".data.txt.commonplace-sync.json");
     let port = get_available_port();
+    let mqtt_port = get_available_port();
     let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
 
     let mut guard = ProcessGuard::new();
-    let server = spawn_server(port, &db_path);
+    let mqtt = spawn_mqtt_broker(mqtt_port);
+    guard.add(mqtt);
+    let server = spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker));
     guard.add(server);
 
     let client = reqwest::blocking::Client::new();
@@ -342,7 +400,7 @@ fn test_cid_persistence_survives_sync_restart() {
     assert!(resp.status().is_success(), "Failed to replace content");
 
     // Start sync client - it should pull the initial content
-    let mut sync = spawn_sync_file(&server_url, &sync_file, doc_id);
+    let mut sync = spawn_sync_file(&server_url, &mqtt_broker, &sync_file, doc_id);
 
     // Wait for sync to create file
     let start = std::time::Instant::now();
@@ -411,7 +469,7 @@ fn test_cid_persistence_survives_sync_restart() {
     std::fs::write(&sync_file, edited_content).expect("Failed to write local file");
 
     // Restart sync client
-    let sync2 = spawn_sync_file(&server_url, &sync_file, doc_id);
+    let sync2 = spawn_sync_file(&server_url, &mqtt_broker, &sync_file, doc_id);
     guard.add(sync2);
 
     // Wait for sync to process and push the local edit
@@ -433,11 +491,18 @@ fn test_cid_persistence_survives_sync_restart() {
 }
 
 /// Helper to spawn sync client in directory mode
-fn spawn_sync_directory(server_url: &str, directory: &std::path::Path, node_id: &str) -> Child {
+fn spawn_sync_directory(
+    server_url: &str,
+    mqtt_broker: &str,
+    directory: &std::path::Path,
+    node_id: &str,
+) -> Child {
     Command::new(env!("CARGO_BIN_EXE_commonplace-sync"))
         .args([
             "--server",
             server_url,
+            "--mqtt-broker",
+            mqtt_broker,
             "--node",
             node_id,
             "--directory",
@@ -453,6 +518,7 @@ fn spawn_sync_directory(server_url: &str, directory: &std::path::Path, node_id: 
 #[allow(dead_code)]
 fn spawn_sync_directory_debug(
     server_url: &str,
+    mqtt_broker: &str,
     directory: &std::path::Path,
     node_id: &str,
 ) -> Child {
@@ -460,11 +526,12 @@ fn spawn_sync_directory_debug(
         .args([
             "--server",
             server_url,
+            "--mqtt-broker",
+            mqtt_broker,
             "--node",
             node_id,
             "--directory",
             directory.to_str().unwrap(),
-            "--push-only", // Skip MQTT requirement for testing
         ])
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
@@ -489,10 +556,14 @@ fn test_node_backed_subdir_propagates_without_restart() {
     let sync_dir = temp_dir.path().join("workspace");
     std::fs::create_dir_all(&sync_dir).unwrap();
     let port = get_available_port();
+    let mqtt_port = get_available_port();
     let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
 
     let mut guard = ProcessGuard::new();
-    let server = spawn_server(port, &db_path);
+    let mqtt = spawn_mqtt_broker(mqtt_port);
+    guard.add(mqtt);
+    let server = spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker));
     guard.add(server);
 
     let client = reqwest::blocking::Client::new();
@@ -509,7 +580,7 @@ fn test_node_backed_subdir_propagates_without_restart() {
     let fs_root_id = body["id"].as_str().expect("No id in response");
 
     // Start sync client in directory mode
-    let sync = spawn_sync_directory(&server_url, &sync_dir, fs_root_id);
+    let sync = spawn_sync_directory(&server_url, &mqtt_broker, &sync_dir, fs_root_id);
     guard.add(sync);
 
     // Wait for initial sync to complete
@@ -661,10 +732,14 @@ fn test_offline_edits_sync_on_reconnect() {
     let sync_dir = temp_dir.path().join("workspace");
     std::fs::create_dir_all(&sync_dir).unwrap();
     let port = get_available_port();
+    let mqtt_port = get_available_port();
     let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
 
     let mut guard = ProcessGuard::new();
-    let server = spawn_server(port, &db_path);
+    let mqtt = spawn_mqtt_broker(mqtt_port);
+    guard.add(mqtt);
+    let server = spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker));
     guard.add(server);
 
     let client = reqwest::blocking::Client::new();
@@ -724,7 +799,7 @@ fn test_offline_edits_sync_on_reconnect() {
     assert!(resp.status().is_success());
 
     // Start sync client in directory mode
-    let mut sync = spawn_sync_directory(&server_url, &sync_dir, fs_root_id);
+    let mut sync = spawn_sync_directory(&server_url, &mqtt_broker, &sync_dir, fs_root_id);
 
     // Wait for initial sync to complete
     std::thread::sleep(Duration::from_secs(2));
@@ -781,7 +856,7 @@ fn test_offline_edits_sync_on_reconnect() {
     );
 
     // O4: Restart sync process
-    let sync = spawn_sync_directory(&server_url, &sync_dir, fs_root_id);
+    let sync = spawn_sync_directory(&server_url, &mqtt_broker, &sync_dir, fs_root_id);
     guard.add(sync);
 
     // Wait for sync to reconnect and push local changes
@@ -815,10 +890,14 @@ fn test_local_file_in_existing_subdir_updates_server_schema() {
     let sync_dir = temp_dir.path().join("workspace");
     std::fs::create_dir_all(&sync_dir).unwrap();
     let port = get_available_port();
+    let mqtt_port = get_available_port();
     let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
 
     let mut guard = ProcessGuard::new();
-    let server = spawn_server(port, &db_path);
+    let mqtt = spawn_mqtt_broker(mqtt_port);
+    guard.add(mqtt);
+    let server = spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker));
     guard.add(server);
 
     let client = reqwest::blocking::Client::new();
@@ -883,8 +962,8 @@ fn test_local_file_in_existing_subdir_updates_server_schema() {
         .expect("Failed to update fs-root schema");
     assert!(resp.status().is_success());
 
-    // Start sync client (with push-only to skip MQTT requirement in tests)
-    let sync = spawn_sync_directory_debug(&server_url, &sync_dir, fs_root_id);
+    // Start sync client
+    let sync = spawn_sync_directory_debug(&server_url, &mqtt_broker, &sync_dir, fs_root_id);
     guard.add(sync);
 
     // Wait for initial sync and watcher setup
@@ -963,10 +1042,14 @@ fn test_local_new_subdir_with_file_updates_server_schemas() {
     let sync_dir = temp_dir.path().join("workspace");
     std::fs::create_dir_all(&sync_dir).unwrap();
     let port = get_available_port();
+    let mqtt_port = get_available_port();
     let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
 
     let mut guard = ProcessGuard::new();
-    let server = spawn_server(port, &db_path);
+    let mqtt = spawn_mqtt_broker(mqtt_port);
+    guard.add(mqtt);
+    let server = spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker));
     guard.add(server);
 
     let client = reqwest::blocking::Client::new();
@@ -983,7 +1066,7 @@ fn test_local_new_subdir_with_file_updates_server_schemas() {
     let fs_root_id = body["id"].as_str().expect("No id in response");
 
     // Start sync client (using debug version to see logs)
-    let sync = spawn_sync_directory_debug(&server_url, &sync_dir, fs_root_id);
+    let sync = spawn_sync_directory_debug(&server_url, &mqtt_broker, &sync_dir, fs_root_id);
     guard.add(sync);
 
     // Wait for initial sync to complete and watcher to start
@@ -1113,10 +1196,14 @@ fn test_initial_sync_creates_documents_before_schema() {
     let sync_dir = temp_dir.path().join("workspace");
     std::fs::create_dir_all(&sync_dir).unwrap();
     let port = get_available_port();
+    let mqtt_port = get_available_port();
     let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
 
     let mut guard = ProcessGuard::new();
-    let server = spawn_server(port, &db_path);
+    let mqtt = spawn_mqtt_broker(mqtt_port);
+    guard.add(mqtt);
+    let server = spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker));
     guard.add(server);
 
     let client = reqwest::blocking::Client::new();
@@ -1141,7 +1228,7 @@ fn test_initial_sync_creates_documents_before_schema() {
         .expect("Failed to write nested file");
 
     // Start sync client
-    let sync = spawn_sync_directory_debug(&server_url, &sync_dir, fs_root_id);
+    let sync = spawn_sync_directory_debug(&server_url, &mqtt_broker, &sync_dir, fs_root_id);
     guard.add(sync);
 
     // Wait for initial sync to complete

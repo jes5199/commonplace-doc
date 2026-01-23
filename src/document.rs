@@ -167,6 +167,50 @@ impl DocumentStore {
         doc
     }
 
+    /// Get an existing document or create one with the given ID, without pre-initializing
+    /// the Y.Doc root type. Use this when an incoming CRDT update will establish the type.
+    ///
+    /// This is needed because Yrs allows multiple types with the same name, so if we
+    /// pre-create a YMap and then apply an update with YText at the same root name,
+    /// they will coexist rather than the YText replacing the YMap.
+    pub async fn get_or_create_with_id_uninit(
+        &self,
+        id: &str,
+        content_type: ContentType,
+    ) -> Document {
+        // First check with read lock
+        {
+            let documents = self.documents.read().await;
+            if let Some(doc) = documents.get(id) {
+                return doc.clone();
+            }
+        }
+
+        // Not found, create with write lock
+        let mut documents = self.documents.write().await;
+
+        // Double-check after acquiring write lock
+        if let Some(doc) = documents.get(id) {
+            return doc.clone();
+        }
+
+        // Create new document with this ID but don't initialize the Y.Doc root type
+        // The incoming CRDT update will establish what type the root is
+        let ydoc = yrs::Doc::with_client_id(Self::DEFAULT_YDOC_CLIENT_ID);
+        // Note: we intentionally don't call get_or_insert_* here
+
+        let content = content_type.default_content();
+
+        let doc = Document {
+            content,
+            content_type,
+            ydoc: Some(ydoc),
+        };
+
+        documents.insert(id.to_string(), doc.clone());
+        doc
+    }
+
     pub async fn delete_document(&self, id: &str) -> bool {
         let mut documents = self.documents.write().await;
         documents.remove(id).is_some()
@@ -184,24 +228,57 @@ impl DocumentStore {
         let content_type = doc.content_type;
         txn.apply_update(update);
 
+        // Detect the actual content type from the Y.Doc structure
+        // This handles the case where documents are created without knowing if they're
+        // file content (YText) or schema content (YMap)
+        let root = txn
+            .root_refs()
+            .find(|(name, _)| *name == Self::TEXT_ROOT_NAME)
+            .map(|(_, value)| value);
+
         doc.content = match content_type {
             ContentType::Text => {
-                let text = txn.get_or_insert_text(Self::TEXT_ROOT_NAME);
-                text.get_string(&txn)
+                // Check if the Y.Doc actually has YMap (schema) instead of YText (file)
+                match root {
+                    Some(Value::YMap(map)) => {
+                        // This is actually a schema document, update content_type and extract as JSON
+                        doc.content_type = ContentType::Json;
+                        let any = map.to_json(&txn);
+                        serde_json::to_string(&any)
+                            .map_err(|e| ApplyError::Serialization(e.to_string()))?
+                    }
+                    Some(Value::YText(text)) => text.get_string(&txn),
+                    _ => {
+                        // Try to get text directly
+                        let text = txn.get_or_insert_text(Self::TEXT_ROOT_NAME);
+                        text.get_string(&txn)
+                    }
+                }
             }
             ContentType::Json => {
-                let root = txn
-                    .root_refs()
-                    .find(|(name, _)| *name == Self::TEXT_ROOT_NAME)
-                    .map(|(_, value)| value);
-
                 match root {
                     Some(Value::YMap(map)) => {
                         let any = map.to_json(&txn);
                         serde_json::to_string(&any)
                             .map_err(|e| ApplyError::Serialization(e.to_string()))?
                     }
-                    _ => ContentType::Json.default_content(),
+                    Some(Value::YText(text)) => {
+                        // Handle YText in case document was created as JSON but contains text content
+                        // This happens when CRDT edits arrive before the document type is known
+                        // Update content_type to reflect the actual type
+                        doc.content_type = ContentType::Text;
+                        text.get_string(&txn)
+                    }
+                    _ => {
+                        // Try to get text directly in case root_refs doesn't match the expected pattern
+                        let text = txn.get_or_insert_text(Self::TEXT_ROOT_NAME);
+                        let content = text.get_string(&txn);
+                        if !content.is_empty() {
+                            content
+                        } else {
+                            ContentType::Json.default_content()
+                        }
+                    }
                 }
             }
             ContentType::JsonArray => {

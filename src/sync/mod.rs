@@ -91,7 +91,7 @@ pub use schema_io::{
 };
 pub use subscriptions::{
     directory_mqtt_task, directory_sse_task, spawn_subdir_mqtt_task, spawn_subdir_sse_task,
-    subdir_mqtt_task, subdir_sse_task,
+    subdir_mqtt_task, subdir_sse_task, CrdtFileSyncContext,
 };
 pub use uuid_map::{
     build_uuid_map_and_write_schemas, build_uuid_map_from_doc, build_uuid_map_recursive,
@@ -133,8 +133,8 @@ pub use state::{InodeKey, InodeState, InodeTracker, PendingWrite, SyncState};
 pub use types::{
     build_uuid_to_paths_map, remove_file_state_and_abort, CommitData, DirEvent, EditEventData,
     EditRequest, EditResponse, FileEvent, FileSyncState, ForkResponse, HeadResponse,
-    InitialSyncComplete, ReplaceResponse, ReplaceSummary, SharedStateFile, UuidToPathsMap,
-    WrittenSchemas,
+    InitialSyncComplete, ReplaceResponse, ReplaceSummary, SharedLastContent, SharedStateFile,
+    UuidToPathsMap, WrittenSchemas,
 };
 pub use urls::{
     build_commits_url, build_edit_url, build_fork_url, build_head_at_commit_url, build_head_url,

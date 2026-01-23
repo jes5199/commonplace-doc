@@ -563,6 +563,7 @@ pub async fn handle_subdir_new_files(
                     task_handles,
                     use_paths,
                     content_hash: Some(content_hash),
+                    crdt_last_content: None,
                 },
             );
         }
@@ -1027,6 +1028,7 @@ pub async fn handle_schema_change(
                         task_handles,
                         use_paths,
                         content_hash: Some(content_hash),
+                        crdt_last_content: None,
                     },
                 );
             }
