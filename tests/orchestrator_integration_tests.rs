@@ -153,9 +153,12 @@ fn create_test_config_with_discovery(
 }
 
 /// Wait for the orchestrator status file to exist and have the expected processes
-fn wait_for_orchestrator_ready(timeout: Duration) -> Result<serde_json::Value, String> {
+fn wait_for_orchestrator_ready(
+    config_path: &std::path::Path,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
     let start = std::time::Instant::now();
-    let status_path = "/tmp/commonplace-orchestrator-status.json";
+    let status_path = status_file_path(config_path);
 
     loop {
         if start.elapsed() > timeout {
@@ -163,7 +166,7 @@ fn wait_for_orchestrator_ready(timeout: Duration) -> Result<serde_json::Value, S
         }
 
         // Check if status file exists
-        if let Ok(content) = std::fs::read_to_string(status_path) {
+        if let Ok(content) = std::fs::read_to_string(&status_path) {
             if let Ok(status) = serde_json::from_str::<serde_json::Value>(&content) {
                 // Check if we have both server and sync running
                 if let Some(processes) = status.get("processes").and_then(|p| p.as_array()) {
@@ -190,14 +193,18 @@ fn wait_for_orchestrator_ready(timeout: Duration) -> Result<serde_json::Value, S
 }
 
 /// Wait for a discovered process to appear in the orchestrator status
-fn wait_for_discovered_process(process_name: &str, timeout: Duration) -> Result<(), String> {
+fn wait_for_discovered_process(
+    config_path: &std::path::Path,
+    process_name: &str,
+    timeout: Duration,
+) -> Result<(), String> {
     let start = std::time::Instant::now();
-    let status_path = "/tmp/commonplace-orchestrator-status.json";
+    let status_path = status_file_path(config_path);
 
     loop {
         if start.elapsed() > timeout {
             // Return what we did find for debugging
-            if let Ok(content) = std::fs::read_to_string(status_path) {
+            if let Ok(content) = std::fs::read_to_string(&status_path) {
                 eprintln!("Status file contents at timeout: {}", content);
             }
             return Err(format!(
@@ -206,7 +213,7 @@ fn wait_for_discovered_process(process_name: &str, timeout: Duration) -> Result<
             ));
         }
 
-        if let Ok(content) = std::fs::read_to_string(status_path) {
+        if let Ok(content) = std::fs::read_to_string(&status_path) {
             if let Ok(status) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(processes) = status.get("processes").and_then(|p| p.as_array()) {
                     let found = processes
@@ -238,8 +245,7 @@ fn test_orchestrator_starts_base_processes() {
         return;
     }
 
-    // Clean up any stale status file from previous runs
-    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+    // Status file is scoped to config path, so no global cleanup needed
 
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
@@ -288,7 +294,7 @@ fn test_orchestrator_starts_base_processes() {
     guard.add(orchestrator);
 
     // Wait for orchestrator to be ready with server and sync running
-    let status = wait_for_orchestrator_ready(Duration::from_secs(30))
+    let status = wait_for_orchestrator_ready(&config_path, Duration::from_secs(30))
         .expect("Orchestrator failed to start within timeout");
 
     // P1: Verify orchestrator PID is set
@@ -362,8 +368,7 @@ fn test_commonplace_ps_reports_status() {
         return;
     }
 
-    // Clean up any stale status file from previous runs
-    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+    // Status file is scoped to config path, so no global cleanup needed
 
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
@@ -410,7 +415,7 @@ fn test_commonplace_ps_reports_status() {
     guard.add(orchestrator);
 
     // Wait for orchestrator to be ready
-    wait_for_orchestrator_ready(Duration::from_secs(30))
+    wait_for_orchestrator_ready(&config_path, Duration::from_secs(30))
         .expect("Orchestrator failed to start within timeout");
 
     // Run commonplace-ps --json and verify output
@@ -467,8 +472,7 @@ fn test_sandbox_process_runs_in_sandbox_cwd() {
         return;
     }
 
-    // Clean up any stale status file from previous runs
-    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+    // Status file is scoped to config path, so no global cleanup needed
 
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
@@ -550,7 +554,7 @@ fn test_sandbox_process_runs_in_sandbox_cwd() {
     guard.add(orchestrator);
 
     // Wait for orchestrator to be ready with base processes
-    wait_for_orchestrator_ready(Duration::from_secs(30))
+    wait_for_orchestrator_ready(&config_path, Duration::from_secs(30))
         .expect("Orchestrator failed to start within timeout");
 
     // Wait for the sandbox process to be discovered and appear in status
@@ -558,7 +562,7 @@ fn test_sandbox_process_runs_in_sandbox_cwd() {
     // 1. sync to push the sandbox-test/.commonplace.json and __processes.json to server
     // 2. orchestrator discovery to find the __processes.json
     // 3. orchestrator to spawn the sandbox process
-    wait_for_discovered_process("pwd-test", Duration::from_secs(60))
+    wait_for_discovered_process(&config_path, "pwd-test", Duration::from_secs(60))
         .expect("Sandbox process 'pwd-test' was not discovered");
 
     // Now wait for the sandbox process to actually write its output
@@ -597,13 +601,17 @@ fn test_sandbox_process_runs_in_sandbox_cwd() {
 /// Wait for a discovered process to disappear from the orchestrator status
 /// TODO(CP-y1cu): Use this function once sync modification propagation is fixed
 #[allow(dead_code)]
-fn wait_for_process_removed(process_name: &str, timeout: Duration) -> Result<(), String> {
+fn wait_for_process_removed(
+    config_path: &std::path::Path,
+    process_name: &str,
+    timeout: Duration,
+) -> Result<(), String> {
     let start = std::time::Instant::now();
-    let status_path = "/tmp/commonplace-orchestrator-status.json";
+    let status_path = status_file_path(config_path);
 
     loop {
         if start.elapsed() > timeout {
-            if let Ok(content) = std::fs::read_to_string(status_path) {
+            if let Ok(content) = std::fs::read_to_string(&status_path) {
                 eprintln!("Status file contents at timeout: {}", content);
             }
             return Err(format!(
@@ -612,7 +620,7 @@ fn wait_for_process_removed(process_name: &str, timeout: Duration) -> Result<(),
             ));
         }
 
-        if let Ok(content) = std::fs::read_to_string(status_path) {
+        if let Ok(content) = std::fs::read_to_string(&status_path) {
             if let Ok(status) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(processes) = status.get("processes").and_then(|p| p.as_array()) {
                     let found = processes
@@ -645,8 +653,7 @@ fn test_processes_json_add_remove_starts_stops_processes() {
         return;
     }
 
-    // Clean up any stale status file from previous runs
-    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+    // Status file is scoped to config path, so no global cleanup needed
 
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
@@ -727,11 +734,11 @@ fn test_processes_json_add_remove_starts_stops_processes() {
     guard.add(orchestrator);
 
     // Wait for orchestrator to be ready
-    wait_for_orchestrator_ready(Duration::from_secs(30))
+    wait_for_orchestrator_ready(&config_path, Duration::from_secs(30))
         .expect("Orchestrator failed to start within timeout");
 
     // Wait for the initial process to be discovered
-    wait_for_discovered_process("initial-proc", Duration::from_secs(60))
+    wait_for_discovered_process(&config_path, "initial-proc", Duration::from_secs(60))
         .expect("Initial process 'initial-proc' was not discovered");
 
     // H3: Add a new process to __processes.json
@@ -753,7 +760,7 @@ fn test_processes_json_add_remove_starts_stops_processes() {
     .unwrap();
 
     // H4: Verify new process appears within 10 seconds (using 30 to be safe in CI)
-    wait_for_discovered_process("added-proc", Duration::from_secs(30))
+    wait_for_discovered_process(&config_path, "added-proc", Duration::from_secs(30))
         .expect("Added process 'added-proc' should appear after updating __processes.json");
 
     // Verify the added process actually ran
@@ -803,11 +810,10 @@ fn test_processes_json_add_remove_starts_stops_processes() {
     // Wait for orchestrator to reconcile (with timeout)
     let start = std::time::Instant::now();
     let mut removed = false;
+    let status_path = status_file_path(&config_path);
     while start.elapsed() < Duration::from_secs(15) {
         std::thread::sleep(Duration::from_millis(500));
-        if let Ok(status_content) =
-            std::fs::read_to_string("/tmp/commonplace-orchestrator-status.json")
-        {
+        if let Ok(status_content) = std::fs::read_to_string(&status_path) {
             if let Ok(status) = serde_json::from_str::<serde_json::Value>(&status_content) {
                 if let Some(processes) = status.get("processes").and_then(|p| p.as_array()) {
                     let added_still_running = processes
@@ -823,8 +829,7 @@ fn test_processes_json_add_remove_starts_stops_processes() {
     }
 
     // H6: Verify added-proc was removed
-    let status_content =
-        std::fs::read_to_string("/tmp/commonplace-orchestrator-status.json").unwrap();
+    let status_content = std::fs::read_to_string(&status_path).unwrap();
     let status: serde_json::Value = serde_json::from_str(&status_content).unwrap();
     let processes = status.get("processes").and_then(|p| p.as_array()).unwrap();
     let initial_running = processes
@@ -866,8 +871,7 @@ fn test_process_config_change_triggers_restart() {
         return;
     }
 
-    // Clean up any stale status file from previous runs
-    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+    // Status file is scoped to config path, so no global cleanup needed
 
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
@@ -948,13 +952,13 @@ fn test_process_config_change_triggers_restart() {
     guard.add(orchestrator);
 
     // Wait for orchestrator to be ready
-    wait_for_orchestrator_ready(Duration::from_secs(30))
+    wait_for_orchestrator_ready(&config_path, Duration::from_secs(30))
         .expect("Orchestrator failed to start within timeout");
 
     eprintln!("=== Process config change restart test starting ===");
 
     // Wait for the process to be discovered and running
-    wait_for_discovered_process("restart-proc", Duration::from_secs(60))
+    wait_for_discovered_process(&config_path, "restart-proc", Duration::from_secs(60))
         .expect("Process 'restart-proc' was not discovered");
 
     // Wait for the marker file to confirm process started
@@ -968,7 +972,7 @@ fn test_process_config_change_triggers_restart() {
     // Get the initial PID from status (with retry - PID may take a moment to appear in status file)
     let start = std::time::Instant::now();
     let initial_pid = loop {
-        if let Some(pid) = get_process_pid("restart-proc") {
+        if let Some(pid) = get_process_pid(&config_path, "restart-proc") {
             break pid;
         }
         if start.elapsed() > Duration::from_secs(10) {
@@ -1004,7 +1008,7 @@ fn test_process_config_change_triggers_restart() {
     while start.elapsed() < Duration::from_secs(30) {
         std::thread::sleep(Duration::from_millis(500));
 
-        if let Some(pid) = get_process_pid("restart-proc") {
+        if let Some(pid) = get_process_pid(&config_path, "restart-proc") {
             if initial_pid != pid {
                 new_pid = Some(pid);
                 restarted = true;
@@ -1017,7 +1021,7 @@ fn test_process_config_change_triggers_restart() {
         restarted,
         "Process should have restarted with new PID (initial: {}, current: {:?})",
         initial_pid,
-        get_process_pid("restart-proc")
+        get_process_pid(&config_path, "restart-proc")
     );
     eprintln!(
         "H2: Process restarted (old PID: {}, new PID: {:?})",
@@ -1038,9 +1042,9 @@ fn test_process_config_change_triggers_restart() {
 }
 
 /// Helper to get a process PID from the orchestrator status file.
-fn get_process_pid(process_name: &str) -> Option<u32> {
-    let status_content =
-        std::fs::read_to_string("/tmp/commonplace-orchestrator-status.json").ok()?;
+fn get_process_pid(config_path: &std::path::Path, process_name: &str) -> Option<u32> {
+    let status_path = status_file_path(config_path);
+    let status_content = std::fs::read_to_string(&status_path).ok()?;
     let status: serde_json::Value = serde_json::from_str(&status_content).ok()?;
     let processes = status.get("processes")?.as_array()?;
 
@@ -1221,8 +1225,7 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
         return;
     }
 
-    // Clean up any stale status file from previous runs
-    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+    // Status file is scoped to config path, so no global cleanup needed
 
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
@@ -1310,11 +1313,11 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     guard.add(orchestrator);
 
     // Wait for orchestrator to be ready
-    wait_for_orchestrator_ready(Duration::from_secs(30))
+    wait_for_orchestrator_ready(&config_path, Duration::from_secs(30))
         .expect("Orchestrator failed to start within timeout");
 
     // Wait for the sandbox process to be discovered and appear in status
-    wait_for_discovered_process("sync-test-proc", Duration::from_secs(60))
+    wait_for_discovered_process(&config_path, "sync-test-proc", Duration::from_secs(60))
         .expect("Sandbox process 'sync-test-proc' was not discovered");
 
     // Wait for the sandbox directory for this test's process (handles parallel test runs)
@@ -1446,8 +1449,7 @@ fn test_commonplace_link_schema_push_updates_server() {
         return;
     }
 
-    // Clean up any stale status file from previous runs
-    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+    // Status file is scoped to config path, so no global cleanup needed
 
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
@@ -1528,11 +1530,11 @@ fn test_commonplace_link_schema_push_updates_server() {
     guard.add(orchestrator);
 
     // Wait for orchestrator to be ready
-    wait_for_orchestrator_ready(Duration::from_secs(30))
+    wait_for_orchestrator_ready(&config_path, Duration::from_secs(30))
         .expect("Orchestrator failed to start within timeout");
 
     // Wait for sandbox process to be discovered
-    wait_for_discovered_process("link-test-proc", Duration::from_secs(60))
+    wait_for_discovered_process(&config_path, "link-test-proc", Duration::from_secs(60))
         .expect("Sandbox process 'link-test-proc' was not discovered");
 
     // Find the sandbox directory for this test's process (handles parallel test runs)
@@ -1718,8 +1720,7 @@ fn test_sandbox_stdio_ephemeral_events() {
         return;
     }
 
-    // Clean up any stale status file from previous runs
-    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+    // Status file is scoped to config path, so no global cleanup needed
 
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
@@ -1806,13 +1807,13 @@ fn test_sandbox_stdio_ephemeral_events() {
     guard.add(orchestrator);
 
     // Wait for orchestrator to be ready
-    wait_for_orchestrator_ready(Duration::from_secs(30))
+    wait_for_orchestrator_ready(&config_path, Duration::from_secs(30))
         .expect("Orchestrator failed to start within timeout");
 
     eprintln!("=== Sandbox stdio ephemeral events test starting ===");
 
     // Wait for sandbox process to be discovered
-    wait_for_discovered_process("stdio-proc", Duration::from_secs(60))
+    wait_for_discovered_process(&config_path, "stdio-proc", Duration::from_secs(60))
         .expect("Sandbox process 'stdio-proc' was not discovered");
     eprintln!("PASS: stdio-proc discovered");
 
@@ -1892,8 +1893,7 @@ fn test_jsonl_file_append_sync_behavior() {
         return;
     }
 
-    // Clean up any stale status file from previous runs
-    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+    // Status file is scoped to config path, so no global cleanup needed
 
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
@@ -1978,13 +1978,13 @@ fn test_jsonl_file_append_sync_behavior() {
     guard.add(orchestrator);
 
     // Wait for orchestrator to be ready
-    wait_for_orchestrator_ready(Duration::from_secs(30))
+    wait_for_orchestrator_ready(&config_path, Duration::from_secs(30))
         .expect("Orchestrator failed to start within timeout");
 
     eprintln!("=== JSONL append/sync test starting ===");
 
     // Wait for sandbox process to be discovered
-    wait_for_discovered_process("jsonl-proc", Duration::from_secs(60))
+    wait_for_discovered_process(&config_path, "jsonl-proc", Duration::from_secs(60))
         .expect("Sandbox process 'jsonl-proc' was not discovered");
 
     // Find the sandbox directory for this test's process (handles parallel test runs)
@@ -2105,8 +2105,7 @@ fn test_process_termination_cascade_on_shutdown() {
         return;
     }
 
-    // Clean up any stale status file from previous runs
-    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+    // Status file is scoped to config path, so no global cleanup needed
 
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
@@ -2186,19 +2185,19 @@ fn test_process_termination_cascade_on_shutdown() {
     let orchestrator_pid = orchestrator.id();
 
     // Wait for orchestrator to be ready
-    wait_for_orchestrator_ready(Duration::from_secs(30))
+    wait_for_orchestrator_ready(&config_path, Duration::from_secs(30))
         .expect("Orchestrator failed to start within timeout");
 
     eprintln!("=== Process termination cascade test starting ===");
 
     // Wait for sandbox process to be discovered
-    wait_for_discovered_process("cascade-proc", Duration::from_secs(60))
+    wait_for_discovered_process(&config_path, "cascade-proc", Duration::from_secs(60))
         .expect("Process 'cascade-proc' was not discovered");
 
     // === T1: Record all PIDs via status file ===
     eprintln!("=== T1: Recording all PIDs ===");
-    let status_content =
-        std::fs::read_to_string("/tmp/commonplace-orchestrator-status.json").unwrap();
+    let status_path = status_file_path(&config_path);
+    let status_content = std::fs::read_to_string(&status_path).unwrap();
     let status: serde_json::Value = serde_json::from_str(&status_content).unwrap();
     let processes = status.get("processes").and_then(|p| p.as_array()).unwrap();
 
@@ -2304,7 +2303,7 @@ fn test_process_termination_cascade_on_shutdown() {
     eprintln!("T4: No orphaned processes found");
 
     // Clean up status file manually since we didn't use ProcessGuard
-    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+    let _ = std::fs::remove_file(status_file_path(&config_path));
 
     eprintln!("=== Process termination cascade test PASSED ===");
 }
@@ -2326,8 +2325,7 @@ fn test_uuid_linked_files_sync_bidirectionally() {
         return;
     }
 
-    // Clean up any stale status file from previous runs
-    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+    // Status file is scoped to config path, so no global cleanup needed
 
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
@@ -2441,15 +2439,15 @@ fn test_uuid_linked_files_sync_bidirectionally() {
     guard.add(orchestrator);
 
     // Wait for orchestrator to be ready
-    wait_for_orchestrator_ready(Duration::from_secs(30))
+    wait_for_orchestrator_ready(&config_path, Duration::from_secs(30))
         .expect("Orchestrator failed to start within timeout");
 
     eprintln!("=== UUID-linked bidirectional sync test starting ===");
 
     // Wait for both sandbox processes to be discovered
-    wait_for_discovered_process("sender-proc", Duration::from_secs(60))
+    wait_for_discovered_process(&config_path, "sender-proc", Duration::from_secs(60))
         .expect("Sandbox process 'sender-proc' was not discovered");
-    wait_for_discovered_process("receiver-proc", Duration::from_secs(60))
+    wait_for_discovered_process(&config_path, "receiver-proc", Duration::from_secs(60))
         .expect("Sandbox process 'receiver-proc' was not discovered");
 
     // Find sandbox directories for both processes
@@ -2664,8 +2662,7 @@ fn test_evaluate_script_with_global_injection() {
         return;
     }
 
-    // Clean up any stale status file from previous runs
-    let _ = std::fs::remove_file("/tmp/commonplace-orchestrator-status.json");
+    // Status file is scoped to config path, so no global cleanup needed
 
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
@@ -2799,13 +2796,13 @@ await commonplace.output.set("# Test Output\n\n");
     guard.add(orchestrator);
 
     // Wait for orchestrator to be ready
-    wait_for_orchestrator_ready(Duration::from_secs(30))
+    wait_for_orchestrator_ready(&config_path, Duration::from_secs(30))
         .expect("Orchestrator failed to start within timeout");
 
     eprintln!("=== Evaluate script integration test starting ===");
 
     // Wait for evaluate process to be discovered and running
-    wait_for_discovered_process("eval-proc", Duration::from_secs(60))
+    wait_for_discovered_process(&config_path, "eval-proc", Duration::from_secs(60))
         .expect("Evaluate process 'eval-proc' was not discovered");
 
     eprintln!("Evaluate process discovered, waiting for it to initialize...");
