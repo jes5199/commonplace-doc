@@ -482,6 +482,16 @@ pub async fn handle_subdir_new_files(
 
         // Fetch content from server
         if let Ok(Some(file_head)) = fetch_head(client, server, &identifier, use_paths).await {
+            // Skip writing if content is empty - the MQTT retained message
+            // will provide the actual content. Writing empty would clobber
+            // content that arrives via MQTT.
+            if file_head.content.is_empty() {
+                debug!(
+                    "Server returned empty content for {}, skipping write (MQTT will handle)",
+                    root_relative_path
+                );
+                continue;
+            }
             // Detect if file is binary and decode base64 if needed
             use base64::{engine::general_purpose::STANDARD, Engine};
             let content_info = detect_from_path(&file_path);
@@ -924,6 +934,16 @@ pub async fn handle_schema_change(
 
             // Fetch content from server
             if let Ok(Some(file_head)) = fetch_head(client, server, &identifier, use_paths).await {
+                // Skip writing if content is empty - the MQTT retained message
+                // will provide the actual content. Writing empty would clobber
+                // content that arrives via MQTT.
+                if file_head.content.is_empty() {
+                    debug!(
+                        "Server returned empty content for {}, skipping write (MQTT will handle)",
+                        path
+                    );
+                    continue;
+                }
                 // Detect if file is binary and decode base64 if needed
                 // Use both extension-based detection AND try decoding as base64
                 // to handle files that were uploaded as binary via content sniffing

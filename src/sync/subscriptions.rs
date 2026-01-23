@@ -985,11 +985,10 @@ async fn sync_uuid_subscriptions(
     *uuid_to_paths = new_uuid_to_paths;
 
     // Brief delay to allow the MQTT event loop to process retained messages
-    // that arrive immediately after subscription. Without this, we might fetch
-    // stale content from server while the correct content is waiting in the
-    // MQTT event queue.
+    // that arrive after subscription. The main content delivery happens via
+    // server fetch with retries below.
     if !to_add.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     // Fetch and write initial content for newly added UUIDs.
@@ -1052,13 +1051,16 @@ async fn handle_file_uuid_edit(
     use std::time::Duration;
     use tokio::time::sleep;
 
-    const MAX_RETRIES: u32 = 5;
+    const MAX_RETRIES: u32 = 15;
     const INITIAL_DELAY_MS: u64 = 100;
 
     // Retry fetching with exponential backoff if content is empty.
     // The server may not have committed the MQTT edit yet.
+    // With 15 retries and exponential backoff (100, 200, 400, 800, 1600, ...),
+    // we wait up to about 3 seconds total for server to have content.
     let mut head = None;
     let mut delay_ms = INITIAL_DELAY_MS;
+    let max_delay_ms = 500; // Cap at 500ms per retry
 
     for attempt in 0..MAX_RETRIES {
         match fetch_head(http_client, server, uuid, use_paths).await? {
@@ -1077,9 +1079,10 @@ async fn handle_file_uuid_edit(
                         MAX_RETRIES
                     );
                     sleep(Duration::from_millis(delay_ms)).await;
-                    delay_ms *= 2; // Exponential backoff
+                    delay_ms = (delay_ms * 2).min(max_delay_ms); // Exponential backoff, capped
                 } else {
-                    // Last attempt, use whatever we got
+                    // Last attempt, content still empty - use it, will write empty file
+                    // This is better than not creating the file at all
                     head = Some(h);
                 }
             }
@@ -1093,7 +1096,7 @@ async fn handle_file_uuid_edit(
                         MAX_RETRIES
                     );
                     sleep(Duration::from_millis(delay_ms)).await;
-                    delay_ms *= 2;
+                    delay_ms = (delay_ms * 2).min(max_delay_ms);
                 }
             }
         }
