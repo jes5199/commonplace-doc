@@ -74,11 +74,11 @@ impl CrdtPeerState {
     pub fn to_doc(&self) -> Result<Doc, String> {
         let doc = Doc::new();
 
-        // Ensure the "content" text root exists
-        {
-            let mut txn = doc.transact_mut();
-            txn.get_or_insert_text("content");
-        }
+        // Note: Don't pre-create any root structure here.
+        // The stored state may contain either:
+        // - A Text "content" (for file content)
+        // - A Map "content" (for schema structure)
+        // Pre-creating the wrong type would cause conflicts.
 
         if let Some(ref state_b64) = self.yjs_state {
             let state_bytes = STANDARD
