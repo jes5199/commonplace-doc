@@ -366,7 +366,7 @@ Concerns:
 
 8. **Streaming diff**: For large documents, consider streaming diff algorithm
 
-9. **Cross-platform sync**: Abstract shadow file handling for Windows compatibility
+9. ~~**Cross-platform sync**: Abstract shadow file handling for Windows compatibility~~ *(not planned)*
 
 ---
 
@@ -444,10 +444,9 @@ The sync `mod.rs` exports 166 items across categories that should be separate mo
 **Severity**: High
 **Impact**: Difficult to understand, maintain, and test independently
 
-#### 4. Platform-Specific Code Leakage
+#### 4. Platform-Specific Code *(Acceptable)*
 
 **Location**: Multiple `#[cfg(unix)]` guards in `src/sync/mod.rs`
-**Principle Violated**: Transport Agnosticism (generalized to platform agnosticism)
 
 ```rust
 #[cfg(unix)]
@@ -459,10 +458,10 @@ pub use sse::{
 };
 ```
 
-Unix-specific features (shadow files, flock) are conditionally compiled, but the sync client doesn't gracefully degrade on Windows—it simply lacks functionality.
+Unix-specific features (shadow files, flock) are conditionally compiled. **This is acceptable** as Windows support is not planned.
 
-**Severity**: Medium
-**Impact**: Windows users get degraded experience
+**Severity**: N/A - by design
+**Impact**: None (Unix-only project)
 
 #### 5. Retry Loops with Magic Numbers
 
@@ -606,7 +605,7 @@ The infrastructure layer (sync, orchestrator) has accumulated **accidental compl
 | **P1** | Error handling | Standardize on typed errors | Better debugging |
 | **P2** | `orchestrator` | Extract process discovery | Cleaner separation |
 | **P2** | Node consolidation | Merge `DocumentStore`/`DocumentNode` | Conceptual clarity |
-| **P3** | Cross-platform | Abstract shadow files | Windows support |
+| ~~P3~~ | ~~Cross-platform~~ | ~~Abstract shadow files~~ | ~~Windows support~~ *(not planned)* |
 
 ### Final Ratings
 
