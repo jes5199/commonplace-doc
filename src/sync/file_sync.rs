@@ -2100,6 +2100,39 @@ pub async fn initialize_crdt_state_from_server(
     filename: &str,
     file_path: &Path,
 ) -> Result<(), String> {
+    initialize_crdt_state_from_server_with_pending(
+        client, server, node_id, crdt_state, filename, file_path, None, None, None,
+    )
+    .await
+}
+
+/// Initialize CRDT state from server and process any pending edits.
+///
+/// This extended version accepts optional MQTT client, workspace, and author
+/// to process pending edits that arrived before initialization completed.
+///
+/// # Arguments
+/// * `client` - HTTP client for fetching from server
+/// * `server` - Server URL
+/// * `node_id` - UUID of the document
+/// * `crdt_state` - Shared CRDT state to initialize
+/// * `filename` - Filename within the directory (for state lookup)
+/// * `file_path` - Path to the local file
+/// * `mqtt_client` - Optional MQTT client for processing pending edits
+/// * `workspace` - Optional workspace name for MQTT topics
+/// * `author` - Optional author for merge commits
+#[allow(clippy::too_many_arguments)]
+pub async fn initialize_crdt_state_from_server_with_pending(
+    client: &Client,
+    server: &str,
+    node_id: Uuid,
+    crdt_state: &Arc<RwLock<DirectorySyncState>>,
+    filename: &str,
+    file_path: &Path,
+    mqtt_client: Option<&Arc<MqttClient>>,
+    workspace: Option<&str>,
+    author: Option<&str>,
+) -> Result<(), String> {
     // Check if we need initialization
     {
         let state = crdt_state.read().await;
@@ -2119,10 +2152,15 @@ pub async fn initialize_crdt_state_from_server(
     match fetch_head(client, server, &identifier, false).await {
         Ok(Some(head)) => {
             if let (Some(ref state_b64), Some(ref cid)) = (&head.state, &head.cid) {
-                // Initialize CRDT state
-                let mut state = crdt_state.write().await;
-                let file_state = state.get_or_create_file(filename, node_id);
-                file_state.initialize_from_server(state_b64, cid);
+                // Initialize CRDT state and collect pending edits
+                let pending_edits = {
+                    let mut state = crdt_state.write().await;
+                    let file_state = state.get_or_create_file(filename, node_id);
+                    file_state.initialize_from_server(state_b64, cid);
+
+                    // Take any pending edits that arrived before init
+                    file_state.take_pending_edits()
+                };
 
                 // CRITICAL: Also write the server's content to the local file.
                 // This prevents the upload task from computing a diff against
@@ -2156,9 +2194,134 @@ pub async fn initialize_crdt_state_from_server(
                     "Initialized CRDT state for {} from server HEAD {}",
                     filename, cid
                 );
+
+                // Process any pending edits that arrived before initialization
+                if !pending_edits.is_empty() {
+                    info!(
+                        "Processing {} pending edits for {} after CRDT init",
+                        pending_edits.len(),
+                        filename
+                    );
+
+                    for pending in pending_edits {
+                        if let Ok(edit_msg) = parse_edit_message(&pending.payload) {
+                            let mut state = crdt_state.write().await;
+                            let file_state = state.get_or_create_file(filename, node_id);
+
+                            match process_received_edit(
+                                mqtt_client,
+                                workspace.unwrap_or(""),
+                                &identifier,
+                                file_state,
+                                &edit_msg,
+                                author.unwrap_or(""),
+                            )
+                            .await
+                            {
+                                Ok((result, maybe_content)) => {
+                                    drop(state); // Release lock before file I/O
+
+                                    if let Some(content) = maybe_content {
+                                        if let Err(e) = tokio::fs::write(file_path, &content).await
+                                        {
+                                            warn!(
+                                                "Failed to write pending edit to {}: {}",
+                                                file_path.display(),
+                                                e
+                                            );
+                                        } else {
+                                            info!(
+                                                "Applied pending edit to {} ({} bytes, {:?})",
+                                                file_path.display(),
+                                                content.len(),
+                                                result
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to process pending edit for {}: {}", filename, e);
+                                }
+                            }
+                        } else {
+                            warn!("Failed to parse pending edit for {}, skipping", filename);
+                        }
+                    }
+
+                    // Save state after processing pending edits
+                    let state = crdt_state.read().await;
+                    if let Err(e) = state.save(file_path.parent().unwrap_or(file_path)).await {
+                        warn!("Failed to save CRDT state after pending edits: {}", e);
+                    }
+                }
+
                 Ok(())
             } else {
                 // Server has no state yet (empty document) - that's fine
+                // Still need to process pending edits as they may initialize the doc
+                let pending_edits = {
+                    let mut state = crdt_state.write().await;
+                    let file_state = state.get_or_create_file(filename, node_id);
+                    file_state.take_pending_edits()
+                };
+
+                if !pending_edits.is_empty() {
+                    info!(
+                        "Server has no state yet, processing {} pending edits for {}",
+                        pending_edits.len(),
+                        filename
+                    );
+
+                    for pending in pending_edits {
+                        if let Ok(edit_msg) = parse_edit_message(&pending.payload) {
+                            let mut state = crdt_state.write().await;
+                            let file_state = state.get_or_create_file(filename, node_id);
+
+                            match process_received_edit(
+                                mqtt_client,
+                                workspace.unwrap_or(""),
+                                &identifier,
+                                file_state,
+                                &edit_msg,
+                                author.unwrap_or(""),
+                            )
+                            .await
+                            {
+                                Ok((result, maybe_content)) => {
+                                    drop(state);
+
+                                    if let Some(content) = maybe_content {
+                                        if let Err(e) = tokio::fs::write(file_path, &content).await
+                                        {
+                                            warn!(
+                                                "Failed to write pending edit to {}: {}",
+                                                file_path.display(),
+                                                e
+                                            );
+                                        } else {
+                                            info!(
+                                                "Applied pending edit to {} ({} bytes, {:?})",
+                                                file_path.display(),
+                                                content.len(),
+                                                result
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to process pending edit for {}: {}", filename, e);
+                                }
+                            }
+                        }
+                    }
+
+                    // Save state after processing pending edits
+                    let state = crdt_state.read().await;
+                    if let Err(e) = state.save(file_path.parent().unwrap_or(file_path)).await {
+                        warn!("Failed to save CRDT state after pending edits: {}", e);
+                    }
+                }
+
                 debug!(
                     "Server has no Yjs state for {} yet, starting fresh",
                     filename
@@ -2274,7 +2437,7 @@ pub async fn receive_task_crdt(
     }
     let context = format!("CRDT receive {}", file_path.display());
 
-    while let Some(msg) = recv_broadcast(&mut message_rx, &context).await {
+    while let Some(msg) = recv_broadcast(&mut message_rx, &context, None::<fn(u64)>).await {
         // Check if this message is for our topic
         if msg.topic != topic {
             continue;
@@ -2302,6 +2465,20 @@ pub async fn receive_task_crdt(
         // Get or create the CRDT state for this file
         let mut state_guard = crdt_state.write().await;
         let file_state = state_guard.get_or_create_file(&filename, node_id);
+
+        // Check if CRDT state needs initialization.
+        // If so, queue the edit for later processing instead of trying to merge
+        // it now (which would fail or produce incorrect results without shared history).
+        if file_state.needs_server_init() {
+            file_state.queue_pending_edit(msg.payload.clone());
+            debug!(
+                "CRDT receive_task: needs init for {}, queued edit (queue size: {})",
+                file_path.display(),
+                file_state.pending_edits.len()
+            );
+            drop(state_guard);
+            continue; // Skip to next message
+        }
 
         // Process the received edit
         match process_received_edit(

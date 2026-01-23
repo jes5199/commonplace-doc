@@ -20,6 +20,17 @@ use yrs::{Doc, ReadTxn, Transact, Update};
 /// Located inside the directory it tracks (not as a sibling).
 pub const CRDT_STATE_FILENAME: &str = ".commonplace-sync.json";
 
+/// Maximum number of edits to queue while waiting for CRDT initialization.
+/// Beyond this limit, older edits are dropped with a warning.
+pub const MAX_PENDING_EDITS: usize = 100;
+
+/// A queued edit message waiting to be applied after CRDT initialization.
+#[derive(Debug, Clone)]
+pub struct PendingEdit {
+    /// The raw MQTT payload (serialized EditMessage)
+    pub payload: Vec<u8>,
+}
+
 /// CRDT peer state for a single document (file content or schema).
 ///
 /// Each tracked entity maintains:
@@ -27,6 +38,7 @@ pub const CRDT_STATE_FILENAME: &str = ".commonplace-sync.json";
 /// - The server HEAD we've merged (`head_cid`)
 /// - Our latest commit (`local_head_cid`)
 /// - The serialized Y.Doc state
+/// - A queue of pending edits received before initialization
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrdtPeerState {
     /// UUID for this document
@@ -40,6 +52,10 @@ pub struct CrdtPeerState {
     /// Serialized Y.Doc state (base64 encoded)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub yjs_state: Option<String>,
+    /// Queue of edits received before CRDT initialization completed.
+    /// These are applied after `initialize_from_server` is called.
+    #[serde(skip)]
+    pub pending_edits: Vec<PendingEdit>,
 }
 
 impl CrdtPeerState {
@@ -50,6 +66,7 @@ impl CrdtPeerState {
             head_cid: None,
             local_head_cid: None,
             yjs_state: None,
+            pending_edits: Vec::new(),
         }
     }
 
@@ -65,6 +82,7 @@ impl CrdtPeerState {
             head_cid: None,
             local_head_cid: None,
             yjs_state: Some(yjs_state),
+            pending_edits: Vec::new(),
         }
     }
 
@@ -136,6 +154,62 @@ impl CrdtPeerState {
     pub fn needs_server_init(&self) -> bool {
         self.yjs_state.is_none()
     }
+
+    /// Mark this state as needing resync from server.
+    ///
+    /// Called after broadcast lag is detected to force re-fetching of server
+    /// state. Clears the yjs_state so that `needs_server_init()` returns true
+    /// and the next initialization will fetch fresh state from server.
+    ///
+    /// Also clears head_cid and local_head_cid to allow fresh ancestry checks.
+    pub fn mark_needs_resync(&mut self) {
+        debug!(
+            "Marking {} as needing resync - clearing CRDT state",
+            self.node_id
+        );
+        self.yjs_state = None;
+        self.head_cid = None;
+        self.local_head_cid = None;
+        // Keep pending_edits - they may still be applicable after resync
+    }
+
+    /// Queue an edit to be applied after CRDT initialization completes.
+    ///
+    /// If the queue exceeds `MAX_PENDING_EDITS`, the oldest edit is dropped.
+    /// This prevents unbounded memory growth while still handling the common
+    /// case of a few edits arriving during initialization.
+    ///
+    /// Returns true if the edit was queued, false if it was dropped due to overflow.
+    pub fn queue_pending_edit(&mut self, payload: Vec<u8>) -> bool {
+        if self.pending_edits.len() >= MAX_PENDING_EDITS {
+            // Drop the oldest edit to make room
+            self.pending_edits.remove(0);
+            warn!(
+                "Pending edit queue overflow for {} - dropped oldest edit (queue at {} edits)",
+                self.node_id, MAX_PENDING_EDITS
+            );
+        }
+        self.pending_edits.push(PendingEdit { payload });
+        debug!(
+            "Queued pending edit for {} (queue size: {})",
+            self.node_id,
+            self.pending_edits.len()
+        );
+        true
+    }
+
+    /// Take all pending edits from the queue.
+    ///
+    /// This is called after CRDT initialization to drain the queue
+    /// and apply all buffered edits.
+    pub fn take_pending_edits(&mut self) -> Vec<PendingEdit> {
+        std::mem::take(&mut self.pending_edits)
+    }
+
+    /// Check if there are pending edits waiting to be applied.
+    pub fn has_pending_edits(&self) -> bool {
+        !self.pending_edits.is_empty()
+    }
 }
 
 /// Sync state for an entire directory.
@@ -199,6 +273,11 @@ impl DirectorySyncState {
     /// Get state for a file if it exists.
     pub fn get_file(&self, filename: &str) -> Option<&CrdtPeerState> {
         self.files.get(filename)
+    }
+
+    /// Get mutable state for a file if it exists.
+    pub fn get_file_mut(&mut self, filename: &str) -> Option<&mut CrdtPeerState> {
+        self.files.get_mut(filename)
     }
 
     /// Remove state for a file.
@@ -675,5 +754,72 @@ mod tests {
         let txn = client_doc.transact();
         let text = txn.get_text("content").unwrap();
         assert_eq!(text.get_string(&txn), "");
+    }
+
+    #[test]
+    fn test_pending_edit_queue() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Initially no pending edits
+        assert!(!state.has_pending_edits());
+        assert_eq!(state.pending_edits.len(), 0);
+
+        // Queue some edits
+        state.queue_pending_edit(vec![1, 2, 3]);
+        assert!(state.has_pending_edits());
+        assert_eq!(state.pending_edits.len(), 1);
+
+        state.queue_pending_edit(vec![4, 5, 6]);
+        assert_eq!(state.pending_edits.len(), 2);
+
+        // Take pending edits
+        let edits = state.take_pending_edits();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0].payload, vec![1, 2, 3]);
+        assert_eq!(edits[1].payload, vec![4, 5, 6]);
+
+        // Queue should be empty after take
+        assert!(!state.has_pending_edits());
+        assert_eq!(state.pending_edits.len(), 0);
+    }
+
+    #[test]
+    fn test_pending_edit_queue_overflow() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Fill queue to max capacity
+        for i in 0..MAX_PENDING_EDITS {
+            state.queue_pending_edit(vec![i as u8]);
+        }
+        assert_eq!(state.pending_edits.len(), MAX_PENDING_EDITS);
+
+        // Queue one more - should drop oldest
+        state.queue_pending_edit(vec![255]);
+        assert_eq!(state.pending_edits.len(), MAX_PENDING_EDITS);
+
+        // First edit should now be [1] (was [0] but got dropped)
+        assert_eq!(state.pending_edits[0].payload, vec![1]);
+
+        // Last edit should be the new one
+        assert_eq!(
+            state.pending_edits[MAX_PENDING_EDITS - 1].payload,
+            vec![255]
+        );
+    }
+
+    #[test]
+    fn test_pending_edits_not_serialized() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+        state.queue_pending_edit(vec![1, 2, 3]);
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&state).unwrap();
+
+        // pending_edits should not be in the JSON (due to #[serde(skip)])
+        assert!(!json.contains("pending_edits"));
+
+        // When deserialized, pending_edits should be empty
+        let loaded: CrdtPeerState = serde_json::from_str(&json).unwrap();
+        assert!(!loaded.has_pending_edits());
     }
 }

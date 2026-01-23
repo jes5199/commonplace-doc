@@ -154,7 +154,7 @@ impl Room {
                         .author
                         .unwrap_or_else(|| "ws-client".to_string()),
                     message: commit_meta.message,
-                    extensions: std::collections::HashMap::new(),
+                    extensions: std::collections::BTreeMap::new(),
                 };
 
                 match store.store_commit(&commit).await {

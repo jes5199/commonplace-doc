@@ -654,3 +654,563 @@ mod no_echo_tests {
         );
     }
 }
+
+// =============================================================================
+// Broadcast Lag Detection Tests (Stage 0)
+//
+// These tests validate that broadcast channel lag is detected correctly and
+// the recv_broadcast_with_lag function returns proper results.
+// =============================================================================
+
+mod broadcast_lag_tests {
+    use commonplace_doc::events::{recv_broadcast_with_lag, BroadcastRecvResult};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::broadcast;
+
+    /// Test that normal message receipt works correctly.
+    #[tokio::test]
+    async fn recv_broadcast_normal_message() {
+        let (tx, mut rx) = broadcast::channel::<String>(16);
+
+        tx.send("hello".to_string()).unwrap();
+
+        match recv_broadcast_with_lag(&mut rx, "test").await {
+            BroadcastRecvResult::Message(msg) => {
+                assert_eq!(msg, "hello");
+            }
+            other => panic!("Expected Message, got {:?}", other),
+        }
+    }
+
+    /// Test that channel close is detected.
+    #[tokio::test]
+    async fn recv_broadcast_detects_close() {
+        let (tx, mut rx) = broadcast::channel::<String>(16);
+        drop(tx); // Close the channel
+
+        match recv_broadcast_with_lag(&mut rx, "test").await {
+            BroadcastRecvResult::Closed => {}
+            other => panic!("Expected Closed, got {:?}", other),
+        }
+    }
+
+    /// Test that lag is detected when messages are dropped.
+    ///
+    /// Creates a broadcast channel with capacity 1, publishes multiple messages
+    /// to trigger lag, and verifies the Lagged result is returned.
+    #[tokio::test]
+    async fn recv_broadcast_detects_lag() {
+        // Create channel with minimal capacity to trigger lag easily
+        let (tx, mut rx) = broadcast::channel::<i32>(1);
+
+        // Send multiple messages - the receiver will lag
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        tx.send(3).unwrap(); // This will cause message 1 to be dropped
+
+        match recv_broadcast_with_lag(&mut rx, "test").await {
+            BroadcastRecvResult::Lagged {
+                missed_count,
+                next_message,
+            } => {
+                // We missed at least 1 message
+                assert!(missed_count >= 1, "Should have missed messages");
+                // Should have the next available message
+                assert!(next_message.is_some(), "Should have next message");
+                // The next message should be 2 or 3 (depending on exact timing)
+                let msg = next_message.unwrap();
+                assert!(
+                    msg == 2 || msg == 3,
+                    "Next message should be 2 or 3, got {}",
+                    msg
+                );
+            }
+            other => panic!("Expected Lagged, got {:?}", other),
+        }
+    }
+
+    /// Test that lag detection can be used to trigger resync.
+    ///
+    /// This simulates the pattern used in directory_mqtt_task where lag
+    /// detection triggers a resync callback.
+    #[tokio::test]
+    async fn lag_triggers_resync_callback() {
+        let resync_count = Arc::new(AtomicUsize::new(0));
+        let resync_count_clone = resync_count.clone();
+
+        let (tx, mut rx) = broadcast::channel::<i32>(1);
+
+        // Send messages to trigger lag
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        tx.send(3).unwrap();
+
+        // Process with lag detection
+        let result = recv_broadcast_with_lag(&mut rx, "test").await;
+
+        match result {
+            BroadcastRecvResult::Lagged { missed_count, .. } => {
+                // In real code, this is where resync would be triggered
+                resync_count_clone.fetch_add(1, Ordering::SeqCst);
+                assert!(missed_count >= 1);
+            }
+            _ => {}
+        }
+
+        assert_eq!(
+            resync_count.load(Ordering::SeqCst),
+            1,
+            "Resync should have been triggered once"
+        );
+    }
+
+    /// Test the full receive loop pattern with lag handling.
+    ///
+    /// This tests the pattern used in directory_mqtt_task where the loop
+    /// continues processing after detecting and handling lag.
+    #[tokio::test]
+    async fn recv_loop_continues_after_lag() {
+        let (tx, mut rx) = broadcast::channel::<i32>(2);
+        let messages_received = Arc::new(AtomicUsize::new(0));
+        let lag_detected = Arc::new(AtomicUsize::new(0));
+
+        // Send messages that will cause lag (don't spawn, do it synchronously)
+        for i in 1..=10 {
+            let _ = tx.send(i);
+        }
+        drop(tx); // Close channel so receiver will get Closed
+
+        let messages_clone = messages_received.clone();
+        let lag_clone = lag_detected.clone();
+
+        // Process messages until channel closes
+        loop {
+            match recv_broadcast_with_lag(&mut rx, "test").await {
+                BroadcastRecvResult::Message(_msg) => {
+                    messages_clone.fetch_add(1, Ordering::SeqCst);
+                }
+                BroadcastRecvResult::Lagged { next_message, .. } => {
+                    lag_clone.fetch_add(1, Ordering::SeqCst);
+                    if next_message.is_some() {
+                        messages_clone.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                BroadcastRecvResult::Closed => break,
+            }
+        }
+
+        // We should have received some messages
+        assert!(
+            messages_received.load(Ordering::SeqCst) > 0,
+            "Should have received at least one message"
+        );
+        // Lag should have been detected (channel capacity 2, sent 10 messages)
+        assert!(
+            lag_detected.load(Ordering::SeqCst) > 0,
+            "Lag should have been detected"
+        );
+    }
+}
+
+// =============================================================================
+// Edit Buffering Before CRDT Init Tests (Stage 0)
+//
+// These tests validate that MQTT edits arriving before CRDT initialization
+// completes are buffered and applied after init.
+//
+// This is critical for preventing lost edits in the race condition where:
+// 1. MQTT edit arrives
+// 2. CRDT state isn't initialized yet
+// 3. Server fetch might not have the edit (server receives MQTT simultaneously)
+// =============================================================================
+
+mod edit_buffering_tests {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use commonplace_doc::commit::Commit;
+    use commonplace_doc::mqtt::EditMessage;
+    use commonplace_doc::sync::crdt_state::{CrdtPeerState, MAX_PENDING_EDITS};
+    use commonplace_doc::sync::{process_received_edit, MergeResult};
+    use uuid::Uuid;
+    use yrs::{Doc, GetString, ReadTxn, Text, Transact, WriteTxn};
+
+    /// Helper to create a Yjs update for text content.
+    fn create_text_update(client_id: u64, text: &str) -> (Vec<u8>, Doc) {
+        let doc = Doc::with_client_id(client_id);
+        let update = {
+            let mut txn = doc.transact_mut();
+            let ytext = txn.get_or_insert_text("content");
+            ytext.insert(&mut txn, 0, text);
+            txn.encode_update_v1()
+        };
+        (update, doc)
+    }
+
+    /// Helper to get text content from a Y.Doc.
+    fn get_doc_text(doc: &Doc) -> String {
+        let txn = doc.transact();
+        match txn.get_text("content") {
+            Some(text) => text.get_string(&txn),
+            None => String::new(),
+        }
+    }
+
+    /// Helper to create an EditMessage from an update.
+    fn make_edit_message(update: &[u8], author: &str, timestamp: u64) -> EditMessage {
+        EditMessage {
+            update: STANDARD.encode(update),
+            parents: vec![],
+            author: author.to_string(),
+            message: None,
+            timestamp,
+        }
+    }
+
+    /// Invariant: Uninitialized CRDT state indicates need for server init.
+    #[test]
+    fn uninitialized_state_needs_server_init() {
+        let state = CrdtPeerState::new(Uuid::new_v4());
+        assert!(
+            state.needs_server_init(),
+            "New state should need server initialization"
+        );
+    }
+
+    /// Invariant: Initialized CRDT state does not need server init.
+    #[test]
+    fn initialized_state_does_not_need_server_init() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Create server state
+        let (update, _doc) = create_text_update(1, "server content");
+        let server_state_b64 = STANDARD.encode(&update);
+
+        state.initialize_from_server(&server_state_b64, "server_cid");
+
+        assert!(
+            !state.needs_server_init(),
+            "Initialized state should not need server init"
+        );
+    }
+
+    /// Invariant: Queued edits are preserved during initialization.
+    ///
+    /// This test simulates the race condition where edits arrive before init:
+    /// 1. Create uninitialized state
+    /// 2. Queue some edits (as would happen in directory_mqtt_task)
+    /// 3. Initialize from server
+    /// 4. Verify queued edits can be retrieved and applied
+    #[tokio::test]
+    async fn queued_edits_applied_after_init() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Simulate server has content "hello"
+        let (server_update, server_doc) = create_text_update(1, "hello");
+        let server_state_b64 = STANDARD.encode({
+            let txn = server_doc.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        });
+        let server_cid = Commit::with_timestamp(
+            vec![],
+            STANDARD.encode(&server_update),
+            "server".to_string(),
+            None,
+            1000,
+        )
+        .calculate_cid();
+
+        // Simulate remote client appends " world" (building on server state)
+        let remote_doc = Doc::with_client_id(2);
+        {
+            // Apply server state first
+            let update = yrs::updates::decoder::Decode::decode_v1(
+                &STANDARD.decode(&server_state_b64).unwrap(),
+            )
+            .unwrap();
+            let mut txn = remote_doc.transact_mut();
+            txn.apply_update(update);
+        }
+        let remote_update = {
+            let mut txn = remote_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 5, " world");
+            txn.encode_update_v1()
+        };
+
+        // Serialize the remote edit as MQTT would
+        let edit_msg = make_edit_message(&remote_update, "remote", 2000);
+        let edit_payload = serde_json::to_vec(&edit_msg).unwrap();
+
+        // Step 1: State is uninitialized - needs_server_init() returns true
+        assert!(state.needs_server_init());
+
+        // Step 2: Queue the edit (simulating directory_mqtt_task behavior)
+        state.queue_pending_edit(edit_payload.clone());
+        assert!(state.has_pending_edits());
+        assert_eq!(state.pending_edits.len(), 1);
+
+        // Step 3: Initialize from server state
+        state.initialize_from_server(&server_state_b64, &server_cid);
+        assert!(!state.needs_server_init());
+
+        // Step 4: Drain pending edits and verify they can be applied
+        let pending = state.take_pending_edits();
+        assert_eq!(pending.len(), 1);
+        assert!(!state.has_pending_edits());
+
+        // Parse and apply the pending edit
+        let parsed: EditMessage = serde_json::from_slice(&pending[0].payload).unwrap();
+        let (result, maybe_content) =
+            process_received_edit(None, "workspace", "node1", &mut state, &parsed, "local")
+                .await
+                .expect("Should process pending edit");
+
+        // The edit should be applied successfully
+        assert!(
+            matches!(
+                result,
+                MergeResult::FastForward { .. } | MergeResult::Merged { .. }
+            ),
+            "Pending edit should be applied, got {:?}",
+            result
+        );
+
+        // Content should be "hello world"
+        if let Some(content) = maybe_content {
+            assert!(
+                content.contains("hello") && content.contains("world"),
+                "Content should contain both 'hello' and 'world': {}",
+                content
+            );
+        } else {
+            // If no content, verify Y.Doc has expected content
+            let doc = state.to_doc().expect("Should have valid doc");
+            let text = get_doc_text(&doc);
+            assert!(
+                text.contains("hello") && text.contains("world"),
+                "Doc text should contain both 'hello' and 'world': {}",
+                text
+            );
+        }
+    }
+
+    /// Invariant: Multiple edits can be queued and applied in order.
+    #[tokio::test]
+    async fn multiple_queued_edits_applied_in_order() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Create three edits
+        let (update1, _) = create_text_update(1, "A");
+        let (update2, _) = create_text_update(2, "B");
+        let (update3, _) = create_text_update(3, "C");
+
+        let msg1 = make_edit_message(&update1, "author1", 1000);
+        let msg2 = make_edit_message(&update2, "author2", 2000);
+        let msg3 = make_edit_message(&update3, "author3", 3000);
+
+        // Queue all three edits
+        state.queue_pending_edit(serde_json::to_vec(&msg1).unwrap());
+        state.queue_pending_edit(serde_json::to_vec(&msg2).unwrap());
+        state.queue_pending_edit(serde_json::to_vec(&msg3).unwrap());
+
+        assert_eq!(state.pending_edits.len(), 3);
+
+        // Take all pending edits
+        let pending = state.take_pending_edits();
+        assert_eq!(pending.len(), 3);
+
+        // Verify order is preserved (FIFO)
+        let parsed1: EditMessage = serde_json::from_slice(&pending[0].payload).unwrap();
+        let parsed2: EditMessage = serde_json::from_slice(&pending[1].payload).unwrap();
+        let parsed3: EditMessage = serde_json::from_slice(&pending[2].payload).unwrap();
+
+        assert_eq!(parsed1.timestamp, 1000);
+        assert_eq!(parsed2.timestamp, 2000);
+        assert_eq!(parsed3.timestamp, 3000);
+    }
+
+    /// Invariant: Queue overflow drops oldest edits with warning.
+    #[test]
+    fn queue_overflow_drops_oldest() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Fill queue to capacity
+        for i in 0..MAX_PENDING_EDITS {
+            let msg = make_edit_message(&[i as u8], "author", i as u64);
+            state.queue_pending_edit(serde_json::to_vec(&msg).unwrap());
+        }
+
+        assert_eq!(state.pending_edits.len(), MAX_PENDING_EDITS);
+
+        // Queue one more - should drop oldest
+        let overflow_msg = make_edit_message(&[255], "author", 999999);
+        state.queue_pending_edit(serde_json::to_vec(&overflow_msg).unwrap());
+
+        // Still at max capacity
+        assert_eq!(state.pending_edits.len(), MAX_PENDING_EDITS);
+
+        // First element should now be the second edit (timestamp 1)
+        let pending = state.take_pending_edits();
+        let first: EditMessage = serde_json::from_slice(&pending[0].payload).unwrap();
+        assert_eq!(
+            first.timestamp, 1,
+            "Oldest edit (timestamp 0) should have been dropped"
+        );
+
+        // Last element should be the overflow edit
+        let last: EditMessage =
+            serde_json::from_slice(&pending[pending.len() - 1].payload).unwrap();
+        assert_eq!(last.timestamp, 999999, "Newest edit should be at the end");
+    }
+
+    /// Invariant: Pending edits are not serialized to disk.
+    ///
+    /// The pending_edits field uses #[serde(skip)] so transient edits
+    /// don't persist across restarts.
+    #[test]
+    fn pending_edits_not_serialized() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        let msg = make_edit_message(&[1, 2, 3], "author", 1000);
+        state.queue_pending_edit(serde_json::to_vec(&msg).unwrap());
+
+        // Serialize state
+        let json = serde_json::to_string(&state).unwrap();
+
+        // pending_edits should not appear in JSON
+        assert!(
+            !json.contains("pending_edits"),
+            "pending_edits should not be serialized"
+        );
+
+        // Deserialize and verify empty queue
+        let loaded: CrdtPeerState = serde_json::from_str(&json).unwrap();
+        assert!(
+            !loaded.has_pending_edits(),
+            "Deserialized state should have empty pending_edits"
+        );
+    }
+
+    /// Invariant: Queue can be drained multiple times (idempotent).
+    #[test]
+    fn take_pending_edits_is_idempotent() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Queue one edit
+        let msg = make_edit_message(&[1], "author", 1000);
+        state.queue_pending_edit(serde_json::to_vec(&msg).unwrap());
+
+        // First take gets the edit
+        let first_take = state.take_pending_edits();
+        assert_eq!(first_take.len(), 1);
+
+        // Second take is empty
+        let second_take = state.take_pending_edits();
+        assert!(second_take.is_empty());
+
+        // Third take is also empty
+        let third_take = state.take_pending_edits();
+        assert!(third_take.is_empty());
+    }
+
+    /// Integration test: Full workflow simulation.
+    ///
+    /// This simulates the complete scenario from CP-hykz:
+    /// 1. Sync client starts up
+    /// 2. MQTT edit arrives before CRDT state is initialized
+    /// 3. Edit is queued (not applied, not fetched from server)
+    /// 4. CRDT initialization completes
+    /// 5. Queued edit is applied
+    /// 6. Final state is correct
+    #[tokio::test]
+    async fn full_workflow_edit_before_init() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Simulate: Server has "hello"
+        let server_doc = Doc::with_client_id(1);
+        {
+            let mut txn = server_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "hello");
+        }
+        let server_state = {
+            let txn = server_doc.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+        let server_state_b64 = STANDARD.encode(&server_state);
+        let server_cid = "server_head_cid";
+
+        // Simulate: Remote client sends " world" edit via MQTT
+        // (This arrives BEFORE our CRDT state is initialized)
+        let remote_doc = Doc::with_client_id(2);
+        {
+            // Remote builds on server state
+            let update = yrs::updates::decoder::Decode::decode_v1(&server_state).unwrap();
+            let mut txn = remote_doc.transact_mut();
+            txn.apply_update(update);
+        }
+        let remote_update = {
+            let mut txn = remote_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 5, " world");
+            txn.encode_update_v1()
+        };
+        let remote_msg = EditMessage {
+            update: STANDARD.encode(&remote_update),
+            parents: vec![server_cid.to_string()],
+            author: "remote".to_string(),
+            message: None,
+            timestamp: 2000,
+        };
+        let mqtt_payload = serde_json::to_vec(&remote_msg).unwrap();
+
+        // Step 1: MQTT edit arrives before init
+        assert!(state.needs_server_init(), "State should need init");
+
+        // Step 2: Queue the edit (as directory_mqtt_task does)
+        state.queue_pending_edit(mqtt_payload);
+        assert!(state.has_pending_edits());
+
+        // Step 3: Initialize from server
+        state.initialize_from_server(&server_state_b64, server_cid);
+        assert!(!state.needs_server_init());
+
+        // Verify server content is available
+        let doc_after_init = state.to_doc().unwrap();
+        assert_eq!(get_doc_text(&doc_after_init), "hello");
+
+        // Step 4: Process pending edits
+        let pending = state.take_pending_edits();
+        assert_eq!(pending.len(), 1);
+
+        let edit_msg: EditMessage = serde_json::from_slice(&pending[0].payload).unwrap();
+        let (result, content) =
+            process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local")
+                .await
+                .expect("Should apply pending edit");
+
+        // Step 5: Verify final state
+        assert!(
+            matches!(
+                result,
+                MergeResult::FastForward { .. } | MergeResult::Merged { .. }
+            ),
+            "Edit should be applied, got {:?}",
+            result
+        );
+
+        // Check final content
+        let final_doc = state.to_doc().unwrap();
+        let final_text = get_doc_text(&final_doc);
+        assert_eq!(
+            final_text, "hello world",
+            "Final content should be 'hello world', got '{}'",
+            final_text
+        );
+
+        // Also verify content returned for writing
+        if let Some(c) = content {
+            assert_eq!(c, "hello world", "Returned content should match");
+        }
+    }
+}

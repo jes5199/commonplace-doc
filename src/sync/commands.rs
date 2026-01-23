@@ -88,7 +88,7 @@ async fn command_listener_task(
 
     // Process incoming MQTT messages
     let context = format!("commands listener for {}", path);
-    while let Some(msg) = recv_broadcast(&mut message_rx, &context).await {
+    while let Some(msg) = recv_broadcast(&mut message_rx, &context, None::<fn(u64)>).await {
         // Check if this message is for our commands topic
         if !msg.topic.starts_with(&topic_prefix) {
             continue;

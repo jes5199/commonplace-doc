@@ -21,6 +21,16 @@ pub const FILE_DEBOUNCE_MS: u64 = 100;
 /// Default debounce duration for directory watcher (500ms)
 pub const DIR_DEBOUNCE_MS: u64 = 500;
 
+/// Interval for file stability checks (50ms)
+pub const STABILITY_CHECK_INTERVAL_MS: u64 = 50;
+
+/// Maximum time to wait for file stability (5 seconds)
+pub const STABILITY_MAX_WAIT_MS: u64 = 5000;
+
+/// Timeout for acquiring shared lock before reading (500ms)
+/// Short timeout to avoid blocking too long, but enough to wait for quick writes
+pub const FLOCK_READ_TIMEOUT_MS: u64 = 500;
+
 /// Create a notify watcher with a channel for receiving events.
 ///
 /// This helper encapsulates the common watcher setup pattern:
@@ -85,6 +95,69 @@ fn is_temp_file(name: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Metadata snapshot for stability checking.
+#[derive(Debug, Clone, PartialEq)]
+struct FileSnapshot {
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FileSnapshot {
+    /// Take a snapshot of file metadata. Returns None if file doesn't exist.
+    fn take(path: &PathBuf) -> Option<Self> {
+        std::fs::metadata(path).ok().map(|m| FileSnapshot {
+            size: m.len(),
+            modified: m.modified().ok(),
+        })
+    }
+}
+
+/// Wait for file content to stabilize by checking size/mtime.
+///
+/// Returns Ok(()) when content is stable, Err if max wait exceeded or file disappeared.
+async fn wait_for_file_stability(path: &PathBuf) -> Result<(), &'static str> {
+    let stability_interval = Duration::from_millis(STABILITY_CHECK_INTERVAL_MS);
+    let max_wait = Duration::from_millis(STABILITY_MAX_WAIT_MS);
+    let start = tokio::time::Instant::now();
+
+    let mut last_snapshot = match FileSnapshot::take(path) {
+        Some(s) => s,
+        None => return Err("file disappeared before stability check"),
+    };
+
+    loop {
+        tokio::time::sleep(stability_interval).await;
+
+        if start.elapsed() > max_wait {
+            // Max wait exceeded, proceed anyway to avoid infinite loop
+            debug!(
+                "Stability check timeout for {}, proceeding anyway",
+                path.display()
+            );
+            return Ok(());
+        }
+
+        let current_snapshot = match FileSnapshot::take(path) {
+            Some(s) => s,
+            None => return Err("file disappeared during stability check"),
+        };
+
+        if current_snapshot == last_snapshot {
+            // File is stable
+            return Ok(());
+        }
+
+        // File still changing, update snapshot and continue waiting
+        debug!(
+            "File {} still changing (size: {} -> {}), waiting...",
+            path.display(),
+            last_snapshot.size,
+            current_snapshot.size
+        );
+        last_snapshot = current_snapshot;
+    }
 }
 
 /// Task that watches a single file for modifications.
@@ -244,41 +317,61 @@ pub async fn file_watcher_task(file_path: PathBuf, tx: mpsc::Sender<FileEvent>) 
                     std::future::pending::<bool>().await
                 }
             } => {
-                // Debounce period elapsed - capture content BEFORE sending event
-                // This prevents race conditions where SSE might overwrite the file
-                // between event dispatch and upload_task reading the file.
+                // Debounce period elapsed - now we need to ensure content is stable
+                // before reading. This handles:
+                // 1. Partial writes (notify fires before content is fully written)
+                // 2. Atomic writes (temp file + rename patterns)
+                // 3. Exclusive locks held by writers
                 debounce_timer = None;
 
-                // Read file content immediately to capture user's edit
-                // Use shared lock to signal to agents that a read is in progress
+                // Step 1: Wait for file stability (size/mtime not changing)
+                if let Err(e) = wait_for_file_stability(&file_path).await {
+                    debug!("File stability check failed for {}: {}", file_path.display(), e);
+                    continue;
+                }
+
+                // Step 2: Try to acquire shared lock before reading
+                // This ensures we don't read while a writer holds LOCK_EX
                 #[cfg(unix)]
-                let content = {
-                    // Acquire shared lock to prevent agents from starting writes
-                    let _guard = match try_flock_shared(&file_path, None).await {
-                        Ok(FlockResult::Acquired(g)) => Some(g),
+                let (content, _guard) = {
+                    let lock_timeout = Duration::from_millis(FLOCK_READ_TIMEOUT_MS);
+                    match try_flock_shared(&file_path, Some(lock_timeout)).await {
+                        Ok(FlockResult::Acquired(g)) => {
+                            // Lock acquired - read content while holding lock
+                            match tokio::fs::read(&file_path).await {
+                                Ok(c) => (c, Some(g)),
+                                Err(e) => {
+                                    warn!("Failed to read file for upload: {}", e);
+                                    continue;
+                                }
+                            }
+                        }
                         Ok(FlockResult::Timeout) => {
-                            debug!("Shared lock timeout on {}, reading anyway", file_path.display());
-                            None
+                            // Exclusive lock held by writer - reset debounce and retry
+                            // This allows the writer to complete their work
+                            debug!(
+                                "Shared lock blocked on {} (writer active), will retry",
+                                file_path.display()
+                            );
+                            debounce_timer = Some(tokio::time::Instant::now() + debounce_duration);
+                            continue;
                         }
                         Err(e) => {
+                            // File might have been deleted or other error
                             debug!("Could not acquire shared lock on {}: {}", file_path.display(), e);
-                            None
+                            continue;
                         }
-                    };
+                    }
+                };
+                #[cfg(not(unix))]
+                let content = {
+                    // On non-Unix, just wait for stability and read
                     match tokio::fs::read(&file_path).await {
                         Ok(c) => c,
                         Err(e) => {
                             warn!("Failed to read file for upload: {}", e);
                             continue;
                         }
-                    }
-                };
-                #[cfg(not(unix))]
-                let content = match tokio::fs::read(&file_path).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!("Failed to read file for upload: {}", e);
-                        continue;
                     }
                 };
 

@@ -255,7 +255,9 @@ impl MqttService {
         // Process incoming messages and dispatch to handlers
         tracing::info!("MQTT event loop starting message processing");
         let mut msg_count = 0u64;
-        while let Some(msg) = recv_broadcast(&mut message_rx, "MQTT message receiver").await {
+        while let Some(msg) =
+            recv_broadcast(&mut message_rx, "MQTT message receiver", None::<fn(u64)>).await
+        {
             msg_count += 1;
             tracing::info!(
                 "MQTT received message #{} on topic: {} ({} bytes)",

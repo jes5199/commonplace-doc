@@ -3,17 +3,14 @@
 //! This module contains the task functions that subscribe to SSE and MQTT
 //! events for directory-level synchronization.
 
-use crate::events::recv_broadcast;
+use crate::events::{recv_broadcast_with_lag, BroadcastRecvResult};
 use crate::mqtt::{MqttClient, Topic};
 use crate::sync::dir_sync::{
     create_subdir_nested_directories, handle_schema_change_with_dedup, handle_subdir_new_files,
     handle_subdir_schema_cleanup,
 };
 use crate::sync::subdir_spawn::{spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport};
-use crate::sync::{
-    encode_node_id, initialize_crdt_state_from_server, spawn_file_sync_tasks_crdt, FileSyncState,
-    SharedLastContent,
-};
+use crate::sync::{encode_node_id, spawn_file_sync_tasks_crdt, FileSyncState, SharedLastContent};
 use futures::StreamExt;
 use reqwest::{Client, StatusCode};
 use reqwest_eventsource::{Error as SseError, Event as SseEvent, EventSource};
@@ -574,8 +571,41 @@ pub async fn directory_mqtt_task(
     // Initialize with the CID from initial sync to prevent pulling stale server content.
     let mut last_schema_cid: Option<String> = initial_schema_cid;
 
-    // Process incoming MQTT messages
-    while let Some(msg) = recv_broadcast(&mut message_rx, "MQTT directory receiver").await {
+    // Process incoming MQTT messages with lag detection
+    loop {
+        let msg = match recv_broadcast_with_lag(&mut message_rx, "MQTT directory receiver").await {
+            BroadcastRecvResult::Message(m) => m,
+            BroadcastRecvResult::Lagged {
+                missed_count,
+                next_message,
+            } => {
+                // Resync all subscribed files to recover missed edits
+                info!(
+                    "MQTT directory receiver lagged by {} messages, triggering resync",
+                    missed_count
+                );
+                resync_subscribed_files(
+                    &http_client,
+                    &server,
+                    &subscribed_uuids,
+                    &uuid_to_paths,
+                    &directory,
+                    use_paths,
+                    &file_states,
+                    crdt_context.as_ref(),
+                    &author,
+                )
+                .await;
+
+                // Process the next message if available
+                match next_message {
+                    Some(m) => m,
+                    None => break, // Channel closed after lag
+                }
+            }
+            BroadcastRecvResult::Closed => break,
+        };
+
         // Parse the topic to extract the document ID
         let doc_id = match Topic::parse(&msg.topic, &workspace) {
             Ok(parsed) => parsed.path,
@@ -729,60 +759,80 @@ pub async fn directory_mqtt_task(
                             let mut state_guard = ctx.crdt_state.write().await;
                             let file_state = state_guard.get_or_create_file(&filename, node_id);
 
-                            match crate::sync::crdt_merge::process_received_edit(
-                                Some(&ctx.mqtt_client),
-                                &ctx.workspace,
-                                &doc_id,
-                                file_state,
-                                &edit_msg,
-                                &author,
-                            )
-                            .await
-                            {
-                                Ok((result, maybe_content)) => {
-                                    drop(state_guard); // Release lock before file I/O
+                            // Check if CRDT state needs initialization.
+                            // If so, queue the edit for later processing instead of
+                            // trying to merge it now (which would fail or produce
+                            // incorrect results without shared history).
+                            if file_state.needs_server_init() {
+                                file_state.queue_pending_edit(msg.payload.clone());
+                                debug!(
+                                    "CRDT needs init for {}, queued edit (queue size: {})",
+                                    filename,
+                                    file_state.pending_edits.len()
+                                );
+                                drop(state_guard);
+                                // Don't fall back to server fetch - we'll apply after init
+                                true
+                            } else {
+                                match crate::sync::crdt_merge::process_received_edit(
+                                    Some(&ctx.mqtt_client),
+                                    &ctx.workspace,
+                                    &doc_id,
+                                    file_state,
+                                    &edit_msg,
+                                    &author,
+                                )
+                                .await
+                                {
+                                    Ok((result, maybe_content)) => {
+                                        drop(state_guard); // Release lock before file I/O
 
-                                    if let Some(content) = maybe_content {
-                                        // Write to all paths
-                                        for rel_path in paths {
-                                            let file_path = directory.join(rel_path);
+                                        if let Some(content) = maybe_content {
+                                            // Write to all paths
+                                            for rel_path in paths {
+                                                let file_path = directory.join(rel_path);
 
-                                            // Update shared_last_content before writing
-                                            {
-                                                let states = file_states.read().await;
-                                                if let Some(state) = states.get(rel_path) {
-                                                    if let Some(ref slc) = state.crdt_last_content {
-                                                        let mut shared = slc.write().await;
-                                                        *shared = Some(content.clone());
+                                                // Update shared_last_content before writing
+                                                {
+                                                    let states = file_states.read().await;
+                                                    if let Some(state) = states.get(rel_path) {
+                                                        if let Some(ref slc) =
+                                                            state.crdt_last_content
+                                                        {
+                                                            let mut shared = slc.write().await;
+                                                            *shared = Some(content.clone());
+                                                        }
                                                     }
                                                 }
-                                            }
 
-                                            if let Some(parent) = file_path.parent() {
-                                                let _ = tokio::fs::create_dir_all(parent).await;
+                                                if let Some(parent) = file_path.parent() {
+                                                    let _ = tokio::fs::create_dir_all(parent).await;
+                                                }
+                                                if let Err(e) =
+                                                    tokio::fs::write(&file_path, &content).await
+                                                {
+                                                    warn!("Failed to write {}: {}", rel_path, e);
+                                                } else {
+                                                    debug!(
+                                                        "CRDT edit applied to {} ({} bytes, {:?})",
+                                                        rel_path,
+                                                        content.len(),
+                                                        result
+                                                    );
+                                                }
                                             }
-                                            if let Err(e) =
-                                                tokio::fs::write(&file_path, &content).await
-                                            {
-                                                warn!("Failed to write {}: {}", rel_path, e);
-                                            } else {
-                                                debug!(
-                                                    "CRDT edit applied to {} ({} bytes, {:?})",
-                                                    rel_path,
-                                                    content.len(),
-                                                    result
-                                                );
-                                            }
+                                            true // Handled via CRDT
+                                        } else {
+                                            debug!(
+                                                "CRDT merge returned no content (already known)"
+                                            );
+                                            true // Handled (no-op)
                                         }
-                                        true // Handled via CRDT
-                                    } else {
-                                        debug!("CRDT merge returned no content (already known)");
-                                        true // Handled (no-op)
                                     }
-                                }
-                                Err(e) => {
-                                    warn!("CRDT merge failed for {}: {}", doc_id, e);
-                                    false // Fall back to server fetch
+                                    Err(e) => {
+                                        warn!("CRDT merge failed for {}: {}", doc_id, e);
+                                        false // Fall back to server fetch
+                                    }
                                 }
                             }
                         } else {
@@ -860,13 +910,16 @@ async fn ensure_crdt_tasks_for_files(
             .unwrap_or(&relative_path)
             .to_string();
 
-        if let Err(e) = initialize_crdt_state_from_server(
+        if let Err(e) = crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
             http_client,
             server,
             node_id,
             &context.crdt_state,
             &filename,
             &file_path,
+            Some(&context.mqtt_client),
+            Some(&context.workspace),
+            Some(author),
         )
         .await
         {
@@ -1148,6 +1201,109 @@ async fn handle_file_uuid_edit(
     Ok(())
 }
 
+/// Resync all subscribed file UUIDs from server after broadcast lag.
+///
+/// When the broadcast channel lags, we may have missed edit messages for files.
+/// This function fetches the current HEAD state from server for all subscribed
+/// file UUIDs and applies any changes to local files.
+///
+/// For CRDT-managed files, it re-initializes the CRDT state from server.
+/// For non-CRDT files, it fetches and writes the content directly.
+#[allow(clippy::too_many_arguments)]
+async fn resync_subscribed_files(
+    http_client: &Client,
+    server: &str,
+    subscribed_uuids: &HashSet<String>,
+    uuid_to_paths: &crate::sync::UuidToPathsMap,
+    directory: &Path,
+    use_paths: bool,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    crdt_context: Option<&CrdtFileSyncContext>,
+    author: &str,
+) {
+    info!(
+        "Resyncing {} subscribed file UUIDs after broadcast lag",
+        subscribed_uuids.len()
+    );
+
+    for uuid in subscribed_uuids {
+        // Get paths for this UUID
+        let paths = match uuid_to_paths.get(uuid) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // For CRDT-managed files, re-initialize from server
+        if let Some(ctx) = crdt_context {
+            if let Ok(node_id) = Uuid::parse_str(uuid) {
+                // Get the filename from the first path
+                let filename = paths
+                    .first()
+                    .and_then(|p| std::path::Path::new(p).file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(uuid)
+                    .to_string();
+
+                let file_path = paths
+                    .first()
+                    .map(|p| directory.join(p))
+                    .unwrap_or_else(|| directory.join(&filename));
+
+                // Mark state as needing re-init so initialize_crdt_state_from_server_with_pending
+                // will actually fetch fresh state
+                {
+                    let mut state_guard = ctx.crdt_state.write().await;
+                    if let Some(file_state) = state_guard.get_file_mut(&filename) {
+                        file_state.mark_needs_resync();
+                    }
+                }
+
+                if let Err(e) =
+                    crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
+                        http_client,
+                        server,
+                        node_id,
+                        &ctx.crdt_state,
+                        &filename,
+                        &file_path,
+                        Some(&ctx.mqtt_client),
+                        Some(&ctx.workspace),
+                        Some(author),
+                    )
+                    .await
+                {
+                    warn!(
+                        "Resync: Failed to re-initialize CRDT state for {}: {}",
+                        uuid, e
+                    );
+                } else {
+                    debug!("Resync: Re-initialized CRDT state for {}", uuid);
+                }
+                continue;
+            }
+        }
+
+        // Fallback for non-CRDT files: fetch from server
+        if let Err(e) = handle_file_uuid_edit(
+            http_client,
+            server,
+            uuid,
+            paths,
+            directory,
+            use_paths,
+            file_states,
+        )
+        .await
+        {
+            warn!("Resync: Failed to fetch UUID {}: {}", uuid, e);
+        } else {
+            debug!("Resync: Fetched UUID {} from server", uuid);
+        }
+    }
+
+    info!("Resync completed for subscribed file UUIDs");
+}
+
 /// Helper to spawn MQTT tasks for subdirectories.
 /// This is separate from subdir_mqtt_task to avoid recursive type issues with tokio::spawn.
 #[allow(clippy::too_many_arguments)]
@@ -1240,9 +1396,49 @@ pub async fn subdir_mqtt_task(
         return;
     }
 
-    // Process incoming MQTT messages
+    // Process incoming MQTT messages with lag detection
     let context = format!("MQTT subdir {} receiver", subdir_path);
-    while let Some(msg) = recv_broadcast(&mut message_rx, &context).await {
+    loop {
+        let msg = match recv_broadcast_with_lag(&mut message_rx, &context).await {
+            BroadcastRecvResult::Message(m) => m,
+            BroadcastRecvResult::Lagged {
+                missed_count,
+                next_message,
+            } => {
+                // For subdir schema watchers, resync by triggering a schema refresh
+                info!(
+                    "MQTT subdir {} receiver lagged by {} messages, triggering schema resync",
+                    subdir_path, missed_count
+                );
+                // Force a schema refresh by calling handle_subdir_edit
+                let subdir_full_path = directory.join(&subdir_path);
+                handle_subdir_edit(
+                    &http_client,
+                    &server,
+                    &subdir_node_id,
+                    &subdir_path,
+                    &subdir_full_path,
+                    &directory,
+                    &file_states,
+                    use_paths,
+                    push_only,
+                    pull_only,
+                    shared_state_file.as_ref(),
+                    &author,
+                    #[cfg(unix)]
+                    inode_tracker.clone(),
+                    "MQTT-resync",
+                )
+                .await;
+
+                match next_message {
+                    Some(m) => m,
+                    None => break, // Channel closed
+                }
+            }
+            BroadcastRecvResult::Closed => break,
+        };
+
         // Check if this message is for our topic
         if msg.topic == topic_str {
             debug!(

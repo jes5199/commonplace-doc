@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// A commit in the document history
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,7 +23,7 @@ pub struct Commit {
 
     /// Allow arbitrary extension fields
     #[serde(flatten)]
-    pub extensions: HashMap<String, serde_json::Value>,
+    pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
 impl Commit {
@@ -43,7 +43,7 @@ impl Commit {
             update,
             author,
             message,
-            extensions: HashMap::new(),
+            extensions: BTreeMap::new(),
         }
     }
 
@@ -82,7 +82,7 @@ impl Commit {
             update,
             author,
             message,
-            extensions: HashMap::new(),
+            extensions: BTreeMap::new(),
         }
     }
 

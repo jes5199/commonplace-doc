@@ -1,1 +1,14 @@
 
+/typing
+/typing
+Hello! I'm Bartleby, your autonomous agent assistant. I have access to the filesystem and shell within this sandboxed workspace.
+
+How can I help you today? I can:
+- Run shell commands and manage processes
+- Read, write, and edit files
+- Search codebases and explore directories
+- Fetch web content
+- Help with coding tasks, debugging, and more
+
+What would you like me to work on?
+/unset typing

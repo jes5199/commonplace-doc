@@ -81,7 +81,8 @@ pub use file_events::{
     handle_file_deleted, handle_file_modified, OwningDocument,
 };
 pub use file_sync::{
-    initial_sync, initialize_crdt_state_from_server, spawn_file_sync_tasks,
+    initial_sync, initialize_crdt_state_from_server,
+    initialize_crdt_state_from_server_with_pending, spawn_file_sync_tasks,
     spawn_file_sync_tasks_crdt, spawn_file_sync_tasks_with_flock, sync_single_file, upload_task,
     upload_task_crdt, upload_task_with_flock,
 };
@@ -161,5 +162,6 @@ pub use crdt_publish::{
     publish_yjs_update, PublishResult,
 };
 pub use crdt_state::{
-    load_or_migrate, migrate_from_old_state, CrdtPeerState, DirectorySyncState, CRDT_STATE_FILENAME,
+    load_or_migrate, migrate_from_old_state, CrdtPeerState, DirectorySyncState, PendingEdit,
+    CRDT_STATE_FILENAME, MAX_PENDING_EDITS,
 };

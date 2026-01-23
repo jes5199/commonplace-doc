@@ -59,7 +59,9 @@ pub fn router(
 async fn commit_listener(room_manager: Arc<RoomManager>, broadcaster: CommitBroadcaster) {
     let mut rx = broadcaster.subscribe();
 
-    while let Some(notification) = recv_broadcast(&mut rx, "WebSocket commit listener").await {
+    while let Some(notification) =
+        recv_broadcast(&mut rx, "WebSocket commit listener", None::<fn(u64)>).await
+    {
         // Forward to all rooms (each room filters by doc_id)
         let rooms = room_manager.get_all_rooms().await;
         for room in rooms {

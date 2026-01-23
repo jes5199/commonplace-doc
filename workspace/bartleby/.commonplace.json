@@ -3,60 +3,60 @@
   "root": {
     "type": "dir",
     "entries": {
-      "debug-test.txt": {
+      "test-note.txt": {
         "type": "doc",
-        "node_id": "a99518a8-f565-45cd-92ed-1bc7fa0f856e",
-        "content_type": null
+        "node_id": "b1fb3ac2-cc4d-4d50-b077-47aa0bf45be4",
+        "content_type": "text/plain"
       },
       "prompts.txt": {
         "type": "doc",
         "node_id": "aae15b58-0cc9-4f8e-8964-81210a44ae66",
-        "content_type": null
-      },
-      "history.jsonl": {
-        "type": "doc",
-        "node_id": "b57856b2-eeed-49e1-81d1-5565d36b4aba",
-        "content_type": null
-      },
-      "test-note.txt": {
-        "type": "doc",
-        "node_id": "b1fb3ac2-cc4d-4d50-b077-47aa0bf45be4",
-        "content_type": null
-      },
-      "trigger-test.txt": {
-        "type": "doc",
-        "node_id": "33db1eff-8cf4-4def-91fe-6f0aba247e42",
-        "content_type": null
-      },
-      "system_prompt.txt": {
-        "type": "doc",
-        "node_id": "ff593cff-1c09-485a-af93-ff26dfeb260c",
-        "content_type": null
-      },
-      "output.txt": {
-        "type": "doc",
-        "node_id": "54685765-286c-43fd-b5b8-35b737c2b170",
-        "content_type": null
-      },
-      "input.txt": {
-        "type": "doc",
-        "node_id": "0ca210d0-434f-43ec-aed9-5a538dc3bb57",
-        "content_type": null
-      },
-      "schema-test.txt": {
-        "type": "doc",
-        "node_id": "99dbace3-3023-4dfa-aa03-11fa3cf7091b",
-        "content_type": null
-      },
-      "trace-test.txt": {
-        "type": "doc",
-        "node_id": "466c7a36-55a3-4385-8bc7-cca8171042ce",
-        "content_type": null
+        "content_type": "text/plain"
       },
       "debug-final.txt": {
         "type": "doc",
         "node_id": "924fdaf1-e261-4c61-a355-17902119f227",
-        "content_type": null
+        "content_type": "text/plain"
+      },
+      "trigger-test.txt": {
+        "type": "doc",
+        "node_id": "33db1eff-8cf4-4def-91fe-6f0aba247e42",
+        "content_type": "text/plain"
+      },
+      "trace-test.txt": {
+        "type": "doc",
+        "node_id": "466c7a36-55a3-4385-8bc7-cca8171042ce",
+        "content_type": "text/plain"
+      },
+      "input.txt": {
+        "type": "doc",
+        "node_id": "0ca210d0-434f-43ec-aed9-5a538dc3bb57",
+        "content_type": "text/plain"
+      },
+      "schema-test.txt": {
+        "type": "doc",
+        "node_id": "99dbace3-3023-4dfa-aa03-11fa3cf7091b",
+        "content_type": "text/plain"
+      },
+      "debug-test.txt": {
+        "type": "doc",
+        "node_id": "a99518a8-f565-45cd-92ed-1bc7fa0f856e",
+        "content_type": "text/plain"
+      },
+      "system_prompt.txt": {
+        "type": "doc",
+        "node_id": "ff593cff-1c09-485a-af93-ff26dfeb260c",
+        "content_type": "text/plain"
+      },
+      "history.jsonl": {
+        "type": "doc",
+        "node_id": "b57856b2-eeed-49e1-81d1-5565d36b4aba",
+        "content_type": "application/x-ndjson"
+      },
+      "output.txt": {
+        "type": "doc",
+        "node_id": "54685765-286c-43fd-b5b8-35b737c2b170",
+        "content_type": "text/plain"
       }
     },
     "node_id": null,

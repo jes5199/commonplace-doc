@@ -3317,7 +3317,7 @@ async fn run_log_listener_mode(
     // Process events until signaled to stop
     let exit_code = tokio::select! {
         _ = async {
-            while let Some(msg) = recv_broadcast(&mut message_rx, "log-listener").await {
+            while let Some(msg) = recv_broadcast(&mut message_rx, "log-listener", None::<fn(u64)>).await {
                 // Determine if this is stdout or stderr
                 let stream_type = if msg.topic == stdout_prefix {
                     "stdout"
