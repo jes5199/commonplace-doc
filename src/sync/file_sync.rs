@@ -2254,6 +2254,11 @@ pub async fn receive_task_crdt(
 ) {
     let node_id_str = node_id.to_string();
 
+    // CRITICAL: Create the broadcast receiver BEFORE subscribing.
+    // This ensures we receive retained messages that the broker sends immediately
+    // after we subscribe.
+    let mut message_rx = mqtt_client.subscribe_messages();
+
     // Subscribe to edits for this file's UUID
     let topic = Topic::edits(&workspace, &node_id_str).to_topic_string();
 
@@ -2267,9 +2272,6 @@ pub async fn receive_task_crdt(
         error!("CRDT receive_task: failed to subscribe to {}: {}", topic, e);
         return;
     }
-
-    // Get a receiver for incoming messages
-    let mut message_rx = mqtt_client.subscribe_messages();
     let context = format!("CRDT receive {}", file_path.display());
 
     while let Some(msg) = recv_broadcast(&mut message_rx, &context).await {

@@ -236,13 +236,17 @@ async fn publish_file_content(
     let payload = serde_json::to_vec(&edit_msg)
         .map_err(|e| format!("Failed to serialize file edit: {}", e))?;
 
+    // Use retained message so new subscribers get the content immediately.
+    // This is critical for the sandbox sync race: the sandbox may subscribe
+    // after the content edit is published, and the retained message ensures
+    // it still receives the content.
     mqtt_client
-        .publish(&topic, &payload, QoS::AtLeastOnce)
+        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
         .await
         .map_err(|e| format!("Failed to publish file edit: {}", e))?;
 
     debug!(
-        "Published initial content commit {} for file {}",
+        "Published initial content commit {} for file {} (retained)",
         cid, file_uuid
     );
 

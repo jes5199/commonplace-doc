@@ -526,6 +526,12 @@ pub async fn directory_mqtt_task(
     initial_uuid_map: HashMap<String, String>,
     crdt_context: Option<CrdtFileSyncContext>,
 ) {
+    // CRITICAL: Create the broadcast receiver BEFORE any MQTT subscriptions.
+    // This ensures we receive retained messages that the broker sends immediately
+    // after we subscribe. If we create the receiver after subscribing, retained
+    // messages may be missed (they're broadcast before our receiver exists).
+    let mut message_rx = mqtt_client.subscribe_messages();
+
     // Subscribe to edits for the fs-root document (schema changes)
     let fs_root_topic = Topic::edits(&workspace, &fs_root_id).to_topic_string();
 
@@ -561,9 +567,6 @@ pub async fn directory_mqtt_task(
         "Subscribed to {} file UUIDs for content sync",
         subscribed_uuids.len()
     );
-
-    // Get a receiver for incoming messages
-    let mut message_rx = mqtt_client.subscribe_messages();
 
     // Track last processed schema to prevent redundant processing
     let mut last_schema_hash: Option<String> = None;
@@ -695,9 +698,10 @@ pub async fn directory_mqtt_task(
                     paths.len()
                 );
 
-                // Try to apply the edit directly via CRDT merge if we have CRDT context
-                // AND the file's CRDT state is initialized. Without initialization,
-                // the CRDT merge would apply updates to an empty doc and produce wrong results.
+                // Try to apply the edit directly via CRDT merge if we have CRDT context.
+                // Yjs updates use encode_state_as_update_v1(&StateVector::default()) which
+                // produces full-state updates that can safely be applied to an empty doc.
+                // This means we can apply updates even before fetching initial state from server.
                 let crdt_handled = if let Some(ref ctx) = crdt_context {
                     if let Ok(edit_msg) = crate::sync::crdt_merge::parse_edit_message(&msg.payload)
                     {
@@ -725,77 +729,62 @@ pub async fn directory_mqtt_task(
                             let mut state_guard = ctx.crdt_state.write().await;
                             let file_state = state_guard.get_or_create_file(&filename, node_id);
 
-                            // Skip CRDT merge if state isn't initialized from server yet.
-                            // Without proper initialization, merging would produce wrong results.
-                            if file_state.needs_server_init() {
-                                debug!(
-                                    "CRDT state for {} not initialized, falling back to server fetch",
-                                    filename
-                                );
-                                drop(state_guard);
-                                false
-                            } else {
-                                match crate::sync::crdt_merge::process_received_edit(
-                                    Some(&ctx.mqtt_client),
-                                    &ctx.workspace,
-                                    &doc_id,
-                                    file_state,
-                                    &edit_msg,
-                                    &author,
-                                )
-                                .await
-                                {
-                                    Ok((result, maybe_content)) => {
-                                        drop(state_guard); // Release lock before file I/O
+                            match crate::sync::crdt_merge::process_received_edit(
+                                Some(&ctx.mqtt_client),
+                                &ctx.workspace,
+                                &doc_id,
+                                file_state,
+                                &edit_msg,
+                                &author,
+                            )
+                            .await
+                            {
+                                Ok((result, maybe_content)) => {
+                                    drop(state_guard); // Release lock before file I/O
 
-                                        if let Some(content) = maybe_content {
-                                            // Write to all paths
-                                            for rel_path in paths {
-                                                let file_path = directory.join(rel_path);
+                                    if let Some(content) = maybe_content {
+                                        // Write to all paths
+                                        for rel_path in paths {
+                                            let file_path = directory.join(rel_path);
 
-                                                // Update shared_last_content before writing
-                                                {
-                                                    let states = file_states.read().await;
-                                                    if let Some(state) = states.get(rel_path) {
-                                                        if let Some(ref slc) =
-                                                            state.crdt_last_content
-                                                        {
-                                                            let mut shared = slc.write().await;
-                                                            *shared = Some(content.clone());
-                                                        }
+                                            // Update shared_last_content before writing
+                                            {
+                                                let states = file_states.read().await;
+                                                if let Some(state) = states.get(rel_path) {
+                                                    if let Some(ref slc) = state.crdt_last_content {
+                                                        let mut shared = slc.write().await;
+                                                        *shared = Some(content.clone());
                                                     }
                                                 }
-
-                                                if let Some(parent) = file_path.parent() {
-                                                    let _ = tokio::fs::create_dir_all(parent).await;
-                                                }
-                                                if let Err(e) =
-                                                    tokio::fs::write(&file_path, &content).await
-                                                {
-                                                    warn!("Failed to write {}: {}", rel_path, e);
-                                                } else {
-                                                    debug!(
-                                                        "CRDT edit applied to {} ({} bytes, {:?})",
-                                                        rel_path,
-                                                        content.len(),
-                                                        result
-                                                    );
-                                                }
                                             }
-                                            true // Handled via CRDT
-                                        } else {
-                                            debug!(
-                                                "CRDT merge returned no content (already known)"
-                                            );
-                                            true // Handled (no-op)
+
+                                            if let Some(parent) = file_path.parent() {
+                                                let _ = tokio::fs::create_dir_all(parent).await;
+                                            }
+                                            if let Err(e) =
+                                                tokio::fs::write(&file_path, &content).await
+                                            {
+                                                warn!("Failed to write {}: {}", rel_path, e);
+                                            } else {
+                                                debug!(
+                                                    "CRDT edit applied to {} ({} bytes, {:?})",
+                                                    rel_path,
+                                                    content.len(),
+                                                    result
+                                                );
+                                            }
                                         }
-                                    }
-                                    Err(e) => {
-                                        warn!("CRDT merge failed for {}: {}", doc_id, e);
-                                        false // Fall back to server fetch
+                                        true // Handled via CRDT
+                                    } else {
+                                        debug!("CRDT merge returned no content (already known)");
+                                        true // Handled (no-op)
                                     }
                                 }
-                            } // Close the else block for needs_server_init check
+                                Err(e) => {
+                                    warn!("CRDT merge failed for {}: {}", doc_id, e);
+                                    false // Fall back to server fetch
+                                }
+                            }
                         } else {
                             false
                         }
@@ -995,9 +984,18 @@ async fn sync_uuid_subscriptions(
     // Update the reverse map BEFORE fetching content (so we have path info)
     *uuid_to_paths = new_uuid_to_paths;
 
+    // Brief delay to allow the MQTT event loop to process retained messages
+    // that arrive immediately after subscription. Without this, we might fetch
+    // stale content from server while the correct content is waiting in the
+    // MQTT event queue.
+    if !to_add.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
     // Fetch and write initial content for newly added UUIDs.
-    // This is critical because the content edit may have been broadcast before
-    // we subscribed, so we need to fetch the current state.
+    // This is a fallback for when MQTT messages are missed (e.g., published before
+    // we subscribed and not retained). The MQTT retained messages should normally
+    // handle this, but server fetch provides a safety net.
     if !to_add.is_empty() {
         info!(
             "Fetching initial content for {} newly subscribed UUIDs",
@@ -1038,6 +1036,9 @@ async fn sync_uuid_subscriptions(
 ///
 /// Also updates shared_last_content for CRDT-managed files to prevent echo publishes
 /// when the file watcher detects the write.
+///
+/// Retries with backoff if server returns empty content, as the server may not have
+/// committed the MQTT edit yet (server and sync clients receive MQTT simultaneously).
 async fn handle_file_uuid_edit(
     http_client: &Client,
     server: &str,
@@ -1048,11 +1049,58 @@ async fn handle_file_uuid_edit(
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::sync::fetch_head;
+    use std::time::Duration;
+    use tokio::time::sleep;
 
-    // Fetch the latest content from the server
-    let head = fetch_head(http_client, server, uuid, use_paths)
-        .await?
-        .ok_or_else(|| format!("Document {} not found", uuid))?;
+    const MAX_RETRIES: u32 = 5;
+    const INITIAL_DELAY_MS: u64 = 100;
+
+    // Retry fetching with exponential backoff if content is empty.
+    // The server may not have committed the MQTT edit yet.
+    let mut head = None;
+    let mut delay_ms = INITIAL_DELAY_MS;
+
+    for attempt in 0..MAX_RETRIES {
+        match fetch_head(http_client, server, uuid, use_paths).await? {
+            Some(h) if !h.content.is_empty() => {
+                head = Some(h);
+                break;
+            }
+            Some(h) => {
+                // Got a response but content is empty - server may still be processing
+                if attempt < MAX_RETRIES - 1 {
+                    debug!(
+                        "Server returned empty content for {}, retrying in {}ms (attempt {}/{})",
+                        uuid,
+                        delay_ms,
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    delay_ms *= 2; // Exponential backoff
+                } else {
+                    // Last attempt, use whatever we got
+                    head = Some(h);
+                }
+            }
+            None => {
+                if attempt < MAX_RETRIES - 1 {
+                    debug!(
+                        "Document {} not found, retrying in {}ms (attempt {}/{})",
+                        uuid,
+                        delay_ms,
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    delay_ms *= 2;
+                }
+            }
+        }
+    }
+
+    let head =
+        head.ok_or_else(|| format!("Document {} not found after {} retries", uuid, MAX_RETRIES))?;
 
     // Decode if binary (base64)
     let content_bytes = if crate::sync::looks_like_base64_binary(&head.content) {
@@ -1171,6 +1219,10 @@ pub async fn subdir_mqtt_task(
     let edits_topic = Topic::edits(&workspace, &subdir_node_id);
     let topic_str = edits_topic.to_topic_string();
 
+    // CRITICAL: Create the broadcast receiver BEFORE subscribing.
+    // This ensures we receive retained messages.
+    let mut message_rx = mqtt_client.subscribe_messages();
+
     info!(
         "Subscribing to MQTT edits for subdir {} at topic: {}",
         subdir_path, topic_str
@@ -1183,9 +1235,6 @@ pub async fn subdir_mqtt_task(
         );
         return;
     }
-
-    // Get a receiver for incoming messages
-    let mut message_rx = mqtt_client.subscribe_messages();
 
     // Process incoming MQTT messages
     let context = format!("MQTT subdir {} receiver", subdir_path);

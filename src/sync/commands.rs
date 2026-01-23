@@ -58,6 +58,10 @@ async fn command_listener_task(
     path: String,
     directory: std::path::PathBuf,
 ) {
+    // CRITICAL: Create the broadcast receiver BEFORE subscribing.
+    // This ensures we receive any retained messages.
+    let mut message_rx = mqtt_client.subscribe_messages();
+
     // Subscribe to all commands for this path: {workspace}/commands/{path}/#
     let topic_pattern = Topic::commands_wildcard(&workspace, &path);
 
@@ -73,9 +77,6 @@ async fn command_listener_task(
         error!("Failed to subscribe to commands topic: {}", e);
         return;
     }
-
-    // Get a receiver for incoming messages
-    let mut message_rx = mqtt_client.subscribe_messages();
 
     // The file to append commands to
     let commands_file = directory.join("__commands.jsonl");

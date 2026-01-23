@@ -125,13 +125,16 @@ pub async fn publish_text_change(
     let payload = serde_json::to_vec(&edit_msg)
         .map_err(|e| format!("Failed to serialize edit message: {}", e))?;
 
+    // Use retained message so new subscribers get the latest content immediately.
+    // This is critical for sync: subscribers may join after messages are published,
+    // and the retained message ensures they receive the current content.
     mqtt_client
-        .publish(&topic, &payload, QoS::AtLeastOnce)
+        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
         .await
         .map_err(|e| format!("Failed to publish edit: {}", e))?;
 
     info!(
-        "Published commit {} for {} ({} bytes)",
+        "Published commit {} for {} ({} bytes, retained)",
         cid,
         node_id,
         update_bytes.len()
@@ -200,13 +203,14 @@ pub async fn publish_yjs_update(
     let payload = serde_json::to_vec(&edit_msg)
         .map_err(|e| format!("Failed to serialize edit message: {}", e))?;
 
+    // Use retained message so new subscribers get the latest content immediately.
     mqtt_client
-        .publish(&topic, &payload, QoS::AtLeastOnce)
+        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
         .await
         .map_err(|e| format!("Failed to publish edit: {}", e))?;
 
     info!(
-        "Published commit {} for {} ({} bytes)",
+        "Published commit {} for {} ({} bytes, retained)",
         cid,
         node_id,
         update_bytes.len()
