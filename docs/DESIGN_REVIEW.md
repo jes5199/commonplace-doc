@@ -349,11 +349,11 @@ Status key:
 |-----------|--------|----------|--------------|
 | Commit DAG + replay | Partial | Unit tests in commit/replay | CID determinism (CP-dj22) |
 | DocumentStore + apply_yjs_update | Partial | Unit tests in document.rs | Type migration complexity |
-| MQTT transport (edits/sync) | Partial | Manual use, no full invariant tests | Init race (CP-hykz), QoS/retain strategy (CP-w41r) |
+| MQTT transport (edits/sync) | Partial | Stage0 MQTT transport tests (17 passing) | Init race (CP-hykz), QoS/retain strategy (CP-w41r) |
 | HTTP server API | Partial | Manual use, some handler tests | Response inconsistencies |
 | HTTP gateway (MQTT bridge) | Unvalidated | No dedicated tests | Timeout/coupling risk |
 | WebSocket transport | Partial | Manual use | Protocol alignment gaps |
-| CRDT merge + publish | Partial | Unit tests in crdt_merge/crdt_publish; Stage0 CRDT harness in tests/sync_harness.rs | Echo suppression removal pending (CP-qqgi) |
+| CRDT merge + publish | Validated | Stage0 CRDT + no-echo harness tests | Echo suppression removal pending (CP-qqgi) |
 | File watcher pipeline | Unvalidated | No stability tests | Early-read race (CP-gz0p) |
 | Subscription/receive pipeline | Unvalidated | Failing sandbox test | Lag resync (CP-oah1) |
 | Schema + UUID mapping | Partial | Tests in ymap_schema/crdt_new_file | Inline vs node-backed mismatch |
@@ -374,11 +374,11 @@ Stage 0: Define invariants and test harness (CP-xp5h)
   - Monotonic ancestry: head never advances if required parents are missing.
   - Stable reads: watcher reads only stable file content (no empty/partial reads).
 - Harness outline (tests/sync_harness.rs):
-  - CRDT invariants tests (CP-xp5h.1)
-  - MQTT transport invariants tests (CP-xp5h.2)
-  - Watcher stability tests (CP-xp5h.3)
-  - Receive pipeline no-echo tests (CP-xp5h.4)
-- Status: CRDT invariants tests implemented in tests/sync_harness.rs
+  - CRDT invariants tests (CP-xp5h.1): Implemented in tests/sync_harness.rs - 3 tests passing
+  - MQTT transport invariants tests (CP-xp5h.2): Implemented in tests/mqtt_transport_harness.rs - 17 tests passing
+  - Watcher stability tests (CP-xp5h.3): Implemented in tests/watcher_harness.rs - 2/3 tests passing (1 timing issue tracked in CP-eshi)
+  - Receive pipeline no-echo tests (CP-xp5h.4): Implemented in tests/sync_harness.rs (no_echo_tests module) - 8 tests passing
+- Status: Stage 0 substantially complete (30/31 tests passing)
 - Exit criteria: invariants documented, harness exists, each test runs
   deterministically and fails with a single-component root cause.
 

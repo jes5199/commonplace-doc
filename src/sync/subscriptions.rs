@@ -924,6 +924,7 @@ async fn ensure_crdt_tasks_for_files(
 ///
 /// If the schema fetch fails, subscriptions are left unchanged to avoid
 /// accidentally unsubscribing from all file topics due to transient errors.
+#[allow(clippy::too_many_arguments)]
 async fn sync_uuid_subscriptions(
     http_client: &Client,
     server: &str,
