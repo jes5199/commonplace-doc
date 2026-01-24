@@ -317,6 +317,8 @@ See `docs/SANDBOX_LINKING.md` for detailed architecture.
 
 ## Code Review Workflow
 
+**Codex model**: When using `codex exec`, always use `--model gpt-5.2-codex` (not o3).
+
 Use a dual-review approach alternating between local and GitHub-based code reviews:
 
 ### Local Code Review (before commit/PR)
