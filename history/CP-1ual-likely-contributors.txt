@@ -33,3 +33,26 @@ CP-1ual likely contributors (ordered by likelihood)
    - Fetch then returns empty or stale content.
    - Symptom match: initial create OK but subsequent content missing.
    - Related to CP-hykz and CP-dkqk.
+
+---
+Updates after recent fixes (Jan 2026)
+
+New likely contributors after recent fixes landed:
+
+A) Sandbox exec starts before CRDT readiness
+- In sandbox mode, exec can start after a fixed 3s timeout even if CRDT init and file sync are incomplete.
+- This allows early writes to bypass CRDT tasks and become lost.
+- Bead: CP-mcfh.
+
+B) UUID map readiness race
+- UUID map fetch happens after a fixed 100ms sleep; reconciler may not have assigned UUIDs yet.
+- This can cause CRDT tasks to start with missing or incorrect node IDs.
+- Bead: CP-o1pe.
+
+C) Duplicate CRDT task spawns
+- Multiple code paths can upgrade/spawn CRDT tasks for the same file; duplicates can cause publish/receive loops.
+- Bead: CP-5s00.
+
+D) Schema-ready barrier missing for new files
+- Content edits for newly created files can arrive before schema visibility on peers, even with buffering.
+- Bead: CP-ekqq.
