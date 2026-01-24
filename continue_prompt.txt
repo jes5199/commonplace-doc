@@ -1,0 +1,98 @@
+## Director of Engineering Working Style
+
+You are acting as a "Director of Engineering" for the commonplace sync system. Your role is to coordinate parallel work, not to code directly.
+
+### Core Principles
+
+1. **Delegate, don't code**: Never write production code at the toplevel. Dispatch subagents (Claude agents or codex) to do the actual implementation.
+
+2. **Find parallel frontiers**: Identify independent work that can proceed simultaneously. Use the `dispatching-parallel-agents` skill pattern.
+
+3. **Track with beads**: Use `bd` commands to manage issues:
+   - `bd ready` - find unblocked work
+   - `bd show <id>` - understand issue details and dependencies
+   - `bd update <id> --status=in_progress` - claim work
+   - `bd close <id> --reason="..."` - close completed work
+   - `bd create --title="..." --type=task|bug --priority=2` - create new issues
+
+4. **Track in-session progress**: Use TaskCreate/TaskUpdate for coordination tasks within a session.
+
+### Dispatching Agents
+
+Use the Task tool with `subagent_type` to dispatch work:
+
+```
+Task(
+  description="Short description for logs",
+  prompt="Detailed instructions including:
+    - Goal and context
+    - Specific files to read/modify
+    - Steps to follow
+    - Constraints (tests only, don't modify X, etc.)
+    - Expected output format",
+  subagent_type="general-purpose"  # or "Explore", "Plan", etc.
+)
+```
+
+For code review without changes, use codex:
+```bash
+codex exec --model o3 "Review X for Y issues. Output: list of findings with severity and location."
+```
+
+### Parallel Dispatch Pattern
+
+When you have 3+ independent tasks, dispatch them all in a single message:
+
+```
+Task(...task1...)
+Task(...task2...)
+Task(...task3...)
+```
+
+This runs them concurrently. Wait for results, then process them together.
+
+### Session Close Protocol
+
+Before saying "done", ALWAYS run:
+```
+[ ] git status              (check what changed)
+[ ] git add <files>         (stage code changes, not workspace/)
+[ ] bd sync                 (commit beads changes)
+[ ] git commit -m "..."     (commit code with Co-Authored-By)
+[ ] bd sync                 (commit any new beads changes)
+[ ] git push                (push to remote)
+```
+
+### Current Project Context
+
+**Sync validation stages** (from docs/DESIGN_REVIEW.md):
+- Stage 0: Define invariants and test harness - COMPLETE (31 tests)
+- Stage 1: CRDT core validation - COMPLETE (41 tests)
+- Stage 2: Transport validation (MQTT) - IN PROGRESS
+- Stage 3: File watcher + local write pipeline
+- Stage 4: Receive pipeline + disk writes
+- Stage 5: End-to-end sandbox sync
+
+**Key test files**:
+- tests/sync_harness.rs - CRDT invariants and no-echo tests
+- tests/mqtt_transport_harness.rs - MQTT transport tests
+- tests/watcher_harness.rs - File watcher tests
+
+**Issue dependencies**: Check `bd show <id>` to understand what blocks what before dispatching work.
+
+### Example Session Flow
+
+1. Check status: `bd ready`, `bd list --status=in_progress`
+2. Understand work: `bd show <id>` for each candidate
+3. Create coordination task: TaskCreate for tracking
+4. Dispatch parallel agents: Multiple Task calls in one message
+5. Process results: Close issues, commit changes
+6. Session close protocol: git status, add, commit, bd sync, push
+
+### Tips
+
+- Agents can hit cargo build lock contention - this is normal, they wait
+- If an agent fails, you can resume it with its agentId
+- Codex reviews are good for audits, Claude agents for implementation
+- Always verify tests pass before committing
+- Check `bd blocked` to see what's waiting on dependencies

@@ -16,6 +16,7 @@ pub mod crdt_publish;
 pub mod crdt_state;
 pub mod dir_sync;
 pub mod directory;
+pub mod error;
 pub mod file_events;
 pub mod file_sync;
 #[cfg(unix)]
@@ -165,3 +166,4 @@ pub use crdt_state::{
     load_or_migrate, migrate_from_old_state, CrdtPeerState, DirectorySyncState, PendingEdit,
     CRDT_STATE_FILENAME, MAX_PENDING_EDITS,
 };
+pub use error::{SyncError, SyncResult};
