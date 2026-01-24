@@ -2059,8 +2059,8 @@ pub async fn upload_task_crdt(
                 }
             }
             Err(e) => {
-                // "Content unchanged" is not really an error
-                if e != "Content unchanged" {
+                // ContentUnchanged is not really an error
+                if !matches!(e, crate::sync::error::SyncError::ContentUnchanged) {
                     error!("CRDT upload failed for {}: {}", file_path.display(), e);
                 }
             }

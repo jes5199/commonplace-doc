@@ -1348,12 +1348,16 @@ pub fn spawn_subdir_mqtt_task(
 
 /// MQTT task for a node-backed subdirectory.
 ///
-/// This task subscribes to a subdirectory's edits topic via MQTT and handles schema changes.
+/// This task subscribes to:
+/// 1. The subdirectory's edits topic via MQTT (for schema changes)
+/// 2. All file UUIDs in the subdirectory's schema (for file content changes)
+///
 /// When the subdirectory's schema changes, it:
 /// 1. Fetches and writes the updated schema to the local .commonplace.json file
 /// 2. Deletes local files that were removed from the server schema
 /// 3. Cleans up orphaned directories that no longer exist in the schema
 /// 4. Syncs NEW files that were added to the server schema
+/// 5. Updates file UUID subscriptions to match the new schema
 ///
 /// This is the MQTT equivalent of `subdir_sse_task`.
 #[allow(clippy::too_many_arguments)]
@@ -1375,9 +1379,9 @@ pub async fn subdir_mqtt_task(
     workspace: String,
     watched_subdirs: Arc<RwLock<HashSet<String>>>,
 ) {
-    // Subscribe to edits for the subdirectory document
+    // Subscribe to edits for the subdirectory document (schema changes)
     let edits_topic = Topic::edits(&workspace, &subdir_node_id);
-    let topic_str = edits_topic.to_topic_string();
+    let schema_topic_str = edits_topic.to_topic_string();
 
     // CRITICAL: Create the broadcast receiver BEFORE subscribing.
     // This ensures we receive retained messages.
@@ -1385,16 +1389,62 @@ pub async fn subdir_mqtt_task(
 
     info!(
         "Subscribing to MQTT edits for subdir {} at topic: {}",
-        subdir_path, topic_str
+        subdir_path, schema_topic_str
     );
 
-    if let Err(e) = mqtt_client.subscribe(&topic_str, QoS::AtLeastOnce).await {
+    if let Err(e) = mqtt_client
+        .subscribe(&schema_topic_str, QoS::AtLeastOnce)
+        .await
+    {
         error!(
             "Failed to subscribe to MQTT edits topic for subdir {}: {}",
             subdir_path, e
         );
         return;
     }
+
+    // Build initial UUID map from the subdirectory's schema
+    // The subdir_path is the prefix for paths within this subdirectory
+    let initial_uuid_map =
+        crate::sync::uuid_map::build_uuid_map_recursive(&http_client, &server, &subdir_node_id)
+            .await;
+
+    // Build reverse map (uuid -> paths) and subscribe to all file UUIDs
+    // Paths need to be prefixed with subdir_path since they're relative to the subdir
+    let prefixed_uuid_map: HashMap<String, String> = initial_uuid_map
+        .into_iter()
+        .map(|(path, uuid)| {
+            let full_path = if subdir_path.is_empty() {
+                path
+            } else {
+                format!("{}/{}", subdir_path, path)
+            };
+            (full_path, uuid)
+        })
+        .collect();
+
+    let mut uuid_to_paths = crate::sync::build_uuid_to_paths_map(&prefixed_uuid_map);
+    let mut subscribed_uuids: HashSet<String> = HashSet::new();
+
+    // Subscribe to all file UUIDs from the initial schema
+    for uuid in uuid_to_paths.keys() {
+        let topic = Topic::edits(&workspace, uuid).to_topic_string();
+        if let Err(e) = mqtt_client.subscribe(&topic, QoS::AtLeastOnce).await {
+            warn!(
+                "Subdir {}: Failed to subscribe to file UUID {}: {}",
+                subdir_path, uuid, e
+            );
+        } else {
+            subscribed_uuids.insert(uuid.clone());
+            debug!("Subdir {}: Subscribed to file UUID: {}", subdir_path, uuid);
+        }
+    }
+
+    info!(
+        "Subdir {}: Subscribed to {} file UUIDs for content sync",
+        subdir_path,
+        subscribed_uuids.len()
+    );
 
     // Process incoming MQTT messages with lag detection
     let context = format!("MQTT subdir {} receiver", subdir_path);
@@ -1405,9 +1455,9 @@ pub async fn subdir_mqtt_task(
                 missed_count,
                 next_message,
             } => {
-                // For subdir schema watchers, resync by triggering a schema refresh
+                // For subdir watchers, resync by triggering a schema refresh and resyncing files
                 info!(
-                    "MQTT subdir {} receiver lagged by {} messages, triggering schema resync",
+                    "MQTT subdir {} receiver lagged by {} messages, triggering resync",
                     subdir_path, missed_count
                 );
                 // Force a schema refresh by calling handle_subdir_edit
@@ -1431,6 +1481,20 @@ pub async fn subdir_mqtt_task(
                 )
                 .await;
 
+                // Also resync subscribed files to recover missed edits
+                resync_subscribed_files(
+                    &http_client,
+                    &server,
+                    &subscribed_uuids,
+                    &uuid_to_paths,
+                    &directory,
+                    use_paths,
+                    &file_states,
+                    None, // No CRDT context for subdirs currently
+                    &author,
+                )
+                .await;
+
                 match next_message {
                     Some(m) => m,
                     None => break, // Channel closed
@@ -1439,10 +1503,22 @@ pub async fn subdir_mqtt_task(
             BroadcastRecvResult::Closed => break,
         };
 
-        // Check if this message is for our topic
-        if msg.topic == topic_str {
+        // Parse the topic to extract the document ID
+        let doc_id = match Topic::parse(&msg.topic, &workspace) {
+            Ok(parsed) => parsed.path,
+            Err(_) => {
+                debug!(
+                    "Subdir {}: Ignoring message with unparseable topic: {}",
+                    subdir_path, msg.topic
+                );
+                continue;
+            }
+        };
+
+        if doc_id == subdir_node_id {
+            // This is a schema change for the subdirectory
             debug!(
-                "MQTT edit received for subdir {}: {} bytes",
+                "MQTT edit received for subdir {} schema: {} bytes",
                 subdir_path,
                 msg.payload.len()
             );
@@ -1471,6 +1547,22 @@ pub async fn subdir_mqtt_task(
                 #[cfg(unix)]
                 inode_tracker.clone(),
                 "MQTT",
+            )
+            .await;
+
+            // Schema changed - update UUID subscriptions for this subdirectory
+            sync_subdir_uuid_subscriptions(
+                &http_client,
+                &server,
+                &subdir_node_id,
+                &subdir_path,
+                &mqtt_client,
+                &workspace,
+                &mut subscribed_uuids,
+                &mut uuid_to_paths,
+                &directory,
+                use_paths,
+                &file_states,
             )
             .await;
 
@@ -1505,8 +1597,188 @@ pub async fn subdir_mqtt_task(
                     );
                 }
             }
+        } else if let Some(paths) = uuid_to_paths.get(&doc_id) {
+            // This is a file content edit - pull and write to local file(s)
+            if pull_only || !push_only {
+                debug!(
+                    "Subdir {}: MQTT edit received for file UUID {}: {} bytes, {} path(s)",
+                    subdir_path,
+                    doc_id,
+                    msg.payload.len(),
+                    paths.len()
+                );
+
+                // Fetch from server and write to local files
+                if let Err(e) = handle_file_uuid_edit(
+                    &http_client,
+                    &server,
+                    &doc_id,
+                    paths,
+                    &directory,
+                    use_paths,
+                    &file_states,
+                )
+                .await
+                {
+                    warn!(
+                        "Subdir {}: Failed to handle file UUID edit for {}: {}",
+                        subdir_path, doc_id, e
+                    );
+                }
+            }
+        } else {
+            // Unknown document ID - might be another subdir's schema, ignore
+            debug!(
+                "Subdir {}: Ignoring edit for unrelated document: {}",
+                subdir_path, doc_id
+            );
         }
     }
 
     info!("MQTT message channel closed for subdir {}", subdir_path);
+}
+
+/// Sync UUID subscriptions for a subdirectory after its schema changes.
+///
+/// Similar to `sync_uuid_subscriptions` but scoped to a single subdirectory.
+/// Compares the current subscribed UUIDs with the new UUID map from the subdir's schema,
+/// subscribing to new UUIDs and unsubscribing from removed ones.
+#[allow(clippy::too_many_arguments)]
+async fn sync_subdir_uuid_subscriptions(
+    http_client: &Client,
+    server: &str,
+    subdir_node_id: &str,
+    subdir_path: &str,
+    mqtt_client: &Arc<MqttClient>,
+    workspace: &str,
+    subscribed_uuids: &mut HashSet<String>,
+    uuid_to_paths: &mut crate::sync::UuidToPathsMap,
+    directory: &std::path::Path,
+    use_paths: bool,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+) {
+    // Fetch the current UUID map from the subdirectory's schema
+    let (new_uuid_map, fetch_succeeded) =
+        crate::sync::uuid_map::build_uuid_map_recursive_with_status(
+            http_client,
+            server,
+            subdir_node_id,
+        )
+        .await;
+
+    // If fetch failed, don't modify subscriptions
+    if !fetch_succeeded {
+        warn!(
+            "Subdir {}: Schema fetch failed during subscription sync - keeping existing subscriptions",
+            subdir_path
+        );
+        return;
+    }
+
+    // Prefix paths with subdir_path
+    let prefixed_uuid_map: HashMap<String, String> = new_uuid_map
+        .into_iter()
+        .map(|(path, uuid)| {
+            let full_path = if subdir_path.is_empty() {
+                path
+            } else {
+                format!("{}/{}", subdir_path, path)
+            };
+            (full_path, uuid)
+        })
+        .collect();
+
+    // Build new reverse map
+    let new_uuid_to_paths = crate::sync::build_uuid_to_paths_map(&prefixed_uuid_map);
+    let new_uuids: HashSet<String> = new_uuid_to_paths.keys().cloned().collect();
+
+    // Find UUIDs to add and remove
+    let to_add: Vec<String> = new_uuids.difference(subscribed_uuids).cloned().collect();
+    let to_remove: Vec<String> = subscribed_uuids.difference(&new_uuids).cloned().collect();
+
+    // Subscribe to new UUIDs
+    for uuid in &to_add {
+        let topic = Topic::edits(workspace, uuid).to_topic_string();
+        if let Err(e) = mqtt_client.subscribe(&topic, QoS::AtLeastOnce).await {
+            warn!(
+                "Subdir {}: Failed to subscribe to new file UUID {}: {}",
+                subdir_path, uuid, e
+            );
+        } else {
+            subscribed_uuids.insert(uuid.clone());
+            debug!(
+                "Subdir {}: Subscribed to new file UUID: {}",
+                subdir_path, uuid
+            );
+        }
+    }
+
+    // Unsubscribe from removed UUIDs
+    for uuid in &to_remove {
+        let topic = Topic::edits(workspace, uuid).to_topic_string();
+        if let Err(e) = mqtt_client.unsubscribe(&topic).await {
+            warn!(
+                "Subdir {}: Failed to unsubscribe from file UUID {}: {}",
+                subdir_path, uuid, e
+            );
+        } else {
+            subscribed_uuids.remove(uuid);
+            debug!(
+                "Subdir {}: Unsubscribed from removed file UUID: {}",
+                subdir_path, uuid
+            );
+        }
+    }
+
+    // Update the reverse map BEFORE fetching content
+    *uuid_to_paths = new_uuid_to_paths;
+
+    // Brief delay to allow MQTT event loop to process retained messages
+    if !to_add.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Fetch and write initial content for newly added UUIDs
+    if !to_add.is_empty() {
+        info!(
+            "Subdir {}: Fetching initial content for {} newly subscribed UUIDs",
+            subdir_path,
+            to_add.len()
+        );
+        for uuid in &to_add {
+            if let Some(paths) = uuid_to_paths.get(uuid) {
+                if let Err(e) = handle_file_uuid_edit(
+                    http_client,
+                    server,
+                    uuid,
+                    paths,
+                    directory,
+                    use_paths,
+                    file_states,
+                )
+                .await
+                {
+                    warn!(
+                        "Subdir {}: Failed to fetch initial content for UUID {}: {}",
+                        subdir_path, uuid, e
+                    );
+                } else {
+                    debug!(
+                        "Subdir {}: Fetched initial content for UUID {}",
+                        subdir_path, uuid
+                    );
+                }
+            }
+        }
+    }
+
+    if !to_add.is_empty() || !to_remove.is_empty() {
+        info!(
+            "Subdir {}: UUID subscriptions updated: +{} -{} (total: {})",
+            subdir_path,
+            to_add.len(),
+            to_remove.len(),
+            subscribed_uuids.len()
+        );
+    }
 }

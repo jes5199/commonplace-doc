@@ -111,7 +111,7 @@ async fn update_schema_with_new_file(
     author: &str,
 ) -> Result<String, String> {
     // Load schema Y.Doc
-    let doc = schema_state.to_doc()?;
+    let doc = schema_state.to_doc().map_err(|e| e.to_string())?;
 
     // Migrate from JSON text format if needed
     if ymap_schema::is_json_text_format(&doc) && !ymap_schema::is_ymap_format(&doc) {
@@ -262,7 +262,7 @@ pub async fn remove_file_from_schema(
     author: &str,
 ) -> Result<String, String> {
     // Load schema Y.Doc
-    let doc = dir_state.schema.to_doc()?;
+    let doc = dir_state.schema.to_doc().map_err(|e| e.to_string())?;
 
     // Migrate from JSON text format if needed
     if ymap_schema::is_json_text_format(&doc) && !ymap_schema::is_ymap_format(&doc) {

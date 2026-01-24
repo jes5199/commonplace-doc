@@ -5,6 +5,7 @@
 //!
 //! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
 
+use crate::sync::error::{SyncError, SyncResult};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -89,7 +90,7 @@ impl CrdtPeerState {
     /// Deserialize the Y.Doc state.
     /// Returns a new Doc with the stored state applied, or an empty Doc if no state.
     /// The "content" text root is always ensured to exist.
-    pub fn to_doc(&self) -> Result<Doc, String> {
+    pub fn to_doc(&self) -> SyncResult<Doc> {
         let doc = Doc::new();
 
         // Note: Don't pre-create any root structure here.
@@ -99,12 +100,11 @@ impl CrdtPeerState {
         // Pre-creating the wrong type would cause conflicts.
 
         if let Some(ref state_b64) = self.yjs_state {
-            let state_bytes = STANDARD
-                .decode(state_b64)
-                .map_err(|e| format!("Failed to decode yjs_state: {}", e))?;
+            let state_bytes = STANDARD.decode(state_b64)?;
 
-            let update = Update::decode_v1(&state_bytes)
-                .map_err(|e| format!("Failed to decode Yrs update: {}", e))?;
+            let update = Update::decode_v1(&state_bytes).map_err(|e| {
+                SyncError::yjs_decode(format!("Failed to decode Yrs update: {}", e))
+            })?;
 
             let mut txn = doc.transact_mut();
             txn.apply_update(update);
@@ -430,10 +430,9 @@ impl DirectorySyncState {
 /// Migration creates empty Y.Docs but preserves CID information.
 pub fn migrate_from_old_state(
     old_state: &crate::sync::state_file::SyncStateFile,
-) -> Result<DirectorySyncState, String> {
+) -> SyncResult<DirectorySyncState> {
     // Parse the node_id as UUID
-    let schema_node_id = Uuid::parse_str(&old_state.node_id)
-        .map_err(|e| format!("Invalid node_id in old state: {}", e))?;
+    let schema_node_id = Uuid::parse_str(&old_state.node_id)?;
 
     let mut new_state = DirectorySyncState::new(schema_node_id);
 

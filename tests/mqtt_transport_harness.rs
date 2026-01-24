@@ -781,6 +781,653 @@ mod broker {
 }
 
 // =============================================================================
+// STAGE 2 TESTS: Advanced ordering, serialization edge cases, topic routing
+// =============================================================================
+// These tests validate more complex MQTT transport invariants in isolation.
+
+mod stage2_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // =========================================================================
+    // Message Ordering Guarantees
+    // =========================================================================
+
+    /// Simulates an IncomingMessage for testing broadcast behavior.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestMessage {
+        topic: String,
+        payload: Vec<u8>,
+        sequence: u64,
+    }
+
+    /// Test that single publisher maintains strict FIFO ordering with high volume.
+    #[test]
+    fn ordering_single_publisher_fifo_high_volume() {
+        let (tx, mut rx) = broadcast::channel::<TestMessage>(1024);
+
+        // Publish 1000 messages to stress test ordering
+        for i in 0u64..1000 {
+            let msg = TestMessage {
+                topic: "test/fifo".to_string(),
+                payload: i.to_le_bytes().to_vec(),
+                sequence: i,
+            };
+            tx.send(msg).expect("send should succeed");
+        }
+
+        // Verify strict FIFO order
+        for expected in 0u64..1000 {
+            let received = rx.try_recv().unwrap();
+            assert_eq!(
+                received.sequence, expected,
+                "Message {} received out of order, expected {}",
+                received.sequence, expected
+            );
+        }
+    }
+
+    /// Test that multiple subscribers receive messages in identical order.
+    #[tokio::test]
+    async fn ordering_multiple_subscribers_identical_order() {
+        let (tx, mut rx1) = broadcast::channel::<TestMessage>(256);
+        let mut rx2 = tx.subscribe();
+        let mut rx3 = tx.subscribe();
+
+        // Publish messages
+        for i in 0u64..100 {
+            let msg = TestMessage {
+                topic: format!("test/multi/{}", i % 10),
+                payload: vec![i as u8],
+                sequence: i,
+            };
+            tx.send(msg).expect("send should succeed");
+        }
+
+        // Collect from all receivers
+        let mut order1 = Vec::new();
+        let mut order2 = Vec::new();
+        let mut order3 = Vec::new();
+
+        for _ in 0..100 {
+            order1.push(rx1.try_recv().unwrap().sequence);
+            order2.push(rx2.try_recv().unwrap().sequence);
+            order3.push(rx3.try_recv().unwrap().sequence);
+        }
+
+        // All receivers must see identical ordering
+        assert_eq!(order1, order2, "rx1 and rx2 saw different orderings");
+        assert_eq!(order2, order3, "rx2 and rx3 saw different orderings");
+
+        // And it should be the expected sequence
+        let expected: Vec<u64> = (0..100).collect();
+        assert_eq!(order1, expected);
+    }
+
+    /// Test interleaved publishing from multiple tasks preserves per-topic ordering.
+    #[tokio::test]
+    async fn ordering_per_topic_preserved_under_interleaving() {
+        let (tx, mut rx) = broadcast::channel::<TestMessage>(512);
+        let tx2 = tx.clone();
+        let tx3 = tx.clone();
+
+        // Three publishers, each publishing to their own topic
+        let h1 = tokio::spawn(async move {
+            for i in 0u64..50 {
+                let msg = TestMessage {
+                    topic: "topic/a".to_string(),
+                    payload: vec![],
+                    sequence: i,
+                };
+                let _ = tx.send(msg);
+                // Small yield to encourage interleaving
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let h2 = tokio::spawn(async move {
+            for i in 0u64..50 {
+                let msg = TestMessage {
+                    topic: "topic/b".to_string(),
+                    payload: vec![],
+                    sequence: i,
+                };
+                let _ = tx2.send(msg);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let h3 = tokio::spawn(async move {
+            for i in 0u64..50 {
+                let msg = TestMessage {
+                    topic: "topic/c".to_string(),
+                    payload: vec![],
+                    sequence: i,
+                };
+                let _ = tx3.send(msg);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        h1.await.unwrap();
+        h2.await.unwrap();
+        h3.await.unwrap();
+
+        // Collect messages by topic
+        let mut by_topic: HashMap<String, Vec<u64>> = HashMap::new();
+        while let Ok(msg) = rx.try_recv() {
+            by_topic
+                .entry(msg.topic.clone())
+                .or_default()
+                .push(msg.sequence);
+        }
+
+        // Each topic should have strictly increasing sequence numbers
+        for (topic, sequences) in by_topic {
+            assert_eq!(sequences.len(), 50, "Topic {} missing messages", topic);
+            for (i, &seq) in sequences.iter().enumerate() {
+                assert_eq!(
+                    seq, i as u64,
+                    "Topic {} has out-of-order sequence at position {}",
+                    topic, i
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // EditMessage Serialization Edge Cases
+    // =========================================================================
+
+    /// Test EditMessage with empty update payload.
+    #[test]
+    fn edit_message_empty_update() {
+        use commonplace_doc::mqtt::EditMessage;
+
+        let msg = EditMessage {
+            update: "".to_string(), // Empty base64
+            parents: vec!["parent-abc".to_string()],
+            author: "system".to_string(),
+            message: None,
+            timestamp: 0,
+        };
+
+        let json = serde_json::to_vec(&msg).expect("serialize empty update");
+        let decoded: EditMessage = serde_json::from_slice(&json).expect("deserialize empty update");
+
+        assert_eq!(decoded.update, "");
+        assert_eq!(decoded.parents.len(), 1);
+    }
+
+    /// Test EditMessage with large update payload (simulating a big CRDT delta).
+    #[test]
+    fn edit_message_large_update() {
+        use commonplace_doc::mqtt::EditMessage;
+
+        // Create a large base64 payload (~1MB when decoded)
+        let large_data = "A".repeat(1_400_000); // ~1MB of base64 data
+
+        let msg = EditMessage {
+            update: large_data.clone(),
+            parents: vec!["parent-1".to_string()],
+            author: "bulk-importer".to_string(),
+            message: Some("Bulk import operation".to_string()),
+            timestamp: 1704067200000,
+        };
+
+        let json = serde_json::to_vec(&msg).expect("serialize large update");
+        assert!(json.len() > 1_000_000, "JSON should be over 1MB");
+
+        let decoded: EditMessage = serde_json::from_slice(&json).expect("deserialize large update");
+        assert_eq!(decoded.update.len(), large_data.len());
+    }
+
+    /// Test EditMessage with merge commit (two parents).
+    #[test]
+    fn edit_message_merge_commit() {
+        use commonplace_doc::mqtt::EditMessage;
+
+        let msg = EditMessage {
+            update: "bWVyZ2VkIGRhdGE=".to_string(), // "merged data"
+            parents: vec!["branch-a-head".to_string(), "branch-b-head".to_string()],
+            author: "merger@example.com".to_string(),
+            message: Some("Merge branch-b into branch-a".to_string()),
+            timestamp: 1704153600000,
+        };
+
+        let json = serde_json::to_vec(&msg).expect("serialize merge commit");
+        let decoded: EditMessage = serde_json::from_slice(&json).expect("deserialize merge commit");
+
+        assert_eq!(decoded.parents.len(), 2);
+        assert!(decoded.parents.contains(&"branch-a-head".to_string()));
+        assert!(decoded.parents.contains(&"branch-b-head".to_string()));
+    }
+
+    /// Test EditMessage with initial commit (no parents).
+    #[test]
+    fn edit_message_initial_commit() {
+        use commonplace_doc::mqtt::EditMessage;
+
+        let msg = EditMessage {
+            update: "aW5pdGlhbA==".to_string(), // "initial"
+            parents: vec![],                    // No parents = initial commit
+            author: "creator@example.com".to_string(),
+            message: Some("Initial document creation".to_string()),
+            timestamp: 1704000000000,
+        };
+
+        let json = serde_json::to_vec(&msg).expect("serialize initial commit");
+        let decoded: EditMessage =
+            serde_json::from_slice(&json).expect("deserialize initial commit");
+
+        assert!(decoded.parents.is_empty());
+        assert_eq!(
+            decoded.message,
+            Some("Initial document creation".to_string())
+        );
+    }
+
+    /// Test EditMessage with special characters in author and message.
+    #[test]
+    fn edit_message_special_characters() {
+        use commonplace_doc::mqtt::EditMessage;
+
+        let msg = EditMessage {
+            update: "dGVzdA==".to_string(),
+            parents: vec!["parent".to_string()],
+            author: "user@example.com <\"Test User\">".to_string(),
+            message: Some("Fix \"bug\" with\nnewlines\tand\ttabs".to_string()),
+            timestamp: 1704067200000,
+        };
+
+        let json = serde_json::to_vec(&msg).expect("serialize special chars");
+        let decoded: EditMessage =
+            serde_json::from_slice(&json).expect("deserialize special chars");
+
+        assert_eq!(decoded.author, "user@example.com <\"Test User\">");
+        assert!(decoded.message.as_ref().unwrap().contains('\n'));
+        assert!(decoded.message.as_ref().unwrap().contains('\t'));
+    }
+
+    /// Test EditMessage with unicode in message and author.
+    #[test]
+    fn edit_message_unicode() {
+        use commonplace_doc::mqtt::EditMessage;
+
+        let msg = EditMessage {
+            update: "dW5pY29kZQ==".to_string(),
+            parents: vec!["parent".to_string()],
+            author: "utilisateur@exemple.fr".to_string(),
+            message: Some("Ajout de contenu en francais avec des accents".to_string()),
+            timestamp: 1704067200000,
+        };
+
+        let json = serde_json::to_vec(&msg).expect("serialize unicode");
+        let decoded: EditMessage = serde_json::from_slice(&json).expect("deserialize unicode");
+
+        assert!(decoded.message.as_ref().unwrap().contains("francais"));
+    }
+
+    /// Test EditMessage with maximum timestamp (far future).
+    #[test]
+    fn edit_message_max_timestamp() {
+        use commonplace_doc::mqtt::EditMessage;
+
+        let msg = EditMessage {
+            update: "dGVzdA==".to_string(),
+            parents: vec![],
+            author: "test".to_string(),
+            message: None,
+            timestamp: u64::MAX,
+        };
+
+        let json = serde_json::to_vec(&msg).expect("serialize max timestamp");
+        let decoded: EditMessage =
+            serde_json::from_slice(&json).expect("deserialize max timestamp");
+
+        assert_eq!(decoded.timestamp, u64::MAX);
+    }
+
+    /// Test EditMessage with many parents (octopus merge).
+    #[test]
+    fn edit_message_octopus_merge() {
+        use commonplace_doc::mqtt::EditMessage;
+
+        let parents: Vec<String> = (0..8).map(|i| format!("branch-{}-head", i)).collect();
+
+        let msg = EditMessage {
+            update: "b2N0b3B1cw==".to_string(), // "octopus"
+            parents: parents.clone(),
+            author: "octopus@example.com".to_string(),
+            message: Some("Octopus merge of 8 branches".to_string()),
+            timestamp: 1704067200000,
+        };
+
+        let json = serde_json::to_vec(&msg).expect("serialize octopus merge");
+        let decoded: EditMessage =
+            serde_json::from_slice(&json).expect("deserialize octopus merge");
+
+        assert_eq!(decoded.parents.len(), 8);
+        for i in 0..8 {
+            assert!(decoded.parents.contains(&format!("branch-{}-head", i)));
+        }
+    }
+
+    // =========================================================================
+    // Topic Parsing and Routing
+    // =========================================================================
+
+    /// Test topic parsing with various path depths.
+    #[test]
+    fn topic_parse_various_depths() {
+        use commonplace_doc::mqtt::Topic;
+
+        // Single segment path
+        let t1 = Topic::parse("ws/edits/doc", "ws").unwrap();
+        assert_eq!(t1.path, "doc");
+
+        // Two segment path
+        let t2 = Topic::parse("ws/edits/folder/doc", "ws").unwrap();
+        assert_eq!(t2.path, "folder/doc");
+
+        // Deep path
+        let t3 = Topic::parse("ws/edits/a/b/c/d/e/f/g", "ws").unwrap();
+        assert_eq!(t3.path, "a/b/c/d/e/f/g");
+    }
+
+    /// Test topic construction and parsing roundtrip for all port types.
+    #[test]
+    fn topic_roundtrip_all_ports() {
+        use commonplace_doc::mqtt::{Port, Topic};
+
+        let workspace = "test-workspace";
+        let path = "documents/notes";
+
+        // Edits roundtrip
+        let edits = Topic::edits(workspace, path);
+        let edits_str = edits.to_topic_string();
+        let parsed_edits = Topic::parse(&edits_str, workspace).unwrap();
+        assert_eq!(parsed_edits.port, Port::Edits);
+        assert_eq!(parsed_edits.path, path);
+
+        // Sync roundtrip (qualifier becomes part of path when parsed)
+        let sync = Topic::sync(workspace, path, "client-id");
+        let sync_str = sync.to_topic_string();
+        let parsed_sync = Topic::parse(&sync_str, workspace).unwrap();
+        assert_eq!(parsed_sync.port, Port::Sync);
+        assert!(parsed_sync.path.contains(path));
+
+        // Events roundtrip
+        let events = Topic::events(workspace, path, "update");
+        let events_str = events.to_topic_string();
+        let parsed_events = Topic::parse(&events_str, workspace).unwrap();
+        assert_eq!(parsed_events.port, Port::Events);
+
+        // Commands roundtrip
+        let commands = Topic::commands(workspace, path, "replace");
+        let commands_str = commands.to_topic_string();
+        let parsed_commands = Topic::parse(&commands_str, workspace).unwrap();
+        assert_eq!(parsed_commands.port, Port::Commands);
+    }
+
+    /// Test topic routing isolation between workspaces.
+    #[test]
+    fn topic_workspace_isolation() {
+        use commonplace_doc::mqtt::Topic;
+
+        let topic_str = "workspace-a/edits/shared/doc";
+
+        // Parsing with correct workspace succeeds
+        assert!(Topic::parse(topic_str, "workspace-a").is_ok());
+
+        // Parsing with wrong workspace fails
+        assert!(Topic::parse(topic_str, "workspace-b").is_err());
+        assert!(Topic::parse(topic_str, "workspace").is_err());
+        assert!(Topic::parse(topic_str, "a").is_err());
+    }
+
+    /// Test topic parsing rejects invalid port names.
+    #[test]
+    fn topic_parse_invalid_ports() {
+        use commonplace_doc::mqtt::Topic;
+
+        let invalid_ports = vec![
+            "ws/edit/doc",      // Missing 's'
+            "ws/syncs/doc",     // Extra 's'
+            "ws/event/doc",     // Missing 's'
+            "ws/command/doc",   // Missing 's'
+            "ws/publish/doc",   // Wrong port name
+            "ws/subscribe/doc", // Wrong port name
+            "ws/EDITS/doc",     // Wrong case
+        ];
+
+        for topic_str in invalid_ports {
+            assert!(
+                Topic::parse(topic_str, "ws").is_err(),
+                "Should reject invalid port in: {}",
+                topic_str
+            );
+        }
+    }
+
+    /// Test topic parsing handles edge cases in path names.
+    #[test]
+    fn topic_parse_path_edge_cases() {
+        use commonplace_doc::mqtt::Topic;
+
+        // Path with dots (file extensions)
+        let t1 = Topic::parse("ws/edits/file.txt", "ws").unwrap();
+        assert_eq!(t1.path, "file.txt");
+
+        // Path with multiple dots
+        let t2 = Topic::parse("ws/edits/archive.tar.gz", "ws").unwrap();
+        assert_eq!(t2.path, "archive.tar.gz");
+
+        // Path with hyphens and underscores
+        let t3 = Topic::parse("ws/edits/my-file_v2", "ws").unwrap();
+        assert_eq!(t3.path, "my-file_v2");
+
+        // Path with numbers
+        let t4 = Topic::parse("ws/edits/log-2024-01-15", "ws").unwrap();
+        assert_eq!(t4.path, "log-2024-01-15");
+    }
+
+    /// Test wildcard pattern generation.
+    #[test]
+    fn topic_wildcard_patterns() {
+        use commonplace_doc::mqtt::Topic;
+
+        // All edits wildcard
+        assert_eq!(Topic::edits_wildcard("myws"), "myws/edits/#");
+
+        // Path-scoped edits wildcard
+        assert_eq!(
+            Topic::edits_path_wildcard("myws", "folder"),
+            "myws/edits/folder/#"
+        );
+
+        // Sync wildcard (single level)
+        assert_eq!(Topic::sync_wildcard("myws", "doc"), "myws/sync/doc/+");
+
+        // Events wildcards
+        assert_eq!(Topic::events_wildcard_all("myws"), "myws/events/#");
+        assert_eq!(Topic::events_wildcard("myws", "node"), "myws/events/node/#");
+
+        // Commands wildcards
+        assert_eq!(Topic::commands_wildcard_all("myws"), "myws/commands/#");
+        assert_eq!(
+            Topic::commands_wildcard("myws", "node"),
+            "myws/commands/node/#"
+        );
+    }
+
+    /// Test that topic string generation is deterministic.
+    #[test]
+    fn topic_string_deterministic() {
+        use commonplace_doc::mqtt::Topic;
+
+        let topic = Topic::edits("workspace", "path/to/doc");
+
+        // Multiple calls should produce identical strings
+        let s1 = topic.to_topic_string();
+        let s2 = topic.to_topic_string();
+        let s3 = topic.to_topic_string();
+
+        assert_eq!(s1, s2);
+        assert_eq!(s2, s3);
+    }
+
+    /// Test SyncMessage variants serialization edge cases.
+    #[test]
+    fn sync_message_edge_cases() {
+        use commonplace_doc::mqtt::SyncMessage;
+
+        // Pull with empty have list (fresh client)
+        let pull = SyncMessage::Pull {
+            req: "r-001".to_string(),
+            have: vec![],
+            want: "HEAD".to_string(),
+        };
+        let json = serde_json::to_string(&pull).unwrap();
+        assert!(json.contains("\"have\":[]"));
+
+        // Get with many commits
+        let commits: Vec<String> = (0..100).map(|i| format!("commit-{}", i)).collect();
+        let get = SyncMessage::Get {
+            req: "r-002".to_string(),
+            commits: commits.clone(),
+        };
+        let json = serde_json::to_string(&get).unwrap();
+        let decoded: SyncMessage = serde_json::from_str(&json).unwrap();
+        match decoded {
+            SyncMessage::Get { commits: c, .. } => {
+                assert_eq!(c.len(), 100);
+            }
+            _ => panic!("Expected Get message"),
+        }
+
+        // Ancestors with depth limit
+        let ancestors = SyncMessage::Ancestors {
+            req: "r-003".to_string(),
+            commit: "HEAD".to_string(),
+            depth: Some(10),
+        };
+        let json = serde_json::to_string(&ancestors).unwrap();
+        assert!(json.contains("\"depth\":10"));
+
+        // Ancestors without depth limit
+        let ancestors_full = SyncMessage::Ancestors {
+            req: "r-004".to_string(),
+            commit: "abc123".to_string(),
+            depth: None,
+        };
+        let json = serde_json::to_string(&ancestors_full).unwrap();
+        assert!(!json.contains("depth")); // depth should be omitted when None
+    }
+
+    /// Test error message serialization.
+    #[test]
+    fn sync_message_error() {
+        use commonplace_doc::mqtt::SyncMessage;
+
+        let error = SyncMessage::Error {
+            req: "r-fail".to_string(),
+            message: "Commit not found: abc123".to_string(),
+        };
+
+        let json = serde_json::to_string(&error).unwrap();
+        assert!(json.contains("\"type\":\"error\""));
+        assert!(json.contains("\"message\":\"Commit not found: abc123\""));
+
+        let decoded: SyncMessage = serde_json::from_str(&json).unwrap();
+        assert!(decoded.is_response());
+        assert!(!decoded.is_request());
+    }
+
+    /// Test IsAncestor request/response roundtrip.
+    #[test]
+    fn sync_message_is_ancestor_roundtrip() {
+        use commonplace_doc::mqtt::SyncMessage;
+
+        let request = SyncMessage::IsAncestor {
+            req: "r-anc".to_string(),
+            ancestor: "old-commit".to_string(),
+            descendant: "new-commit".to_string(),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        let decoded: SyncMessage = serde_json::from_str(&json).unwrap();
+
+        assert!(decoded.is_request());
+        match decoded {
+            SyncMessage::IsAncestor {
+                ancestor,
+                descendant,
+                ..
+            } => {
+                assert_eq!(ancestor, "old-commit");
+                assert_eq!(descendant, "new-commit");
+            }
+            _ => panic!("Expected IsAncestor"),
+        }
+
+        let response = SyncMessage::IsAncestorResponse {
+            req: "r-anc".to_string(),
+            result: true,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"is_ancestor_response\""));
+        assert!(json.contains("\"result\":true"));
+    }
+
+    /// Test message routing based on parsed topic.
+    #[test]
+    fn topic_based_routing() {
+        use commonplace_doc::mqtt::{Port, Topic};
+
+        struct RouteResult {
+            handler: String,
+            path: String,
+        }
+
+        fn route(topic_str: &str, workspace: &str) -> Option<RouteResult> {
+            let topic = Topic::parse(topic_str, workspace).ok()?;
+            let handler = match topic.port {
+                Port::Edits => "edits_handler",
+                Port::Sync => "sync_handler",
+                Port::Events => "events_handler",
+                Port::Commands => "commands_handler",
+            };
+            Some(RouteResult {
+                handler: handler.to_string(),
+                path: topic.path,
+            })
+        }
+
+        // Test routing to correct handlers
+        let r1 = route("ws/edits/doc", "ws").unwrap();
+        assert_eq!(r1.handler, "edits_handler");
+        assert_eq!(r1.path, "doc");
+
+        let r2 = route("ws/sync/doc/client", "ws").unwrap();
+        assert_eq!(r2.handler, "sync_handler");
+
+        let r3 = route("ws/events/node/update", "ws").unwrap();
+        assert_eq!(r3.handler, "events_handler");
+
+        let r4 = route("ws/commands/node/replace", "ws").unwrap();
+        assert_eq!(r4.handler, "commands_handler");
+
+        // Wrong workspace returns None
+        assert!(route("other/edits/doc", "ws").is_none());
+
+        // Invalid port returns None
+        assert!(route("ws/invalid/doc", "ws").is_none());
+    }
+}
+
+// =============================================================================
 // QOS SEMANTICS DOCUMENTATION
 // =============================================================================
 // The following tests document expected QoS behavior rather than testing it,

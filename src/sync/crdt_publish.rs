@@ -11,6 +11,7 @@ use crate::commit::Commit;
 use crate::diff;
 use crate::mqtt::{EditMessage, MqttClient, Topic};
 use crate::sync::crdt_state::CrdtPeerState;
+use crate::sync::error::{SyncError, SyncResult};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rumqttc::QoS;
 use std::sync::Arc;
@@ -47,7 +48,7 @@ pub async fn publish_text_change(
     old_content: &str,
     new_content: &str,
     author: &str,
-) -> Result<PublishResult, String> {
+) -> SyncResult<PublishResult> {
     // Load or create Y.Doc
     let doc = state.to_doc()?;
 
@@ -66,21 +67,21 @@ pub async fn publish_text_change(
             "Content unchanged after doc load, skipping publish for {}",
             node_id
         );
-        return Err("Content unchanged".to_string());
+        return Err(SyncError::ContentUnchanged);
     }
 
     let update_bytes = match compute_text_update(&doc, &current_content, new_content)? {
         Some(update) => update,
         None => {
             debug!("No-op update for {}, skipping publish", node_id);
-            return Err("Content unchanged".to_string());
+            return Err(SyncError::ContentUnchanged);
         }
     };
 
     // Apply the update to our local doc state
     {
-        let update =
-            Update::decode_v1(&update_bytes).map_err(|e| format!("Invalid Yjs update: {}", e))?;
+        let update = Update::decode_v1(&update_bytes)
+            .map_err(|e| SyncError::yjs_decode(format!("Invalid Yjs update: {}", e)))?;
         let mut txn = doc.transact_mut();
         txn.apply_update(update);
     }
@@ -122,8 +123,7 @@ pub async fn publish_text_change(
     };
 
     let topic = Topic::edits(workspace, node_id).to_topic_string();
-    let payload = serde_json::to_vec(&edit_msg)
-        .map_err(|e| format!("Failed to serialize edit message: {}", e))?;
+    let payload = serde_json::to_vec(&edit_msg)?;
 
     // Use retained message so new subscribers get the latest content immediately.
     // This is critical for sync: subscribers may join after messages are published,
@@ -131,7 +131,7 @@ pub async fn publish_text_change(
     mqtt_client
         .publish_retained(&topic, &payload, QoS::AtLeastOnce)
         .await
-        .map_err(|e| format!("Failed to publish edit: {}", e))?;
+        .map_err(|e| SyncError::mqtt(format!("Failed to publish edit: {}", e)))?;
 
     info!(
         "Published commit {} for {} ({} bytes, retained)",
@@ -153,12 +153,12 @@ pub async fn publish_yjs_update(
     state: &mut CrdtPeerState,
     update_bytes: Vec<u8>,
     author: &str,
-) -> Result<PublishResult, String> {
+) -> SyncResult<PublishResult> {
     // Apply update to local doc
     let doc = state.to_doc()?;
     {
-        let update =
-            Update::decode_v1(&update_bytes).map_err(|e| format!("Invalid Yjs update: {}", e))?;
+        let update = Update::decode_v1(&update_bytes)
+            .map_err(|e| SyncError::yjs_decode(format!("Invalid Yjs update: {}", e)))?;
         let mut txn = doc.transact_mut();
         txn.apply_update(update);
     }
@@ -200,14 +200,13 @@ pub async fn publish_yjs_update(
     };
 
     let topic = Topic::edits(workspace, node_id).to_topic_string();
-    let payload = serde_json::to_vec(&edit_msg)
-        .map_err(|e| format!("Failed to serialize edit message: {}", e))?;
+    let payload = serde_json::to_vec(&edit_msg)?;
 
     // Use retained message so new subscribers get the latest content immediately.
     mqtt_client
         .publish_retained(&topic, &payload, QoS::AtLeastOnce)
         .await
-        .map_err(|e| format!("Failed to publish edit: {}", e))?;
+        .map_err(|e| SyncError::mqtt(format!("Failed to publish edit: {}", e)))?;
 
     info!(
         "Published commit {} for {} ({} bytes, retained)",
@@ -236,7 +235,7 @@ pub fn apply_received_commit(
     cid: &str,
     update_b64: &str,
     _parents: &[String],
-) -> Result<bool, String> {
+) -> SyncResult<bool> {
     // Check if we already know this commit
     if state.is_cid_known(cid) {
         debug!("Commit {} already known, skipping", cid);
@@ -244,12 +243,10 @@ pub fn apply_received_commit(
     }
 
     // Decode update
-    let update_bytes = STANDARD
-        .decode(update_b64)
-        .map_err(|e| format!("Failed to decode update: {}", e))?;
+    let update_bytes = STANDARD.decode(update_b64)?;
 
     let update = Update::decode_v1(&update_bytes)
-        .map_err(|e| format!("Failed to decode Yjs update: {}", e))?;
+        .map_err(|e| SyncError::yjs_decode(format!("Failed to decode Yjs update: {}", e)))?;
 
     // Apply to local doc
     let doc = state.to_doc()?;
@@ -267,7 +264,7 @@ pub fn apply_received_commit(
 }
 
 /// Get the current text content from the Y.Doc state.
-pub fn get_text_content(state: &CrdtPeerState) -> Result<String, String> {
+pub fn get_text_content(state: &CrdtPeerState) -> SyncResult<String> {
     let doc = state.to_doc()?;
     let txn = doc.transact();
 
@@ -293,7 +290,7 @@ fn compute_text_update(
     doc: &Doc,
     old_content: &str,
     new_content: &str,
-) -> Result<Option<Vec<u8>>, String> {
+) -> SyncResult<Option<Vec<u8>>> {
     if old_content == new_content {
         return Ok(None);
     }
@@ -304,7 +301,7 @@ fn compute_text_update(
     };
 
     let diff = diff::compute_diff_update_with_base(&base_state, old_content, new_content)
-        .map_err(|e| format!("Diff computation failed: {}", e))?;
+        .map_err(|e| SyncError::other(format!("Diff computation failed: {}", e)))?;
 
     if diff.summary.chars_inserted == 0 && diff.summary.chars_deleted == 0 {
         return Ok(None);

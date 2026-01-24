@@ -82,7 +82,7 @@ pub async fn process_received_edit(
     }
 
     // Load current Y.Doc
-    let doc = state.to_doc()?;
+    let doc = state.to_doc().map_err(|e| e.to_string())?;
 
     // Decode and apply the update (if non-empty)
     // Merge commits have empty updates - they just record parent CIDs
