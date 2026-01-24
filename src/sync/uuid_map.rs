@@ -9,7 +9,9 @@ use crate::sync::{write_schema_file, WrittenSchemas};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::path::Path;
-use tracing::{debug, warn};
+use std::time::Duration;
+use tokio::time::sleep;
+use tracing::{debug, info, warn};
 
 /// Collect all file paths and their node_ids from a schema entry.
 ///
@@ -456,4 +458,119 @@ pub async fn get_all_node_backed_dir_ids(
     }
 
     result
+}
+
+/// Error type for UUID map readiness timeout.
+#[derive(Debug, Clone)]
+pub struct UuidMapTimeoutError {
+    /// Paths that were still missing UUIDs when timeout occurred.
+    pub missing_paths: Vec<String>,
+    /// Total time waited before timeout.
+    pub elapsed: Duration,
+}
+
+impl std::fmt::Display for UuidMapTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "UUID map not ready after {:?}: {} paths still missing UUIDs",
+            self.elapsed,
+            self.missing_paths.len()
+        )
+    }
+}
+
+impl std::error::Error for UuidMapTimeoutError {}
+
+/// Wait for the UUID map to be ready with all expected file paths having UUIDs.
+///
+/// This function polls the server with exponential backoff until all files
+/// in the schema have UUIDs assigned by the reconciler.
+///
+/// # Arguments
+/// * `client` - HTTP client for server requests
+/// * `server` - Server URL
+/// * `fs_root_id` - The fs-root document ID
+/// * `expected_paths` - List of relative file paths that should have UUIDs
+///
+/// # Returns
+/// * `Ok(HashMap<String, String>)` - Map of relative paths to UUIDs when all are ready
+/// * `Err(UuidMapTimeoutError)` - If timeout (10s) is reached with missing UUIDs
+///
+/// # Backoff Strategy
+/// Uses exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms...
+/// with a maximum total wait time of 10 seconds.
+pub async fn wait_for_uuid_map_ready(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    expected_paths: &[String],
+) -> Result<HashMap<String, String>, UuidMapTimeoutError> {
+    const INITIAL_DELAY_MS: u64 = 100;
+    const MAX_DELAY_MS: u64 = 1600;
+    const TIMEOUT_MS: u64 = 10_000;
+
+    // If no paths expected, return early with an empty map
+    if expected_paths.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let start = std::time::Instant::now();
+    let mut delay_ms = INITIAL_DELAY_MS;
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+
+        // Fetch the UUID map
+        let uuid_map = build_uuid_map_recursive(client, server, fs_root_id).await;
+
+        // Check if all expected paths have UUIDs
+        let missing: Vec<String> = expected_paths
+            .iter()
+            .filter(|path| !uuid_map.contains_key(*path))
+            .cloned()
+            .collect();
+
+        if missing.is_empty() {
+            info!(
+                "UUID map ready after {} attempts ({:?}): {} UUIDs resolved",
+                attempt,
+                start.elapsed(),
+                uuid_map.len()
+            );
+            return Ok(uuid_map);
+        }
+
+        // Check timeout
+        let elapsed = start.elapsed();
+        if elapsed.as_millis() >= TIMEOUT_MS as u128 {
+            warn!(
+                "UUID map timeout after {} attempts ({:?}): {} paths still missing UUIDs",
+                attempt,
+                elapsed,
+                missing.len()
+            );
+            for path in &missing {
+                debug!("  Missing UUID for: {}", path);
+            }
+            return Err(UuidMapTimeoutError {
+                missing_paths: missing,
+                elapsed,
+            });
+        }
+
+        // Log progress
+        debug!(
+            "UUID map attempt {}: {}/{} paths resolved, waiting {}ms",
+            attempt,
+            expected_paths.len() - missing.len(),
+            expected_paths.len(),
+            delay_ms
+        );
+
+        // Wait with exponential backoff
+        sleep(Duration::from_millis(delay_ms)).await;
+        delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+    }
 }

@@ -585,6 +585,8 @@ pub async fn handle_subdir_new_files(
                         );
                     }
 
+                    // Check for existing tasks before spawning (prevents duplicates)
+                    let states_snapshot = file_states.read().await;
                     let handles = spawn_file_sync_tasks_crdt(
                         ctx.mqtt_client.clone(),
                         client.clone(),
@@ -597,7 +599,10 @@ pub async fn handle_subdir_new_files(
                         shared_last_content.clone(),
                         pull_only,
                         author.to_string(),
+                        Some(&*states_snapshot),
+                        Some(root_relative_path),
                     );
+                    drop(states_snapshot);
                     (handles, Some(shared_last_content))
                 } else {
                     // Non-UUID identifier, fall back to HTTP sync
@@ -640,8 +645,15 @@ pub async fn handle_subdir_new_files(
                 (handles, None)
             };
 
+            // Skip if spawn was prevented due to existing tasks
+            if task_handles.is_empty() && crdt_last_content.is_some() {
+                // CRDT spawn was attempted but prevented - skip this file
+                continue;
+            }
+
             let mut states = file_states.write().await;
             // Check for race condition - another task might have registered this file
+            // (this can still happen in the window between read lock release and write lock acquire)
             if states.contains_key(root_relative_path) {
                 warn!(
                     "Race detected: file {} already registered during subdir sync, aborting duplicate tasks",
@@ -1140,6 +1152,8 @@ pub async fn handle_schema_change(
                                 );
                             }
 
+                            // Check for existing tasks before spawning (prevents duplicates)
+                            let states_snapshot = file_states.read().await;
                             let handles = spawn_file_sync_tasks_crdt(
                                 ctx.mqtt_client.clone(),
                                 client.clone(),
@@ -1152,7 +1166,10 @@ pub async fn handle_schema_change(
                                 shared_last_content.clone(),
                                 pull_only,
                                 author.to_string(),
+                                Some(&*states_snapshot),
+                                Some(path),
                             );
+                            drop(states_snapshot);
                             (handles, Some(shared_last_content))
                         } else {
                             // Non-UUID identifier, fall back to HTTP sync
@@ -1194,8 +1211,16 @@ pub async fn handle_schema_change(
                 } else {
                     (Vec::new(), None)
                 };
+
+                // Skip if spawn was prevented due to existing tasks
+                if task_handles.is_empty() && crdt_last_content.is_some() {
+                    // CRDT spawn was attempted but prevented - skip this file
+                    continue;
+                }
+
                 let mut states = file_states.write().await;
                 // Check for race condition - another task might have registered this file
+                // (this can still happen in the window between read lock release and write lock acquire)
                 if states.contains_key(path) {
                     warn!(
                         "Race detected: file {} already registered during sync, aborting duplicate tasks",

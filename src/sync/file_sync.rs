@@ -2011,6 +2011,28 @@ pub async fn upload_task_crdt(
             continue;
         }
 
+        // Compute content hashes for tracing
+        let old_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            old_content.hash(&mut h);
+            h.finish()
+        };
+        let new_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            new_content.hash(&mut h);
+            h.finish()
+        };
+        info!(
+            "[SANDBOX-TRACE] upload_task_crdt CHANGE_DETECTED file={} uuid={} old_len={} old_hash={:016x} new_len={} new_hash={:016x}",
+            file_path.display(),
+            node_id,
+            old_content.len(),
+            old_hash,
+            new_content.len(),
+            new_hash
+        );
         // DEBUG: Log the diff being computed
         info!(
             "CRDT upload_task: computing diff for {} - old_len={}, new_len={}, old_preview={:?}, new_preview={:?}",
@@ -2038,6 +2060,13 @@ pub async fn upload_task_crdt(
         .await
         {
             Ok(result) => {
+                info!(
+                    "[SANDBOX-TRACE] upload_task_crdt PUBLISHED file={} uuid={} cid={} update_bytes={}",
+                    file_path.display(),
+                    node_id,
+                    result.cid,
+                    result.update_bytes.len()
+                );
                 info!(
                     "CRDT upload: published commit {} for {} ({} bytes)",
                     result.cid,
@@ -2365,6 +2394,10 @@ pub async fn initialize_crdt_state_from_server_with_pending(
 ///
 /// This is the CRDT equivalent of `spawn_file_sync_tasks`.
 /// Uses MQTT publish for local changes instead of HTTP /replace.
+///
+/// If `file_states` and `relative_path` are provided, checks for existing active
+/// tasks before spawning. Returns empty Vec if tasks are already running to prevent
+/// duplicate publish/receive loops.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_file_sync_tasks_crdt(
     mqtt_client: Arc<MqttClient>,
@@ -2378,7 +2411,24 @@ pub fn spawn_file_sync_tasks_crdt(
     shared_last_content: SharedLastContent,
     pull_only: bool,
     author: String,
+    file_states: Option<&std::collections::HashMap<String, crate::sync::FileSyncState>>,
+    relative_path: Option<&str>,
 ) -> Vec<JoinHandle<()>> {
+    // Check for existing active tasks to prevent duplicates
+    if let (Some(states), Some(path)) = (file_states, relative_path) {
+        if let Some(existing_state) = states.get(path) {
+            if !existing_state.task_handles.is_empty() {
+                warn!(
+                    "Skipping CRDT task spawn for {} (node_id={}): {} tasks already running",
+                    path,
+                    node_id,
+                    existing_state.task_handles.len()
+                );
+                return Vec::new();
+            }
+        }
+    }
+
     let mut handles = Vec::new();
 
     if !pull_only {
@@ -2522,6 +2572,12 @@ pub async fn receive_task_crdt(
             continue;
         }
 
+        info!(
+            "[SANDBOX-TRACE] receive_task_crdt RECV file={} uuid={} payload_len={}",
+            file_path.display(),
+            node_id,
+            msg.payload.len()
+        );
         debug!(
             "CRDT receive_task: got edit for {} ({} bytes)",
             file_path.display(),
@@ -2550,6 +2606,12 @@ pub async fn receive_task_crdt(
         // it now (which would fail or produce incorrect results without shared history).
         if file_state.needs_server_init() {
             file_state.queue_pending_edit(msg.payload.clone());
+            info!(
+                "[SANDBOX-TRACE] receive_task_crdt QUEUED file={} uuid={} queue_size={}",
+                file_path.display(),
+                node_id,
+                file_state.pending_edits.len()
+            );
             debug!(
                 "CRDT receive_task: needs init for {}, queued edit (queue size: {})",
                 file_path.display(),
@@ -2571,6 +2633,13 @@ pub async fn receive_task_crdt(
         .await
         {
             Ok((result, maybe_content)) => {
+                info!(
+                    "[SANDBOX-TRACE] receive_task_crdt CRDT_MERGE file={} uuid={} result={:?} has_content={}",
+                    file_path.display(),
+                    node_id,
+                    result,
+                    maybe_content.is_some()
+                );
                 use crate::sync::crdt_merge::MergeResult;
 
                 match result {
@@ -2666,6 +2735,12 @@ pub async fn receive_task_crdt(
 
                         match tokio::fs::write(&file_path, &content).await {
                             Ok(()) => {
+                                info!(
+                                    "[SANDBOX-TRACE] receive_task_crdt DISK_WRITE file={} uuid={} content_len={}",
+                                    file_path.display(),
+                                    node_id,
+                                    content.len()
+                                );
                                 info!(
                                     "CRDT receive_task: wrote {} bytes to {}",
                                     content.len(),

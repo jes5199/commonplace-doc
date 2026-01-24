@@ -75,10 +75,28 @@ pub async fn create_new_file(
     )
     .await?;
 
-    // 3. Create file state with initial content
+    // 3. Schema-ready barrier: Wait for schema to propagate before sending content.
+    // This prevents a race condition where peers receive content edits before they
+    // know the file UUID (from schema), causing them to ignore the edit.
+    // See: CP-ekqq
+    const SCHEMA_PROPAGATION_DELAY_MS: u64 = 200;
+    debug!(
+        "Waiting {}ms for schema propagation before content publish (file: {}, uuid: {})",
+        SCHEMA_PROPAGATION_DELAY_MS, filename, file_uuid_str
+    );
+    tokio::time::sleep(tokio::time::Duration::from_millis(
+        SCHEMA_PROPAGATION_DELAY_MS,
+    ))
+    .await;
+    debug!(
+        "Schema propagation delay complete, publishing content for file: {}",
+        filename
+    );
+
+    // 4. Create file state with initial content
     let file_state = dir_state.get_or_create_file(filename, file_uuid);
 
-    // 4. Publish file content commit
+    // 5. Publish file content commit
     let file_cid = publish_file_content(
         mqtt_client,
         workspace,

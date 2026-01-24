@@ -23,9 +23,9 @@ use commonplace_doc::sync::{
     is_binary_content, push_schema_to_server, remove_file_from_schema,
     scan_directory_with_contents, schema_to_json, spawn_command_listener,
     spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file, upload_task,
-    wait_for_file_stability, write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent,
-    FileEvent, FileSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions,
-    SharedLastContent, SharedStateFile, SyncState, SCHEMA_FILENAME,
+    wait_for_file_stability, wait_for_uuid_map_ready, write_schema_file, ymap_schema,
+    CrdtFileSyncContext, DirEvent, FileEvent, FileSyncState, InodeKey, InodeTracker,
+    ReplaceResponse, ScanOptions, SharedLastContent, SharedStateFile, SyncState, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -541,6 +541,8 @@ async fn handle_file_created_crdt(
                 let subdir_state_arc = Arc::new(RwLock::new(subdir_state));
                 let file_path = path.to_path_buf();
                 let shared_last_content = Arc::new(RwLock::new(Some(content.clone())));
+                // Check for existing tasks before spawning (prevents duplicates)
+                let states_snapshot = file_states.read().await;
                 let handles = spawn_file_sync_tasks_crdt(
                     crdt.mqtt_client.clone(),
                     client.clone(),
@@ -553,7 +555,10 @@ async fn handle_file_created_crdt(
                     shared_last_content.clone(),
                     false, // pull_only = false for new files
                     author.to_string(),
+                    Some(&*states_snapshot),
+                    Some(&relative_path),
                 );
+                drop(states_snapshot);
 
                 // Add to file_states
                 let mut states = file_states.write().await;
@@ -618,6 +623,8 @@ async fn handle_file_created_crdt(
                 // Spawn CRDT sync tasks for the new file
                 let file_path = path.to_path_buf();
                 let shared_last_content = Arc::new(RwLock::new(Some(content.clone())));
+                // Check for existing tasks before spawning (prevents duplicates)
+                let states_snapshot = file_states.read().await;
                 let handles = spawn_file_sync_tasks_crdt(
                     crdt.mqtt_client.clone(),
                     client.clone(),
@@ -630,7 +637,10 @@ async fn handle_file_created_crdt(
                     shared_last_content.clone(),
                     false, // pull_only = false for new files
                     author.to_string(),
+                    Some(&*states_snapshot),
+                    Some(&filename),
                 );
+                drop(states_snapshot);
 
                 // Add to file_states
                 let mut states = file_states.write().await;
@@ -831,17 +841,42 @@ async fn handle_file_deleted_crdt(
 /// Fetch UUID map from server with logging.
 ///
 /// When `use_paths` is true, returns an empty map (paths used directly).
-/// Otherwise, recursively fetches all UUIDs from the server schema.
+/// Otherwise, waits for the reconciler to assign UUIDs to all expected paths
+/// using exponential backoff, then returns the UUID map.
+///
+/// # Arguments
+/// * `expected_paths` - List of relative file paths that should have UUIDs.
+///   If empty, falls back to a simple fetch without readiness waiting.
 async fn fetch_uuid_map_with_logging(
     client: &Client,
     server: &str,
     fs_root_id: &str,
     use_paths: bool,
+    expected_paths: &[String],
 ) -> HashMap<String, String> {
     if use_paths {
         return HashMap::new();
     }
 
+    // If we have expected paths, wait for them all to have UUIDs
+    if !expected_paths.is_empty() {
+        match wait_for_uuid_map_ready(client, server, fs_root_id, expected_paths).await {
+            Ok(map) => {
+                for (path, uuid) in &map {
+                    debug!("  UUID map: {} -> {}", path, uuid);
+                }
+                return map;
+            }
+            Err(e) => {
+                // Log warning but continue with whatever UUIDs we have
+                warn!("{}", e);
+                warn!("Proceeding with partial UUID map - some files may fail to sync");
+                // Fall through to fetch whatever is available
+            }
+        }
+    }
+
+    // Fallback: simple fetch without readiness waiting
     let map = build_uuid_map_recursive(client, server, fs_root_id).await;
     info!(
         "Resolved {} UUIDs from server schema for initial sync",
@@ -978,6 +1013,13 @@ struct Args {
     /// Events appear on {workspace}/events/{path}/stdout and /stderr topics.
     #[arg(long, requires = "sandbox")]
     log_listener: Option<String>,
+
+    /// Timeout in seconds to wait for CRDT readiness before starting exec.
+    /// In sandbox mode, exec waits for CRDT tasks to be ready for all files,
+    /// or until this timeout expires, whichever comes first.
+    /// Default: 10 seconds.
+    #[arg(long, default_value = "10")]
+    sandbox_timeout: u64,
 }
 
 /// Resolve a path relative to fs-root to a UUID.
@@ -1137,36 +1179,65 @@ async fn resolve_or_create_path(
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
 
-    // Wait for the reconciler to create the document
+    // Wait for the reconciler to create the document with exponential backoff
+    // (100ms, 200ms, 400ms, ...) up to 10 seconds total
     info!("Waiting for server reconciler to create document...");
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    // Fetch the updated schema to get the server-assigned UUID
     let head_url = build_head_url(server, &parent_id, false);
-    let resp = client.get(&head_url).send().await?;
-    if !resp.status().is_success() {
-        return Err(format!("Failed to fetch updated schema: HTTP {}", resp.status()).into());
-    }
 
-    let head: HeadResp = resp.json().await?;
-    let updated_schema: Schema = serde_json::from_str(&head.content)?;
+    const INITIAL_DELAY_MS: u64 = 100;
+    const MAX_DELAY_MS: u64 = 1600;
+    const TIMEOUT_MS: u64 = 10_000;
 
-    // Find the UUID assigned by the server
-    let node_id = updated_schema
-        .root
-        .entries
-        .as_ref()
-        .and_then(|e| e.get(*filename))
-        .and_then(|entry| entry.node_id.clone())
-        .ok_or_else(|| {
-            format!(
-                "Server did not assign UUID for '{}'. Check server logs.",
-                filename
+    let start = std::time::Instant::now();
+    let mut delay_ms = INITIAL_DELAY_MS;
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+
+        // Fetch the updated schema to get the server-assigned UUID
+        let resp = client.get(&head_url).send().await?;
+        if !resp.status().is_success() {
+            return Err(format!("Failed to fetch updated schema: HTTP {}", resp.status()).into());
+        }
+
+        let head: HeadResp = resp.json().await?;
+        let updated_schema: Schema = serde_json::from_str(&head.content)?;
+
+        // Check if the UUID has been assigned
+        if let Some(node_id) = updated_schema
+            .root
+            .entries
+            .as_ref()
+            .and_then(|e| e.get(*filename))
+            .and_then(|entry| entry.node_id.clone())
+        {
+            info!(
+                "Created document: {} -> {} (after {} attempts)",
+                path, node_id, attempt
+            );
+            return Ok(node_id);
+        }
+
+        // Check timeout
+        let elapsed = start.elapsed();
+        if elapsed.as_millis() >= TIMEOUT_MS as u128 {
+            return Err(format!(
+                "Timeout waiting for reconciler to assign UUID for '{}' after {:?}. Check server logs.",
+                filename, elapsed
             )
-        })?;
+            .into());
+        }
 
-    info!("Created document: {} -> {}", path, node_id);
-    Ok(node_id)
+        debug!(
+            "UUID not yet assigned for '{}', attempt {} (waiting {}ms)",
+            filename, attempt, delay_ms
+        );
+
+        // Exponential backoff
+        delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+    }
 }
 
 #[tokio::main]
@@ -1401,6 +1472,7 @@ async fn main() -> ExitCode {
                 mqtt_client,
                 args.workspace,
                 args.path.clone(),
+                args.sandbox_timeout,
             )
             .await
         };
@@ -1471,6 +1543,7 @@ async fn main() -> ExitCode {
                 mqtt_client,
                 args.workspace,
                 args.path.clone(),
+                args.sandbox_timeout,
             )
             .await
         } else {
@@ -1976,13 +2049,14 @@ async fn run_directory_mode(
     let files = scan_directory_with_contents(&directory, &options)
         .map_err(|e| format!("Scan error: {}", e))?;
 
-    // Wait for reconciler to process the schema and create documents
-    sleep(Duration::from_millis(100)).await;
+    // Collect expected file paths for UUID map readiness check
+    let expected_paths: Vec<String> = files.iter().map(|f| f.relative_path.clone()).collect();
 
-    // When not using paths, fetch the updated schema to get UUIDs assigned by reconciler
-    // Build a map of relative_path -> node_id for UUID resolution
-    // This recursively follows node-backed directories to get all UUIDs
-    let uuid_map = fetch_uuid_map_with_logging(&client, &server, &fs_root_id, use_paths).await;
+    // Wait for reconciler to process the schema and create documents.
+    // Uses exponential backoff (100ms, 200ms, 400ms, ...) with 10s timeout.
+    let uuid_map =
+        fetch_uuid_map_with_logging(&client, &server, &fs_root_id, use_paths, &expected_paths)
+            .await;
 
     // Sync files in parallel with concurrency limit
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_SYNCS));
@@ -2236,6 +2310,9 @@ async fn run_directory_mode(
                 );
             }
             file_state.crdt_last_content = Some(shared_last_content.clone());
+            // Note: file_states is None here because we're in the initial setup phase
+            // iterating through all files - deduplication not needed since we're
+            // creating tasks for files that don't have tasks yet
             file_state.task_handles = spawn_file_sync_tasks_crdt(
                 mqtt_client.clone(),
                 client.clone(),
@@ -2248,6 +2325,8 @@ async fn run_directory_mode(
                 shared_last_content,
                 pull_only,
                 author.clone(),
+                None, // file_states - initial setup, not needed
+                None, // relative_path
             );
         }
     }
@@ -2397,6 +2476,7 @@ async fn run_exec_mode(
     mqtt_client: Arc<MqttClient>,
     workspace: String,
     command_path: Option<String>,
+    sandbox_timeout_secs: u64,
 ) -> Result<u8, Box<dyn std::error::Error + Send + Sync>> {
     // Derive author from process_name, defaulting to "sync-client"
     let author = process_name
@@ -2553,13 +2633,14 @@ async fn run_exec_mode(
     let files = scan_directory_with_contents(&directory, &options)
         .map_err(|e| format!("Scan error: {}", e))?;
 
-    // Wait for reconciler to process the schema and create documents
-    sleep(Duration::from_millis(100)).await;
+    // Collect expected file paths for UUID map readiness check
+    let expected_paths: Vec<String> = files.iter().map(|f| f.relative_path.clone()).collect();
 
-    // When not using paths, fetch the updated schema to get UUIDs assigned by reconciler
-    // Build a map of relative_path -> node_id for UUID resolution
-    // This recursively follows node-backed directories to get all UUIDs
-    let uuid_map = fetch_uuid_map_with_logging(&client, &server, &fs_root_id, use_paths).await;
+    // Wait for reconciler to process the schema and create documents.
+    // Uses exponential backoff (100ms, 200ms, 400ms, ...) with 10s timeout.
+    let uuid_map =
+        fetch_uuid_map_with_logging(&client, &server, &fs_root_id, use_paths, &expected_paths)
+            .await;
 
     // In sandbox mode, use a timeout to not block exec for too long
     // In non-sandbox mode, sync files synchronously before continuing
@@ -2825,6 +2906,9 @@ async fn run_exec_mode(
                 );
             }
             file_state.crdt_last_content = Some(shared_last_content.clone());
+            // Note: file_states is None here because we're in the initial setup phase
+            // iterating through all files - deduplication not needed since we're
+            // creating tasks for files that don't have tasks yet
             file_state.task_handles = spawn_file_sync_tasks_crdt(
                 mqtt_client.clone(),
                 client.clone(),
@@ -2837,6 +2921,8 @@ async fn run_exec_mode(
                 shared_last_content,
                 pull_only,
                 author.clone(),
+                None, // file_states - initial setup, not needed
+                None, // relative_path
             );
         }
     }
@@ -2914,6 +3000,48 @@ async fn run_exec_mode(
             }
         }
     });
+
+    // Wait for CRDT readiness before starting exec (in sandbox mode)
+    // This ensures all file sync tasks are ready to capture writes from the exec process
+    if sandbox {
+        let timeout = Duration::from_secs(sandbox_timeout_secs);
+        let start = Instant::now();
+        let check_interval = Duration::from_millis(100);
+
+        loop {
+            // Check if all files have CRDT state initialized
+            let state = crdt_state.read().await;
+            let unready_files: Vec<String> = state
+                .files
+                .iter()
+                .filter(|(_, file_state)| file_state.needs_server_init())
+                .map(|(name, _)| name.clone())
+                .collect();
+            drop(state);
+
+            if unready_files.is_empty() {
+                info!(
+                    "CRDT readiness achieved: all {} files ready, starting exec ({}ms elapsed)",
+                    file_count,
+                    start.elapsed().as_millis()
+                );
+                break;
+            }
+
+            if start.elapsed() >= timeout {
+                warn!(
+                    "CRDT readiness timeout after {}s: {} files still not ready ({:?}), proceeding to exec",
+                    sandbox_timeout_secs,
+                    unready_files.len(),
+                    unready_files
+                );
+                break;
+            }
+
+            // Brief sleep before next check
+            sleep(check_interval).await;
+        }
+    }
 
     // Build the command to execute
     // Parse exec_cmd - if it contains spaces and no exec_args, treat as shell command

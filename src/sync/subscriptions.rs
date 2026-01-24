@@ -977,6 +977,9 @@ async fn ensure_crdt_tasks_for_files(
             handle.abort();
         }
 
+        // Note: We intentionally pass None for file_states here because this code path
+        // already explicitly aborts old tasks before spawning new ones (see lines above).
+        // The deduplication check is for preventing concurrent spawns from different code paths.
         let handles = spawn_file_sync_tasks_crdt(
             context.mqtt_client.clone(),
             http_client.clone(),
@@ -989,6 +992,8 @@ async fn ensure_crdt_tasks_for_files(
             shared_last_content.clone(),
             pull_only,
             author.to_string(),
+            None, // file_states - not needed, old tasks already aborted above
+            None, // relative_path
         );
 
         let mut states = file_states.write().await;
@@ -1494,6 +1499,12 @@ pub async fn subdir_mqtt_task(
 
     // Process incoming MQTT messages with lag detection
     let context = format!("MQTT subdir {} receiver", subdir_path);
+    info!(
+        "[SANDBOX-TRACE] subdir_mqtt_task READY for subdir={} node_id={} subscribed_uuids={}",
+        subdir_path,
+        subdir_node_id,
+        subscribed_uuids.len()
+    );
     loop {
         let msg = match recv_broadcast_with_lag(&mut message_rx, &context).await {
             BroadcastRecvResult::Message(m) => m,
@@ -1564,6 +1575,12 @@ pub async fn subdir_mqtt_task(
 
         if doc_id == subdir_node_id {
             // This is a schema change for the subdirectory
+            info!(
+                "[SANDBOX-TRACE] subdir_mqtt_task RECV schema_change subdir={} doc_id={} payload_len={}",
+                subdir_path,
+                doc_id,
+                msg.payload.len()
+            );
             debug!(
                 "MQTT edit received for subdir {} schema: {} bytes",
                 subdir_path,
@@ -1649,6 +1666,13 @@ pub async fn subdir_mqtt_task(
         } else if let Some(paths) = uuid_to_paths.get(&doc_id) {
             // This is a file content edit - pull and write to local file(s)
             if pull_only || !push_only {
+                info!(
+                    "[SANDBOX-TRACE] subdir_mqtt_task RECV file_edit subdir={} uuid={} payload_len={} paths={:?}",
+                    subdir_path,
+                    doc_id,
+                    msg.payload.len(),
+                    paths
+                );
                 debug!(
                     "Subdir {}: MQTT edit received for file UUID {}: {} bytes, {} path(s)",
                     subdir_path,
@@ -1691,6 +1715,12 @@ pub async fn subdir_mqtt_task(
                             // incorrect results without shared history).
                             if file_state.needs_server_init() {
                                 file_state.queue_pending_edit(msg.payload.clone());
+                                info!(
+                                    "[SANDBOX-TRACE] subdir_mqtt_task CRDT_QUEUED subdir={} file={} queue_size={}",
+                                    subdir_path,
+                                    filename,
+                                    file_state.pending_edits.len()
+                                );
                                 debug!(
                                     "Subdir {}: CRDT needs init for {}, queued edit (queue size: {})",
                                     subdir_path,
@@ -1712,6 +1742,13 @@ pub async fn subdir_mqtt_task(
                                 .await
                                 {
                                     Ok((result, maybe_content)) => {
+                                        info!(
+                                            "[SANDBOX-TRACE] subdir_mqtt_task CRDT_MERGE subdir={} file={} result={:?} has_content={}",
+                                            subdir_path,
+                                            filename,
+                                            result,
+                                            maybe_content.is_some()
+                                        );
                                         drop(state_guard); // Release lock before file I/O
 
                                         if let Some(content) = maybe_content {
@@ -1755,6 +1792,12 @@ pub async fn subdir_mqtt_task(
                                                         subdir_path, rel_path, e
                                                     );
                                                 } else {
+                                                    info!(
+                                                        "[SANDBOX-TRACE] subdir_mqtt_task DISK_WRITE subdir={} file={} content_len={}",
+                                                        subdir_path,
+                                                        rel_path,
+                                                        content.len()
+                                                    );
                                                     debug!(
                                                         "Subdir {}: CRDT edit applied to {} ({} bytes, {:?})",
                                                         subdir_path,
@@ -1766,6 +1809,11 @@ pub async fn subdir_mqtt_task(
                                             }
                                             true // Handled via CRDT
                                         } else {
+                                            info!(
+                                                "[SANDBOX-TRACE] subdir_mqtt_task CRDT_NO_CONTENT subdir={} file={} (already known)",
+                                                subdir_path,
+                                                filename
+                                            );
                                             debug!(
                                                 "Subdir {}: CRDT merge returned no content (already known)",
                                                 subdir_path
