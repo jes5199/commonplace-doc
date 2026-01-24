@@ -2600,6 +2600,87 @@ pub async fn receive_task_crdt(
         }
     }
 
+    // RACE CONDITION FIX: After becoming ready, check if server HEAD has advanced
+    // since our initial fetch. This catches edits that arrived between init and
+    // subscription. We compare current server HEAD with our head_cid.
+    {
+        let current_head_cid = {
+            let state_guard = crdt_state.read().await;
+            state_guard
+                .get_file(&filename)
+                .and_then(|f| f.head_cid.clone())
+        };
+
+        // Fetch current server HEAD
+        match crate::sync::client::fetch_head(&http_client, &server, &node_id_str, false).await {
+            Ok(Some(head)) => {
+                if let Some(ref server_cid) = head.cid {
+                    let needs_resync = match &current_head_cid {
+                        Some(local_cid) => local_cid != server_cid,
+                        None => true,
+                    };
+
+                    if needs_resync {
+                        info!(
+                            "CRDT receive_task: server HEAD advanced during init for {} (local: {:?}, server: {}), resyncing",
+                            file_path.display(),
+                            current_head_cid,
+                            server_cid
+                        );
+
+                        // Mark state as needing re-init
+                        {
+                            let mut state_guard = crdt_state.write().await;
+                            if let Some(file_state) = state_guard.get_file_mut(&filename) {
+                                file_state.mark_needs_resync();
+                            }
+                        }
+
+                        // Resync from server
+                        if let Err(e) = initialize_crdt_state_from_server_with_pending(
+                            &http_client,
+                            &server,
+                            node_id,
+                            &crdt_state,
+                            &filename,
+                            &file_path,
+                            Some(&mqtt_client),
+                            Some(&workspace),
+                            Some(&author),
+                            Some(&shared_last_content),
+                        )
+                        .await
+                        {
+                            warn!(
+                                "CRDT receive_task: failed to resync {} after init race: {}",
+                                file_path.display(),
+                                e
+                            );
+                        } else {
+                            info!(
+                                "CRDT receive_task: resynced {} from server after init race",
+                                file_path.display()
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                debug!(
+                    "CRDT receive_task: no server HEAD for {} during init race check",
+                    file_path.display()
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "CRDT receive_task: failed to check server HEAD for {} during init race check: {}",
+                    file_path.display(),
+                    e
+                );
+            }
+        }
+    }
+
     let context = format!("CRDT receive {}", file_path.display());
 
     loop {
