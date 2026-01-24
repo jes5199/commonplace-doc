@@ -2169,6 +2169,7 @@ async fn run_directory_mode(
             #[cfg(unix)]
             inode_tracker: inode_tracker.clone(),
             watched_subdirs: watched_subdirs.clone(),
+            crdt_context: crdt_context.clone(),
         };
         let transport = SubdirTransport::Mqtt {
             client: mqtt_client.clone(),
@@ -2743,6 +2744,7 @@ async fn run_exec_mode(
             #[cfg(unix)]
             inode_tracker: inode_tracker.clone(),
             watched_subdirs: watched_subdirs.clone(),
+            crdt_context: crdt_context.clone(),
         };
         let transport = SubdirTransport::Mqtt {
             client: mqtt_client.clone(),

@@ -12,6 +12,7 @@ use crate::sync::schema_io::{
 use crate::sync::state_file::{
     compute_content_hash, load_synced_directories, mark_directory_synced, unmark_directory_synced,
 };
+use crate::sync::subscriptions::CrdtFileSyncContext;
 use crate::sync::uuid_map::{
     build_uuid_map_and_write_schemas, build_uuid_map_recursive,
     build_uuid_map_recursive_with_status,
@@ -19,7 +20,8 @@ use crate::sync::uuid_map::{
 use crate::sync::{
     ancestry::determine_sync_direction, build_info_url, detect_from_path, is_allowed_extension,
     is_binary_content, looks_like_base64_binary, push_schema_to_server,
-    remove_file_state_and_abort, spawn_file_sync_tasks, FileSyncState, SyncState,
+    remove_file_state_and_abort, spawn_file_sync_tasks, spawn_file_sync_tasks_crdt, FileSyncState,
+    SharedLastContent, SyncState,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -29,6 +31,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 /// Check if a file path exists in any recently written schema.
 ///
@@ -347,6 +350,9 @@ pub async fn handle_subdir_schema_cleanup(
 ///
 /// This is called from `subdir_sse_task` when a subdirectory schema changes.
 /// It finds files in the server schema that don't exist locally and syncs them.
+///
+/// When `crdt_context` is provided, CRDT sync tasks are spawned instead of HTTP sync tasks.
+/// This enables file edits to be published via MQTT instead of HTTP.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_subdir_new_files(
     client: &Client,
@@ -362,6 +368,7 @@ pub async fn handle_subdir_new_files(
     shared_state_file: Option<&crate::sync::SharedStateFile>,
     author: &str,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    crdt_context: Option<&CrdtFileSyncContext>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Don't pull if push_only mode
     if push_only {
@@ -531,26 +538,103 @@ pub async fn handle_subdir_new_files(
             // Update with content for echo detection
             {
                 let mut s = state.write().await;
-                s.last_written_content = file_head.content;
+                s.last_written_content = file_head.content.clone();
             }
 
             info!("Created local file from subdir: {}", file_path.display());
 
             // Spawn sync tasks for the new file
-            let task_handles = spawn_file_sync_tasks(
-                client.clone(),
-                server.to_string(),
-                identifier.clone(),
-                file_path.clone(),
-                state.clone(),
-                use_paths,
-                push_only,
-                pull_only,
-                false, // force_push: directory mode doesn't support force-push
-                author.to_string(),
-                #[cfg(unix)]
-                inode_tracker.clone(),
-            );
+            // Use CRDT tasks if context is provided and identifier is a valid UUID
+            let (task_handles, crdt_last_content) = if let Some(ctx) = crdt_context {
+                // Try to parse identifier as UUID for CRDT sync
+                if let Ok(node_uuid) = Uuid::parse_str(&identifier) {
+                    // Initialize CRDT state from server
+                    let filename = file_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&identifier)
+                        .to_string();
+
+                    if let Err(e) =
+                        crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
+                            client,
+                            server,
+                            node_uuid,
+                            &ctx.crdt_state,
+                            &filename,
+                            &file_path,
+                            Some(&ctx.mqtt_client),
+                            Some(&ctx.workspace),
+                            Some(author),
+                        )
+                        .await
+                    {
+                        warn!(
+                            "Failed to initialize CRDT state for {}: {}",
+                            root_relative_path, e
+                        );
+                    }
+
+                    // Create shared_last_content for echo detection
+                    let initial_content = tokio::fs::read_to_string(&file_path)
+                        .await
+                        .ok()
+                        .filter(|s| !s.is_empty());
+                    let shared_last_content: SharedLastContent =
+                        Arc::new(RwLock::new(initial_content));
+
+                    let handles = spawn_file_sync_tasks_crdt(
+                        ctx.mqtt_client.clone(),
+                        ctx.workspace.clone(),
+                        node_uuid,
+                        file_path.clone(),
+                        ctx.crdt_state.clone(),
+                        filename,
+                        shared_last_content.clone(),
+                        pull_only,
+                        author.to_string(),
+                    );
+                    (handles, Some(shared_last_content))
+                } else {
+                    // Non-UUID identifier, fall back to HTTP sync
+                    debug!(
+                        "Subdir {} file {} has non-UUID identifier, using HTTP sync",
+                        subdir_path, root_relative_path
+                    );
+                    let handles = spawn_file_sync_tasks(
+                        client.clone(),
+                        server.to_string(),
+                        identifier.clone(),
+                        file_path.clone(),
+                        state.clone(),
+                        use_paths,
+                        push_only,
+                        pull_only,
+                        false, // force_push: directory mode doesn't support force-push
+                        author.to_string(),
+                        #[cfg(unix)]
+                        inode_tracker.clone(),
+                    );
+                    (handles, None)
+                }
+            } else {
+                // No CRDT context, use HTTP sync
+                let handles = spawn_file_sync_tasks(
+                    client.clone(),
+                    server.to_string(),
+                    identifier.clone(),
+                    file_path.clone(),
+                    state.clone(),
+                    use_paths,
+                    push_only,
+                    pull_only,
+                    false, // force_push: directory mode doesn't support force-push
+                    author.to_string(),
+                    #[cfg(unix)]
+                    inode_tracker.clone(),
+                );
+                (handles, None)
+            };
 
             let mut states = file_states.write().await;
             // Check for race condition - another task might have registered this file
@@ -573,7 +657,7 @@ pub async fn handle_subdir_new_files(
                     task_handles,
                     use_paths,
                     content_hash: Some(content_hash),
-                    crdt_last_content: None,
+                    crdt_last_content,
                 },
             );
         }

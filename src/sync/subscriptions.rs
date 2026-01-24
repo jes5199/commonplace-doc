@@ -42,6 +42,8 @@ pub struct CrdtFileSyncContext {
 /// 1. Cleanup deleted files and orphaned directories
 /// 2. Sync NEW files from server
 /// 3. Create directories for new node-backed subdirectories
+///
+/// When `crdt_context` is provided, CRDT sync tasks are spawned instead of HTTP sync tasks.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_subdir_edit(
     client: &Client,
@@ -58,6 +60,7 @@ pub async fn handle_subdir_edit(
     author: &str,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     log_prefix: &str,
+    crdt_context: Option<&CrdtFileSyncContext>,
 ) {
     // First, cleanup deleted files and orphaned directories
     match handle_subdir_schema_cleanup(
@@ -101,6 +104,7 @@ pub async fn handle_subdir_edit(
         author,
         #[cfg(unix)]
         inode_tracker,
+        crdt_context,
     )
     .await
     {
@@ -267,6 +271,7 @@ pub async fn directory_sse_task(
                                     #[cfg(unix)]
                                     inode_tracker: inode_tracker.clone(),
                                     watched_subdirs: watched_subdirs.clone(),
+                                    crdt_context: None, // SSE path doesn't have CRDT context
                                 };
                                 spawn_subdir_watchers(&params, SubdirTransport::Sse).await;
                             }
@@ -403,6 +408,7 @@ pub async fn subdir_sse_task(
                             let subdir_full_path = directory.join(&subdir_path);
 
                             // Use shared helper for edit handling
+                            // SSE path doesn't have CRDT context, use None
                             handle_subdir_edit(
                                 &client,
                                 &server,
@@ -419,6 +425,7 @@ pub async fn subdir_sse_task(
                                 #[cfg(unix)]
                                 inode_tracker.clone(),
                                 "SSE",
+                                None, // No CRDT context for SSE
                             )
                             .await;
 
@@ -701,6 +708,7 @@ pub async fn directory_mqtt_task(
                     #[cfg(unix)]
                     inode_tracker: inode_tracker.clone(),
                     watched_subdirs: watched_subdirs.clone(),
+                    crdt_context: crdt_context.clone(),
                 };
                 spawn_subdir_watchers(
                     &params,
@@ -1324,6 +1332,7 @@ pub fn spawn_subdir_mqtt_task(
     mqtt_client: Arc<MqttClient>,
     workspace: String,
     watched_subdirs: Arc<RwLock<HashSet<String>>>,
+    crdt_context: Option<CrdtFileSyncContext>,
 ) {
     tokio::spawn(subdir_mqtt_task(
         http_client,
@@ -1343,6 +1352,7 @@ pub fn spawn_subdir_mqtt_task(
         mqtt_client,
         workspace,
         watched_subdirs,
+        crdt_context,
     ));
 }
 
@@ -1358,6 +1368,8 @@ pub fn spawn_subdir_mqtt_task(
 /// 3. Cleans up orphaned directories that no longer exist in the schema
 /// 4. Syncs NEW files that were added to the server schema
 /// 5. Updates file UUID subscriptions to match the new schema
+///
+/// When `crdt_context` is provided, CRDT sync tasks are spawned for new files.
 ///
 /// This is the MQTT equivalent of `subdir_sse_task`.
 #[allow(clippy::too_many_arguments)]
@@ -1378,6 +1390,7 @@ pub async fn subdir_mqtt_task(
     mqtt_client: Arc<MqttClient>,
     workspace: String,
     watched_subdirs: Arc<RwLock<HashSet<String>>>,
+    crdt_context: Option<CrdtFileSyncContext>,
 ) {
     // Subscribe to edits for the subdirectory document (schema changes)
     let edits_topic = Topic::edits(&workspace, &subdir_node_id);
@@ -1478,6 +1491,7 @@ pub async fn subdir_mqtt_task(
                     #[cfg(unix)]
                     inode_tracker.clone(),
                     "MQTT-resync",
+                    crdt_context.as_ref(),
                 )
                 .await;
 
@@ -1547,6 +1561,7 @@ pub async fn subdir_mqtt_task(
                 #[cfg(unix)]
                 inode_tracker.clone(),
                 "MQTT",
+                crdt_context.as_ref(),
             )
             .await;
 
@@ -1594,6 +1609,7 @@ pub async fn subdir_mqtt_task(
                         mqtt_client.clone(),
                         workspace.clone(),
                         watched_subdirs.clone(),
+                        crdt_context.clone(),
                     );
                 }
             }

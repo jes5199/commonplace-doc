@@ -8,7 +8,7 @@
 //! Used by both `subscriptions.rs` and `bin/sync.rs` to avoid duplication.
 
 use crate::mqtt::MqttClient;
-use crate::sync::subscriptions::{subdir_mqtt_task, subdir_sse_task};
+use crate::sync::subscriptions::{subdir_mqtt_task, subdir_sse_task, CrdtFileSyncContext};
 use crate::sync::uuid_map::get_all_node_backed_dir_ids;
 use crate::sync::FileSyncState;
 use reqwest::Client;
@@ -46,6 +46,9 @@ pub struct SubdirSpawnParams {
     #[cfg(unix)]
     pub inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     pub watched_subdirs: Arc<RwLock<HashSet<String>>>,
+    /// CRDT context for spawning CRDT sync tasks instead of HTTP sync tasks.
+    /// When provided, subdirectory file syncs will use MQTT instead of HTTP.
+    pub crdt_context: Option<CrdtFileSyncContext>,
 }
 
 /// Discover and spawn tasks for all node-backed subdirectories.
@@ -122,6 +125,7 @@ pub async fn spawn_subdir_watchers(
                     client.clone(),
                     workspace.clone(),
                     params.watched_subdirs.clone(),
+                    params.crdt_context.clone(),
                 ));
             }
         }
