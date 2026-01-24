@@ -419,8 +419,14 @@ Stage 5: End-to-end sandbox sync - **IN PROGRESS**
 - Run the flaky test with tracing enabled; verify timeline of publish/receive,
   schema updates, and file writes in both workspace and sandbox.
 - Required exit criteria: create/edit/delete sequence passes repeatedly.
-- Status: CP-1ual tracks the flaky test. Diagnostic tracing added. Root cause identified:
-  LocalAhead result during CRDT merge indicates state divergence during initialization.
+- Status: CP-1ual tracks the flaky test. Diagnostic tracing added. LocalAhead
+  divergence is observed during initialization, but fixes have not eliminated
+  intermittent failures.
+- Current state (2026-01-24): most runs miss workspace→sandbox edit; occasional
+  runs miss sandbox→workspace edit (per CP-1ual notes after race fixes).
+- Suspected remaining causes: sandbox exec starts before CRDT readiness (CP-mcfh),
+  UUID readiness race (CP-o1pe), missing schema-ready barrier for new files
+  (CP-ekqq), and duplicate CRDT task spawns (CP-5s00).
 
 **Test Summary (2026-01-24)**:
 - sync_harness.rs: 73 tests
