@@ -241,6 +241,7 @@ pub async fn directory_sse_task(
                                 inode_tracker.clone(),
                                 written_schemas.as_ref(),
                                 shared_state_file.as_ref(),
+                                None, // SSE path doesn't have CRDT context
                             )
                             .await
                             {
@@ -630,6 +631,8 @@ pub async fn directory_mqtt_task(
             );
 
             // Use content-based deduplication and ancestry checking
+            // Pass crdt_context so new files spawn CRDT tasks directly,
+            // avoiding race conditions between subscription and task upgrade
             match handle_schema_change_with_dedup(
                 &http_client,
                 &server,
@@ -647,6 +650,7 @@ pub async fn directory_mqtt_task(
                 inode_tracker.clone(),
                 written_schemas.as_ref(),
                 shared_state_file.as_ref(),
+                crdt_context.as_ref(),
             )
             .await
             {
@@ -668,6 +672,8 @@ pub async fn directory_mqtt_task(
                     )
                     .await;
 
+                    // Still call ensure_crdt_tasks_for_files for files that existed
+                    // before this schema change (they may not have CRDT tasks yet)
                     if let Some(ref context) = crdt_context {
                         if let Err(e) = ensure_crdt_tasks_for_files(
                             &http_client,

@@ -1946,6 +1946,7 @@ async fn run_directory_mode(
             inode_tracker.clone(),
             Some(&written_schemas),
             Some(&shared_state_file),
+            None, // No CRDT context during initial sync
         )
         .await?;
         info!("Server files pulled to local directory");
@@ -2054,6 +2055,7 @@ async fn run_directory_mode(
         inode_tracker.clone(),
         Some(&written_schemas),
         Some(&shared_state_file),
+        None, // No CRDT context during initial sync
     )
     .await?;
 
@@ -2504,6 +2506,7 @@ async fn run_exec_mode(
             inode_tracker.clone(),
             Some(&written_schemas),
             Some(&shared_state_file),
+            None, // No CRDT context during initial sync
         )
         .await?;
         info!("Server files pulled to local directory");

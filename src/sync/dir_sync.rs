@@ -919,6 +919,7 @@ pub async fn handle_schema_change(
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
     shared_state_file: Option<&crate::sync::SharedStateFile>,
+    crdt_context: Option<&CrdtFileSyncContext>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Fetch, parse, and validate schema from server
     let fetched = match fetch_and_validate_schema(client, server, fs_root_id, true).await {
@@ -1093,23 +1094,97 @@ pub async fn handle_schema_change(
                 info!("Created local file: {}", file_path.display());
 
                 // Spawn sync tasks for the new file (only if requested)
-                let task_handles = if spawn_tasks {
-                    spawn_file_sync_tasks(
-                        client.clone(),
-                        server.to_string(),
-                        identifier.clone(),
-                        file_path.clone(),
-                        state.clone(),
-                        use_paths,
-                        push_only,
-                        pull_only,
-                        false, // force_push: directory mode doesn't support force-push
-                        author.to_string(),
-                        #[cfg(unix)]
-                        inode_tracker.clone(),
-                    )
+                // Use CRDT tasks if context is provided and identifier is a valid UUID
+                let (task_handles, crdt_last_content) = if spawn_tasks {
+                    if let Some(ctx) = crdt_context {
+                        // Try to parse identifier as UUID for CRDT sync
+                        if let Ok(node_uuid) = Uuid::parse_str(&identifier) {
+                            // Initialize CRDT state from server
+                            let filename = file_path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(&identifier)
+                                .to_string();
+
+                            if let Err(e) =
+                                crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
+                                    client,
+                                    server,
+                                    node_uuid,
+                                    &ctx.crdt_state,
+                                    &filename,
+                                    &file_path,
+                                    Some(&ctx.mqtt_client),
+                                    Some(&ctx.workspace),
+                                    Some(author),
+                                )
+                                .await
+                            {
+                                warn!(
+                                    "Failed to initialize CRDT state for {}: {}",
+                                    path, e
+                                );
+                            }
+
+                            // Create shared_last_content for echo detection
+                            let initial_content = tokio::fs::read_to_string(&file_path)
+                                .await
+                                .ok()
+                                .filter(|s| !s.is_empty());
+                            let shared_last_content: SharedLastContent =
+                                Arc::new(RwLock::new(initial_content));
+
+                            let handles = spawn_file_sync_tasks_crdt(
+                                ctx.mqtt_client.clone(),
+                                ctx.workspace.clone(),
+                                node_uuid,
+                                file_path.clone(),
+                                ctx.crdt_state.clone(),
+                                filename,
+                                shared_last_content.clone(),
+                                pull_only,
+                                author.to_string(),
+                            );
+                            (handles, Some(shared_last_content))
+                        } else {
+                            // Non-UUID identifier, fall back to HTTP sync
+                            debug!("File {} has non-UUID identifier, using HTTP sync", path);
+                            let handles = spawn_file_sync_tasks(
+                                client.clone(),
+                                server.to_string(),
+                                identifier.clone(),
+                                file_path.clone(),
+                                state.clone(),
+                                use_paths,
+                                push_only,
+                                pull_only,
+                                false, // force_push: directory mode doesn't support force-push
+                                author.to_string(),
+                                #[cfg(unix)]
+                                inode_tracker.clone(),
+                            );
+                            (handles, None)
+                        }
+                    } else {
+                        // No CRDT context, use HTTP sync
+                        let handles = spawn_file_sync_tasks(
+                            client.clone(),
+                            server.to_string(),
+                            identifier.clone(),
+                            file_path.clone(),
+                            state.clone(),
+                            use_paths,
+                            push_only,
+                            pull_only,
+                            false, // force_push: directory mode doesn't support force-push
+                            author.to_string(),
+                            #[cfg(unix)]
+                            inode_tracker.clone(),
+                        );
+                        (handles, None)
+                    }
                 } else {
-                    Vec::new()
+                    (Vec::new(), None)
                 };
                 let mut states = file_states.write().await;
                 // Check for race condition - another task might have registered this file
@@ -1132,7 +1207,7 @@ pub async fn handle_schema_change(
                         task_handles,
                         use_paths,
                         content_hash: Some(content_hash),
-                        crdt_last_content: None,
+                        crdt_last_content,
                     },
                 );
             }
@@ -1218,6 +1293,7 @@ pub async fn handle_schema_change_with_dedup(
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
     shared_state_file: Option<&crate::sync::SharedStateFile>,
+    crdt_context: Option<&CrdtFileSyncContext>,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     // Fetch current schema from server
     let head = match fetch_head(client, server, fs_root_id, false).await {
@@ -1284,6 +1360,7 @@ pub async fn handle_schema_change_with_dedup(
         inode_tracker,
         written_schemas,
         shared_state_file,
+        crdt_context,
     )
     .await?;
 
