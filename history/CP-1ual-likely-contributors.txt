@@ -56,3 +56,16 @@ C) Duplicate CRDT task spawns
 D) Schema-ready barrier missing for new files
 - Content edits for newly created files can arrive before schema visibility on peers, even with buffering.
 - Bead: CP-ekqq.
+
+---
+Current status update (2026-01-24)
+
+Stage 5 remains intermittent after race fixes:
+- Most runs miss workspace→sandbox edit
+- Occasional runs miss sandbox→workspace edit
+
+Remaining suspected causes:
+- Sandbox exec starts before CRDT readiness (CP-mcfh)
+- UUID readiness race (CP-o1pe)
+- Missing schema-ready barrier for new files (CP-ekqq)
+- Duplicate CRDT task spawns (CP-5s00)
