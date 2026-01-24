@@ -1407,6 +1407,8 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     std::fs::remove_file(&workspace_test_file).expect("Failed to delete test file");
 
     // D2: Verify file is removed from sandbox
+    // Note: CP-1ual tracks a race condition where sandbox fetch may see stale HTTP state
+    // before MQTT deletion is processed by server
     wait_for_file_deleted(&sandbox_test_file, Duration::from_secs(10))
         .expect("Sandbox file should be deleted when workspace file is deleted");
 }
