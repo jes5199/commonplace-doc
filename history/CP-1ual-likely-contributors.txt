@@ -1,0 +1,35 @@
+CP-1ual likely contributors (ordered by likelihood)
+
+1) CRDT init race
+   - When needs_server_init() is true, CRDT merge is skipped and the client falls back to a server fetch.
+   - If the edit arrives before the server has processed it, the fetch returns stale content and the edit is lost.
+   - Symptom match: empty file or missing edit after initial create.
+   - Bead: CP-hykz.
+
+2) Broadcast lag without resync
+   - recv_broadcast() logs Lagged and continues, but no resync occurs.
+   - Missed edits are permanently lost for that session.
+   - Symptom match: later edits silently fail to land.
+   - Bead: CP-oah1.
+
+3) Watcher reads unstable files
+   - Create/modify events can fire before content is fully written (temp file + rename, editor swap).
+   - Empty or partial reads can be published as real edits.
+   - Symptom match: file created but empty or truncated.
+   - Bead: CP-gz0p.
+
+4) Echo suppression or fallback writes interfering with real edits
+   - Echo suppression/fallback write paths can block legitimate remote updates or cause echo loops.
+   - Symptom match: sandbox -> workspace edits not propagating.
+   - Beads: CP-qqgi (echo suppression removal), CP-dkqk (pipeline investigation).
+
+5) MQTT retain/QoS strategy inconsistencies
+   - If retained edits or QoS are inconsistent, late-joining peers miss updates.
+   - Symptom match: sandbox joins and never receives the latest content.
+   - Bead: CP-w41r.
+
+6) Subscription timing vs schema updates
+   - Schema update triggers UUID subscription; content edit can arrive before subscription is active.
+   - Fetch then returns empty or stale content.
+   - Symptom match: initial create OK but subsequent content missing.
+   - Related to CP-hykz and CP-dkqk.
