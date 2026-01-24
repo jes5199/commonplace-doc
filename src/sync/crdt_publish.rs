@@ -105,7 +105,13 @@ pub async fn publish_text_change(
     let cid = commit.calculate_cid();
 
     // Update state
+    // Update both local_head_cid AND head_cid when we publish.
+    // This is critical: when we publish a commit, it becomes the new logical
+    // server head. Without updating head_cid, the merge strategy will think
+    // we have diverged from the server when we receive edits that build on
+    // our published commit, causing LocalAhead instead of FastForward.
     state.local_head_cid = Some(cid.clone());
+    state.head_cid = Some(cid.clone());
     state.update_from_doc(&doc);
 
     // Publish via MQTT
@@ -182,7 +188,13 @@ pub async fn publish_yjs_update(
     let cid = commit.calculate_cid();
 
     // Update state
+    // Update both local_head_cid AND head_cid when we publish.
+    // This is critical: when we publish a commit, it becomes the new logical
+    // server head. Without updating head_cid, the merge strategy will think
+    // we have diverged from the server when we receive edits that build on
+    // our published commit, causing LocalAhead instead of FastForward.
     state.local_head_cid = Some(cid.clone());
+    state.head_cid = Some(cid.clone());
     state.update_from_doc(&doc);
 
     // Publish via MQTT

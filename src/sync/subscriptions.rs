@@ -667,19 +667,26 @@ pub async fn directory_mqtt_task(
                     debug!("MQTT: Schema change processed successfully");
 
                     // Schema changed - update UUID subscriptions
-                    sync_uuid_subscriptions(
-                        &http_client,
-                        &server,
-                        &fs_root_id,
-                        &mqtt_client,
-                        &workspace,
-                        &mut subscribed_uuids,
-                        &mut uuid_to_paths,
-                        &directory,
-                        use_paths,
-                        &file_states,
-                    )
-                    .await;
+                    // IMPORTANT: Skip sync_uuid_subscriptions when CRDT context is present.
+                    // In CRDT mode, each file's receive_task_crdt handles its own subscription.
+                    // The HTTP-based sync_uuid_subscriptions can race with the server's
+                    // reconciler, causing UUIDs to be overwritten and subscriptions lost.
+                    // See CP-1ual for details on this race condition.
+                    if crdt_context.is_none() {
+                        sync_uuid_subscriptions(
+                            &http_client,
+                            &server,
+                            &fs_root_id,
+                            &mqtt_client,
+                            &workspace,
+                            &mut subscribed_uuids,
+                            &mut uuid_to_paths,
+                            &directory,
+                            use_paths,
+                            &file_states,
+                        )
+                        .await;
+                    }
 
                     // Still call ensure_crdt_tasks_for_files for files that existed
                     // before this schema change (they may not have CRDT tasks yet)
@@ -1644,20 +1651,27 @@ pub async fn subdir_mqtt_task(
             .await;
 
             // Schema changed - update UUID subscriptions for this subdirectory
-            sync_subdir_uuid_subscriptions(
-                &http_client,
-                &server,
-                &subdir_node_id,
-                &subdir_path,
-                &mqtt_client,
-                &workspace,
-                &mut subscribed_uuids,
-                &mut uuid_to_paths,
-                &directory,
-                use_paths,
-                &file_states,
-            )
-            .await;
+            // IMPORTANT: Skip sync_subdir_uuid_subscriptions when CRDT context is present.
+            // In CRDT mode, each file's receive_task_crdt handles its own subscription.
+            // The HTTP-based sync_subdir_uuid_subscriptions can race with the server's
+            // reconciler, causing UUIDs to be overwritten and subscriptions lost.
+            // See CP-1ual for details on this race condition.
+            if crdt_context.is_none() {
+                sync_subdir_uuid_subscriptions(
+                    &http_client,
+                    &server,
+                    &subdir_node_id,
+                    &subdir_path,
+                    &mqtt_client,
+                    &workspace,
+                    &mut subscribed_uuids,
+                    &mut uuid_to_paths,
+                    &directory,
+                    use_paths,
+                    &file_states,
+                )
+                .await;
+            }
 
             // Check for newly discovered nested node-backed subdirs and spawn MQTT tasks
             if !push_only {

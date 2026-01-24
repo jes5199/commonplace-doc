@@ -1989,10 +1989,19 @@ pub async fn upload_task_crdt(
             shared.clone().unwrap_or_default()
         };
 
+        info!(
+            "[UPLOAD-TRACE] upload_task_crdt recv for {} - old_len={} old={:?} new_len={} new={:?}",
+            file_path.display(),
+            old_content.len(),
+            old_content.chars().take(30).collect::<String>(),
+            new_content.len(),
+            new_content.chars().take(30).collect::<String>()
+        );
+
         // Skip if content unchanged
         if old_content == new_content {
-            debug!(
-                "CRDT upload_task: content unchanged for {}",
+            info!(
+                "[UPLOAD-TRACE] upload_task_crdt SKIPPING unchanged content for {}",
                 file_path.display()
             );
             continue;
@@ -2903,6 +2912,12 @@ pub async fn receive_task_crdt(
                         let previous_content = {
                             let mut shared = shared_last_content.write().await;
                             let prev = shared.clone();
+                            info!(
+                                "[RECEIVE-TRACE] receive_task_crdt updating shared_last_content for {} from {:?} to {:?}",
+                                file_path.display(),
+                                prev.as_ref().map(|s| s.chars().take(30).collect::<String>()),
+                                content.chars().take(30).collect::<String>()
+                            );
                             *shared = Some(content.clone());
                             prev
                         };

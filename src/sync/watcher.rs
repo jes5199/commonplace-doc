@@ -395,6 +395,12 @@ pub async fn file_watcher_task(file_path: PathBuf, tx: mpsc::Sender<FileEvent>) 
                     }
                 };
 
+                info!(
+                    "[WATCHER-TRACE] Sending FileEvent::Modified for {} ({} bytes, content={:?})",
+                    file_path.display(),
+                    content.len(),
+                    String::from_utf8_lossy(&content).chars().take(50).collect::<String>()
+                );
                 if tx.send(FileEvent::Modified(content)).await.is_err() {
                     break;
                 }
