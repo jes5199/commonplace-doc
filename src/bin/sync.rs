@@ -19,12 +19,13 @@ use commonplace_doc::sync::{
     directory_watcher_task, discover_fs_root, ensure_fs_root_exists,
     ensure_parent_directories_exist, file_watcher_task, find_owning_document, fork_node,
     handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
-    handle_schema_modified, initial_sync, is_binary_content, push_schema_to_server,
-    remove_file_from_schema, scan_directory_with_contents, schema_to_json, spawn_command_listener,
+    handle_schema_modified, initial_sync, initialize_crdt_state_from_server_with_pending,
+    is_binary_content, push_schema_to_server, remove_file_from_schema,
+    scan_directory_with_contents, schema_to_json, spawn_command_listener,
     spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file, upload_task,
     wait_for_file_stability, write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent,
     FileEvent, FileSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions,
-    SharedStateFile, SyncState, SCHEMA_FILENAME,
+    SharedLastContent, SharedStateFile, SyncState, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -2199,16 +2200,29 @@ async fn run_directory_mode(
                 .unwrap_or(relative_path)
                 .to_string();
 
+            // Create shared_last_content BEFORE init so we can update it during init.
+            // This prevents the file watcher from detecting init writes as local changes,
+            // which would cause LocalAhead divergence.
+            let initial_content = tokio::fs::read_to_string(&file_path)
+                .await
+                .ok()
+                .filter(|s| !s.is_empty());
+            let shared_last_content: SharedLastContent = Arc::new(RwLock::new(initial_content));
+
             // Initialize CRDT state from server before spawning tasks.
             // This ensures all sync clients share the same Yjs operation history,
             // which is critical for merges to work correctly (especially deletions).
-            if let Err(e) = commonplace_doc::sync::initialize_crdt_state_from_server(
+            if let Err(e) = initialize_crdt_state_from_server_with_pending(
                 &client,
                 &server,
                 node_id,
                 &crdt_state,
                 &filename,
                 &file_path,
+                Some(&mqtt_client),
+                Some(&workspace),
+                Some(&author),
+                Some(&shared_last_content),
             )
             .await
             {
@@ -2217,8 +2231,6 @@ async fn run_directory_mode(
                     relative_path, e
                 );
             }
-
-            let shared_last_content = Arc::new(RwLock::new(None));
             file_state.crdt_last_content = Some(shared_last_content.clone());
             file_state.task_handles = spawn_file_sync_tasks_crdt(
                 mqtt_client.clone(),
@@ -2775,16 +2787,29 @@ async fn run_exec_mode(
                 .unwrap_or(relative_path)
                 .to_string();
 
+            // Create shared_last_content BEFORE init so we can update it during init.
+            // This prevents the file watcher from detecting init writes as local changes,
+            // which would cause LocalAhead divergence.
+            let initial_content = tokio::fs::read_to_string(&file_path)
+                .await
+                .ok()
+                .filter(|s| !s.is_empty());
+            let shared_last_content: SharedLastContent = Arc::new(RwLock::new(initial_content));
+
             // Initialize CRDT state from server before spawning tasks.
             // This ensures all sync clients share the same Yjs operation history,
             // which is critical for merges to work correctly (especially deletions).
-            if let Err(e) = commonplace_doc::sync::initialize_crdt_state_from_server(
+            if let Err(e) = initialize_crdt_state_from_server_with_pending(
                 &client,
                 &server,
                 node_id,
                 &crdt_state,
                 &filename,
                 &file_path,
+                Some(&mqtt_client),
+                Some(&workspace),
+                Some(&author),
+                Some(&shared_last_content),
             )
             .await
             {
@@ -2793,8 +2818,6 @@ async fn run_exec_mode(
                     relative_path, e
                 );
             }
-
-            let shared_last_content = Arc::new(RwLock::new(None));
             file_state.crdt_last_content = Some(shared_last_content.clone());
             file_state.task_handles = spawn_file_sync_tasks_crdt(
                 mqtt_client.clone(),

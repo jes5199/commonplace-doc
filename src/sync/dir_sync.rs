@@ -555,6 +555,15 @@ pub async fn handle_subdir_new_files(
                         .unwrap_or(&identifier)
                         .to_string();
 
+                    // Create shared_last_content BEFORE init so we can update it during init
+                    // This prevents the file watcher from detecting init writes as local changes
+                    let initial_content = tokio::fs::read_to_string(&file_path)
+                        .await
+                        .ok()
+                        .filter(|s| !s.is_empty());
+                    let shared_last_content: SharedLastContent =
+                        Arc::new(RwLock::new(initial_content));
+
                     if let Err(e) =
                         crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
                             client,
@@ -566,6 +575,7 @@ pub async fn handle_subdir_new_files(
                             Some(&ctx.mqtt_client),
                             Some(&ctx.workspace),
                             Some(author),
+                            Some(&shared_last_content),
                         )
                         .await
                     {
@@ -574,14 +584,6 @@ pub async fn handle_subdir_new_files(
                             root_relative_path, e
                         );
                     }
-
-                    // Create shared_last_content for echo detection
-                    let initial_content = tokio::fs::read_to_string(&file_path)
-                        .await
-                        .ok()
-                        .filter(|s| !s.is_empty());
-                    let shared_last_content: SharedLastContent =
-                        Arc::new(RwLock::new(initial_content));
 
                     let handles = spawn_file_sync_tasks_crdt(
                         ctx.mqtt_client.clone(),
@@ -1106,6 +1108,15 @@ pub async fn handle_schema_change(
                                 .unwrap_or(&identifier)
                                 .to_string();
 
+                            // Create shared_last_content BEFORE init so we can update it during init
+                            // This prevents the file watcher from detecting init writes as local changes
+                            let initial_content = tokio::fs::read_to_string(&file_path)
+                                .await
+                                .ok()
+                                .filter(|s| !s.is_empty());
+                            let shared_last_content: SharedLastContent =
+                                Arc::new(RwLock::new(initial_content));
+
                             if let Err(e) =
                                 crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
                                     client,
@@ -1117,6 +1128,7 @@ pub async fn handle_schema_change(
                                     Some(&ctx.mqtt_client),
                                     Some(&ctx.workspace),
                                     Some(author),
+                                    Some(&shared_last_content),
                                 )
                                 .await
                             {
@@ -1125,14 +1137,6 @@ pub async fn handle_schema_change(
                                     path, e
                                 );
                             }
-
-                            // Create shared_last_content for echo detection
-                            let initial_content = tokio::fs::read_to_string(&file_path)
-                                .await
-                                .ok()
-                                .filter(|s| !s.is_empty());
-                            let shared_last_content: SharedLastContent =
-                                Arc::new(RwLock::new(initial_content));
 
                             let handles = spawn_file_sync_tasks_crdt(
                                 ctx.mqtt_client.clone(),

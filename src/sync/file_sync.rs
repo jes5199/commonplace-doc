@@ -2101,7 +2101,7 @@ pub async fn initialize_crdt_state_from_server(
     file_path: &Path,
 ) -> SyncResult<()> {
     initialize_crdt_state_from_server_with_pending(
-        client, server, node_id, crdt_state, filename, file_path, None, None, None,
+        client, server, node_id, crdt_state, filename, file_path, None, None, None, None,
     )
     .await
 }
@@ -2132,6 +2132,7 @@ pub async fn initialize_crdt_state_from_server_with_pending(
     mqtt_client: Option<&Arc<MqttClient>>,
     workspace: Option<&str>,
     author: Option<&str>,
+    shared_last_content: Option<&SharedLastContent>,
 ) -> SyncResult<()> {
     // Check if we need initialization
     {
@@ -2174,6 +2175,11 @@ pub async fn initialize_crdt_state_from_server_with_pending(
 
                     // Only write if local differs from server
                     if local_content != head.content {
+                        // Update shared_last_content BEFORE writing to prevent echo detection
+                        if let Some(slc) = shared_last_content {
+                            let mut shared = slc.write().await;
+                            *shared = Some(head.content.clone());
+                        }
                         if let Err(e) = tokio::fs::write(file_path, &head.content).await {
                             warn!(
                                 "Failed to write server content to {}: {}",
@@ -2222,6 +2228,11 @@ pub async fn initialize_crdt_state_from_server_with_pending(
                                     drop(state); // Release lock before file I/O
 
                                     if let Some(content) = maybe_content {
+                                        // Update shared_last_content BEFORE writing to prevent echo
+                                        if let Some(slc) = shared_last_content {
+                                            let mut shared = slc.write().await;
+                                            *shared = Some(content.clone());
+                                        }
                                         if let Err(e) = tokio::fs::write(file_path, &content).await
                                         {
                                             warn!(
@@ -2291,6 +2302,11 @@ pub async fn initialize_crdt_state_from_server_with_pending(
                                     drop(state);
 
                                     if let Some(content) = maybe_content {
+                                        // Update shared_last_content BEFORE writing to prevent echo
+                                        if let Some(slc) = shared_last_content {
+                                            let mut shared = slc.write().await;
+                                            *shared = Some(content.clone());
+                                        }
                                         if let Err(e) = tokio::fs::write(file_path, &content).await
                                         {
                                             warn!(

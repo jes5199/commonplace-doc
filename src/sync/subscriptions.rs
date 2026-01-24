@@ -924,6 +924,14 @@ async fn ensure_crdt_tasks_for_files(
             .unwrap_or(&relative_path)
             .to_string();
 
+        // Create shared_last_content BEFORE init so we can update it during init
+        // This prevents the file watcher from detecting init writes as local changes
+        let initial_content = tokio::fs::read_to_string(&file_path)
+            .await
+            .ok()
+            .filter(|s| !s.is_empty());
+        let shared_last_content: SharedLastContent = Arc::new(RwLock::new(initial_content));
+
         if let Err(e) = crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
             http_client,
             server,
@@ -934,6 +942,7 @@ async fn ensure_crdt_tasks_for_files(
             Some(&context.mqtt_client),
             Some(&context.workspace),
             Some(author),
+            Some(&shared_last_content),
         )
         .await
         {
@@ -942,12 +951,6 @@ async fn ensure_crdt_tasks_for_files(
                 relative_path, e
             );
         }
-
-        let initial_content = tokio::fs::read_to_string(&file_path)
-            .await
-            .ok()
-            .filter(|s| !s.is_empty());
-        let shared_last_content: SharedLastContent = Arc::new(RwLock::new(initial_content));
 
         let old_handles = {
             let mut states = file_states.write().await;
@@ -1272,6 +1275,15 @@ async fn resync_subscribed_files(
                     }
                 }
 
+                // Look up existing shared_last_content from file_states
+                let relative_path = paths.first().cloned().unwrap_or_else(|| filename.clone());
+                let shared_last_content = {
+                    let states = file_states.read().await;
+                    states
+                        .get(&relative_path)
+                        .and_then(|s| s.crdt_last_content.clone())
+                };
+
                 if let Err(e) =
                     crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
                         http_client,
@@ -1283,6 +1295,7 @@ async fn resync_subscribed_files(
                         Some(&ctx.mqtt_client),
                         Some(&ctx.workspace),
                         Some(author),
+                        shared_last_content.as_ref(),
                     )
                     .await
                 {

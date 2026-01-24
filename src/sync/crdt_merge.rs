@@ -312,7 +312,7 @@ async fn publish_merge_commit(
         .map_err(|e| format!("Failed to serialize merge commit: {}", e))?;
 
     mqtt_client
-        .publish(&topic, &payload, QoS::AtLeastOnce)
+        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
         .await
         .map_err(|e| format!("Failed to publish merge commit: {}", e))?;
 
