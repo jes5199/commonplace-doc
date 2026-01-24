@@ -4,10 +4,11 @@
 //! events for directory-level synchronization.
 
 use crate::events::{recv_broadcast_with_lag, BroadcastRecvResult};
+use crate::fs::FsSchema;
 use crate::mqtt::{MqttClient, Topic};
 use crate::sync::dir_sync::{
-    create_subdir_nested_directories, handle_schema_change_with_dedup, handle_subdir_new_files,
-    handle_subdir_schema_cleanup,
+    create_subdir_nested_directories, decode_schema_from_mqtt_payload,
+    handle_schema_change_with_dedup, handle_subdir_new_files, handle_subdir_schema_cleanup,
 };
 use crate::sync::subdir_spawn::{spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport};
 use crate::sync::{encode_node_id, spawn_file_sync_tasks_crdt, FileSyncState, SharedLastContent};
@@ -44,6 +45,10 @@ pub struct CrdtFileSyncContext {
 /// 3. Create directories for new node-backed subdirectories
 ///
 /// When `crdt_context` is provided, CRDT sync tasks are spawned instead of HTTP sync tasks.
+///
+/// When `mqtt_schema` is provided (decoded from MQTT payload), it's used directly for cleanup
+/// instead of fetching from HTTP. This avoids race conditions where the server hasn't
+/// processed the MQTT edit yet.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_subdir_edit(
     client: &Client,
@@ -61,6 +66,7 @@ pub async fn handle_subdir_edit(
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     log_prefix: &str,
     crdt_context: Option<&CrdtFileSyncContext>,
+    mqtt_schema: Option<(FsSchema, String)>,
 ) {
     // First, cleanup deleted files and orphaned directories
     match handle_subdir_schema_cleanup(
@@ -71,6 +77,7 @@ pub async fn handle_subdir_edit(
         subdir_full_path,
         directory,
         file_states,
+        mqtt_schema,
     )
     .await
     {
@@ -410,6 +417,7 @@ pub async fn subdir_sse_task(
 
                             // Use shared helper for edit handling
                             // SSE path doesn't have CRDT context, use None
+                            // SSE path doesn't have MQTT payload, fetch schema from HTTP
                             handle_subdir_edit(
                                 &client,
                                 &server,
@@ -427,6 +435,7 @@ pub async fn subdir_sse_task(
                                 inode_tracker.clone(),
                                 "SSE",
                                 None, // No CRDT context for SSE
+                                None, // No MQTT schema for SSE, fetch from HTTP
                             )
                             .await;
 
@@ -1518,6 +1527,7 @@ pub async fn subdir_mqtt_task(
                     subdir_path, missed_count
                 );
                 // Force a schema refresh by calling handle_subdir_edit
+                // Resync fetches from HTTP (no MQTT payload available)
                 let subdir_full_path = directory.join(&subdir_path);
                 handle_subdir_edit(
                     &http_client,
@@ -1536,6 +1546,7 @@ pub async fn subdir_mqtt_task(
                     inode_tracker.clone(),
                     "MQTT-resync",
                     crdt_context.as_ref(),
+                    None, // No MQTT schema during resync, fetch from HTTP
                 )
                 .await;
 
@@ -1594,6 +1605,22 @@ pub async fn subdir_mqtt_task(
             );
             let subdir_full_path = directory.join(&subdir_path);
 
+            // Decode schema from MQTT payload to avoid HTTP race condition.
+            // The MQTT payload contains the actual CRDT update - using it directly
+            // ensures we have the correct state even before the server processes it.
+            let mqtt_schema = decode_schema_from_mqtt_payload(&msg.payload);
+            if mqtt_schema.is_some() {
+                info!(
+                    "[SANDBOX-TRACE] Decoded schema from MQTT payload for subdir={} (avoids HTTP race)",
+                    subdir_path
+                );
+            } else {
+                debug!(
+                    "Failed to decode schema from MQTT payload for subdir={}, will fetch from HTTP",
+                    subdir_path
+                );
+            }
+
             // Use shared helper for edit handling
             handle_subdir_edit(
                 &http_client,
@@ -1612,6 +1639,7 @@ pub async fn subdir_mqtt_task(
                 inode_tracker.clone(),
                 "MQTT",
                 crdt_context.as_ref(),
+                mqtt_schema, // Use MQTT-decoded schema to avoid HTTP race
             )
             .await;
 

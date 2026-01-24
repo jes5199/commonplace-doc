@@ -5,6 +5,7 @@
 
 use crate::fs::{Entry, FsSchema};
 use crate::sync::client::fetch_head;
+use crate::sync::crdt_merge::parse_edit_message;
 use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
 use crate::sync::schema_io::{
     fetch_and_validate_schema, write_nested_schemas, write_schema_file, SCHEMA_FILENAME,
@@ -17,12 +18,14 @@ use crate::sync::uuid_map::{
     build_uuid_map_and_write_schemas, build_uuid_map_recursive,
     build_uuid_map_recursive_with_status,
 };
+use crate::sync::ymap_schema;
 use crate::sync::{
     ancestry::determine_sync_direction, build_info_url, detect_from_path, is_allowed_extension,
     is_binary_content, looks_like_base64_binary, push_schema_to_server,
     remove_file_state_and_abort, spawn_file_sync_tasks, spawn_file_sync_tasks_crdt, FileSyncState,
     SharedLastContent, SyncState,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::path::Path;
@@ -32,6 +35,65 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+use yrs::updates::decoder::Decode;
+use yrs::{Doc, Transact, Update};
+
+/// Decode an MQTT schema update payload into an FsSchema.
+///
+/// This parses the EditMessage from the MQTT payload, decodes the Yrs update,
+/// applies it to a fresh Y.Doc, and converts to FsSchema. This allows us to
+/// use the MQTT payload directly instead of fetching from HTTP, which avoids
+/// race conditions where the server hasn't processed the MQTT edit yet.
+///
+/// Returns None if decoding fails (caller should fall back to HTTP fetch).
+pub fn decode_schema_from_mqtt_payload(payload: &[u8]) -> Option<(FsSchema, String)> {
+    // Parse the EditMessage JSON
+    let edit_msg = match parse_edit_message(payload) {
+        Ok(m) => m,
+        Err(e) => {
+            debug!("Failed to parse MQTT schema payload: {}", e);
+            return None;
+        }
+    };
+
+    // Decode base64 Yrs update
+    let update_bytes = match STANDARD.decode(&edit_msg.update) {
+        Ok(b) => b,
+        Err(e) => {
+            debug!("Failed to decode base64 schema update: {}", e);
+            return None;
+        }
+    };
+
+    // Create a fresh Y.Doc and apply the update
+    let doc = Doc::new();
+    {
+        let mut txn = doc.transact_mut();
+        match Update::decode_v1(&update_bytes) {
+            Ok(update) => {
+                txn.apply_update(update);
+            }
+            Err(e) => {
+                debug!("Failed to decode Yrs update: {:?}", e);
+                return None;
+            }
+        }
+    }
+
+    // Convert YMap format to FsSchema
+    let schema = ymap_schema::to_fs_schema(&doc);
+
+    // Also serialize back to JSON for writing to local schema file
+    let schema_json = match serde_json::to_string_pretty(&schema) {
+        Ok(j) => j,
+        Err(e) => {
+            debug!("Failed to serialize schema to JSON: {}", e);
+            return None;
+        }
+    };
+
+    Some((schema, schema_json))
+}
 
 /// Check if a file path exists in any recently written schema.
 ///
@@ -201,13 +263,17 @@ async fn cleanup_orphaned_directories(directory: &Path, schema: &FsSchema) {
 /// deleting files that were removed from the server.
 ///
 /// This function handles SSE "edit" events for node-backed subdirectories by:
-/// 1. Fetching the subdirectory schema from the server
+/// 1. Fetching the subdirectory schema from the server (or using provided schema from MQTT)
 /// 2. Validating and writing it to the local .commonplace.json file
 /// 3. Deleting local files that no longer exist in the server schema
 /// 4. Cleaning up orphaned directories not in the schema
 ///
+/// If `mqtt_schema` is provided, it will be used directly instead of fetching from HTTP.
+/// This avoids race conditions where the server hasn't processed the MQTT edit yet.
+///
 /// File sync tasks for NEW files in subdirectories are tracked in CP-fs3x.
 /// This function focuses on cleanup (deletions), not pulling new content.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_subdir_schema_cleanup(
     client: &Client,
     server: &str,
@@ -216,16 +282,26 @@ pub async fn handle_subdir_schema_cleanup(
     subdir_directory: &Path,
     root_directory: &Path,
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    mqtt_schema: Option<(FsSchema, String)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Fetch, parse, and validate schema from server
-    let fetched = match fetch_and_validate_schema(client, server, subdir_node_id, true).await {
-        Some(f) => f,
-        None => return Ok(()), // Logged inside fetch_and_validate_schema
+    // Use provided schema or fetch from server
+    let (schema, schema_json) = if let Some((s, json)) = mqtt_schema {
+        debug!(
+            "Using MQTT-decoded schema for subdir {} cleanup (avoids HTTP race)",
+            subdir_path
+        );
+        (s, json)
+    } else {
+        // Fetch, parse, and validate schema from server
+        let fetched = match fetch_and_validate_schema(client, server, subdir_node_id, true).await {
+            Some(f) => f,
+            None => return Ok(()), // Logged inside fetch_and_validate_schema
+        };
+        (fetched.schema, fetched.content)
     };
-    let schema = fetched.schema;
 
     // Write valid schema to local .commonplace.json file
-    if let Err(e) = write_schema_file(subdir_directory, &fetched.content, None).await {
+    if let Err(e) = write_schema_file(subdir_directory, &schema_json, None).await {
         warn!("Failed to write subdir schema file: {}", e);
     }
 
