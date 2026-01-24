@@ -11,7 +11,7 @@ use crate::sync::uuid_map::fetch_subdir_node_id;
 use crate::sync::{
     delete_schema_entry, detect_from_path, fork_node, is_allowed_extension, is_binary_content,
     normalize_path, push_content_by_type, push_schema_to_server, remove_file_state_and_abort,
-    spawn_file_sync_tasks, FileSyncState, SyncState,
+    spawn_file_sync_tasks, wait_for_file_stability, FileSyncState, SyncState,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -468,6 +468,19 @@ pub async fn handle_file_created(
     };
 
     if !already_tracked && path.is_file() {
+        // Wait for file content to stabilize before reading.
+        // This ensures we don't read partial content from atomic writes or
+        // multi-step editor saves that trigger notify events before completion.
+        let path_buf = path.to_path_buf();
+        if let Err(e) = wait_for_file_stability(&path_buf).await {
+            debug!(
+                "File stability check failed for {}: {}, skipping",
+                path.display(),
+                e
+            );
+            return;
+        }
+
         // Read file content first (needed for both hash check and push)
         let raw_content = match tokio::fs::read(path).await {
             Ok(c) => c,

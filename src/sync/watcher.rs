@@ -116,8 +116,28 @@ impl FileSnapshot {
 
 /// Wait for file content to stabilize by checking size/mtime.
 ///
-/// Returns Ok(()) when content is stable, Err if max wait exceeded or file disappeared.
-async fn wait_for_file_stability(path: &PathBuf) -> Result<(), &'static str> {
+/// This function polls the file's metadata (size and modification time) until
+/// it remains unchanged for at least one stability interval (50ms). This ensures
+/// that file content is fully written before reading, handling:
+/// - Partial writes where notify fires before content is complete
+/// - Atomic writes with temp files
+/// - Editor save patterns that write in multiple steps
+///
+/// # Arguments
+///
+/// * `path` - Path to the file to check for stability
+///
+/// # Returns
+///
+/// * `Ok(())` - File is stable and ready to read
+/// * `Err(&str)` - File disappeared during stability check
+///
+/// # Timeout Behavior
+///
+/// If stability is not achieved within `STABILITY_MAX_WAIT_MS` (5 seconds),
+/// the function returns `Ok(())` anyway to avoid blocking indefinitely.
+/// This handles edge cases like continuously-written log files.
+pub async fn wait_for_file_stability(path: &PathBuf) -> Result<(), &'static str> {
     let stability_interval = Duration::from_millis(STABILITY_CHECK_INTERVAL_MS);
     let max_wait = Duration::from_millis(STABILITY_MAX_WAIT_MS);
     let start = tokio::time::Instant::now();

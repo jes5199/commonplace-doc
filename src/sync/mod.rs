@@ -145,7 +145,10 @@ pub use urls::{
 };
 #[cfg(unix)]
 pub use watcher::spawn_shadow_tasks;
-pub use watcher::{directory_watcher_task, file_watcher_task, ShadowWriteEvent};
+pub use watcher::{
+    directory_watcher_task, file_watcher_task, wait_for_file_stability, ShadowWriteEvent,
+    STABILITY_CHECK_INTERVAL_MS, STABILITY_MAX_WAIT_MS,
+};
 // Note: shadow_gc_task, shadow_watcher_task, SHADOW_GC_INTERVAL are internal
 pub use yjs::{
     base64_decode, base64_encode, create_yjs_json_delete_key, create_yjs_json_merge,

@@ -22,9 +22,9 @@ use commonplace_doc::sync::{
     handle_schema_modified, initial_sync, is_binary_content, push_schema_to_server,
     remove_file_from_schema, scan_directory_with_contents, schema_to_json, spawn_command_listener,
     spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file, upload_task,
-    write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent, FileEvent, FileSyncState,
-    InodeKey, InodeTracker, ReplaceResponse, ScanOptions, SharedStateFile, SyncState,
-    SCHEMA_FILENAME,
+    wait_for_file_stability, write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent,
+    FileEvent, FileSyncState, InodeKey, InodeTracker, ReplaceResponse, ScanOptions,
+    SharedStateFile, SyncState, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -368,6 +368,19 @@ async fn handle_file_created_crdt(
             );
             return;
         }
+    }
+
+    // Wait for file content to stabilize before reading.
+    // This ensures we don't read partial content from atomic writes or
+    // multi-step editor saves that trigger notify events before completion.
+    let path_buf = path.to_path_buf();
+    if let Err(e) = wait_for_file_stability(&path_buf).await {
+        debug!(
+            "File stability check failed for {}: {}, skipping",
+            path.display(),
+            e
+        );
+        return;
     }
 
     // Read file content

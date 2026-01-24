@@ -14,11 +14,11 @@ use crate::sync::state::InodeKey;
 use crate::sync::state_file::compute_content_hash;
 use crate::sync::uuid_map::fetch_node_id_from_schema;
 use crate::sync::{
-    build_edit_url, build_replace_url, create_yjs_text_update, detect_from_path, file_watcher_task,
-    flock_state::record_upload_result, is_binary_content, looks_like_base64_binary,
-    push_json_content, push_jsonl_content, push_schema_to_server, refresh_from_head, sse_task,
-    EditRequest, EditResponse, FileEvent, FlockSyncState, ReplaceResponse, SharedLastContent,
-    SyncState, PENDING_WRITE_TIMEOUT,
+    build_edit_url, build_replace_url, create_yjs_text_update, detect_from_path, error::SyncResult,
+    file_watcher_task, flock_state::record_upload_result, is_binary_content,
+    looks_like_base64_binary, push_json_content, push_jsonl_content, push_schema_to_server,
+    refresh_from_head, sse_task, EditRequest, EditResponse, FileEvent, FlockSyncState,
+    ReplaceResponse, SharedLastContent, SyncState, PENDING_WRITE_TIMEOUT,
 };
 use reqwest::Client;
 use rumqttc::QoS;
@@ -2099,7 +2099,7 @@ pub async fn initialize_crdt_state_from_server(
     crdt_state: &Arc<RwLock<DirectorySyncState>>,
     filename: &str,
     file_path: &Path,
-) -> Result<(), String> {
+) -> SyncResult<()> {
     initialize_crdt_state_from_server_with_pending(
         client, server, node_id, crdt_state, filename, file_path, None, None, None,
     )
@@ -2132,7 +2132,7 @@ pub async fn initialize_crdt_state_from_server_with_pending(
     mqtt_client: Option<&Arc<MqttClient>>,
     workspace: Option<&str>,
     author: Option<&str>,
-) -> Result<(), String> {
+) -> SyncResult<()> {
     // Check if we need initialization
     {
         let state = crdt_state.read().await;

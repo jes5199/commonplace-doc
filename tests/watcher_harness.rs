@@ -4,7 +4,9 @@
 //! create/modify events and honors write completion before reading.
 
 use commonplace_doc::sync::watcher::FILE_DEBOUNCE_MS;
-use commonplace_doc::sync::{file_watcher_task, FileEvent};
+use commonplace_doc::sync::{
+    file_watcher_task, wait_for_file_stability, FileEvent, STABILITY_CHECK_INTERVAL_MS,
+};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -194,4 +196,133 @@ async fn watcher_waits_for_write_completion() {
 
     handle.abort();
     let _ = handle.await;
+}
+
+// ============================================================================
+// Tests for wait_for_file_stability function
+// ============================================================================
+
+/// Test that wait_for_file_stability returns quickly for a stable file.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn stability_check_returns_for_stable_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("stable.txt");
+
+    // Create a file and wait a bit for it to "settle"
+    std::fs::write(&file_path, "stable content").unwrap();
+
+    // Advance time slightly past the stability interval
+    tokio::time::advance(Duration::from_millis(STABILITY_CHECK_INTERVAL_MS + 10)).await;
+
+    // Stability check should succeed
+    let path_buf = file_path.clone();
+    let result = wait_for_file_stability(&path_buf).await;
+    assert!(
+        result.is_ok(),
+        "Stability check should succeed for stable file"
+    );
+}
+
+/// Test that wait_for_file_stability waits for file size to stabilize.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn stability_check_waits_for_size_to_stabilize() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("growing.txt");
+
+    // Create initial file
+    std::fs::write(&file_path, "initial").unwrap();
+
+    let path_buf = file_path.clone();
+
+    // Spawn the stability check
+    let stability_handle = tokio::spawn(async move { wait_for_file_stability(&path_buf).await });
+
+    // Advance time, but write more data before stability interval completes
+    tokio::time::advance(Duration::from_millis(STABILITY_CHECK_INTERVAL_MS / 2)).await;
+    tokio::task::yield_now().await;
+
+    // Append more data - this resets the stability window
+    {
+        let mut file = OpenOptions::new().append(true).open(&file_path).unwrap();
+        file.write_all(b" more data").unwrap();
+        file.sync_all().unwrap();
+    }
+
+    // Advance past the stability interval
+    tokio::time::advance(Duration::from_millis(STABILITY_CHECK_INTERVAL_MS + 20)).await;
+    tokio::task::yield_now().await;
+
+    // Now stability check should complete
+    tokio::time::advance(Duration::from_millis(STABILITY_CHECK_INTERVAL_MS + 20)).await;
+
+    let result = stability_handle.await.unwrap();
+    assert!(result.is_ok(), "Stability check should eventually succeed");
+}
+
+/// Test that wait_for_file_stability returns error if file disappears.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn stability_check_fails_if_file_disappears() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("vanishing.txt");
+
+    // Create file
+    std::fs::write(&file_path, "temporary").unwrap();
+
+    let path_buf = file_path.clone();
+
+    // Spawn the stability check
+    let stability_handle = tokio::spawn(async move { wait_for_file_stability(&path_buf).await });
+
+    // Give it a moment to start
+    tokio::task::yield_now().await;
+
+    // Delete the file during stability check
+    std::fs::remove_file(&file_path).unwrap();
+
+    // Advance time past the stability interval
+    tokio::time::advance(Duration::from_millis(STABILITY_CHECK_INTERVAL_MS + 10)).await;
+    tokio::task::yield_now().await;
+
+    let result = stability_handle.await.unwrap();
+    assert!(
+        result.is_err(),
+        "Stability check should fail when file disappears"
+    );
+}
+
+/// Test that stability check catches atomic writes (delete + create pattern).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn stability_check_handles_atomic_write() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("atomic.txt");
+    let temp_file = temp_dir.path().join("atomic.txt.tmp");
+
+    // Create initial file
+    std::fs::write(&file_path, "original content").unwrap();
+
+    let path_buf = file_path.clone();
+
+    // Spawn stability check
+    let stability_handle = tokio::spawn(async move { wait_for_file_stability(&path_buf).await });
+
+    // Give it a moment
+    tokio::task::yield_now().await;
+
+    // Simulate atomic write: write to temp, rename to target
+    std::fs::write(&temp_file, "new content via atomic write").unwrap();
+    std::fs::rename(&temp_file, &file_path).unwrap();
+
+    // Advance time for stability
+    tokio::time::advance(Duration::from_millis(STABILITY_CHECK_INTERVAL_MS * 2 + 20)).await;
+    tokio::task::yield_now().await;
+
+    let result = stability_handle.await.unwrap();
+    assert!(
+        result.is_ok(),
+        "Stability check should succeed after atomic write"
+    );
+
+    // Verify the file has the new content
+    let content = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(content, "new content via atomic write");
 }
