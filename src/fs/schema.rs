@@ -24,20 +24,25 @@ pub enum Entry {
 
 /// A directory entry.
 ///
-/// Directories can be either:
-/// - **Inline**: has `entries` map containing child entries
-/// - **Node-backed**: has `node_id` pointing to another JSON document
+/// **All directories must be node-backed** (have a `node_id` pointing to another JSON document).
 ///
-/// These two forms are mutually exclusive.
+/// The `entries` field is only used for the **root directory** of a schema document
+/// to define its immediate children. Non-root directories (subdirectories) must
+/// always have `entries: None` and a `node_id` pointing to their own schema document.
+///
+/// **DEPRECATED**: Inline subdirectories (non-root directories with `entries` but no `node_id`)
+/// are no longer supported and will be rejected during schema validation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirEntry {
-    /// Inline entries (mutually exclusive with node_id)
+    /// Child entries - only valid for the root directory of a schema document.
+    /// Subdirectories must have `entries: None` and use `node_id` instead.
     #[serde(default)]
     pub entries: Option<HashMap<String, Entry>>,
-    /// Node-backed directory reference (mutually exclusive with entries)
+    /// Node ID pointing to this directory's schema document.
+    /// Required for all subdirectories (non-root directories).
     #[serde(default)]
     pub node_id: Option<String>,
-    /// Content type for node-backed directories
+    /// Content type for node-backed directories (default: application/json)
     #[serde(default)]
     pub content_type: Option<String>,
 }
@@ -51,6 +56,73 @@ pub struct DocEntry {
     /// MIME type for new nodes (default: application/json)
     #[serde(default)]
     pub content_type: Option<String>,
+}
+
+impl FsSchema {
+    /// Validate the schema structure.
+    ///
+    /// This checks:
+    /// - Version is supported (currently only version 1)
+    /// - Root entry (if present) is a directory
+    /// - No inline subdirectories exist (all subdirectories must be node-backed)
+    /// - All entry names are valid
+    pub fn validate(&self) -> Result<(), FsError> {
+        if self.version != 1 {
+            return Err(FsError::SchemaError(format!(
+                "Unsupported schema version: {} (only version 1 is supported)",
+                self.version
+            )));
+        }
+
+        if let Some(ref root) = self.root {
+            match root {
+                Entry::Dir(dir) => {
+                    // Root directory can have entries - validate its children
+                    if let Some(ref entries) = dir.entries {
+                        for (name, entry) in entries {
+                            Entry::validate_name(name)?;
+                            Self::validate_entry(entry, name)?;
+                        }
+                    }
+                }
+                Entry::Doc(_) => {
+                    return Err(FsError::SchemaError(
+                        "Root entry must be a directory".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate a non-root entry recursively.
+    ///
+    /// Subdirectories must be node-backed (have `node_id`, not `entries`).
+    fn validate_entry(entry: &Entry, path: &str) -> Result<(), FsError> {
+        match entry {
+            Entry::Doc(_) => Ok(()),
+            Entry::Dir(dir) => {
+                // Check for inline subdirectory (entries without node_id)
+                if dir.entries.is_some() && dir.node_id.is_none() {
+                    return Err(FsError::SchemaError(format!(
+                        "Inline subdirectory '{}' is not supported. All subdirectories must be node-backed (have node_id).",
+                        path
+                    )));
+                }
+
+                // Check for invalid combination (both entries and node_id)
+                if dir.entries.is_some() && dir.node_id.is_some() {
+                    return Err(FsError::SchemaError(format!(
+                        "Directory '{}' has both node_id and entries (mutually exclusive)",
+                        path
+                    )));
+                }
+
+                Ok(())
+            }
+        }
+    }
 }
 
 impl Entry {
@@ -176,5 +248,120 @@ mod tests {
         assert!(Entry::validate_name("..").is_err());
         assert!(Entry::validate_name("with/slash").is_err());
         assert!(Entry::validate_name("").is_err());
+    }
+
+    #[test]
+    fn test_validate_schema_version() {
+        let schema = FsSchema {
+            version: 2,
+            root: None,
+        };
+        let result = schema.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("version"));
+    }
+
+    #[test]
+    fn test_validate_schema_root_must_be_dir() {
+        let json = r#"{
+            "version": 1,
+            "root": { "type": "doc" }
+        }"#;
+        let schema: FsSchema = serde_json::from_str(json).unwrap();
+        let result = schema.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("directory"));
+    }
+
+    #[test]
+    fn test_validate_inline_subdirectory_rejected() {
+        // Inline subdirectory (entries but no node_id) should be rejected
+        let json = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "subdir": {
+                        "type": "dir",
+                        "entries": {
+                            "file.txt": { "type": "doc" }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let schema: FsSchema = serde_json::from_str(json).unwrap();
+        let result = schema.validate();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Inline subdirectory"),
+            "Expected inline subdirectory error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_validate_node_backed_subdirectory_accepted() {
+        // Node-backed subdirectory (node_id, no entries) should be accepted
+        let json = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "subdir": {
+                        "type": "dir",
+                        "node_id": "some-uuid"
+                    }
+                }
+            }
+        }"#;
+        let schema: FsSchema = serde_json::from_str(json).unwrap();
+        assert!(schema.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_both_entries_and_node_id_rejected() {
+        // Directory with both entries and node_id should be rejected
+        let json = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "subdir": {
+                        "type": "dir",
+                        "node_id": "some-uuid",
+                        "entries": {
+                            "file.txt": { "type": "doc" }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let schema: FsSchema = serde_json::from_str(json).unwrap();
+        let result = schema.validate();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("mutually exclusive"),
+            "Expected mutually exclusive error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_validate_root_with_entries_accepted() {
+        // Root directory can have entries - this is normal
+        let json = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "file.txt": { "type": "doc", "node_id": "uuid-1" }
+                }
+            }
+        }"#;
+        let schema: FsSchema = serde_json::from_str(json).unwrap();
+        assert!(schema.validate().is_ok());
     }
 }

@@ -847,7 +847,9 @@ pub async fn handle_file_deleted(
     // delete the file entry from that document, not from the parent schema
     if relative_path.contains('/') {
         // Extract first path component (the immediate subdirectory)
-        let first_component = relative_path.split('/').next().unwrap();
+        // Note: split('/').next() always returns Some for non-empty strings,
+        // and we're inside a contains('/') check, but we use unwrap_or for safety
+        let first_component = relative_path.split('/').next().unwrap_or("");
         let subdir_schema_path = directory.join(first_component).join(SCHEMA_FILENAME);
 
         if subdir_schema_path.exists() {
