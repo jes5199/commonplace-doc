@@ -2,7 +2,7 @@
 //!
 //! This module contains functions for syncing a single file with a server document.
 
-use crate::events::recv_broadcast;
+use crate::events::{recv_broadcast_with_lag, BroadcastRecvResult};
 use crate::mqtt::{MqttClient, Topic};
 use crate::sync::client::fetch_head;
 use crate::sync::crdt_merge::{parse_edit_message, process_received_edit};
@@ -2368,6 +2368,8 @@ pub async fn initialize_crdt_state_from_server_with_pending(
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_file_sync_tasks_crdt(
     mqtt_client: Arc<MqttClient>,
+    http_client: Client,
+    server: String,
     workspace: String,
     node_id: Uuid,
     file_path: PathBuf,
@@ -2402,6 +2404,8 @@ pub fn spawn_file_sync_tasks_crdt(
     // Spawn CRDT receive task for incoming changes
     handles.push(tokio::spawn(receive_task_crdt(
         mqtt_client,
+        http_client,
+        server,
         workspace,
         node_id,
         file_path,
@@ -2420,9 +2424,12 @@ pub fn spawn_file_sync_tasks_crdt(
 /// - Subscribe to MQTT edits for this file's UUID
 /// - When an edit arrives, parse and apply via process_received_edit
 /// - If the merge produces content to write, update the local file
+/// - On broadcast lag, resync from server to recover missed edits
 #[allow(clippy::too_many_arguments)]
 pub async fn receive_task_crdt(
     mqtt_client: Arc<MqttClient>,
+    http_client: Client,
+    server: String,
     workspace: String,
     node_id: Uuid,
     file_path: PathBuf,
@@ -2453,7 +2460,63 @@ pub async fn receive_task_crdt(
     }
     let context = format!("CRDT receive {}", file_path.display());
 
-    while let Some(msg) = recv_broadcast(&mut message_rx, &context, None::<fn(u64)>).await {
+    loop {
+        let msg = match recv_broadcast_with_lag(&mut message_rx, &context).await {
+            BroadcastRecvResult::Message(m) => m,
+            BroadcastRecvResult::Lagged {
+                missed_count,
+                next_message,
+            } => {
+                // Resync from server to recover missed edits
+                info!(
+                    "CRDT receive_task: {} lagged by {} messages, triggering resync from server",
+                    file_path.display(),
+                    missed_count
+                );
+
+                // Mark state as needing re-init so the fetch actually happens
+                {
+                    let mut state_guard = crdt_state.write().await;
+                    if let Some(file_state) = state_guard.get_file_mut(&filename) {
+                        file_state.mark_needs_resync();
+                    }
+                }
+
+                // Re-initialize from server to get the latest state
+                if let Err(e) = initialize_crdt_state_from_server_with_pending(
+                    &http_client,
+                    &server,
+                    node_id,
+                    &crdt_state,
+                    &filename,
+                    &file_path,
+                    Some(&mqtt_client),
+                    Some(&workspace),
+                    Some(&author),
+                    Some(&shared_last_content),
+                )
+                .await
+                {
+                    warn!(
+                        "CRDT receive_task: failed to resync {} from server after lag: {}",
+                        file_path.display(),
+                        e
+                    );
+                } else {
+                    info!(
+                        "CRDT receive_task: successfully resynced {} from server after lag",
+                        file_path.display()
+                    );
+                }
+
+                // Process the next message if available
+                match next_message {
+                    Some(m) => m,
+                    None => break, // Channel closed after lag
+                }
+            }
+            BroadcastRecvResult::Closed => break,
+        };
         // Check if this message is for our topic
         if msg.topic != topic {
             continue;

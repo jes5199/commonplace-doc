@@ -806,7 +806,9 @@ pub async fn directory_mqtt_task(
                                             for rel_path in paths {
                                                 let file_path = directory.join(rel_path);
 
-                                                // Update shared_last_content before writing
+                                                // Update shared_last_content before writing to prevent echo
+                                                // If we can't update it, log a warning since this may cause
+                                                // echo loops when the file watcher detects our write
                                                 {
                                                     let states = file_states.read().await;
                                                     if let Some(state) = states.get(rel_path) {
@@ -815,7 +817,17 @@ pub async fn directory_mqtt_task(
                                                         {
                                                             let mut shared = slc.write().await;
                                                             *shared = Some(content.clone());
+                                                        } else {
+                                                            warn!(
+                                                                "No crdt_last_content for {} - echo suppression may fail",
+                                                                rel_path
+                                                            );
                                                         }
+                                                    } else {
+                                                        warn!(
+                                                            "No file state for {} - echo suppression may fail",
+                                                            rel_path
+                                                        );
                                                     }
                                                 }
 
@@ -967,6 +979,8 @@ async fn ensure_crdt_tasks_for_files(
 
         let handles = spawn_file_sync_tasks_crdt(
             context.mqtt_client.clone(),
+            http_client.clone(),
+            server.to_string(),
             context.workspace.clone(),
             node_id,
             file_path,
@@ -1705,7 +1719,9 @@ pub async fn subdir_mqtt_task(
                                             for rel_path in paths {
                                                 let file_path = directory.join(rel_path);
 
-                                                // Update shared_last_content before writing
+                                                // Update shared_last_content before writing to prevent echo
+                                                // If we can't update it, log a warning since this may cause
+                                                // echo loops when the file watcher detects our write
                                                 {
                                                     let states = file_states.read().await;
                                                     if let Some(state) = states.get(rel_path) {
@@ -1714,7 +1730,17 @@ pub async fn subdir_mqtt_task(
                                                         {
                                                             let mut shared = slc.write().await;
                                                             *shared = Some(content.clone());
+                                                        } else {
+                                                            warn!(
+                                                                "Subdir {}: No crdt_last_content for {} - echo suppression may fail",
+                                                                subdir_path, rel_path
+                                                            );
                                                         }
+                                                    } else {
+                                                        warn!(
+                                                            "Subdir {}: No file state for {} - echo suppression may fail",
+                                                            subdir_path, rel_path
+                                                        );
                                                     }
                                                 }
 

@@ -587,6 +587,8 @@ pub async fn handle_subdir_new_files(
 
                     let handles = spawn_file_sync_tasks_crdt(
                         ctx.mqtt_client.clone(),
+                        client.clone(),
+                        server.to_string(),
                         ctx.workspace.clone(),
                         node_uuid,
                         file_path.clone(),
@@ -1140,6 +1142,8 @@ pub async fn handle_schema_change(
 
                             let handles = spawn_file_sync_tasks_crdt(
                                 ctx.mqtt_client.clone(),
+                                client.clone(),
+                                server.to_string(),
                                 ctx.workspace.clone(),
                                 node_uuid,
                                 file_path.clone(),

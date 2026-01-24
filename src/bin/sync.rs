@@ -543,6 +543,8 @@ async fn handle_file_created_crdt(
                 let shared_last_content = Arc::new(RwLock::new(Some(content.clone())));
                 let handles = spawn_file_sync_tasks_crdt(
                     crdt.mqtt_client.clone(),
+                    client.clone(),
+                    server.to_string(),
                     crdt.workspace.clone(),
                     new_file.uuid,
                     file_path,
@@ -618,6 +620,8 @@ async fn handle_file_created_crdt(
                 let shared_last_content = Arc::new(RwLock::new(Some(content.clone())));
                 let handles = spawn_file_sync_tasks_crdt(
                     crdt.mqtt_client.clone(),
+                    client.clone(),
+                    server.to_string(),
                     crdt.workspace.clone(),
                     new_file.uuid,
                     file_path,
@@ -2234,6 +2238,8 @@ async fn run_directory_mode(
             file_state.crdt_last_content = Some(shared_last_content.clone());
             file_state.task_handles = spawn_file_sync_tasks_crdt(
                 mqtt_client.clone(),
+                client.clone(),
+                server.clone(),
                 workspace.clone(),
                 node_id,
                 file_path,
@@ -2821,6 +2827,8 @@ async fn run_exec_mode(
             file_state.crdt_last_content = Some(shared_last_content.clone());
             file_state.task_handles = spawn_file_sync_tasks_crdt(
                 mqtt_client.clone(),
+                client.clone(),
+                server.clone(),
                 workspace.clone(),
                 node_id,
                 file_path,

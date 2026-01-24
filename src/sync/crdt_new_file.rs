@@ -178,13 +178,16 @@ async fn update_schema_with_new_file(
     let payload = serde_json::to_vec(&edit_msg)
         .map_err(|e| format!("Failed to serialize schema edit: {}", e))?;
 
+    // Use retained message so new subscribers get the latest schema state immediately.
+    // This is critical for sync: subscribers may join after schema updates are published,
+    // and the retained message ensures they receive the current file mappings.
     mqtt_client
-        .publish(&topic, &payload, QoS::AtLeastOnce)
+        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
         .await
         .map_err(|e| format!("Failed to publish schema edit: {}", e))?;
 
     debug!(
-        "Published schema commit {} for new file '{}'",
+        "Published schema commit {} for new file '{}' (retained)",
         cid, filename
     );
 
@@ -336,13 +339,16 @@ pub async fn remove_file_from_schema(
     let payload = serde_json::to_vec(&edit_msg)
         .map_err(|e| format!("Failed to serialize schema edit: {}", e))?;
 
+    // Use retained message so new subscribers get the latest schema state immediately.
+    // This is critical for sync: subscribers may join after schema updates are published,
+    // and the retained message ensures they receive the current file mappings.
     mqtt_client
-        .publish(&topic, &payload, QoS::AtLeastOnce)
+        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
         .await
         .map_err(|e| format!("Failed to publish schema edit: {}", e))?;
 
     info!(
-        "Published schema commit {} to remove file '{}'",
+        "Published schema commit {} to remove file '{}' (retained)",
         cid, filename
     );
 

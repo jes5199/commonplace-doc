@@ -3576,3 +3576,304 @@ mod receive_pipeline_tests {
         }
     }
 }
+
+// =============================================================================
+// Edit Propagation Tests (Stage 0)
+//
+// These tests isolate the CRDT merge logic for edit propagation between peers.
+// The goal is to identify if edit propagation bugs are in:
+// - CRDT merge logic (these tests fail)
+// - MQTT transport (these tests pass but integration fails)
+// - File I/O (these tests pass but integration fails)
+// =============================================================================
+
+mod edit_propagation_tests {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use commonplace_doc::commit::Commit;
+    use commonplace_doc::mqtt::EditMessage;
+    use commonplace_doc::sync::crdt_state::CrdtPeerState;
+    use commonplace_doc::sync::{process_received_edit, MergeResult};
+    use uuid::Uuid;
+    use yrs::{Doc, GetString, ReadTxn, Text, Transact, WriteTxn};
+
+    /// Helper to get text content from a Y.Doc.
+    fn get_doc_text(doc: &Doc) -> String {
+        let txn = doc.transact();
+        match txn.get_text("content") {
+            Some(text) => text.get_string(&txn),
+            None => String::new(),
+        }
+    }
+
+    /// Helper to create a publish message from a peer's Y.Doc state.
+    fn create_publish_message(
+        doc: &Doc,
+        parents: Vec<String>,
+        author: &str,
+        timestamp: u64,
+    ) -> (EditMessage, String) {
+        let txn = doc.transact();
+        let update = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+        let update_b64 = STANDARD.encode(&update);
+
+        let commit = Commit::with_timestamp(
+            parents.clone(),
+            update_b64.clone(),
+            author.to_string(),
+            None,
+            timestamp,
+        );
+        let cid = commit.calculate_cid();
+
+        let msg = EditMessage {
+            update: update_b64,
+            parents,
+            author: author.to_string(),
+            message: None,
+            timestamp,
+        };
+
+        (msg, cid)
+    }
+
+    /// Test: Edit propagation between workspace and sandbox peers.
+    ///
+    /// This test simulates the exact scenario where edits fail to propagate:
+    /// 1. Workspace creates initial content "hello" and publishes
+    /// 2. Sandbox receives and applies the publish (should get "hello")
+    /// 3. Workspace edits to "hello world" and publishes
+    /// 4. Sandbox receives and applies the edit
+    /// 5. Assert sandbox has "hello world"
+    ///
+    /// If this test fails, the bug is in CRDT merge logic.
+    /// If this test passes but integration fails, the bug is in MQTT or file I/O.
+    #[tokio::test]
+    async fn edit_propagation_workspace_to_sandbox() {
+        // Create two CrdtPeerState instances simulating workspace and sandbox
+        let node_id = Uuid::new_v4();
+        let mut workspace_state = CrdtPeerState::new(node_id);
+        let mut sandbox_state = CrdtPeerState::new(node_id);
+
+        // === Step 1: Workspace creates initial content "hello" ===
+        let workspace_doc = Doc::with_client_id(1);
+        {
+            let mut txn = workspace_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "hello");
+        }
+        workspace_state.update_from_doc(&workspace_doc);
+
+        // Workspace publishes (creates a commit message)
+        let (publish_msg_1, cid_1) =
+            create_publish_message(&workspace_doc, vec![], "workspace", 1000);
+
+        // Update workspace state with the new CID
+        workspace_state.head_cid = Some(cid_1.clone());
+        workspace_state.local_head_cid = Some(cid_1.clone());
+
+        // === Step 2: Sandbox receives and applies the initial publish ===
+        // First, sandbox needs to initialize from the publish (simulate server init)
+        let server_state_b64 = publish_msg_1.update.clone();
+        sandbox_state.initialize_from_server(&server_state_b64, &cid_1);
+
+        // Verify sandbox has "hello"
+        let sandbox_doc_1 = sandbox_state.to_doc().expect("sandbox to_doc failed");
+        let sandbox_text_1 = get_doc_text(&sandbox_doc_1);
+        assert_eq!(
+            sandbox_text_1, "hello",
+            "Sandbox should have 'hello' after initial sync, got '{}'",
+            sandbox_text_1
+        );
+
+        // === Step 3: Workspace edits to "hello world" ===
+        {
+            let mut txn = workspace_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            // Append " world" at position 5
+            text.insert(&mut txn, 5, " world");
+        }
+        workspace_state.update_from_doc(&workspace_doc);
+
+        // Verify workspace doc has "hello world"
+        let workspace_text = get_doc_text(&workspace_doc);
+        assert_eq!(
+            workspace_text, "hello world",
+            "Workspace should have 'hello world', got '{}'",
+            workspace_text
+        );
+
+        // Workspace publishes the edit
+        let (publish_msg_2, cid_2) =
+            create_publish_message(&workspace_doc, vec![cid_1.clone()], "workspace", 2000);
+
+        // Update workspace state with the new CID
+        workspace_state.head_cid = Some(cid_2.clone());
+        workspace_state.local_head_cid = Some(cid_2.clone());
+
+        // === Step 4: Sandbox receives and applies the edit ===
+        let (result, maybe_content) = process_received_edit(
+            None, // No MQTT client needed for this test
+            "sandbox",
+            &node_id.to_string(),
+            &mut sandbox_state,
+            &publish_msg_2,
+            "sandbox_author",
+        )
+        .await
+        .expect("Sandbox should process the edit successfully");
+
+        // The result should be FastForward or Merged (not AlreadyKnown)
+        assert!(
+            matches!(
+                result,
+                MergeResult::FastForward { .. } | MergeResult::Merged { .. }
+            ),
+            "Expected FastForward or Merged, got {:?}",
+            result
+        );
+
+        // === Step 5: Assert sandbox has "hello world" ===
+        let sandbox_doc_2 = sandbox_state.to_doc().expect("sandbox to_doc failed");
+        let sandbox_text_2 = get_doc_text(&sandbox_doc_2);
+        assert_eq!(
+            sandbox_text_2, "hello world",
+            "Sandbox should have 'hello world' after edit, got '{}'",
+            sandbox_text_2
+        );
+
+        // Also verify via the content returned from process_received_edit
+        if let Some(content) = maybe_content {
+            assert_eq!(
+                content, "hello world",
+                "Content from process_received_edit should be 'hello world', got '{}'",
+                content
+            );
+        }
+    }
+
+    /// Test: Bidirectional edit propagation.
+    ///
+    /// This test verifies that edits can propagate in both directions:
+    /// 1. Workspace -> Sandbox (initial sync)
+    /// 2. Sandbox -> Workspace (sandbox edit)
+    /// 3. Workspace -> Sandbox (workspace edit)
+    #[tokio::test]
+    async fn edit_propagation_bidirectional() {
+        let node_id = Uuid::new_v4();
+        let mut workspace_state = CrdtPeerState::new(node_id);
+        let mut sandbox_state = CrdtPeerState::new(node_id);
+
+        // === Initial sync: Workspace creates "hello" ===
+        let workspace_doc = Doc::with_client_id(1);
+        {
+            let mut txn = workspace_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "hello");
+        }
+        workspace_state.update_from_doc(&workspace_doc);
+
+        let (msg_1, cid_1) = create_publish_message(&workspace_doc, vec![], "workspace", 1000);
+        workspace_state.head_cid = Some(cid_1.clone());
+        workspace_state.local_head_cid = Some(cid_1.clone());
+
+        // Sandbox initializes
+        sandbox_state.initialize_from_server(&msg_1.update, &cid_1);
+
+        // === Sandbox edits: "hello" -> "hello sandbox" ===
+        let sandbox_doc = sandbox_state.to_doc().expect("sandbox to_doc");
+        {
+            let mut txn = sandbox_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 5, " sandbox");
+        }
+        sandbox_state.update_from_doc(&sandbox_doc);
+
+        let (msg_2, cid_2) =
+            create_publish_message(&sandbox_doc, vec![cid_1.clone()], "sandbox", 2000);
+        sandbox_state.head_cid = Some(cid_2.clone());
+        sandbox_state.local_head_cid = Some(cid_2.clone());
+
+        // Workspace receives sandbox's edit
+        let (result_w, _) = process_received_edit(
+            None,
+            "workspace",
+            &node_id.to_string(),
+            &mut workspace_state,
+            &msg_2,
+            "workspace_author",
+        )
+        .await
+        .expect("Workspace should process sandbox edit");
+
+        assert!(
+            matches!(
+                result_w,
+                MergeResult::FastForward { .. } | MergeResult::Merged { .. }
+            ),
+            "Workspace should accept sandbox edit: {:?}",
+            result_w
+        );
+
+        // Verify workspace has "hello sandbox"
+        let ws_doc = workspace_state.to_doc().expect("workspace to_doc");
+        let ws_text = get_doc_text(&ws_doc);
+        assert_eq!(
+            ws_text, "hello sandbox",
+            "Workspace should have 'hello sandbox', got '{}'",
+            ws_text
+        );
+
+        // === Workspace edits: "hello sandbox" -> "hello sandbox world" ===
+        {
+            let mut txn = ws_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 13, " world"); // After "hello sandbox"
+        }
+        workspace_state.update_from_doc(&ws_doc);
+
+        let (msg_3, cid_3) =
+            create_publish_message(&ws_doc, vec![cid_2.clone()], "workspace", 3000);
+        workspace_state.head_cid = Some(cid_3.clone());
+        workspace_state.local_head_cid = Some(cid_3.clone());
+
+        // Sandbox receives workspace's edit
+        let (result_s, _) = process_received_edit(
+            None,
+            "sandbox",
+            &node_id.to_string(),
+            &mut sandbox_state,
+            &msg_3,
+            "sandbox_author",
+        )
+        .await
+        .expect("Sandbox should process workspace edit");
+
+        assert!(
+            matches!(
+                result_s,
+                MergeResult::FastForward { .. } | MergeResult::Merged { .. }
+            ),
+            "Sandbox should accept workspace edit: {:?}",
+            result_s
+        );
+
+        // Verify both have the same content
+        let final_ws_doc = workspace_state.to_doc().expect("ws to_doc");
+        let final_sb_doc = sandbox_state.to_doc().expect("sb to_doc");
+        let ws_final = get_doc_text(&final_ws_doc);
+        let sb_final = get_doc_text(&final_sb_doc);
+
+        assert_eq!(
+            ws_final, sb_final,
+            "Workspace and sandbox should converge: ws='{}', sb='{}'",
+            ws_final, sb_final
+        );
+        assert!(
+            ws_final.contains("hello")
+                && ws_final.contains("sandbox")
+                && ws_final.contains("world"),
+            "Final content should have all edits: '{}'",
+            ws_final
+        );
+    }
+}
