@@ -269,6 +269,10 @@ pub async fn handle_subdir_schema_cleanup(
     if skip_deletions {
         // Don't proceed with deletions, just clean up orphaned directories
     } else {
+        // Collect schema-relative paths (filenames in this subdir's schema)
+        let schema_filenames: std::collections::HashSet<String> =
+            subdir_uuid_map.keys().cloned().collect();
+
         // Convert subdir-relative paths to root-relative paths for comparison with file_states
         let schema_paths: std::collections::HashSet<String> = subdir_uuid_map
             .keys()
@@ -299,8 +303,51 @@ pub async fn handle_subdir_schema_cleanup(
                 .collect()
         };
 
+        // ALSO scan the actual disk directory for files not in schema.
+        // This is critical for sandbox sync: files may exist on disk (written via MQTT)
+        // but not be tracked in file_states. Without this disk scan, such files would
+        // never be deleted when removed from the schema.
+        let disk_deleted_paths: Vec<String> = {
+            let mut paths = Vec::new();
+            if let Ok(mut entries) = tokio::fs::read_dir(subdir_directory).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let entry_path = entry.path();
+                    if !entry_path.is_file() {
+                        continue;
+                    }
+                    let filename = match entry.file_name().into_string() {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    };
+                    // Skip hidden files and schema files
+                    if filename.starts_with('.') {
+                        continue;
+                    }
+                    // If this file is not in the schema, mark for deletion
+                    if !schema_filenames.contains(&filename) {
+                        let full_path = if subdir_path.is_empty() {
+                            filename
+                        } else {
+                            format!("{}/{}", subdir_path, filename)
+                        };
+                        // Only add if not already tracked in file_states (avoid double-processing)
+                        if !deleted_paths.contains(&full_path) {
+                            paths.push(full_path);
+                        }
+                    }
+                }
+            }
+            paths
+        };
+
+        // Combine paths from file_states and disk scan
+        let all_deleted_paths: Vec<String> = deleted_paths
+            .into_iter()
+            .chain(disk_deleted_paths.into_iter())
+            .collect();
+
         // Delete files that were removed from server
-        for path in &deleted_paths {
+        for path in &all_deleted_paths {
             let file_path = root_directory.join(path);
 
             // Safety check: don't delete files that were modified very recently (within 10 seconds)
@@ -1251,14 +1298,65 @@ pub async fn handle_schema_change(
     let schema_path_set: std::collections::HashSet<&String> =
         schema_paths.iter().map(|(p, _)| p).collect();
 
-    // Find files that exist locally but not in schema
+    // Build a set of schema filenames for disk scanning (for root directory files)
+    let schema_filenames: std::collections::HashSet<String> = schema_paths
+        .iter()
+        .filter_map(|(p, _)| {
+            // Only include root-level files (no path separator)
+            if !p.contains('/') {
+                Some(p.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Find files that exist in file_states but not in schema
     let deleted_paths: Vec<String> = known_paths
         .iter()
         .filter(|p| !schema_path_set.contains(p))
         .cloned()
         .collect();
 
-    for path in &deleted_paths {
+    // ALSO scan the actual disk directory for files not in schema.
+    // This is critical for sandbox sync: files may exist on disk (written via MQTT)
+    // but not be tracked in file_states. Without this disk scan, such files would
+    // never be deleted when removed from the schema.
+    let disk_deleted_paths: Vec<String> = {
+        let mut paths = Vec::new();
+        if let Ok(mut entries) = tokio::fs::read_dir(directory).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let entry_path = entry.path();
+                if !entry_path.is_file() {
+                    continue;
+                }
+                let filename = match entry.file_name().into_string() {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                // Skip hidden files and schema files
+                if filename.starts_with('.') {
+                    continue;
+                }
+                // If this file is not in the schema, mark for deletion
+                if !schema_filenames.contains(&filename) {
+                    // Only add if not already tracked in file_states (avoid double-processing)
+                    if !deleted_paths.contains(&filename) {
+                        paths.push(filename);
+                    }
+                }
+            }
+        }
+        paths
+    };
+
+    // Combine paths from file_states and disk scan
+    let all_deleted_paths: Vec<String> = deleted_paths
+        .into_iter()
+        .chain(disk_deleted_paths.into_iter())
+        .collect();
+
+    for path in &all_deleted_paths {
         // Check if we recently wrote a schema containing this file
         // This prevents race conditions where we create a file, push schema,
         // but receive a stale SSE update before the server processes our push
