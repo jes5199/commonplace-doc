@@ -1630,22 +1630,151 @@ pub async fn subdir_mqtt_task(
                     paths.len()
                 );
 
-                // Fetch from server and write to local files
-                if let Err(e) = handle_file_uuid_edit(
-                    &http_client,
-                    &server,
-                    &doc_id,
-                    paths,
-                    &directory,
-                    use_paths,
-                    &file_states,
-                )
-                .await
-                {
-                    warn!(
-                        "Subdir {}: Failed to handle file UUID edit for {}: {}",
-                        subdir_path, doc_id, e
-                    );
+                // Try CRDT handling first, fall back to server fetch if needed
+                let crdt_handled = if let Some(ref ctx) = crdt_context {
+                    if let Ok(edit_msg) = crate::sync::crdt_merge::parse_edit_message(&msg.payload)
+                    {
+                        // Apply to CRDT state and get content
+                        let node_id = match uuid::Uuid::parse_str(&doc_id) {
+                            Ok(id) => id,
+                            Err(_) => {
+                                debug!(
+                                    "Subdir {}: Non-UUID document {}, falling back to server fetch",
+                                    subdir_path, doc_id
+                                );
+                                uuid::Uuid::nil() // Skip CRDT handling
+                            }
+                        };
+
+                        if !node_id.is_nil() {
+                            // Get the filename from the first path
+                            let filename = paths
+                                .first()
+                                .and_then(|p| std::path::Path::new(p).file_name())
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(&doc_id)
+                                .to_string();
+
+                            let mut state_guard = ctx.crdt_state.write().await;
+                            let file_state = state_guard.get_or_create_file(&filename, node_id);
+
+                            // Check if CRDT state needs initialization.
+                            // If so, queue the edit for later processing instead of
+                            // trying to merge it now (which would fail or produce
+                            // incorrect results without shared history).
+                            if file_state.needs_server_init() {
+                                file_state.queue_pending_edit(msg.payload.clone());
+                                debug!(
+                                    "Subdir {}: CRDT needs init for {}, queued edit (queue size: {})",
+                                    subdir_path,
+                                    filename,
+                                    file_state.pending_edits.len()
+                                );
+                                drop(state_guard);
+                                // Don't fall back to server fetch - we'll apply after init
+                                true
+                            } else {
+                                match crate::sync::crdt_merge::process_received_edit(
+                                    Some(&ctx.mqtt_client),
+                                    &ctx.workspace,
+                                    &doc_id,
+                                    file_state,
+                                    &edit_msg,
+                                    &author,
+                                )
+                                .await
+                                {
+                                    Ok((result, maybe_content)) => {
+                                        drop(state_guard); // Release lock before file I/O
+
+                                        if let Some(content) = maybe_content {
+                                            // Write to all paths
+                                            for rel_path in paths {
+                                                let file_path = directory.join(rel_path);
+
+                                                // Update shared_last_content before writing
+                                                {
+                                                    let states = file_states.read().await;
+                                                    if let Some(state) = states.get(rel_path) {
+                                                        if let Some(ref slc) =
+                                                            state.crdt_last_content
+                                                        {
+                                                            let mut shared = slc.write().await;
+                                                            *shared = Some(content.clone());
+                                                        }
+                                                    }
+                                                }
+
+                                                if let Some(parent) = file_path.parent() {
+                                                    let _ = tokio::fs::create_dir_all(parent).await;
+                                                }
+                                                if let Err(e) =
+                                                    tokio::fs::write(&file_path, &content).await
+                                                {
+                                                    warn!(
+                                                        "Subdir {}: Failed to write {}: {}",
+                                                        subdir_path, rel_path, e
+                                                    );
+                                                } else {
+                                                    debug!(
+                                                        "Subdir {}: CRDT edit applied to {} ({} bytes, {:?})",
+                                                        subdir_path,
+                                                        rel_path,
+                                                        content.len(),
+                                                        result
+                                                    );
+                                                }
+                                            }
+                                            true // Handled via CRDT
+                                        } else {
+                                            debug!(
+                                                "Subdir {}: CRDT merge returned no content (already known)",
+                                                subdir_path
+                                            );
+                                            true // Handled (no-op)
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Subdir {}: CRDT merge failed for {}: {}",
+                                            subdir_path, doc_id, e
+                                        );
+                                        false // Fall back to server fetch
+                                    }
+                                }
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        debug!(
+                            "Subdir {}: Failed to parse MQTT message for {}",
+                            subdir_path, doc_id
+                        );
+                        false // Fall back to server fetch
+                    }
+                } else {
+                    false // No CRDT context, use server fetch
+                };
+
+                // Fallback: fetch from server for non-CRDT paths or if CRDT handling failed
+                if !crdt_handled {
+                    if let Err(e) = handle_file_uuid_edit(
+                        &http_client,
+                        &server,
+                        &doc_id,
+                        paths,
+                        &directory,
+                        use_paths,
+                        &file_states,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Subdir {}: Failed to handle file UUID edit for {}: {}",
+                            subdir_path, doc_id, e
+                        );
+                    }
                 }
             }
         } else {
