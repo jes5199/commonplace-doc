@@ -387,29 +387,46 @@ Stage 0 Evidence (completed 2026-01-23):
 - tests/watcher_harness.rs: 3 tests (watcher stability)
 - Total: 31 tests, all passing
 
-Stage 1: CRDT core validation
+Stage 1: CRDT core validation - **COMPLETE** (2026-01-24)
 - Validate crdt_merge, crdt_publish, and crdt_state with isolated unit tests.
 - Required exit criteria: concurrent edits converge; delete merges are correct.
+- Evidence: 41 tests added to sync_harness.rs covering crdt_merge, crdt_publish, crdt_state
+- Total sync_harness tests: 52 (11 Stage 0 + 41 Stage 1)
 
-Stage 2: Transport validation (MQTT)
+Stage 2: Transport validation (MQTT) - **COMPLETE** (2026-01-24)
 - Validate edit publish/subscribe flow, retain/QoS behavior, and resync on lag.
 - Required exit criteria: new subscribers reach correct state from retained edits
   and/or sync backfill without missing updates.
+- Evidence: 22 tests added to mqtt_transport_harness.rs
+- Total mqtt_transport_harness tests: 39
 
-Stage 3: File watcher + local write pipeline
+Stage 3: File watcher + local write pipeline - **COMPLETE** (2026-01-24)
 - Validate that watcher events read stable content and do not emit echo updates.
 - Required exit criteria: create/modify events publish the correct content once.
+- Evidence: 10 tests added to watcher_harness.rs (6 unit + 4 integration)
+- Tests cover: stability checks, chunked writes, rapid writes coalescing, delete during stability
+- Total watcher_harness tests: 17 (10 run + 7 ignored integration tests requiring real time)
 
-Stage 4: Receive pipeline + disk writes
+Stage 4: Receive pipeline + disk writes - **COMPLETE** (2026-01-24)
 - Validate inbound edits apply to CRDT and write to disk without republish loops.
 - Required exit criteria: remote edits update local files and do not re-emit.
+- Evidence: 11 tests added to sync_harness.rs receive_pipeline_tests module
+- Tests cover: CRDT apply, disk write, shared_last_content echo suppression, no republish,
+  concurrent edits, duplicate CID rejection, missing parent handling, LocalAhead scenario
+- Total sync_harness tests: 73 (52 + 11 Stage 4 + 10 broadcast_lag tests)
 
-Stage 5: End-to-end sandbox sync
+Stage 5: End-to-end sandbox sync - **IN PROGRESS**
 - Run the flaky test with tracing enabled; verify timeline of publish/receive,
   schema updates, and file writes in both workspace and sandbox.
 - Required exit criteria: create/edit/delete sequence passes repeatedly.
+- Status: CP-1ual tracks the flaky test. Diagnostic tracing added. Root cause identified:
+  LocalAhead result during CRDT merge indicates state divergence during initialization.
 
-Update this section after each stage with evidence and remaining gaps.
+**Test Summary (2026-01-24)**:
+- sync_harness.rs: 73 tests
+- mqtt_transport_harness.rs: 39 tests
+- watcher_harness.rs: 17 tests
+- Total harness tests: 129 (122 run + 7 ignored)
 
 ---
 

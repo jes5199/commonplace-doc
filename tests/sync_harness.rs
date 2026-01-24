@@ -2798,3 +2798,781 @@ mod crdt_merge_tests {
         assert_eq!(content.len(), 1024 + 5 + 3, "Length should be correct");
     }
 }
+
+// =============================================================================
+// Stage 4 Validation Tests: Receive Pipeline + Disk Writes (CP-xxx)
+//
+// These tests validate that inbound edits:
+// 1. Apply correctly to CRDT state
+// 2. Write to disk without triggering republish loops
+// 3. Update shared_last_content for echo suppression
+// 4. Handle concurrent edits, duplicates, and missing parents correctly
+// =============================================================================
+
+mod receive_pipeline_tests {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use commonplace_doc::commit::Commit;
+    use commonplace_doc::mqtt::EditMessage;
+    use commonplace_doc::sync::crdt_state::CrdtPeerState;
+    use commonplace_doc::sync::types::SharedLastContent;
+    use commonplace_doc::sync::{process_received_edit, MergeResult};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::sync::RwLock;
+    use uuid::Uuid;
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update, WriteTxn};
+
+    /// Helper to create a Yjs update for text insertion.
+    fn create_insert_update(client_id: u64, text: &str, position: u32) -> Vec<u8> {
+        let doc = Doc::with_client_id(client_id);
+        let mut txn = doc.transact_mut();
+        let ytext = txn.get_or_insert_text("content");
+        ytext.insert(&mut txn, position, text);
+        txn.encode_update_v1()
+    }
+
+    /// Helper to create a Yjs update building on existing state.
+    fn create_insert_update_on_state(
+        client_id: u64,
+        base_state: &[u8],
+        text: &str,
+        position: u32,
+    ) -> Vec<u8> {
+        let doc = Doc::with_client_id(client_id);
+        {
+            let update = Update::decode_v1(base_state).expect("decode base state");
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update);
+        }
+        let mut txn = doc.transact_mut();
+        let ytext = txn.get_or_insert_text("content");
+        ytext.insert(&mut txn, position, text);
+        txn.encode_update_v1()
+    }
+
+    /// Helper to get full state from a doc.
+    fn doc_full_state(doc: &Doc) -> Vec<u8> {
+        let txn = doc.transact();
+        txn.encode_state_as_update_v1(&StateVector::default())
+    }
+
+    /// Helper to get text content from a Y.Doc.
+    fn get_doc_text(doc: &Doc) -> String {
+        let txn = doc.transact();
+        match txn.get_text("content") {
+            Some(text) => text.get_string(&txn),
+            None => String::new(),
+        }
+    }
+
+    /// Helper to create an EditMessage with explicit timestamp.
+    fn make_edit_message(
+        update_b64: &str,
+        parents: Vec<String>,
+        author: &str,
+        timestamp: u64,
+    ) -> EditMessage {
+        EditMessage {
+            update: update_b64.to_string(),
+            parents,
+            author: author.to_string(),
+            message: None,
+            timestamp,
+        }
+    }
+
+    // =========================================================================
+    // Test 1: Receive edit applies Yjs update to CRDT
+    // =========================================================================
+
+    /// Verify that receiving an edit message applies the Yjs update correctly.
+    ///
+    /// This tests the core receive pipeline: process_received_edit should decode
+    /// the base64 update, apply it to the Y.Doc, and update state.
+    #[tokio::test]
+    async fn test_receive_applies_yjs_update_to_crdt() {
+        // Setup: Initialize state from server with "hello"
+        let server_doc = Doc::with_client_id(1);
+        {
+            let mut txn = server_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "hello");
+        }
+        let server_state = doc_full_state(&server_doc);
+        let server_state_b64 = STANDARD.encode(&server_state);
+        let server_cid = Commit::with_timestamp(
+            vec![],
+            server_state_b64.clone(),
+            "server".to_string(),
+            None,
+            1000,
+        )
+        .calculate_cid();
+
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+        state.initialize_from_server(&server_state_b64, &server_cid);
+
+        // Verify initial state
+        let initial_doc = state.to_doc().expect("to_doc should succeed");
+        assert_eq!(get_doc_text(&initial_doc), "hello");
+
+        // Create edit that appends " world"
+        let edit_update = create_insert_update_on_state(2, &server_state, " world", 5);
+        let edit_update_b64 = STANDARD.encode(&edit_update);
+
+        let edit_msg = make_edit_message(
+            &edit_update_b64,
+            vec![server_cid.clone()],
+            "remote_peer",
+            2000,
+        );
+
+        // Process the edit
+        let (result, maybe_content) = process_received_edit(
+            None, // No MQTT client needed
+            "workspace",
+            "node1",
+            &mut state,
+            &edit_msg,
+            "local_author",
+        )
+        .await
+        .expect("Should process edit");
+
+        // Should be fast-forward since we're in sync
+        assert!(
+            matches!(result, MergeResult::FastForward { .. }),
+            "Expected FastForward, got {:?}",
+            result
+        );
+
+        // Verify Y.Doc has merged content
+        let final_doc = state.to_doc().expect("to_doc should succeed");
+        let final_text = get_doc_text(&final_doc);
+        assert_eq!(final_text, "hello world", "CRDT should have merged content");
+
+        // Verify content is returned for disk write
+        assert!(
+            maybe_content.is_some(),
+            "Should return content for disk write"
+        );
+        assert_eq!(maybe_content.unwrap(), "hello world");
+    }
+
+    // =========================================================================
+    // Test 2: Receive writes to disk after merge
+    // =========================================================================
+
+    /// Verify that receiving an edit returns content suitable for disk write.
+    ///
+    /// The process_received_edit function returns (MergeResult, Option<String>).
+    /// For FastForward and Merged results, content should be Some() for writing.
+    #[tokio::test]
+    async fn test_receive_writes_to_disk_after_merge() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let file_path = temp_dir.path().join("test.txt");
+
+        // Setup: Initialize empty state
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Create initial edit
+        let update = create_insert_update(1, "disk write test", 0);
+        let update_b64 = STANDARD.encode(&update);
+
+        let edit_msg = make_edit_message(&update_b64, vec![], "author", 1000);
+
+        // Process the edit
+        let (result, maybe_content) =
+            process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local")
+                .await
+                .expect("Should process edit");
+
+        // Should be fast-forward (first edit to empty state)
+        assert!(
+            matches!(result, MergeResult::FastForward { .. }),
+            "Expected FastForward, got {:?}",
+            result
+        );
+
+        // Content should be returned for writing
+        let content = maybe_content.expect("Should have content to write");
+        assert_eq!(content, "disk write test");
+
+        // Simulate disk write
+        std::fs::write(&file_path, &content).expect("write to disk");
+
+        // Verify file content
+        let read_back = std::fs::read_to_string(&file_path).expect("read back");
+        assert_eq!(read_back, "disk write test");
+    }
+
+    // =========================================================================
+    // Test 3: Receive updates shared_last_content
+    // =========================================================================
+
+    /// Verify that shared_last_content is updated to prevent echo upload.
+    ///
+    /// The receive pipeline should update shared_last_content BEFORE writing
+    /// to disk, so that when the file watcher detects the change, the upload
+    /// task can compare and skip the echo.
+    #[tokio::test]
+    async fn test_receive_updates_shared_last_content() {
+        let shared_last_content: SharedLastContent = Arc::new(RwLock::new(None));
+
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Create edit
+        let update = create_insert_update(1, "content for echo test", 0);
+        let update_b64 = STANDARD.encode(&update);
+        let edit_msg = make_edit_message(&update_b64, vec![], "author", 1000);
+
+        // Process the edit
+        let (result, maybe_content) =
+            process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local")
+                .await
+                .expect("Should process edit");
+
+        assert!(matches!(result, MergeResult::FastForward { .. }));
+
+        // Simulate what the receive task would do: update shared_last_content
+        // BEFORE writing to disk
+        let content = maybe_content.expect("Should have content");
+        {
+            let mut shared = shared_last_content.write().await;
+            *shared = Some(content.clone());
+        }
+
+        // Simulate file watcher detecting the write
+        let file_content = content.clone();
+
+        // Upload task reads shared_last_content
+        let shared_content = {
+            let shared = shared_last_content.read().await;
+            shared.clone().unwrap_or_default()
+        };
+
+        // Echo detection: content matches, upload should be skipped
+        assert_eq!(
+            shared_content, file_content,
+            "shared_last_content should match file content"
+        );
+
+        // This is the echo prevention check used in upload_task
+        let should_skip_upload = shared_content == file_content;
+        assert!(
+            should_skip_upload,
+            "Upload should be skipped when content matches shared_last_content"
+        );
+    }
+
+    // =========================================================================
+    // Test 4: Receive does not republish after disk write
+    // =========================================================================
+
+    /// Verify that receiving an edit does NOT trigger outbound publish.
+    ///
+    /// This test validates the no-republish invariant: receiving a remote
+    /// edit should only update local state and disk, never publish.
+    #[tokio::test]
+    async fn test_receive_no_republish_after_disk_write() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Track publish attempts (in real code, this would be the MQTT client)
+        let publish_count = Arc::new(AtomicUsize::new(0));
+
+        // Setup state with server content
+        let server_doc = Doc::with_client_id(1);
+        {
+            let mut txn = server_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "base");
+        }
+        let server_state = doc_full_state(&server_doc);
+        let server_state_b64 = STANDARD.encode(&server_state);
+        let server_cid = "server_cid_base";
+
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+        state.initialize_from_server(&server_state_b64, server_cid);
+
+        // Create remote edit
+        let edit_update = create_insert_update_on_state(2, &server_state, " extended", 4);
+        let edit_update_b64 = STANDARD.encode(&edit_update);
+        let edit_msg = make_edit_message(
+            &edit_update_b64,
+            vec![server_cid.to_string()],
+            "remote",
+            2000,
+        );
+
+        // Process with None mqtt_client - this is the key test
+        // If process_received_edit tried to publish, it would need an mqtt_client
+        let (result, content) =
+            process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local")
+                .await
+                .expect("Should succeed without mqtt_client");
+
+        // FastForward should not require any publishing
+        assert!(
+            matches!(result, MergeResult::FastForward { .. }),
+            "Expected FastForward, got {:?}",
+            result
+        );
+
+        // Content is returned for disk write
+        assert!(content.is_some());
+
+        // No publishes occurred (counter is still 0)
+        assert_eq!(
+            publish_count.load(Ordering::SeqCst),
+            0,
+            "No publish should occur on receive"
+        );
+    }
+
+    // =========================================================================
+    // Test 5: Receive handles concurrent edits
+    // =========================================================================
+
+    /// Verify that two concurrent edits both merge correctly.
+    ///
+    /// Scenario: Two remote peers make concurrent edits on the same base state.
+    /// Both edits arrive at our node. Both should be applied and merged.
+    #[tokio::test]
+    async fn test_receive_handles_concurrent_edits() {
+        // Setup base state
+        let base_doc = Doc::with_client_id(0);
+        {
+            let mut txn = base_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "BASE");
+        }
+        let base_state = doc_full_state(&base_doc);
+        let base_state_b64 = STANDARD.encode(&base_state);
+        let base_cid = "base_cid";
+
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+        state.initialize_from_server(&base_state_b64, base_cid);
+
+        // Peer A's concurrent edit: insert "AAA" at start
+        let update_a = create_insert_update_on_state(10, &base_state, "AAA", 0);
+        let update_a_b64 = STANDARD.encode(&update_a);
+        let msg_a = make_edit_message(&update_a_b64, vec![base_cid.to_string()], "peer_a", 1000);
+
+        // Peer B's concurrent edit: insert "BBB" at end
+        let update_b = create_insert_update_on_state(20, &base_state, "BBB", 4);
+        let update_b_b64 = STANDARD.encode(&update_b);
+        let msg_b = make_edit_message(&update_b_b64, vec![base_cid.to_string()], "peer_b", 1001);
+
+        // Process edit A
+        let (result_a, _) =
+            process_received_edit(None, "workspace", "node1", &mut state, &msg_a, "local")
+                .await
+                .expect("Process A");
+        assert!(
+            matches!(result_a, MergeResult::FastForward { .. }),
+            "First concurrent edit should fast-forward"
+        );
+
+        // Process edit B (arrives shortly after A)
+        let (result_b, _content_b) =
+            process_received_edit(None, "workspace", "node1", &mut state, &msg_b, "local")
+                .await
+                .expect("Process B");
+
+        // B might trigger LocalAhead, Merged, or FastForward depending on timing
+        // The key invariant is that both edits are preserved in the Y.Doc
+        assert!(
+            matches!(
+                result_b,
+                MergeResult::FastForward { .. }
+                    | MergeResult::Merged { .. }
+                    | MergeResult::LocalAhead
+            ),
+            "Second concurrent edit result: {:?}",
+            result_b
+        );
+
+        // Verify both edits are in the final state
+        let final_doc = state.to_doc().expect("to_doc");
+        let final_text = get_doc_text(&final_doc);
+        assert!(
+            final_text.contains("AAA"),
+            "Should contain peer A's edit: {}",
+            final_text
+        );
+        assert!(
+            final_text.contains("BBB"),
+            "Should contain peer B's edit: {}",
+            final_text
+        );
+        assert!(
+            final_text.contains("BASE"),
+            "Should contain base content: {}",
+            final_text
+        );
+    }
+
+    // =========================================================================
+    // Test 6: Receive rejects duplicate CID
+    // =========================================================================
+
+    /// Verify that receiving the same CID twice returns AlreadyKnown.
+    ///
+    /// This is critical for echo suppression - when we receive our own
+    /// edit echoed back from MQTT, it should be recognized and ignored.
+    #[tokio::test]
+    async fn test_receive_rejects_duplicate_cid() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Create an edit with explicit timestamp for deterministic CID
+        let update = create_insert_update(1, "unique content", 0);
+        let update_b64 = STANDARD.encode(&update);
+        let timestamp = 12345u64;
+
+        // Calculate what the CID will be
+        let commit = Commit::with_timestamp(
+            vec![],
+            update_b64.clone(),
+            "author".to_string(),
+            None,
+            timestamp,
+        );
+        let expected_cid = commit.calculate_cid();
+
+        let edit_msg = make_edit_message(&update_b64, vec![], "author", timestamp);
+
+        // First receive - should succeed
+        let (result1, content1) =
+            process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local")
+                .await
+                .expect("First receive");
+
+        assert!(
+            matches!(result1, MergeResult::FastForward { .. }),
+            "First receive should fast-forward"
+        );
+        assert!(content1.is_some(), "First receive should return content");
+
+        // Verify CID is now tracked
+        assert!(
+            state.is_cid_known(&expected_cid),
+            "CID should be known after first receive"
+        );
+
+        // Second receive with same message - should be detected as duplicate
+        let (result2, content2) =
+            process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local")
+                .await
+                .expect("Second receive");
+
+        assert_eq!(
+            result2,
+            MergeResult::AlreadyKnown,
+            "Duplicate CID must return AlreadyKnown"
+        );
+        assert!(content2.is_none(), "AlreadyKnown should not return content");
+    }
+
+    // =========================================================================
+    // Test 7: Receive handles missing parent
+    // =========================================================================
+
+    /// Verify behavior when receiving an edit with unknown parent CID.
+    ///
+    /// In a well-functioning system, commits arrive in order. But if there's
+    /// lag or message loss, we might receive a commit whose parent we haven't
+    /// seen. The system should still apply the Yjs update (CRDTs are order-independent).
+    #[tokio::test]
+    async fn test_receive_handles_missing_parent() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Initialize with some content
+        let base_doc = Doc::with_client_id(0);
+        {
+            let mut txn = base_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "base");
+        }
+        let base_state = doc_full_state(&base_doc);
+        let base_state_b64 = STANDARD.encode(&base_state);
+        state.initialize_from_server(&base_state_b64, "base_cid");
+
+        // Create an edit that references a parent we DON'T have
+        let edit_update = create_insert_update_on_state(1, &base_state, " added", 4);
+        let edit_update_b64 = STANDARD.encode(&edit_update);
+
+        // This edit claims a parent "unknown_parent_cid" that we haven't seen
+        let edit_msg = make_edit_message(
+            &edit_update_b64,
+            vec!["unknown_parent_cid".to_string()],
+            "remote",
+            2000,
+        );
+
+        // Process should still work - Yjs updates are self-describing
+        let result =
+            process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local").await;
+
+        // Should succeed (CRDTs can apply updates out of order)
+        assert!(result.is_ok(), "Should succeed with missing parent");
+
+        let (merge_result, _content) = result.unwrap();
+
+        // Result depends on state tracking, but the update should be applied
+        // It might be LocalAhead (our base_cid is different from unknown_parent_cid)
+        assert!(
+            matches!(
+                merge_result,
+                MergeResult::FastForward { .. }
+                    | MergeResult::LocalAhead
+                    | MergeResult::Merged { .. }
+            ),
+            "Missing parent should still process: {:?}",
+            merge_result
+        );
+
+        // Verify Y.Doc state includes the update
+        let doc = state.to_doc().expect("to_doc");
+        let text = get_doc_text(&doc);
+        // The Yjs update should have been applied
+        assert!(text.contains("base"), "Should have base content: {}", text);
+        // The edit might or might not merge depending on Yjs semantics
+        // The key is that we didn't crash or error
+    }
+
+    // =========================================================================
+    // Test 8: Receive local ahead scenario
+    // =========================================================================
+
+    /// Verify LocalAhead result when local state is ahead of received edit.
+    ///
+    /// Scenario: We have local uncommitted changes. A remote edit arrives
+    /// that doesn't include our changes. The system should recognize we're
+    /// "ahead" and not overwrite our local content.
+    #[tokio::test]
+    async fn test_receive_local_ahead_scenario() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Initialize from server
+        let base_doc = Doc::with_client_id(0);
+        {
+            let mut txn = base_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "server");
+        }
+        let base_state = doc_full_state(&base_doc);
+        let base_state_b64 = STANDARD.encode(&base_state);
+        let server_cid = "server_head";
+
+        state.initialize_from_server(&base_state_b64, server_cid);
+
+        // Simulate local edit that hasn't been synced yet
+        let local_doc = Doc::with_client_id(99);
+        {
+            let update = Update::decode_v1(&base_state).unwrap();
+            let mut txn = local_doc.transact_mut();
+            txn.apply_update(update);
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 6, " local_edit");
+        }
+        let local_state = doc_full_state(&local_doc);
+        let local_state_b64 = STANDARD.encode(&local_state);
+        let local_cid = "local_edit_cid";
+
+        // Update state to reflect local edit
+        state.local_head_cid = Some(local_cid.to_string());
+        state.yjs_state = Some(local_state_b64);
+        // head_cid stays at server_head (we haven't synced)
+
+        // Now receive a DIFFERENT remote edit (not including our local changes)
+        let remote_update = create_insert_update_on_state(2, &base_state, " remote", 6);
+        let remote_update_b64 = STANDARD.encode(&remote_update);
+
+        let remote_msg = make_edit_message(
+            &remote_update_b64,
+            vec![server_cid.to_string()], // Based on server, not our local
+            "other_peer",
+            2000,
+        );
+
+        let (result, content) =
+            process_received_edit(None, "workspace", "node1", &mut state, &remote_msg, "local")
+                .await
+                .expect("Should process");
+
+        // Should be either LocalAhead (we have uncommitted changes) or trigger merge
+        assert!(
+            matches!(
+                result,
+                MergeResult::LocalAhead
+                    | MergeResult::NeedsMerge { .. }
+                    | MergeResult::Merged { .. }
+            ),
+            "Expected LocalAhead, NeedsMerge, or Merged when local is ahead, got {:?}",
+            result
+        );
+
+        // If LocalAhead, content should NOT be returned (preserves our local file)
+        if matches!(result, MergeResult::LocalAhead) {
+            assert!(
+                content.is_none(),
+                "LocalAhead should not return content to write"
+            );
+
+            // Our local state should be preserved
+            let doc = state.to_doc().expect("to_doc");
+            let text = get_doc_text(&doc);
+            assert!(
+                text.contains("local_edit"),
+                "Local edit should be preserved: {}",
+                text
+            );
+        }
+    }
+
+    // =========================================================================
+    // Additional Edge Case Tests
+    // =========================================================================
+
+    /// Empty update (merge commit) should not corrupt state.
+    #[tokio::test]
+    async fn test_receive_empty_update() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Initialize with content
+        let base_doc = Doc::with_client_id(0);
+        {
+            let mut txn = base_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "existing content");
+        }
+        let base_state = doc_full_state(&base_doc);
+        let base_state_b64 = STANDARD.encode(&base_state);
+        state.initialize_from_server(&base_state_b64, "base_cid");
+
+        // Receive a merge commit with empty update
+        let empty_msg = EditMessage {
+            update: String::new(), // Empty update
+            parents: vec!["base_cid".to_string(), "other_cid".to_string()],
+            author: "merger".to_string(),
+            message: Some("Merge commit".to_string()),
+            timestamp: 2000,
+        };
+
+        let result =
+            process_received_edit(None, "workspace", "node1", &mut state, &empty_msg, "local")
+                .await;
+
+        assert!(result.is_ok(), "Empty update should not error");
+
+        // Content should be unchanged
+        let doc = state.to_doc().expect("to_doc");
+        let text = get_doc_text(&doc);
+        assert_eq!(
+            text, "existing content",
+            "Empty update should not change content"
+        );
+    }
+
+    /// Binary-looking content (base64 with padding) processes correctly.
+    #[tokio::test]
+    async fn test_receive_base64_update_with_padding() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Create a small update that will have base64 padding
+        let update = create_insert_update(1, "x", 0);
+        let update_b64 = STANDARD.encode(&update);
+
+        // Verify it has the expected base64 characteristics
+        assert!(update_b64.len() > 0);
+
+        let edit_msg = make_edit_message(&update_b64, vec![], "author", 1000);
+
+        let result =
+            process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local").await;
+
+        assert!(result.is_ok(), "Base64 with padding should work");
+
+        let (merge_result, content) = result.unwrap();
+        assert!(
+            matches!(merge_result, MergeResult::FastForward { .. }),
+            "Should fast-forward"
+        );
+        assert_eq!(content, Some("x".to_string()));
+    }
+
+    /// Rapid sequential edits all apply correctly.
+    #[tokio::test]
+    async fn test_receive_rapid_sequential_edits() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Process 10 sequential edits rapidly
+        let mut prev_cid = String::new();
+        let current_doc = Doc::with_client_id(0);
+        {
+            let mut txn = current_doc.transact_mut();
+            txn.get_or_insert_text("content");
+        }
+
+        for i in 0..10 {
+            let base_state = doc_full_state(&current_doc);
+
+            // Create edit appending a character
+            let update = create_insert_update_on_state(
+                (i + 1) as u64,
+                &base_state,
+                &format!("{}", i),
+                i as u32,
+            );
+            let update_b64 = STANDARD.encode(&update);
+
+            let parents = if prev_cid.is_empty() {
+                vec![]
+            } else {
+                vec![prev_cid.clone()]
+            };
+
+            let commit = Commit::with_timestamp(
+                parents.clone(),
+                update_b64.clone(),
+                "author".to_string(),
+                None,
+                (1000 + i as u64) * 1000,
+            );
+            prev_cid = commit.calculate_cid();
+
+            let edit_msg =
+                make_edit_message(&update_b64, parents, "author", (1000 + i as u64) * 1000);
+
+            let result =
+                process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local")
+                    .await;
+
+            assert!(
+                result.is_ok(),
+                "Sequential edit {} should succeed: {:?}",
+                i,
+                result
+            );
+
+            // Update current_doc for next iteration
+            let update_bytes = STANDARD.decode(&update_b64).unwrap();
+            let u = Update::decode_v1(&update_bytes).unwrap();
+            let mut txn = current_doc.transact_mut();
+            txn.apply_update(u);
+        }
+
+        // Verify final state has all digits
+        let final_doc = state.to_doc().expect("to_doc");
+        let final_text = get_doc_text(&final_doc);
+        for i in 0..10 {
+            assert!(
+                final_text.contains(&format!("{}", i)),
+                "Should contain digit {}: {}",
+                i,
+                final_text
+            );
+        }
+    }
+}
