@@ -23,7 +23,7 @@ pub use rumqttc::QoS;
 use std::sync::Arc;
 use thiserror::Error;
 
-pub use client::MqttClient;
+pub use client::{IncomingMessage, MqttClient};
 pub use messages::{
     CommandMessage, CreateDocumentRequest, CreateDocumentResponse, DeleteDocumentRequest,
     DeleteDocumentResponse, EditMessage, EventMessage, GetContentRequest, GetContentResponse,

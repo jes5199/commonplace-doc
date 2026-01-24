@@ -168,6 +168,6 @@ pub use crdt_publish::{
 };
 pub use crdt_state::{
     load_or_migrate, migrate_from_old_state, CrdtPeerState, DirectorySyncState, PendingEdit,
-    CRDT_STATE_FILENAME, MAX_PENDING_EDITS,
+    QueueReason, CRDT_STATE_FILENAME, MAX_PENDING_EDITS,
 };
 pub use error::{SyncError, SyncResult};

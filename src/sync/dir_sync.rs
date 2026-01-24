@@ -666,6 +666,35 @@ pub async fn handle_subdir_new_files(
 
             info!("Created local file from subdir: {}", file_path.display());
 
+            // RACE CONDITION FIX: Register file state BEFORE spawning tasks.
+            // This ensures any messages that arrive immediately after task spawn
+            // can find the registered state. We register with empty task_handles
+            // initially, then update after spawning.
+            {
+                let mut states = file_states.write().await;
+                // Check for race condition - another task might have registered this file
+                if states.contains_key(root_relative_path) {
+                    warn!(
+                        "Race detected: file {} already registered during subdir sync, skipping",
+                        root_relative_path
+                    );
+                    continue;
+                }
+                // Register state with empty task_handles - will be updated after spawn
+                states.insert(
+                    root_relative_path.clone(),
+                    FileSyncState {
+                        relative_path: root_relative_path.clone(),
+                        identifier: identifier.clone(),
+                        state: state.clone(),
+                        task_handles: Vec::new(), // Empty initially, updated after spawn
+                        use_paths,
+                        content_hash: Some(content_hash.clone()),
+                        crdt_last_content: None, // Updated for CRDT path after spawn
+                    },
+                );
+            }
+
             // Spawn sync tasks for the new file
             // Use CRDT tasks if context is provided and identifier is a valid UUID
             let (task_handles, crdt_last_content) = if let Some(ctx) = crdt_context {
@@ -708,8 +737,8 @@ pub async fn handle_subdir_new_files(
                         );
                     }
 
-                    // Check for existing tasks before spawning (prevents duplicates)
-                    let states_snapshot = file_states.read().await;
+                    // State is already registered, spawn tasks
+                    // Pass None for file_states since we already registered
                     let handles = spawn_file_sync_tasks_crdt(
                         ctx.mqtt_client.clone(),
                         client.clone(),
@@ -722,10 +751,9 @@ pub async fn handle_subdir_new_files(
                         shared_last_content.clone(),
                         pull_only,
                         author.to_string(),
-                        Some(&*states_snapshot),
-                        Some(root_relative_path),
+                        None, // Already registered, no need to check
+                        None,
                     );
-                    drop(states_snapshot);
                     (handles, Some(shared_last_content))
                 } else {
                     // Non-UUID identifier, fall back to HTTP sync
@@ -768,37 +796,14 @@ pub async fn handle_subdir_new_files(
                 (handles, None)
             };
 
-            // Skip if spawn was prevented due to existing tasks
-            if task_handles.is_empty() && crdt_last_content.is_some() {
-                // CRDT spawn was attempted but prevented - skip this file
-                continue;
-            }
-
-            let mut states = file_states.write().await;
-            // Check for race condition - another task might have registered this file
-            // (this can still happen in the window between read lock release and write lock acquire)
-            if states.contains_key(root_relative_path) {
-                warn!(
-                    "Race detected: file {} already registered during subdir sync, aborting duplicate tasks",
-                    root_relative_path
-                );
-                for handle in task_handles {
-                    handle.abort();
+            // Update the registered state with task handles and crdt_last_content
+            {
+                let mut states = file_states.write().await;
+                if let Some(file_state) = states.get_mut(root_relative_path) {
+                    file_state.task_handles = task_handles;
+                    file_state.crdt_last_content = crdt_last_content;
                 }
-                continue;
             }
-            states.insert(
-                root_relative_path.clone(),
-                FileSyncState {
-                    relative_path: root_relative_path.clone(),
-                    identifier,
-                    state,
-                    task_handles,
-                    use_paths,
-                    content_hash: Some(content_hash),
-                    crdt_last_content,
-                },
-            );
         }
     }
 

@@ -32,6 +32,15 @@ pub struct PendingEdit {
     pub payload: Vec<u8>,
 }
 
+/// Reason why edits are being queued (for logging/debugging).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueReason {
+    /// CRDT state hasn't been initialized from server yet
+    NeedsServerInit,
+    /// Receive task hasn't started processing yet
+    ReceiveTaskNotReady,
+}
+
 /// CRDT peer state for a single document (file content or schema).
 ///
 /// Each tracked entity maintains:
@@ -40,6 +49,7 @@ pub struct PendingEdit {
 /// - Our latest commit (`local_head_cid`)
 /// - The serialized Y.Doc state
 /// - A queue of pending edits received before initialization
+/// - A flag indicating whether the receive task is ready
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrdtPeerState {
     /// UUID for this document
@@ -53,10 +63,15 @@ pub struct CrdtPeerState {
     /// Serialized Y.Doc state (base64 encoded)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub yjs_state: Option<String>,
-    /// Queue of edits received before CRDT initialization completed.
-    /// These are applied after `initialize_from_server` is called.
+    /// Queue of edits received before CRDT initialization completed
+    /// AND receive task became ready. Edits are queued until both
+    /// conditions are met.
     #[serde(skip)]
     pub pending_edits: Vec<PendingEdit>,
+    /// Whether the receive task has subscribed and is ready to process edits.
+    /// Edits are queued until this is true (even after CRDT init completes).
+    #[serde(skip)]
+    pub receive_task_ready: bool,
 }
 
 impl CrdtPeerState {
@@ -68,6 +83,7 @@ impl CrdtPeerState {
             local_head_cid: None,
             yjs_state: None,
             pending_edits: Vec::new(),
+            receive_task_ready: false,
         }
     }
 
@@ -84,6 +100,7 @@ impl CrdtPeerState {
             local_head_cid: None,
             yjs_state: Some(yjs_state),
             pending_edits: Vec::new(),
+            receive_task_ready: false,
         }
     }
 
@@ -155,6 +172,49 @@ impl CrdtPeerState {
         self.yjs_state.is_none()
     }
 
+    /// Check if edits should be queued rather than processed directly.
+    ///
+    /// Returns `Some(reason)` if edits should be queued, `None` if ready to process.
+    /// Edits should be queued if EITHER:
+    /// 1. CRDT state hasn't been initialized from server yet
+    /// 2. Receive task hasn't signaled it's ready yet
+    ///
+    /// This prevents the race condition where edits arrive between CRDT init
+    /// completion and receive task startup.
+    pub fn should_queue_edits(&self) -> Option<QueueReason> {
+        if self.yjs_state.is_none() {
+            Some(QueueReason::NeedsServerInit)
+        } else if !self.receive_task_ready {
+            Some(QueueReason::ReceiveTaskNotReady)
+        } else {
+            None
+        }
+    }
+
+    /// Mark the receive task as ready to process edits.
+    ///
+    /// Called by the receive task after it has subscribed to MQTT.
+    /// Returns any pending edits that were queued before ready.
+    pub fn mark_receive_task_ready(&mut self) -> Vec<PendingEdit> {
+        self.receive_task_ready = true;
+        debug!(
+            "Marked receive task ready for {} (had {} pending edits)",
+            self.node_id,
+            self.pending_edits.len()
+        );
+        // Drain pending edits now that we're ready
+        std::mem::take(&mut self.pending_edits)
+    }
+
+    /// Reset receive task ready state (for resync scenarios).
+    ///
+    /// Called when resync is needed to ensure edits are queued again
+    /// until the task re-subscribes.
+    pub fn mark_receive_task_not_ready(&mut self) {
+        self.receive_task_ready = false;
+        debug!("Marked receive task not ready for {}", self.node_id);
+    }
+
     /// Mark this state as needing resync from server.
     ///
     /// Called after broadcast lag is detected to force re-fetching of server
@@ -162,6 +222,7 @@ impl CrdtPeerState {
     /// and the next initialization will fetch fresh state from server.
     ///
     /// Also clears head_cid and local_head_cid to allow fresh ancestry checks.
+    /// Does NOT reset receive_task_ready since the task is still running.
     pub fn mark_needs_resync(&mut self) {
         debug!(
             "Marking {} as needing resync - clearing CRDT state",
@@ -171,6 +232,7 @@ impl CrdtPeerState {
         self.head_cid = None;
         self.local_head_cid = None;
         // Keep pending_edits - they may still be applicable after resync
+        // Keep receive_task_ready - the task is still running and subscribed
     }
 
     /// Queue an edit to be applied after CRDT initialization completes.
@@ -820,5 +882,82 @@ mod tests {
         // When deserialized, pending_edits should be empty
         let loaded: CrdtPeerState = serde_json::from_str(&json).unwrap();
         assert!(!loaded.has_pending_edits());
+    }
+
+    #[test]
+    fn test_should_queue_edits() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // New state: needs server init AND receive task not ready
+        assert_eq!(
+            state.should_queue_edits(),
+            Some(QueueReason::NeedsServerInit)
+        );
+
+        // After server init but before receive task ready
+        state.yjs_state = Some("some_state".to_string());
+        assert_eq!(
+            state.should_queue_edits(),
+            Some(QueueReason::ReceiveTaskNotReady)
+        );
+
+        // After both conditions met
+        state.receive_task_ready = true;
+        assert_eq!(state.should_queue_edits(), None);
+    }
+
+    #[test]
+    fn test_mark_receive_task_ready() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+        state.yjs_state = Some("some_state".to_string());
+
+        // Queue some edits before ready
+        state.queue_pending_edit(vec![1, 2, 3]);
+        state.queue_pending_edit(vec![4, 5, 6]);
+
+        assert!(!state.receive_task_ready);
+        assert_eq!(state.pending_edits.len(), 2);
+
+        // Mark ready - should drain pending edits
+        let pending = state.mark_receive_task_ready();
+
+        assert!(state.receive_task_ready);
+        assert!(state.pending_edits.is_empty());
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].payload, vec![1, 2, 3]);
+        assert_eq!(pending[1].payload, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn test_receive_task_ready_not_serialized() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+        state.receive_task_ready = true;
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&state).unwrap();
+
+        // receive_task_ready should not be in the JSON (due to #[serde(skip)])
+        assert!(!json.contains("receive_task_ready"));
+
+        // When deserialized, receive_task_ready should be false (default)
+        let loaded: CrdtPeerState = serde_json::from_str(&json).unwrap();
+        assert!(!loaded.receive_task_ready);
+    }
+
+    #[test]
+    fn test_mark_needs_resync_keeps_receive_ready() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+        state.yjs_state = Some("some_state".to_string());
+        state.head_cid = Some("cid".to_string());
+        state.receive_task_ready = true;
+
+        // Mark needs resync
+        state.mark_needs_resync();
+
+        // Yjs state and CIDs should be cleared
+        assert!(state.yjs_state.is_none());
+        assert!(state.head_cid.is_none());
+        // But receive_task_ready should still be true (task is still running)
+        assert!(state.receive_task_ready);
     }
 }

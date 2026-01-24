@@ -3,7 +3,7 @@
 //! This module contains functions for syncing a single file with a server document.
 
 use crate::events::{recv_broadcast_with_lag, BroadcastRecvResult};
-use crate::mqtt::{MqttClient, Topic};
+use crate::mqtt::{IncomingMessage, MqttClient, Topic};
 use crate::sync::client::fetch_head;
 use crate::sync::crdt_merge::{parse_edit_message, process_received_edit};
 use crate::sync::crdt_publish::publish_text_change;
@@ -25,7 +25,7 @@ use rumqttc::QoS;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -2451,6 +2451,11 @@ pub fn spawn_file_sync_tasks_crdt(
         )));
     }
 
+    // CRITICAL: Subscribe to MQTT broadcast channel BEFORE spawning the receive task.
+    // This fixes a race condition where messages broadcast before the task starts
+    // would be lost if the receiver was created inside the spawned task.
+    let message_rx = mqtt_client.subscribe_messages();
+
     // Spawn CRDT receive task for incoming changes
     handles.push(tokio::spawn(receive_task_crdt(
         mqtt_client,
@@ -2463,6 +2468,7 @@ pub fn spawn_file_sync_tasks_crdt(
         filename,
         shared_last_content,
         author,
+        message_rx,
     )));
 
     handles
@@ -2487,13 +2493,14 @@ pub async fn receive_task_crdt(
     filename: String,
     shared_last_content: SharedLastContent,
     author: String,
+    message_rx: broadcast::Receiver<IncomingMessage>,
 ) {
     let node_id_str = node_id.to_string();
 
-    // CRITICAL: Create the broadcast receiver BEFORE subscribing.
-    // This ensures we receive retained messages that the broker sends immediately
-    // after we subscribe.
-    let mut message_rx = mqtt_client.subscribe_messages();
+    // The message_rx is passed in from spawn_file_sync_tasks_crdt, which subscribes
+    // BEFORE spawning this task to avoid a race condition where messages could be
+    // lost if the receiver was created here (after the task starts).
+    let mut message_rx = message_rx;
 
     // Subscribe to edits for this file's UUID
     let topic = Topic::edits(&workspace, &node_id_str).to_topic_string();
@@ -2508,6 +2515,91 @@ pub async fn receive_task_crdt(
         error!("CRDT receive_task: failed to subscribe to {}: {}", topic, e);
         return;
     }
+
+    // Mark the receive task as ready and drain any pending edits that arrived
+    // between CRDT init and now.
+    let pending_edits = {
+        let mut state_guard = crdt_state.write().await;
+        let file_state = state_guard.get_or_create_file(&filename, node_id);
+        file_state.mark_receive_task_ready()
+    };
+
+    // Process any pending edits that were queued before we were ready
+    if !pending_edits.is_empty() {
+        info!(
+            "CRDT receive_task: processing {} pending edits for {} after becoming ready",
+            pending_edits.len(),
+            file_path.display()
+        );
+
+        for pending in pending_edits {
+            if let Ok(edit_msg) = parse_edit_message(&pending.payload) {
+                let mut state_guard = crdt_state.write().await;
+                let file_state = state_guard.get_or_create_file(&filename, node_id);
+
+                match process_received_edit(
+                    Some(&mqtt_client),
+                    &workspace,
+                    &node_id_str,
+                    file_state,
+                    &edit_msg,
+                    &author,
+                )
+                .await
+                {
+                    Ok((result, maybe_content)) => {
+                        debug!(
+                            "CRDT receive_task: processed pending edit for {}: {:?}",
+                            file_path.display(),
+                            result
+                        );
+
+                        // Write content if merge produced new content
+                        if let Some(content) = maybe_content {
+                            // Update shared_last_content BEFORE writing
+                            {
+                                let mut shared = shared_last_content.write().await;
+                                *shared = Some(content.clone());
+                            }
+                            if let Err(e) = tokio::fs::write(&file_path, &content).await {
+                                error!(
+                                    "CRDT receive_task: failed to write pending edit content to {}: {}",
+                                    file_path.display(),
+                                    e
+                                );
+                            } else {
+                                info!(
+                                    "CRDT receive_task: wrote {} bytes from pending edit to {}",
+                                    content.len(),
+                                    file_path.display()
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "CRDT receive_task: failed to process pending edit for {}: {}",
+                            file_path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Save state after processing pending edits
+        let state_guard = crdt_state.read().await;
+        if let Err(e) = state_guard
+            .save(file_path.parent().unwrap_or(&file_path))
+            .await
+        {
+            warn!(
+                "CRDT receive_task: failed to save state after pending edits: {}",
+                e
+            );
+        }
+    }
+
     let context = format!("CRDT receive {}", file_path.display());
 
     loop {
@@ -2601,20 +2693,21 @@ pub async fn receive_task_crdt(
         let mut state_guard = crdt_state.write().await;
         let file_state = state_guard.get_or_create_file(&filename, node_id);
 
-        // Check if CRDT state needs initialization.
-        // If so, queue the edit for later processing instead of trying to merge
-        // it now (which would fail or produce incorrect results without shared history).
-        if file_state.needs_server_init() {
+        // Check if edits should be queued (CRDT not initialized OR receive task not ready).
+        // Queue the edit for later processing instead of trying to merge it now.
+        if let Some(reason) = file_state.should_queue_edits() {
             file_state.queue_pending_edit(msg.payload.clone());
             info!(
-                "[SANDBOX-TRACE] receive_task_crdt QUEUED file={} uuid={} queue_size={}",
+                "[SANDBOX-TRACE] receive_task_crdt QUEUED file={} uuid={} queue_size={} reason={:?}",
                 file_path.display(),
                 node_id,
-                file_state.pending_edits.len()
+                file_state.pending_edits.len(),
+                reason
             );
             debug!(
-                "CRDT receive_task: needs init for {}, queued edit (queue size: {})",
+                "CRDT receive_task: queuing edit for {} (reason: {:?}, queue size: {})",
                 file_path.display(),
+                reason,
                 file_state.pending_edits.len()
             );
             drop(state_guard);
