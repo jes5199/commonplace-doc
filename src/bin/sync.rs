@@ -3009,13 +3009,19 @@ async fn run_exec_mode(
         let check_interval = Duration::from_millis(100);
 
         loop {
-            // Check if all files have CRDT state initialized
+            // Check if all files have CRDT state initialized AND receive tasks ready.
+            // We use should_queue_edits() to check both conditions:
+            // 1. yjs_state is set (CRDT initialized from server)
+            // 2. receive_task_ready is true (receive task is subscribed and ready)
             let state = crdt_state.read().await;
-            let unready_files: Vec<String> = state
+            let unready_files: Vec<(String, &str)> = state
                 .files
                 .iter()
-                .filter(|(_, file_state)| file_state.needs_server_init())
-                .map(|(name, _)| name.clone())
+                .filter_map(|(name, file_state)| {
+                    file_state
+                        .should_queue_edits()
+                        .map(|reason| (name.clone(), reason.as_str()))
+                })
                 .collect();
             drop(state);
 

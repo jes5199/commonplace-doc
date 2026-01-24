@@ -41,6 +41,16 @@ pub enum QueueReason {
     ReceiveTaskNotReady,
 }
 
+impl QueueReason {
+    /// Returns a short string description of the queue reason.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            QueueReason::NeedsServerInit => "needs_server_init",
+            QueueReason::ReceiveTaskNotReady => "receive_task_not_ready",
+        }
+    }
+}
+
 /// CRDT peer state for a single document (file content or schema).
 ///
 /// Each tracked entity maintains:
