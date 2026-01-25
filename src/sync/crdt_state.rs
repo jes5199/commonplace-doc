@@ -663,30 +663,42 @@ impl SubdirStateCache {
 
     /// Get or create a DirectorySyncState for a subdirectory.
     ///
-    /// If the state is already cached, returns the existing instance.
+    /// If the state is already cached AND has a matching node_id, returns the existing instance.
+    /// If cached but node_id doesn't match (e.g., directory was deleted and recreated),
+    /// evicts the stale entry and reloads from disk.
     /// Otherwise, loads from disk (or creates new) and caches it.
     pub async fn get_or_load(
         &self,
         directory: &Path,
         schema_node_id: Uuid,
     ) -> io::Result<Arc<RwLock<DirectorySyncState>>> {
-        // First check if cached (read lock)
-        {
+        // First check if cached (clone the Arc without holding lock across await)
+        let cached_state = {
             let cache = self.cache.read().unwrap();
-            if let Some(state) = cache.get(directory) {
-                return Ok(state.clone());
-            }
-        }
+            cache.get(directory).cloned()
+        };
 
-        // Double-check with read lock before loading
-        // (Another thread may have loaded while we released the first read lock)
-        {
-            let cache = self.cache.read().unwrap();
-            if let Some(state) = cache.get(directory) {
-                return Ok(state.clone());
+        // Validate cached state if present
+        if let Some(state) = cached_state {
+            let state_guard = state.read().await;
+            let cached_node_id = state_guard.schema.node_id;
+            drop(state_guard);
+
+            if cached_node_id == schema_node_id {
+                return Ok(state);
             }
+            // node_id mismatch - evict and reload below
+            {
+                let mut cache = self.cache.write().unwrap();
+                cache.remove(directory);
+            }
+            tracing::debug!(
+                "Evicted stale cache entry for {} (expected node_id {}, found {})",
+                directory.display(),
+                schema_node_id,
+                cached_node_id
+            );
         }
-        // Read lock released here before async operation
 
         // Load from disk (no lock held during async I/O)
         let state = DirectorySyncState::load_or_create(directory, schema_node_id).await?;
@@ -694,11 +706,24 @@ impl SubdirStateCache {
 
         // Insert into cache (acquire write lock again)
         // Another thread might have inserted while we were loading, so check again
-        let mut cache = self.cache.write().unwrap();
-        if let Some(existing) = cache.get(directory) {
-            // Another thread loaded it while we were loading - use theirs
-            return Ok(existing.clone());
+        let existing_clone = {
+            let cache = self.cache.read().unwrap();
+            cache.get(directory).cloned()
+        };
+
+        if let Some(existing) = existing_clone {
+            // Another thread loaded it while we were loading - validate node_id before using
+            let existing_guard = existing.read().await;
+            if existing_guard.schema.node_id == schema_node_id {
+                drop(existing_guard);
+                return Ok(existing);
+            }
+            // node_id mismatches - use our freshly loaded state and update cache
+            drop(existing_guard);
         }
+
+        // Insert our freshly loaded state (either no existing or existing had wrong node_id)
+        let mut cache = self.cache.write().unwrap();
         cache.insert(directory.to_path_buf(), arc_state.clone());
         Ok(arc_state)
     }

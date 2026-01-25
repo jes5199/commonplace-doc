@@ -342,7 +342,9 @@ async fn handle_file_created_crdt(
 
     // Ensure parent directories exist as node-backed directories
     // This handles the case where a file is created in a new subdirectory
-    // Skip HTTP schema push since CRDT/MQTT handles schema propagation
+    // We must push schema updates via HTTP so other clients learn about new directories.
+    // Without this, new subdirectories created alongside files would never propagate
+    // to other clients, breaking sync for those branches.
     if let Err(e) = ensure_parent_directories_exist(
         client,
         server,
@@ -352,7 +354,7 @@ async fn handle_file_created_crdt(
         options,
         author,
         written_schemas,
-        true, // skip_http_schema_push: CRDT/MQTT handles schema updates
+        false, // skip_http_schema_push: push schema so other clients see new directories
     )
     .await
     {
