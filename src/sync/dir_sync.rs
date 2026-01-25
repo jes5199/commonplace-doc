@@ -480,10 +480,15 @@ pub async fn handle_subdir_schema_cleanup(
     if skip_deletions {
         // Don't proceed with deletions, just clean up orphaned directories
     } else {
-        // Convert MQTT schema entry names to root-relative paths for comparison with file_states.
-        // IMPORTANT: Use schema_entry_names from MQTT (not subdir_uuid_map from HTTP) to avoid
-        // race conditions where HTTP returns stale data with deleted files still present.
-        let schema_paths: std::collections::HashSet<String> = schema_entry_names
+        // Build the set of paths that legitimately exist in the schema.
+        // We need to combine:
+        // 1. Top-level entries from schema_entry_names (MQTT-derived, authoritative for deletes)
+        // 2. Recursive paths from subdir_uuid_map (for files in nested node-backed directories)
+        //
+        // For top-level files, schema_entry_names is authoritative (avoids HTTP race conditions).
+        // But for node-backed subdirectories, the entries in schema_entry_names are just directory
+        // names - the actual files live in nested schemas and are captured by subdir_uuid_map.
+        let mut schema_paths: std::collections::HashSet<String> = schema_entry_names
             .iter()
             .map(|name| {
                 if subdir_path.is_empty() {
@@ -493,6 +498,17 @@ pub async fn handle_subdir_schema_cleanup(
                 }
             })
             .collect();
+
+        // Add recursive paths from subdir_uuid_map for nested files in node-backed directories.
+        // The uuid_map keys are relative to subdir, so convert to root-relative paths.
+        for rel_path in subdir_uuid_map.keys() {
+            let root_relative = if subdir_path.is_empty() {
+                rel_path.clone()
+            } else {
+                format!("{}/{}", subdir_path, rel_path)
+            };
+            schema_paths.insert(root_relative);
+        }
 
         // Find files in file_states that are under this subdir but no longer in schema
         let deleted_paths: Vec<String> = {

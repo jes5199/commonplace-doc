@@ -1790,27 +1790,65 @@ pub async fn subdir_mqtt_task(
             // the Y.Doc state across updates. DELETE operations now work correctly
             // because the delta is applied to the existing doc (which has entries)
             // rather than a fresh empty doc.
+            //
+            // IMPORTANT: We must use the subdirectory's cached state, NOT the root
+            // crdt_state. Using the root state would corrupt it by merging subdir
+            // schema edits into the root document.
             let mqtt_schema = if let Some(ref ctx) = crdt_context {
-                // Use persistent state for proper CRDT merging
-                let mut state = ctx.crdt_state.write().await;
-                let result = apply_schema_update_to_state(&mut state.schema, &msg.payload);
-                if let Some((ref schema, _)) = result {
-                    let entry_count = if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
-                        root.entries.as_ref().map(|e| e.len()).unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    info!(
-                        "[SANDBOX-TRACE] Applied schema update to persistent state for subdir={} entry_count={}",
-                        subdir_path, entry_count
-                    );
+                // Parse subdir_node_id as UUID for cache lookup
+                let subdir_uuid = match Uuid::parse_str(&subdir_node_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        warn!(
+                            "Failed to parse subdir_node_id {} as UUID: {}, falling back to HTTP",
+                            subdir_node_id, e
+                        );
+                        // Fall through to None result
+                        Uuid::nil()
+                    }
+                };
+
+                if subdir_uuid.is_nil() {
+                    None
                 } else {
-                    debug!(
-                        "Failed to apply schema update for subdir={}, will fetch from HTTP",
-                        subdir_path
-                    );
+                    // Get the subdirectory's cached state (NOT the root state!)
+                    match ctx
+                        .subdir_cache
+                        .get_or_load(&subdir_full_path, subdir_uuid)
+                        .await
+                    {
+                        Ok(subdir_state) => {
+                            let mut state = subdir_state.write().await;
+                            let result =
+                                apply_schema_update_to_state(&mut state.schema, &msg.payload);
+                            if let Some((ref schema, _)) = result {
+                                let entry_count =
+                                    if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
+                                        root.entries.as_ref().map(|e| e.len()).unwrap_or(0)
+                                    } else {
+                                        0
+                                    };
+                                info!(
+                                    "[SANDBOX-TRACE] Applied schema update to subdir cached state for subdir={} entry_count={}",
+                                    subdir_path, entry_count
+                                );
+                            } else {
+                                debug!(
+                                    "Failed to apply schema update for subdir={}, will fetch from HTTP",
+                                    subdir_path
+                                );
+                            }
+                            result
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to load subdir state for {}: {}, falling back to HTTP",
+                                subdir_path, e
+                            );
+                            None
+                        }
+                    }
                 }
-                result
             } else {
                 // No CRDT context - use stateless decode (may not work for DELETE)
                 let result = decode_schema_from_mqtt_payload(&msg.payload);
