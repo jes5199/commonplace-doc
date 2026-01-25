@@ -79,7 +79,9 @@ pub async fn create_new_file(
     // This prevents a race condition where peers receive content edits before they
     // know the file UUID (from schema), causing them to ignore the edit.
     // See: CP-ekqq
-    const SCHEMA_PROPAGATION_DELAY_MS: u64 = 200;
+    // Increased from 200ms to 3000ms to allow sandbox sync to fully process schema,
+    // create the file, and subscribe to MQTT topic before content is published.
+    const SCHEMA_PROPAGATION_DELAY_MS: u64 = 3000;
     debug!(
         "Waiting {}ms for schema propagation before content publish (file: {}, uuid: {})",
         SCHEMA_PROPAGATION_DELAY_MS, filename, file_uuid_str
@@ -195,6 +197,24 @@ async fn update_schema_with_new_file(
     let topic = Topic::edits(workspace, &schema_node_id).to_topic_string();
     let payload = serde_json::to_vec(&edit_msg)
         .map_err(|e| format!("Failed to serialize schema edit: {}", e))?;
+
+    // Trace log for debugging
+    {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/sandbox-trace.log")
+        {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let pid = std::process::id();
+            let _ = writeln!(file, "[{} pid={}] PUBLISH schema update for new file: filename={}, cid={}, topic={}, payload_len={}",
+                timestamp, pid, filename, cid, topic, payload.len());
+        }
+    }
 
     // Use retained message so new subscribers get the latest schema state immediately.
     // This is critical for sync: subscribers may join after schema updates are published,

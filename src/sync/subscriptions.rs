@@ -3,12 +3,32 @@
 //! This module contains the task functions that subscribe to SSE and MQTT
 //! events for directory-level synchronization.
 
+use std::io::Write;
+
+/// Write a trace message to /tmp/sandbox-trace.log for debugging
+fn trace_log(msg: &str) {
+    use std::fs::OpenOptions;
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/sandbox-trace.log")
+    {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let _ = writeln!(file, "[{} pid={}] {}", timestamp, pid, msg);
+    }
+}
+
 use crate::events::{recv_broadcast_with_lag, BroadcastRecvResult};
 use crate::fs::FsSchema;
 use crate::mqtt::{MqttClient, Topic};
 use crate::sync::dir_sync::{
-    create_subdir_nested_directories, decode_schema_from_mqtt_payload,
-    handle_schema_change_with_dedup, handle_subdir_new_files, handle_subdir_schema_cleanup,
+    apply_schema_update_to_state, create_subdir_nested_directories,
+    decode_schema_from_mqtt_payload, handle_schema_change_with_dedup, handle_subdir_new_files,
+    handle_subdir_schema_cleanup,
 };
 use crate::sync::subdir_spawn::{spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport};
 use crate::sync::{encode_node_id, spawn_file_sync_tasks_crdt, FileSyncState, SharedLastContent};
@@ -31,6 +51,7 @@ pub struct CrdtFileSyncContext {
     pub mqtt_client: Arc<MqttClient>,
     pub workspace: String,
     pub crdt_state: Arc<RwLock<crate::sync::DirectorySyncState>>,
+    pub subdir_cache: Arc<crate::sync::SubdirStateCache>,
 }
 
 // ============================================================================
@@ -558,6 +579,11 @@ pub async fn directory_mqtt_task(
         fs_root_id, fs_root_topic
     );
 
+    trace_log(&format!(
+        "directory_mqtt_task starting: fs_root={}, topic={}",
+        fs_root_id, fs_root_topic
+    ));
+
     if let Err(e) = mqtt_client
         .subscribe(&fs_root_topic, QoS::AtLeastOnce)
         .await
@@ -565,6 +591,11 @@ pub async fn directory_mqtt_task(
         error!("Failed to subscribe to MQTT edits topic: {}", e);
         return;
     }
+
+    trace_log(&format!(
+        "directory_mqtt_task subscribed to topic: {}",
+        fs_root_topic
+    ));
 
     // Build reverse map (uuid -> paths) and subscribe to all file UUIDs
     let mut uuid_to_paths = crate::sync::build_uuid_to_paths_map(&initial_uuid_map);
@@ -585,6 +616,18 @@ pub async fn directory_mqtt_task(
         "Subscribed to {} file UUIDs for content sync",
         subscribed_uuids.len()
     );
+
+    // Write a readiness marker to indicate MQTT subscriptions are established.
+    // This allows tests to wait for the sandbox to be fully ready to receive messages.
+    let ready_marker = directory.join(".mqtt-ready");
+    if let Err(e) = std::fs::write(
+        &ready_marker,
+        format!("ready at {:?}", std::time::SystemTime::now()),
+    ) {
+        warn!("Failed to write MQTT readiness marker: {}", e);
+    } else {
+        debug!("Wrote MQTT readiness marker to {}", ready_marker.display());
+    }
 
     // Track last processed schema to prevent redundant processing
     let mut last_schema_hash: Option<String> = None;
@@ -638,45 +681,189 @@ pub async fn directory_mqtt_task(
 
         if doc_id == fs_root_id {
             // This is a schema change for the fs-root
-            debug!(
-                "MQTT edit received for fs-root: {} bytes",
+            trace_log(&format!(
+                "MQTT schema edit received for fs-root {}: {} bytes",
+                fs_root_id,
+                msg.payload.len()
+            ));
+            info!(
+                "[SANDBOX-TRACE] MQTT schema edit received for fs-root {}: {} bytes",
+                fs_root_id,
                 msg.payload.len()
             );
 
-            // Use content-based deduplication and ancestry checking
-            // Pass crdt_context so new files spawn CRDT tasks directly,
-            // avoiding race conditions between subscription and task upgrade
-            match handle_schema_change_with_dedup(
-                &http_client,
-                &server,
-                &fs_root_id,
-                &directory,
-                &file_states,
-                true, // spawn_tasks: true for runtime schema changes
-                use_paths,
-                &mut last_schema_hash,
-                &mut last_schema_cid,
-                push_only,
-                pull_only,
-                &author,
-                #[cfg(unix)]
-                inode_tracker.clone(),
-                written_schemas.as_ref(),
-                shared_state_file.as_ref(),
-                crdt_context.as_ref(),
-            )
-            .await
-            {
-                Ok(true) => {
-                    debug!("MQTT: Schema change processed successfully");
+            // When CRDT context is available, apply the MQTT delta to persistent state
+            // and use it DIRECTLY for file creation and deletion. This avoids race
+            // conditions where HTTP may return stale data.
+            //
+            // When CRDT context is NOT available, fall back to HTTP-based processing.
+            if let Some(ref ctx) = crdt_context {
+                // Apply MQTT delta to persistent CRDT state
+                let mut state = ctx.crdt_state.write().await;
+                let mqtt_schema = apply_schema_update_to_state(&mut state.schema, &msg.payload);
+                drop(state); // Release lock before doing I/O
 
-                    // Schema changed - update UUID subscriptions
-                    // IMPORTANT: Skip sync_uuid_subscriptions when CRDT context is present.
-                    // In CRDT mode, each file's receive_task_crdt handles its own subscription.
-                    // The HTTP-based sync_uuid_subscriptions can race with the server's
-                    // reconciler, causing UUIDs to be overwritten and subscriptions lost.
-                    // See CP-1ual for details on this race condition.
-                    if crdt_context.is_none() {
+                if let Some((ref schema, ref schema_json)) = mqtt_schema {
+                    let entry_count = if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
+                        root.entries.as_ref().map(|e| e.len()).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    // Log entry names for debugging
+                    let entry_names: Vec<String> =
+                        if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
+                            root.entries
+                                .as_ref()
+                                .map(|e| e.keys().cloned().collect())
+                                .unwrap_or_default()
+                        } else {
+                            vec![]
+                        };
+                    trace_log(&format!(
+                        "MQTT schema decoded: entry_count={}, entries={:?}",
+                        entry_count, entry_names
+                    ));
+                    info!(
+                        "[SANDBOX-TRACE] MQTT schema decoded: entry_count={}, entries={:?}",
+                        entry_count, entry_names
+                    );
+
+                    // Compute hash for deduplication
+                    let current_hash =
+                        crate::sync::state_file::compute_content_hash(schema_json.as_bytes());
+                    let is_duplicate = last_schema_hash.as_ref() == Some(&current_hash);
+
+                    if !is_duplicate {
+                        // Write the schema to disk
+                        if let Err(e) = crate::sync::write_schema_file(
+                            &directory,
+                            schema_json,
+                            written_schemas.as_ref(),
+                        )
+                        .await
+                        {
+                            warn!("MQTT: Failed to write schema file: {}", e);
+                        }
+
+                        // Handle new files using MQTT schema
+                        let schema_tuple = (schema.clone(), schema_json.clone());
+                        if !push_only {
+                            if let Err(e) = handle_subdir_new_files(
+                                &http_client,
+                                &server,
+                                &fs_root_id,
+                                "", // root directory = empty subdir_path
+                                &directory,
+                                &directory,
+                                &file_states,
+                                use_paths,
+                                push_only,
+                                pull_only,
+                                shared_state_file.as_ref(),
+                                &author,
+                                #[cfg(unix)]
+                                inode_tracker.clone(),
+                                crdt_context.as_ref(),
+                                Some(schema_tuple.clone()),
+                            )
+                            .await
+                            {
+                                warn!("MQTT: Failed to sync new files: {}", e);
+                            }
+                        }
+
+                        // Handle deletions using MQTT schema
+                        if let Err(e) = handle_subdir_schema_cleanup(
+                            &http_client,
+                            &server,
+                            &fs_root_id,
+                            "", // root directory = empty subdir_path
+                            &directory,
+                            &directory,
+                            &file_states,
+                            Some(schema_tuple),
+                        )
+                        .await
+                        {
+                            warn!("MQTT: Failed to cleanup deleted files: {}", e);
+                        }
+
+                        // Ensure CRDT tasks exist for all files
+                        if let Err(e) = ensure_crdt_tasks_for_files(
+                            &http_client,
+                            &server,
+                            &directory,
+                            &file_states,
+                            pull_only,
+                            &author,
+                            ctx,
+                        )
+                        .await
+                        {
+                            warn!("MQTT: Failed to ensure CRDT tasks: {}", e);
+                        }
+
+                        // Update dedup state
+                        last_schema_hash = Some(current_hash);
+                    } else {
+                        debug!("MQTT: Schema unchanged (same hash), skipped processing");
+                    }
+                } else {
+                    trace_log(
+                        "MQTT: Failed to decode schema from CRDT state, falling back to HTTP",
+                    );
+                    debug!("MQTT: Failed to decode schema from CRDT state, falling back to HTTP");
+                    // Fall through to HTTP-based processing
+                    if let Err(e) = handle_schema_change_with_dedup(
+                        &http_client,
+                        &server,
+                        &fs_root_id,
+                        &directory,
+                        &file_states,
+                        true,
+                        use_paths,
+                        &mut last_schema_hash,
+                        &mut last_schema_cid,
+                        push_only,
+                        pull_only,
+                        &author,
+                        #[cfg(unix)]
+                        inode_tracker.clone(),
+                        written_schemas.as_ref(),
+                        shared_state_file.as_ref(),
+                        crdt_context.as_ref(),
+                    )
+                    .await
+                    {
+                        warn!("MQTT: Failed to handle schema change: {}", e);
+                    }
+                }
+            } else {
+                // No CRDT context - use HTTP-based processing (legacy mode)
+                match handle_schema_change_with_dedup(
+                    &http_client,
+                    &server,
+                    &fs_root_id,
+                    &directory,
+                    &file_states,
+                    true, // spawn_tasks: true for runtime schema changes
+                    use_paths,
+                    &mut last_schema_hash,
+                    &mut last_schema_cid,
+                    push_only,
+                    pull_only,
+                    &author,
+                    #[cfg(unix)]
+                    inode_tracker.clone(),
+                    written_schemas.as_ref(),
+                    shared_state_file.as_ref(),
+                    crdt_context.as_ref(),
+                )
+                .await
+                {
+                    Ok(true) => {
+                        debug!("MQTT: Schema change processed successfully (HTTP mode)");
+                        // Update UUID subscriptions in legacy mode
                         sync_uuid_subscriptions(
                             &http_client,
                             &server,
@@ -691,30 +878,12 @@ pub async fn directory_mqtt_task(
                         )
                         .await;
                     }
-
-                    // Still call ensure_crdt_tasks_for_files for files that existed
-                    // before this schema change (they may not have CRDT tasks yet)
-                    if let Some(ref context) = crdt_context {
-                        if let Err(e) = ensure_crdt_tasks_for_files(
-                            &http_client,
-                            &server,
-                            &directory,
-                            &file_states,
-                            pull_only,
-                            &author,
-                            context,
-                        )
-                        .await
-                        {
-                            warn!("MQTT: Failed to ensure CRDT tasks: {}", e);
-                        }
+                    Ok(false) => {
+                        debug!("MQTT: Schema unchanged, skipped processing (HTTP mode)");
                     }
-                }
-                Ok(false) => {
-                    debug!("MQTT: Schema unchanged, skipped processing");
-                }
-                Err(e) => {
-                    warn!("MQTT: Failed to handle schema change: {}", e);
+                    Err(e) => {
+                        warn!("MQTT: Failed to handle schema change: {}", e);
+                    }
                 }
             }
 
@@ -1616,33 +1785,53 @@ pub async fn subdir_mqtt_task(
             );
             let subdir_full_path = directory.join(&subdir_path);
 
-            // Decode schema from MQTT payload to avoid HTTP race condition.
-            // The MQTT payload contains the actual CRDT update - using it directly
-            // ensures we have the correct state for ADD operations.
-            //
-            // NOTE: For DELETE operations, MQTT decode doesn't work reliably because
-            // the delta is applied to a fresh Y.Doc. DELETE has no effect on empty doc.
-            // We handle this by passing None to handle_subdir_schema_cleanup (forces HTTP).
-            //
-            // TODO: Maintain a Y.Doc for schema and apply deltas incrementally.
-            let mqtt_schema = decode_schema_from_mqtt_payload(&msg.payload);
-            if let Some((ref schema, _)) = mqtt_schema {
-                // Log what we decoded
-                let entry_count = if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
-                    root.entries.as_ref().map(|e| e.len()).unwrap_or(0)
+            // Apply MQTT schema update to persistent CRDT state.
+            // This properly handles both ADD and DELETE operations by maintaining
+            // the Y.Doc state across updates. DELETE operations now work correctly
+            // because the delta is applied to the existing doc (which has entries)
+            // rather than a fresh empty doc.
+            let mqtt_schema = if let Some(ref ctx) = crdt_context {
+                // Use persistent state for proper CRDT merging
+                let mut state = ctx.crdt_state.write().await;
+                let result = apply_schema_update_to_state(&mut state.schema, &msg.payload);
+                if let Some((ref schema, _)) = result {
+                    let entry_count = if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
+                        root.entries.as_ref().map(|e| e.len()).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    info!(
+                        "[SANDBOX-TRACE] Applied schema update to persistent state for subdir={} entry_count={}",
+                        subdir_path, entry_count
+                    );
                 } else {
-                    0
-                };
-                info!(
-                    "[SANDBOX-TRACE] Decoded schema from MQTT payload for subdir={} entry_count={} (used for new files)",
-                    subdir_path, entry_count
-                );
+                    debug!(
+                        "Failed to apply schema update for subdir={}, will fetch from HTTP",
+                        subdir_path
+                    );
+                }
+                result
             } else {
-                debug!(
-                    "Failed to decode schema from MQTT payload for subdir={}, will fetch from HTTP",
-                    subdir_path
-                );
-            }
+                // No CRDT context - use stateless decode (may not work for DELETE)
+                let result = decode_schema_from_mqtt_payload(&msg.payload);
+                if let Some((ref schema, _)) = result {
+                    let entry_count = if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
+                        root.entries.as_ref().map(|e| e.len()).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    info!(
+                        "[SANDBOX-TRACE] Decoded schema from MQTT payload for subdir={} entry_count={} (stateless)",
+                        subdir_path, entry_count
+                    );
+                } else {
+                    debug!(
+                        "Failed to decode schema from MQTT payload for subdir={}, will fetch from HTTP",
+                        subdir_path
+                    );
+                }
+                result
+            };
 
             // Use shared helper for edit handling
             handle_subdir_edit(

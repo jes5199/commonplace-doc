@@ -2307,7 +2307,16 @@ pub async fn initialize_crdt_state_from_server_with_pending(
                 Ok(())
             } else {
                 // Server has no state yet (empty document) - that's fine
-                // Still need to process pending edits as they may initialize the doc
+                // CRITICAL: Initialize to empty state so should_queue_edits() doesn't
+                // return NeedsServerInit. Without this, incoming MQTT edits would be
+                // queued forever because yjs_state remains None.
+                {
+                    let mut state = crdt_state.write().await;
+                    let file_state = state.get_or_create_file(filename, node_id);
+                    file_state.initialize_empty();
+                }
+
+                // Still need to process pending edits as they may have arrived during init
                 let pending_edits = {
                     let mut state = crdt_state.write().await;
                     let file_state = state.get_or_create_file(filename, node_id);
@@ -2385,7 +2394,18 @@ pub async fn initialize_crdt_state_from_server_with_pending(
         }
         Ok(None) => {
             // Document doesn't exist on server yet - that's fine
-            debug!("Document {} doesn't exist on server yet", identifier);
+            // CRITICAL: Initialize to empty state so should_queue_edits() doesn't
+            // return NeedsServerInit. Without this, incoming MQTT edits would be
+            // queued forever because yjs_state remains None.
+            {
+                let mut state = crdt_state.write().await;
+                let file_state = state.get_or_create_file(filename, node_id);
+                file_state.initialize_empty();
+            }
+            debug!(
+                "Document {} doesn't exist on server yet, initialized empty",
+                identifier
+            );
             Ok(())
         }
         Err(e) => {
@@ -2393,7 +2413,15 @@ pub async fn initialize_crdt_state_from_server_with_pending(
                 "Failed to fetch HEAD for CRDT initialization of {}: {:?}",
                 filename, e
             );
-            // Don't fail - we can still try to sync, just might have issues
+            // CRITICAL: Initialize to empty state so should_queue_edits() doesn't
+            // return NeedsServerInit. Without this, incoming MQTT edits would be
+            // queued forever because yjs_state remains None.
+            {
+                let mut state = crdt_state.write().await;
+                let file_state = state.get_or_create_file(filename, node_id);
+                file_state.initialize_empty();
+            }
+            // Don't fail - we can still try to sync via MQTT
             Ok(())
         }
     }
@@ -2524,6 +2552,13 @@ pub async fn receive_task_crdt(
         error!("CRDT receive_task: failed to subscribe to {}: {}", topic, e);
         return;
     }
+
+    info!(
+        "[SANDBOX-TRACE] receive_task_crdt SUBSCRIBED file={} uuid={} topic={}",
+        file_path.display(),
+        node_id,
+        topic
+    );
 
     // Mark the receive task as ready and drain any pending edits that arrived
     // between CRDT init and now.
@@ -2691,6 +2726,12 @@ pub async fn receive_task_crdt(
     }
 
     let context = format!("CRDT receive {}", file_path.display());
+
+    info!(
+        "[SANDBOX-TRACE] receive_task_crdt ENTERING_LOOP file={} uuid={}",
+        file_path.display(),
+        node_id
+    );
 
     loop {
         let msg = match recv_broadcast_with_lag(&mut message_rx, &context).await {

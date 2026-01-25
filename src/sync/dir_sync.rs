@@ -7,6 +7,7 @@ use crate::fs::{Entry, FsSchema};
 use crate::sync::client::fetch_head;
 use crate::sync::crdt_merge::parse_edit_message;
 use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
+use crate::sync::file_events::find_owning_document;
 use crate::sync::schema_io::{
     fetch_and_validate_schema, write_nested_schemas, write_schema_file, SCHEMA_FILENAME,
 };
@@ -79,6 +80,118 @@ pub fn decode_schema_from_mqtt_payload(payload: &[u8]) -> Option<(FsSchema, Stri
             }
         }
     }
+
+    // Convert YMap format to FsSchema
+    let schema = ymap_schema::to_fs_schema(&doc);
+
+    // Also serialize back to JSON for writing to local schema file
+    let schema_json = match serde_json::to_string_pretty(&schema) {
+        Ok(j) => j,
+        Err(e) => {
+            debug!("Failed to serialize schema to JSON: {}", e);
+            return None;
+        }
+    };
+
+    Some((schema, schema_json))
+}
+
+/// Apply an MQTT schema update to persistent CRDT state.
+///
+/// Unlike `decode_schema_from_mqtt_payload` which creates a fresh Y.Doc,
+/// this function loads the existing Y.Doc state, applies the delta, and
+/// saves the updated state back. This is critical for DELETE operations
+/// where the delta removes entries - applying a delete to an empty doc
+/// has no effect, but applying it to a doc with the entries works correctly.
+///
+/// # Arguments
+/// * `state` - The persistent CRDT state for this schema document
+/// * `payload` - The raw MQTT payload containing the EditMessage
+///
+/// # Returns
+/// * `Some((FsSchema, String))` - The decoded schema and its JSON representation
+/// * `None` - If decoding fails (caller should fall back to HTTP fetch)
+pub fn apply_schema_update_to_state(
+    state: &mut crate::sync::CrdtPeerState,
+    payload: &[u8],
+) -> Option<(FsSchema, String)> {
+    // Parse the EditMessage JSON
+    let edit_msg = match parse_edit_message(payload) {
+        Ok(m) => m,
+        Err(e) => {
+            debug!("Failed to parse MQTT schema payload: {}", e);
+            return None;
+        }
+    };
+
+    // Decode base64 Yrs update
+    let update_bytes = match STANDARD.decode(&edit_msg.update) {
+        Ok(b) => b,
+        Err(e) => {
+            debug!("Failed to decode base64 schema update: {}", e);
+            return None;
+        }
+    };
+
+    // Load existing Y.Doc from state, or create fresh if none exists.
+    // Since we no longer initialize from local file (see CP-1ual), the first MQTT
+    // message will initialize the state with the server's correct item IDs.
+    // This ensures DELETE operations work correctly.
+    let doc = match state.to_doc() {
+        Ok(d) => {
+            // Log existing entries for debugging
+            let before_schema = ymap_schema::to_fs_schema(&d);
+            let before_count = before_schema
+                .root
+                .as_ref()
+                .and_then(|e| match e {
+                    crate::fs::Entry::Dir(dir) => dir.entries.as_ref().map(|e| e.len()),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            info!(
+                "[CRDT-DEBUG] Loaded existing Y.Doc with {} entries",
+                before_count
+            );
+            d
+        }
+        Err(e) => {
+            info!("[CRDT-DEBUG] Failed to load Y.Doc: {:?}, creating fresh", e);
+            Doc::new()
+        }
+    };
+
+    // Apply the incoming update
+    {
+        let mut txn = doc.transact_mut();
+        match Update::decode_v1(&update_bytes) {
+            Ok(update) => {
+                txn.apply_update(update);
+            }
+            Err(e) => {
+                debug!("Failed to decode Yrs update: {:?}", e);
+                return None;
+            }
+        }
+    }
+
+    // Log entries after update for debugging
+    let after_schema = ymap_schema::to_fs_schema(&doc);
+    let after_count = after_schema
+        .root
+        .as_ref()
+        .and_then(|e| match e {
+            crate::fs::Entry::Dir(dir) => dir.entries.as_ref().map(|e| e.len()),
+            _ => None,
+        })
+        .unwrap_or(0);
+    info!(
+        "[CRDT-DEBUG] After applying update: {} entries",
+        after_count
+    );
+
+    // Save the updated doc back to state
+    state.update_from_doc(&doc);
 
     // Convert YMap format to FsSchema
     let schema = ymap_schema::to_fs_schema(&doc);
@@ -284,56 +397,18 @@ pub async fn handle_subdir_schema_cleanup(
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
     mqtt_schema: Option<(FsSchema, String)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Use provided schema or fetch from server
-    // IMPORTANT: For DELETE operations, MQTT decode produces empty schema (delta applied to
-    // fresh doc). We detect this by checking if MQTT schema is empty but files exist on disk.
-    // In that case, fall back to HTTP which has the authoritative state.
+    // Track whether we're using MQTT schema (authoritative) vs HTTP (may be stale)
+    let using_mqtt_schema = mqtt_schema.is_some();
+
+    // Use provided schema or fetch from server.
+    // When using persistent CRDT state (via apply_schema_update_to_state), DELETE operations
+    // are handled correctly because the delta is applied to the existing doc.
     let (schema, schema_json) = if let Some((s, json)) = mqtt_schema {
-        // Check if MQTT schema is empty
-        let mqtt_entry_count = if let Some(Entry::Dir(ref root)) = s.root {
-            root.entries.as_ref().map(|e| e.len()).unwrap_or(0)
-        } else {
-            0
-        };
-
-        // Check if there are files on disk (excluding hidden/schema files)
-        let has_files_on_disk = if let Ok(mut entries) = tokio::fs::read_dir(subdir_directory).await
-        {
-            let mut found_file = false;
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Ok(name) = entry.file_name().into_string() {
-                    if !name.starts_with('.') && entry.path().is_file() {
-                        found_file = true;
-                        break;
-                    }
-                }
-            }
-            found_file
-        } else {
-            false
-        };
-
-        // If MQTT schema is empty but files exist, this is likely a DELETE operation.
-        // Fall back to HTTP for authoritative state.
-        if mqtt_entry_count == 0 && has_files_on_disk {
-            debug!(
-                "MQTT schema empty but files on disk for subdir {} - falling back to HTTP (DELETE operation)",
-                subdir_path
-            );
-            // Fetch, parse, and validate schema from server
-            let fetched =
-                match fetch_and_validate_schema(client, server, subdir_node_id, true).await {
-                    Some(f) => f,
-                    None => return Ok(()), // Logged inside fetch_and_validate_schema
-                };
-            (fetched.schema, fetched.content)
-        } else {
-            debug!(
-                "Using MQTT-decoded schema for subdir {} cleanup (avoids HTTP race)",
-                subdir_path
-            );
-            (s, json)
-        }
+        debug!(
+            "Using MQTT-decoded schema for subdir {} cleanup (avoids HTTP race)",
+            subdir_path
+        );
+        (s, json)
     } else {
         // Fetch, parse, and validate schema from server
         let fetched = match fetch_and_validate_schema(client, server, subdir_node_id, true).await {
@@ -405,14 +480,16 @@ pub async fn handle_subdir_schema_cleanup(
     if skip_deletions {
         // Don't proceed with deletions, just clean up orphaned directories
     } else {
-        // Convert subdir-relative paths to root-relative paths for comparison with file_states
-        let schema_paths: std::collections::HashSet<String> = subdir_uuid_map
-            .keys()
-            .map(|p| {
+        // Convert MQTT schema entry names to root-relative paths for comparison with file_states.
+        // IMPORTANT: Use schema_entry_names from MQTT (not subdir_uuid_map from HTTP) to avoid
+        // race conditions where HTTP returns stale data with deleted files still present.
+        let schema_paths: std::collections::HashSet<String> = schema_entry_names
+            .iter()
+            .map(|name| {
                 if subdir_path.is_empty() {
-                    p.clone()
+                    name.clone()
                 } else {
-                    format!("{}/{}", subdir_path, p)
+                    format!("{}/{}", subdir_path, name)
                 }
             })
             .collect();
@@ -488,10 +565,16 @@ pub async fn handle_subdir_schema_cleanup(
             let file_path = root_directory.join(path);
 
             // Safety check: don't delete files that were modified very recently (within 10 seconds)
+            // ONLY when using HTTP-fetched schema. When using MQTT schema, the delete is
+            // authoritative and should proceed regardless of local modification time.
+            //
             // This protects against race conditions where we just created a file via CRDT but
             // the server schema hasn't been updated yet. Without this check, the cleanup would
             // see the file isn't in the server schema and delete it prematurely.
-            if file_path.exists() && file_path.is_file() {
+            //
+            // When using_mqtt_schema is true, we trust the MQTT-delivered schema as authoritative
+            // because MQTT messages are delivered in causal order within a topic.
+            if !using_mqtt_schema && file_path.exists() && file_path.is_file() {
                 if let Ok(metadata) = file_path.metadata() {
                     if let Ok(modified) = metadata.modified() {
                         if let Ok(elapsed) = modified.elapsed() {
@@ -504,6 +587,27 @@ pub async fn handle_subdir_schema_cleanup(
                             }
                         }
                     }
+                }
+            }
+
+            // Trace log for debugging
+            {
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/sandbox-trace.log")
+                {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    let pid = std::process::id();
+                    let _ = writeln!(
+                        file,
+                        "[{} pid={}] DELETE file: subdir={}, path={}",
+                        timestamp, pid, subdir_path, path
+                    );
                 }
             }
 
@@ -588,8 +692,11 @@ pub async fn handle_subdir_new_files(
         })
         .collect();
 
-    // Also add files from schema.root.entries that don't have node_id
-    // These files exist in the schema but haven't been assigned UUIDs yet
+    // Also add files from schema.root.entries that aren't in the UUID map yet.
+    // This handles two cases:
+    // 1. Files without node_id (haven't been assigned UUIDs yet)
+    // 2. Files with node_id that were added via MQTT but not yet visible via HTTP
+    //    (race condition where HTTP returns stale data)
     if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
         if let Some(ref entries) = root.entries {
             for (name, entry) in entries {
@@ -597,19 +704,18 @@ pub async fn handle_subdir_new_files(
                     continue; // Skip hidden files/schema
                 }
                 if let crate::fs::Entry::Doc(doc) = entry {
-                    if doc.node_id.is_none() {
-                        // File without node_id - add with None if not already present
-                        let root_relative_path = if subdir_path.is_empty() {
-                            name.clone()
-                        } else {
-                            format!("{}/{}", subdir_path, name)
-                        };
-                        if !schema_paths
-                            .iter()
-                            .any(|(p, _, _)| p == &root_relative_path)
-                        {
-                            schema_paths.push((root_relative_path, name.clone(), None));
-                        }
+                    let root_relative_path = if subdir_path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", subdir_path, name)
+                    };
+                    // Only add if not already in schema_paths (from HTTP uuid_map)
+                    if !schema_paths
+                        .iter()
+                        .any(|(p, _, _)| p == &root_relative_path)
+                    {
+                        // Use node_id from schema if available, otherwise None
+                        schema_paths.push((root_relative_path, name.clone(), doc.node_id.clone()));
                     }
                 }
             }
@@ -705,18 +811,142 @@ pub async fn handle_subdir_new_files(
                 .unwrap_or_else(|| format!("{}:{}", subdir_node_id, root_relative_path))
         };
 
-        // Fetch content from server
-        if let Ok(Some(file_head)) = fetch_head(client, server, &identifier, use_paths).await {
-            // Skip writing if content is empty - the MQTT retained message
-            // will provide the actual content. Writing empty would clobber
-            // content that arrives via MQTT.
-            if file_head.content.is_empty() {
-                debug!(
-                    "Server returned empty content for {}, skipping write (MQTT will handle)",
-                    root_relative_path
-                );
-                continue;
+        // READINESS FIX: If file already exists locally, skip HTTP fetch.
+        // This handles the race where handle_file_created_crdt is processing a new file
+        // while directory_mqtt_task receives the schema update and calls this function.
+        // See: CP-1ual (MQTT_FALLBACK race condition)
+        if file_path.exists() {
+            debug!(
+                "File {} already exists locally, skipping HTTP fetch for subdir sync",
+                root_relative_path
+            );
+
+            // Read local content and start sync tasks
+            if let Some(ctx) = crdt_context {
+                if let Ok(node_uuid) = Uuid::parse_str(&identifier) {
+                    // Check if already registered
+                    {
+                        let states = file_states.read().await;
+                        if states.contains_key(root_relative_path) {
+                            debug!("File {} already registered, skipping", root_relative_path);
+                            continue;
+                        }
+                    }
+
+                    let filename = file_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&identifier)
+                        .to_string();
+
+                    let local_content = tokio::fs::read_to_string(&file_path).await.ok();
+                    let shared_last_content: SharedLastContent =
+                        Arc::new(RwLock::new(local_content.clone()));
+                    let content_hash = compute_content_hash(
+                        local_content.as_ref().map(|s| s.as_bytes()).unwrap_or(b""),
+                    );
+
+                    // Create state
+                    let state = if let Some(sf) = shared_state_file {
+                        Arc::new(RwLock::new(SyncState::for_directory_file(
+                            None, // CID will be updated by CRDT sync
+                            sf.clone(),
+                            root_relative_path.clone(),
+                        )))
+                    } else {
+                        Arc::new(RwLock::new(SyncState::new()))
+                    };
+
+                    // Register file state BEFORE spawning tasks
+                    {
+                        let mut states = file_states.write().await;
+                        if states.contains_key(root_relative_path) {
+                            debug!(
+                                "Race detected: file {} already registered, skipping",
+                                root_relative_path
+                            );
+                            continue;
+                        }
+                        states.insert(
+                            root_relative_path.clone(),
+                            FileSyncState {
+                                relative_path: root_relative_path.clone(),
+                                identifier: identifier.clone(),
+                                state: state.clone(),
+                                task_handles: Vec::new(),
+                                use_paths,
+                                content_hash: Some(content_hash),
+                                crdt_last_content: Some(shared_last_content.clone()),
+                            },
+                        );
+                    }
+
+                    // Load subdirectory state from cache
+                    let subdir_node_uuid = match Uuid::parse_str(subdir_node_id) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            warn!("Invalid subdir_node_id '{}': {}", subdir_node_id, e);
+                            continue;
+                        }
+                    };
+                    let subdir_directory = root_directory.join(subdir_path);
+                    let subdir_state = match ctx
+                        .subdir_cache
+                        .get_or_load(&subdir_directory, subdir_node_uuid)
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(
+                                "Failed to load CRDT state for subdir {}: {}",
+                                subdir_path, e
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Spawn CRDT sync tasks
+                    let handles = spawn_file_sync_tasks_crdt(
+                        ctx.mqtt_client.clone(),
+                        client.clone(),
+                        server.to_string(),
+                        ctx.workspace.clone(),
+                        node_uuid,
+                        file_path.clone(),
+                        subdir_state,
+                        filename,
+                        shared_last_content.clone(),
+                        pull_only,
+                        author.to_string(),
+                        None,
+                        None,
+                    );
+
+                    // Update task handles
+                    {
+                        let mut states = file_states.write().await;
+                        if let Some(file_state) = states.get_mut(root_relative_path) {
+                            file_state.task_handles = handles;
+                        }
+                    }
+
+                    continue; // Skip the rest of the loop iteration
+                }
             }
+            // If no CRDT context or invalid UUID, fall through to existing logic
+        }
+
+        // Fetch content from server
+        let fetch_result = fetch_head(client, server, &identifier, use_paths).await;
+
+        // Track if we have a valid UUID from MQTT schema for fallback when HTTP returns 404
+        let has_mqtt_uuid = node_id.is_some() && crdt_context.is_some();
+
+        if let Ok(Some(file_head)) = fetch_result {
+            // Note: We must NOT skip when content is empty. If we skip, the file
+            // won't be registered in file_states, and subsequent MQTT messages
+            // for the file's UUID will be ignored. Instead, create an empty file
+            // and start sync tasks - the MQTT receive task will handle content updates.
             // Detect if file is binary and decode base64 if needed
             use base64::{engine::general_purpose::STANDARD, Engine};
             let content_info = detect_from_path(&file_path);
@@ -811,12 +1041,40 @@ pub async fn handle_subdir_new_files(
                     let shared_last_content: SharedLastContent =
                         Arc::new(RwLock::new(initial_content));
 
+                    // CRITICAL FIX: Use subdirectory's state from cache, not root's state.
+                    // See comment in MQTT fallback path above for full explanation.
+                    let subdir_node_uuid = match Uuid::parse_str(subdir_node_id) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            warn!(
+                                "Invalid subdir_node_id '{}' for HTTP path: {}",
+                                subdir_node_id, e
+                            );
+                            continue;
+                        }
+                    };
+                    let subdir_directory = root_directory.join(subdir_path);
+                    let subdir_state = match ctx
+                        .subdir_cache
+                        .get_or_load(&subdir_directory, subdir_node_uuid)
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(
+                                "Failed to load CRDT state for subdirectory {} (HTTP path): {}",
+                                subdir_path, e
+                            );
+                            continue;
+                        }
+                    };
+
                     if let Err(e) =
                         crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
                             client,
                             server,
                             node_uuid,
-                            &ctx.crdt_state,
+                            &subdir_state,
                             &filename,
                             &file_path,
                             Some(&ctx.mqtt_client),
@@ -832,7 +1090,7 @@ pub async fn handle_subdir_new_files(
                         );
                     }
 
-                    // State is already registered, spawn tasks
+                    // State is already registered, spawn tasks using subdirectory state
                     // Pass None for file_states since we already registered
                     let handles = spawn_file_sync_tasks_crdt(
                         ctx.mqtt_client.clone(),
@@ -841,7 +1099,7 @@ pub async fn handle_subdir_new_files(
                         ctx.workspace.clone(),
                         node_uuid,
                         file_path.clone(),
-                        ctx.crdt_state.clone(),
+                        subdir_state,
                         filename,
                         shared_last_content.clone(),
                         pull_only,
@@ -897,6 +1155,174 @@ pub async fn handle_subdir_new_files(
                 if let Some(file_state) = states.get_mut(root_relative_path) {
                     file_state.task_handles = task_handles;
                     file_state.crdt_last_content = crdt_last_content;
+                }
+            }
+        } else if has_mqtt_uuid && matches!(fetch_result, Ok(None)) {
+            // MQTT-only fallback: HTTP returned 404 but we have a UUID from MQTT schema.
+            // This happens when a new file is created via MQTT but the server hasn't
+            // processed it yet. Create an empty file and start CRDT tasks - the retained
+            // MQTT content message will be received by the CRDT receive task.
+            //
+            // See: CP-1ual (flaky sync test due to HTTP/MQTT race condition)
+            // Trace log for debugging
+            {
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/sandbox-trace.log")
+                {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    let pid = std::process::id();
+                    let _ = writeln!(
+                        file,
+                        "[{} pid={}] MQTT_FALLBACK create: path={}, uuid={}",
+                        timestamp, pid, root_relative_path, identifier
+                    );
+                }
+            }
+
+            info!(
+                "MQTT fallback: HTTP 404 for {} but have UUID {} from schema, creating empty file for CRDT sync",
+                root_relative_path, identifier
+            );
+
+            // Create empty file
+            tokio::fs::write(&file_path, "").await?;
+            let content_hash = compute_content_hash(b"");
+
+            // Create state with no CID (will be updated when CRDT content arrives)
+            let state = if let Some(sf) = shared_state_file {
+                Arc::new(RwLock::new(SyncState::for_directory_file(
+                    None, // No CID yet
+                    sf.clone(),
+                    root_relative_path.clone(),
+                )))
+            } else {
+                Arc::new(RwLock::new(SyncState::new()))
+            };
+
+            // Register file state before spawning tasks
+            {
+                let mut states = file_states.write().await;
+                if states.contains_key(root_relative_path) {
+                    warn!(
+                        "Race detected: file {} already registered during MQTT fallback, skipping",
+                        root_relative_path
+                    );
+                    continue;
+                }
+                states.insert(
+                    root_relative_path.clone(),
+                    FileSyncState {
+                        relative_path: root_relative_path.clone(),
+                        identifier: identifier.clone(),
+                        state: state.clone(),
+                        task_handles: Vec::new(),
+                        use_paths,
+                        content_hash: Some(content_hash.clone()),
+                        crdt_last_content: None,
+                    },
+                );
+            }
+
+            // Start CRDT sync tasks - we have crdt_context and valid UUID guaranteed by has_mqtt_uuid
+            if let Some(ctx) = crdt_context {
+                if let Ok(node_uuid) = Uuid::parse_str(&identifier) {
+                    let filename = file_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&identifier)
+                        .to_string();
+
+                    // Create shared_last_content with empty content
+                    let shared_last_content: SharedLastContent =
+                        Arc::new(RwLock::new(Some(String::new())));
+
+                    // CRITICAL FIX: Use subdirectory's state from cache, not root's state.
+                    // The root crdt_state has a nil UUID (because fs_root_id="workspace" isn't a UUID).
+                    // When CRDT tasks save to file_path.parent() (the subdirectory), they would
+                    // overwrite the subdirectory's correct state with the root's nil UUID state.
+                    // This breaks delete operations because the Y.js schema gets cleared on load.
+                    let subdir_node_uuid = match Uuid::parse_str(subdir_node_id) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            warn!(
+                                "Invalid subdir_node_id '{}' for MQTT fallback: {}",
+                                subdir_node_id, e
+                            );
+                            continue;
+                        }
+                    };
+                    let subdir_directory = root_directory.join(subdir_path);
+                    let subdir_state = match ctx
+                        .subdir_cache
+                        .get_or_load(&subdir_directory, subdir_node_uuid)
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(
+                                "Failed to load CRDT state for subdirectory {} (MQTT fallback): {}",
+                                subdir_path, e
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Initialize CRDT state from server (will handle empty/404 case)
+                    if let Err(e) =
+                        crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
+                            client,
+                            server,
+                            node_uuid,
+                            &subdir_state,
+                            &filename,
+                            &file_path,
+                            Some(&ctx.mqtt_client),
+                            Some(&ctx.workspace),
+                            Some(author),
+                            Some(&shared_last_content),
+                        )
+                        .await
+                    {
+                        warn!(
+                            "Failed to initialize CRDT state for {} (MQTT fallback): {}",
+                            root_relative_path, e
+                        );
+                    }
+
+                    // Spawn CRDT tasks using subdirectory state
+                    // Pass file_states and relative_path to enable deduplication check
+                    let states_snapshot = file_states.read().await;
+                    let handles = spawn_file_sync_tasks_crdt(
+                        ctx.mqtt_client.clone(),
+                        client.clone(),
+                        server.to_string(),
+                        ctx.workspace.clone(),
+                        node_uuid,
+                        file_path.clone(),
+                        subdir_state,
+                        filename,
+                        shared_last_content.clone(),
+                        pull_only,
+                        author.to_string(),
+                        Some(&*states_snapshot),
+                        Some(root_relative_path),
+                    );
+                    drop(states_snapshot);
+
+                    // Update file state with task handles
+                    {
+                        let mut states = file_states.write().await;
+                        if let Some(file_state) = states.get_mut(root_relative_path) {
+                            file_state.task_handles = handles;
+                            file_state.crdt_last_content = Some(shared_last_content);
+                        }
+                    }
                 }
             }
         }
@@ -1388,12 +1814,49 @@ pub async fn handle_schema_change(
                             let shared_last_content: SharedLastContent =
                                 Arc::new(RwLock::new(initial_content));
 
+                            // CRITICAL FIX: Use the correct directory's state from cache, not root's state.
+                            // For files in subdirectories, we need to load the subdirectory's state.
+                            // See comment in handle_subdir_new_files for full explanation.
+                            let owning_doc = find_owning_document(directory, fs_root_id, path);
+                            let dir_state = if owning_doc.document_id != fs_root_id {
+                                // File is in a subdirectory - load that subdirectory's state from cache
+                                let subdir_node_uuid = match Uuid::parse_str(
+                                    &owning_doc.document_id,
+                                ) {
+                                    Ok(id) => id,
+                                    Err(e) => {
+                                        warn!(
+                                            "Invalid subdir document_id '{}' for handle_schema_change: {}",
+                                            owning_doc.document_id, e
+                                        );
+                                        continue;
+                                    }
+                                };
+                                match ctx
+                                    .subdir_cache
+                                    .get_or_load(&owning_doc.directory, subdir_node_uuid)
+                                    .await
+                                {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to load CRDT state for subdirectory {} in handle_schema_change: {}",
+                                            owning_doc.directory.display(), e
+                                        );
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                // File is in root directory - use root's state
+                                ctx.crdt_state.clone()
+                            };
+
                             if let Err(e) =
                                 crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
                                     client,
                                     server,
                                     node_uuid,
-                                    &ctx.crdt_state,
+                                    &dir_state,
                                     &filename,
                                     &file_path,
                                     Some(&ctx.mqtt_client),
@@ -1418,7 +1881,7 @@ pub async fn handle_schema_change(
                                 ctx.workspace.clone(),
                                 node_uuid,
                                 file_path.clone(),
-                                ctx.crdt_state.clone(),
+                                dir_state,
                                 filename,
                                 shared_last_content.clone(),
                                 pull_only,

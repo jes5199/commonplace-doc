@@ -1209,6 +1209,45 @@ fn wait_for_file_deleted(path: &std::path::Path, timeout: Duration) -> Result<()
     }
 }
 
+/// Wait for a schema file to have a node_id for a specific directory entry.
+///
+/// This ensures the root sync client has completed its initial sync and written
+/// the schema with server-assigned UUIDs before the test proceeds.
+fn wait_for_schema_node_id(
+    schema_path: &std::path::Path,
+    dir_name: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed() > timeout {
+            // Read current schema for error message
+            let current = std::fs::read_to_string(schema_path).unwrap_or_default();
+            return Err(format!(
+                "Timeout waiting for schema {:?} to have node_id for '{}'. Current schema: {}",
+                schema_path, dir_name, current
+            ));
+        }
+        if schema_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(schema_path) {
+                if let Ok(schema) = serde_json::from_str::<serde_json::Value>(&content) {
+                    // Check if root.entries.{dir_name}.node_id exists
+                    if let Some(node_id) = schema
+                        .get("root")
+                        .and_then(|r| r.get("entries"))
+                        .and_then(|e| e.get(dir_name))
+                        .and_then(|d| d.get("node_id"))
+                        .and_then(|n| n.as_str())
+                    {
+                        return Ok(node_id.to_string());
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// CP-s7sx: Test workspace <-> sandbox file sync for create/edit/delete operations.
 ///
 /// Verifies:
@@ -1329,6 +1368,23 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     .expect("Failed to find sandbox directory for sync-test-proc");
 
     eprintln!("Sandbox directory: {:?}", sandbox_dir);
+
+    // Wait for sandbox MQTT subscriptions to be ready.
+    // The sandbox writes a .mqtt-ready marker file after establishing MQTT subscriptions.
+    // This ensures the sandbox is fully ready to receive file sync messages.
+    let ready_marker = sandbox_dir.join(".mqtt-ready");
+    wait_for_file(&ready_marker, None, Duration::from_secs(60))
+        .expect("Sandbox should establish MQTT subscriptions (create .mqtt-ready)");
+
+    // Wait for the workspace's schema to have a node_id for sync-test.
+    // This ensures the root sync client has completed its initial sync and written
+    // the server-assigned UUID to its local .commonplace.json. Without this, the
+    // root sync client won't know that sync-test files belong to the sandbox document.
+    let workspace_schema = workspace_dir.join(".commonplace.json");
+    let sync_test_node_id =
+        wait_for_schema_node_id(&workspace_schema, "sync-test", Duration::from_secs(30))
+            .expect("Workspace schema should have node_id for sync-test");
+    eprintln!("sync-test has node_id: {}", sync_test_node_id);
 
     // === C1-C3: File Creation Propagation ===
 

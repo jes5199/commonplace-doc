@@ -25,7 +25,8 @@ use commonplace_doc::sync::{
     spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file, upload_task,
     wait_for_file_stability, wait_for_uuid_map_ready, write_schema_file, ymap_schema,
     CrdtFileSyncContext, DirEvent, FileEvent, FileSyncState, InodeKey, InodeTracker,
-    ReplaceResponse, ScanOptions, SharedLastContent, SharedStateFile, SyncState, SCHEMA_FILENAME,
+    ReplaceResponse, ScanOptions, SharedLastContent, SharedStateFile, SubdirStateCache, SyncState,
+    SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -131,6 +132,7 @@ struct CrdtEventParams {
     mqtt_client: Arc<MqttClient>,
     workspace: String,
     crdt_state: Arc<RwLock<DirectorySyncState>>,
+    subdir_cache: Arc<SubdirStateCache>,
 }
 
 /// Handle a single directory event by dispatching to the appropriate handler.
@@ -197,10 +199,17 @@ async fn handle_dir_event(
             }
         }
         DirEvent::Modified(path) => {
-            handle_file_modified(
-                client, server, fs_root_id, directory, &path, options, author,
-            )
-            .await;
+            // Skip HTTP schema push when CRDT is enabled - MQTT handles schema propagation
+            // The per-file CRDT tasks handle content updates, not the directory-level handler
+            if crdt_params.is_none() {
+                handle_file_modified(
+                    client, server, fs_root_id, directory, &path, options, author,
+                )
+                .await;
+            }
+            // When CRDT is enabled, file content changes are handled by the per-file CRDT sync tasks
+            // spawned in handle_file_created_crdt. Schema updates are not needed for modifications
+            // since the file entry already exists in the schema.
         }
         DirEvent::Deleted(path) => {
             // Use CRDT path if available
@@ -333,6 +342,7 @@ async fn handle_file_created_crdt(
 
     // Ensure parent directories exist as node-backed directories
     // This handles the case where a file is created in a new subdirectory
+    // Skip HTTP schema push since CRDT/MQTT handles schema propagation
     if let Err(e) = ensure_parent_directories_exist(
         client,
         server,
@@ -342,6 +352,7 @@ async fn handle_file_created_crdt(
         options,
         author,
         written_schemas,
+        true, // skip_http_schema_push: CRDT/MQTT handles schema updates
     )
     .await
     {
@@ -398,7 +409,7 @@ async fn handle_file_created_crdt(
     let is_subdirectory = owning_doc.document_id != fs_root_id;
 
     if is_subdirectory {
-        // Load or create state for the subdirectory
+        // Load or create state for the subdirectory from cache
         let subdir_node_id = match uuid::Uuid::parse_str(&owning_doc.document_id) {
             Ok(id) => id,
             Err(e) => {
@@ -410,38 +421,47 @@ async fn handle_file_created_crdt(
             }
         };
 
-        let mut subdir_state =
-            match DirectorySyncState::load_or_create(&owning_doc.directory, subdir_node_id).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        "Failed to load state for subdirectory {}: {}",
-                        owning_doc.directory.display(),
-                        e
-                    );
-                    return;
-                }
-            };
+        let subdir_state_arc = match crdt
+            .subdir_cache
+            .get_or_load(&owning_doc.directory, subdir_node_id)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "Failed to load state for subdirectory {}: {}",
+                    owning_doc.directory.display(),
+                    e
+                );
+                return;
+            }
+        };
 
         // Check if already tracked in subdirectory state
-        if subdir_state.files.contains_key(&owning_doc.relative_path) {
-            debug!(
-                "File '{}' already in subdirectory CRDT state, skipping",
-                owning_doc.relative_path
-            );
-            return;
+        {
+            let subdir_state = subdir_state_arc.read().await;
+            if subdir_state.files.contains_key(&owning_doc.relative_path) {
+                debug!(
+                    "File '{}' already in subdirectory CRDT state, skipping",
+                    owning_doc.relative_path
+                );
+                return;
+            }
         }
 
         // Create file via CRDT using subdirectory state
-        let result = create_new_file(
-            &crdt.mqtt_client,
-            &crdt.workspace,
-            &mut subdir_state,
-            &owning_doc.relative_path,
-            &content,
-            author,
-        )
-        .await;
+        let result = {
+            let mut subdir_state = subdir_state_arc.write().await;
+            create_new_file(
+                &crdt.mqtt_client,
+                &crdt.workspace,
+                &mut subdir_state,
+                &owning_doc.relative_path,
+                &content,
+                author,
+            )
+            .await
+        };
 
         match result {
             Ok(new_file) => {
@@ -454,91 +474,99 @@ async fn handle_file_created_crdt(
                     new_file.file_cid
                 );
 
-                // Save the subdirectory state (.commonplace-sync.json)
-                if let Err(e) = subdir_state.save(&owning_doc.directory).await {
-                    warn!(
-                        "Failed to save subdirectory state for {}: {}",
-                        owning_doc.directory.display(),
-                        e
-                    );
-                }
+                // Save the subdirectory state and convert schema (requires read lock)
+                {
+                    let subdir_state = subdir_state_arc.read().await;
 
-                // Also write the local schema file (.commonplace.json) so it reflects the new file
-                // Convert the Y.Doc schema to FsSchema and write to disk
-                info!(
-                    "Converting Y.Doc schema for subdirectory {} (dir: {}), yjs_state len: {}",
-                    owning_doc.document_id,
-                    owning_doc.directory.display(),
-                    subdir_state
-                        .schema
-                        .yjs_state
-                        .as_ref()
-                        .map(|s| s.len())
-                        .unwrap_or(0)
-                );
-                match subdir_state.schema.to_doc() {
-                    Ok(doc) => {
-                        let fs_schema = ymap_schema::to_fs_schema(&doc);
-                        let entry_count = fs_schema
-                            .root
-                            .as_ref()
-                            .and_then(|e| match e {
-                                commonplace_doc::fs::Entry::Dir(d) => {
-                                    d.entries.as_ref().map(|e| e.len())
-                                }
-                                _ => None,
-                            })
-                            .unwrap_or(0);
-                        info!(
-                            "Converted Y.Doc to FsSchema for {}: {} entries",
-                            owning_doc.directory.display(),
-                            entry_count
-                        );
-                        match schema_to_json(&fs_schema) {
-                            Ok(schema_json) => {
-                                info!(
-                                    "Serialized schema JSON ({} bytes) for {}",
-                                    schema_json.len(),
-                                    owning_doc.directory.display()
-                                );
-                                match write_schema_file(&owning_doc.directory, &schema_json, None)
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        info!(
-                                            "Successfully wrote local schema for {}",
-                                            owning_doc.directory.display()
-                                        );
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to write local schema for {}: {}",
-                                            owning_doc.directory.display(),
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to serialize schema for {}: {}",
-                                    owning_doc.directory.display(),
-                                    e
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
+                    // Save the subdirectory state (.commonplace-sync.json)
+                    if let Err(e) = subdir_state.save(&owning_doc.directory).await {
                         warn!(
-                            "Failed to convert schema state to Y.Doc for {}: {}",
+                            "Failed to save subdirectory state for {}: {}",
                             owning_doc.directory.display(),
                             e
                         );
                     }
+
+                    // Also write the local schema file (.commonplace.json) so it reflects the new file
+                    // Convert the Y.Doc schema to FsSchema and write to disk
+                    info!(
+                        "Converting Y.Doc schema for subdirectory {} (dir: {}), yjs_state len: {}",
+                        owning_doc.document_id,
+                        owning_doc.directory.display(),
+                        subdir_state
+                            .schema
+                            .yjs_state
+                            .as_ref()
+                            .map(|s| s.len())
+                            .unwrap_or(0)
+                    );
+                    match subdir_state.schema.to_doc() {
+                        Ok(doc) => {
+                            let fs_schema = ymap_schema::to_fs_schema(&doc);
+                            let entry_count = fs_schema
+                                .root
+                                .as_ref()
+                                .and_then(|e| match e {
+                                    commonplace_doc::fs::Entry::Dir(d) => {
+                                        d.entries.as_ref().map(|e| e.len())
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap_or(0);
+                            info!(
+                                "Converted Y.Doc to FsSchema for {}: {} entries",
+                                owning_doc.directory.display(),
+                                entry_count
+                            );
+                            match schema_to_json(&fs_schema) {
+                                Ok(schema_json) => {
+                                    info!(
+                                        "Serialized schema JSON ({} bytes) for {}",
+                                        schema_json.len(),
+                                        owning_doc.directory.display()
+                                    );
+                                    match write_schema_file(
+                                        &owning_doc.directory,
+                                        &schema_json,
+                                        None,
+                                    )
+                                    .await
+                                    {
+                                        Ok(_) => {
+                                            info!(
+                                                "Successfully wrote local schema for {}",
+                                                owning_doc.directory.display()
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to write local schema for {}: {}",
+                                                owning_doc.directory.display(),
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to serialize schema for {}: {}",
+                                        owning_doc.directory.display(),
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to convert schema state to Y.Doc for {}: {}",
+                                owning_doc.directory.display(),
+                                e
+                            );
+                        }
+                    }
                 }
 
-                // Spawn CRDT sync tasks for the new file using a new state Arc
-                let subdir_state_arc = Arc::new(RwLock::new(subdir_state));
+                // Spawn CRDT sync tasks for the new file using the cached state Arc
                 let file_path = path.to_path_buf();
                 let shared_last_content = Arc::new(RwLock::new(Some(content.clone())));
                 // Check for existing tasks before spawning (prevents duplicates)
@@ -681,6 +709,29 @@ async fn handle_file_deleted_crdt(
     author: &str,
     crdt: &CrdtEventParams,
 ) {
+    // Trace log for debugging
+    {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/sandbox-trace.log")
+        {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let pid = std::process::id();
+            let _ = writeln!(
+                file,
+                "[{} pid={}] handle_file_deleted_crdt called: path={}",
+                timestamp,
+                pid,
+                path.display()
+            );
+        }
+    }
+
     // Get filename from path
     let filename = match path.file_name().and_then(|n| n.to_str()) {
         Some(n) => n.to_string(),
@@ -750,7 +801,7 @@ async fn handle_file_deleted_crdt(
     let is_subdirectory = owning_doc.document_id != fs_root_id;
 
     if is_subdirectory {
-        // Load state for the subdirectory
+        // Load state for the subdirectory from cache
         let subdir_node_id = match uuid::Uuid::parse_str(&owning_doc.document_id) {
             Ok(id) => id,
             Err(e) => {
@@ -762,28 +813,88 @@ async fn handle_file_deleted_crdt(
             }
         };
 
-        let mut subdir_state =
-            match DirectorySyncState::load_or_create(&owning_doc.directory, subdir_node_id).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        "Failed to load state for subdirectory {}: {}",
-                        owning_doc.directory.display(),
-                        e
-                    );
-                    return;
-                }
-            };
+        let subdir_state_arc = match crdt
+            .subdir_cache
+            .get_or_load(&owning_doc.directory, subdir_node_id)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "Failed to load state for subdirectory {}: {}",
+                    owning_doc.directory.display(),
+                    e
+                );
+                return;
+            }
+        };
+
+        // Trace log the loaded state
+        {
+            let subdir_state = subdir_state_arc.read().await;
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/sandbox-trace.log")
+            {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let pid = std::process::id();
+                let yjs_state_len = subdir_state
+                    .schema
+                    .yjs_state
+                    .as_ref()
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                let files_count = subdir_state.files.len();
+                let _ = writeln!(
+                    file,
+                    "[{} pid={}] Loaded subdir_state for delete: dir={}, yjs_state_len={}, files_count={}",
+                    timestamp, pid, owning_doc.directory.display(), yjs_state_len, files_count
+                );
+            }
+        }
 
         // Remove file from subdirectory schema via CRDT
-        let result = remove_file_from_schema(
-            &crdt.mqtt_client,
-            &crdt.workspace,
-            &mut subdir_state,
-            &owning_doc.relative_path,
-            author,
-        )
-        .await;
+        let result = {
+            let mut subdir_state = subdir_state_arc.write().await;
+            remove_file_from_schema(
+                &crdt.mqtt_client,
+                &crdt.workspace,
+                &mut subdir_state,
+                &owning_doc.relative_path,
+                author,
+            )
+            .await
+        };
+
+        // Trace log the result
+        {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/sandbox-trace.log")
+            {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let pid = std::process::id();
+                let result_str = match &result {
+                    Ok(cid) => format!("OK: cid={}", cid),
+                    Err(e) => format!("ERR: {}", e),
+                };
+                let _ = writeln!(
+                    file,
+                    "[{} pid={}] remove_file_from_schema result: file={}, doc={}, result={}",
+                    timestamp, pid, owning_doc.relative_path, owning_doc.document_id, result_str
+                );
+            }
+        }
 
         match result {
             Ok(cid) => {
@@ -793,12 +904,15 @@ async fn handle_file_deleted_crdt(
                 );
 
                 // Save the subdirectory state
-                if let Err(e) = subdir_state.save(&owning_doc.directory).await {
-                    warn!(
-                        "Failed to save subdirectory state for {}: {}",
-                        owning_doc.directory.display(),
-                        e
-                    );
+                {
+                    let subdir_state = subdir_state_arc.read().await;
+                    if let Err(e) = subdir_state.save(&owning_doc.directory).await {
+                        warn!(
+                            "Failed to save subdirectory state for {}: {}",
+                            owning_doc.directory.display(),
+                            e
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -2184,10 +2298,12 @@ async fn run_directory_mode(
             .await
             .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
     ));
+    let subdir_cache = Arc::new(SubdirStateCache::new());
     let crdt_context = Some(CrdtFileSyncContext {
         mqtt_client: mqtt_client.clone(),
         workspace: workspace.clone(),
         crdt_state: crdt_state.clone(),
+        subdir_cache: subdir_cache.clone(),
     });
 
     // Start subscription task for fs-root (skip if push-only)
@@ -2378,6 +2494,7 @@ async fn run_directory_mode(
             mqtt_client: mqtt_client.clone(),
             workspace: workspace.clone(),
             crdt_state: crdt_state.clone(),
+            subdir_cache: subdir_cache.clone(),
         };
         async move {
             while let Some(event) = dir_rx.recv().await {
@@ -2782,10 +2899,12 @@ async fn run_exec_mode(
             .await
             .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
     ));
+    let subdir_cache = Arc::new(SubdirStateCache::new());
     let crdt_context = Some(CrdtFileSyncContext {
         mqtt_client: mqtt_client.clone(),
         workspace: workspace.clone(),
         crdt_state: crdt_state.clone(),
+        subdir_cache: subdir_cache.clone(),
     });
 
     // Start subscription task for fs-root (skip if push-only)
@@ -2974,6 +3093,7 @@ async fn run_exec_mode(
             mqtt_client: mqtt_client.clone(),
             workspace: workspace.clone(),
             crdt_state: crdt_state.clone(),
+            subdir_cache: subdir_cache.clone(),
         };
         async move {
             while let Some(event) = dir_rx.recv().await {

@@ -329,6 +329,29 @@ async fn edit_doc(
     Path(id): Path<String>,
     Json(req): Json<DocEditRequest>,
 ) -> Result<Json<DocEditResponse>, ServiceError> {
+    // Trace log for debugging HTTP edits
+    {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/sandbox-trace.log")
+        {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let pid = std::process::id();
+            let _ = writeln!(
+                file,
+                "[{} pid={}] HTTP edit_doc: doc_id={}, update_len={}",
+                timestamp,
+                pid,
+                id,
+                req.update.len()
+            );
+        }
+    }
     let result = state
         .service
         .edit_document(&id, &req.update, req.author, req.message)

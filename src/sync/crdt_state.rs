@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
+use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
 use yrs::updates::decoder::Decode;
@@ -172,6 +174,18 @@ impl CrdtPeerState {
             server_cid,
             server_state_b64.len()
         );
+    }
+
+    /// Initialize with an empty Y.Doc state.
+    ///
+    /// This marks the state as "initialized" but with no content.
+    /// Used when the server has no state yet (empty document) so that
+    /// incoming MQTT edits are processed normally instead of being queued
+    /// waiting for server initialization.
+    pub fn initialize_empty(&mut self) {
+        let doc = Doc::new();
+        self.update_from_doc(&doc);
+        debug!("Initialized CRDT state as empty for node {}", self.node_id);
     }
 
     /// Check if this state needs initialization from server.
@@ -387,6 +401,30 @@ impl DirectorySyncState {
         let path = Self::state_file_path(directory);
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // Trace log for debugging
+        {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/sandbox-trace.log")
+            {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let pid = std::process::id();
+                let yjs_state_len = self.schema.yjs_state.as_ref().map(|s| s.len()).unwrap_or(0);
+                let files_count = self.files.len();
+                let _ = writeln!(
+                    file,
+                    "[{} pid={}] DirectorySyncState::save: dir={}, yjs_state_len={}, files_count={}, node_id={}",
+                    timestamp, pid, directory.display(), yjs_state_len, files_count, self.schema.node_id
+                );
+            }
+        }
+
         fs::write(&path, content).await
     }
 
@@ -403,6 +441,35 @@ impl DirectorySyncState {
     pub async fn load_or_create(directory: &Path, schema_node_id: Uuid) -> io::Result<Self> {
         match Self::load(directory).await? {
             Some(mut state) => {
+                // Trace log for debugging
+                {
+                    use std::io::Write;
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/sandbox-trace.log")
+                    {
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0);
+                        let pid = std::process::id();
+                        let yjs_state_len = state
+                            .schema
+                            .yjs_state
+                            .as_ref()
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        let files_count = state.files.len();
+                        let node_id_match = state.schema.node_id == schema_node_id;
+                        let _ = writeln!(
+                            file,
+                            "[{} pid={}] load_or_create LOADED: dir={}, yjs_state_len={}, files_count={}, loaded_node_id={}, expected_node_id={}, match={}",
+                            timestamp, pid, directory.display(), yjs_state_len, files_count, state.schema.node_id, schema_node_id, node_id_match
+                        );
+                    }
+                }
+
                 // Fix corrupted node_id if it doesn't match expected value
                 if state.schema.node_id != schema_node_id {
                     tracing::warn!(
@@ -416,15 +483,19 @@ impl DirectorySyncState {
                     state.schema.head_cid = None;
                     state.schema.local_head_cid = None;
 
-                    // Try to initialize Y.Doc from existing .commonplace.json
-                    Self::initialize_schema_from_local_file(&mut state, directory).await;
+                    // NOTE: We no longer initialize from local file here.
+                    // This was causing Y.Doc client ID mismatches that broke DELETE operations.
+                    // The first MQTT retained message will initialize the state with correct IDs.
+                    // See CP-1ual for details.
                 }
                 Ok(state)
             }
             None => {
-                let mut state = Self::new(schema_node_id);
-                // Try to initialize Y.Doc from existing .commonplace.json
-                Self::initialize_schema_from_local_file(&mut state, directory).await;
+                let state = Self::new(schema_node_id);
+                // NOTE: We no longer initialize from local file here.
+                // This was causing Y.Doc client ID mismatches that broke DELETE operations.
+                // The first MQTT retained message will initialize the state with correct IDs.
+                // See CP-1ual for details.
                 Ok(state)
             }
         }
@@ -572,6 +643,77 @@ pub async fn load_or_migrate(
 
     // No existing state, create new
     Ok(DirectorySyncState::new(schema_node_id))
+}
+
+/// Cache for subdirectory CRDT states to prevent race conditions.
+///
+/// Without this cache, multiple code paths could load DirectorySyncState
+/// independently for the same directory, leading to race conditions where
+/// one path's changes are overwritten by another's stale state.
+pub struct SubdirStateCache {
+    cache: std::sync::RwLock<HashMap<PathBuf, Arc<RwLock<DirectorySyncState>>>>,
+}
+
+impl SubdirStateCache {
+    pub fn new() -> Self {
+        Self {
+            cache: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Get or create a DirectorySyncState for a subdirectory.
+    ///
+    /// If the state is already cached, returns the existing instance.
+    /// Otherwise, loads from disk (or creates new) and caches it.
+    pub async fn get_or_load(
+        &self,
+        directory: &Path,
+        schema_node_id: Uuid,
+    ) -> io::Result<Arc<RwLock<DirectorySyncState>>> {
+        // First check if cached (read lock)
+        {
+            let cache = self.cache.read().unwrap();
+            if let Some(state) = cache.get(directory) {
+                return Ok(state.clone());
+            }
+        }
+
+        // Double-check with read lock before loading
+        // (Another thread may have loaded while we released the first read lock)
+        {
+            let cache = self.cache.read().unwrap();
+            if let Some(state) = cache.get(directory) {
+                return Ok(state.clone());
+            }
+        }
+        // Read lock released here before async operation
+
+        // Load from disk (no lock held during async I/O)
+        let state = DirectorySyncState::load_or_create(directory, schema_node_id).await?;
+        let arc_state = Arc::new(RwLock::new(state));
+
+        // Insert into cache (acquire write lock again)
+        // Another thread might have inserted while we were loading, so check again
+        let mut cache = self.cache.write().unwrap();
+        if let Some(existing) = cache.get(directory) {
+            // Another thread loaded it while we were loading - use theirs
+            return Ok(existing.clone());
+        }
+        cache.insert(directory.to_path_buf(), arc_state.clone());
+        Ok(arc_state)
+    }
+
+    /// Remove a subdirectory state from cache (e.g., when directory is deleted).
+    pub fn remove(&self, directory: &Path) {
+        let mut cache = self.cache.write().unwrap();
+        cache.remove(directory);
+    }
+}
+
+impl Default for SubdirStateCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]

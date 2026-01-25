@@ -84,6 +84,29 @@ impl MqttClient {
 
     /// Publish a message to a topic.
     pub async fn publish(&self, topic: &str, payload: &[u8], qos: QoS) -> Result<(), MqttError> {
+        // Trace log for debugging
+        {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/sandbox-trace.log")
+            {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let pid = std::process::id();
+                let _ = writeln!(
+                    file,
+                    "[{} pid={}] MQTT publish (non-retained): topic={}, payload_len={}",
+                    timestamp,
+                    pid,
+                    topic,
+                    payload.len()
+                );
+            }
+        }
         self.client
             .publish(topic, qos, false, payload)
             .await
@@ -102,6 +125,29 @@ impl MqttClient {
         payload: &[u8],
         qos: QoS,
     ) -> Result<(), MqttError> {
+        // Trace log for debugging
+        {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/sandbox-trace.log")
+            {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let pid = std::process::id();
+                let _ = writeln!(
+                    file,
+                    "[{} pid={}] MQTT publish_retained: topic={}, payload_len={}",
+                    timestamp,
+                    pid,
+                    topic,
+                    payload.len()
+                );
+            }
+        }
         self.client
             .publish(topic, qos, true, payload)
             .await

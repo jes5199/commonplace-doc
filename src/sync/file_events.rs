@@ -155,6 +155,11 @@ pub fn find_owning_document(
 ///
 /// Returns the deepest directory's node_id (the one that will own the file),
 /// or the fs_root_id if the file is in the root directory.
+///
+/// When `skip_http_schema_push` is true, schema updates are written locally
+/// but NOT pushed to the server via HTTP. This is used when CRDT/MQTT sync
+/// is enabled, as the MQTT path handles schema propagation and HTTP pushes
+/// would cause conflicting updates from the server.
 #[allow(clippy::too_many_arguments)]
 pub async fn ensure_parent_directories_exist(
     client: &Client,
@@ -165,6 +170,7 @@ pub async fn ensure_parent_directories_exist(
     options: &ScanOptions,
     author: &str,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
+    skip_http_schema_push: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(
         "ensure_parent_directories_exist called for: {}",
@@ -266,12 +272,19 @@ pub async fn ensure_parent_directories_exist(
                     warn!("Failed to write local schema for '{}': {}", dir_name, e);
                 }
 
-                // Push to server
-                if let Err(e) =
-                    push_schema_to_server(client, server, &current_parent_id, &updated_json, author)
-                        .await
-                {
-                    warn!("Failed to push parent schema for '{}': {}", dir_name, e);
+                // Push to server (skip when CRDT/MQTT sync handles schema propagation)
+                if !skip_http_schema_push {
+                    if let Err(e) = push_schema_to_server(
+                        client,
+                        server,
+                        &current_parent_id,
+                        &updated_json,
+                        author,
+                    )
+                    .await
+                    {
+                        warn!("Failed to push parent schema for '{}': {}", dir_name, e);
+                    }
                 }
             }
 
@@ -301,11 +314,14 @@ pub async fn ensure_parent_directories_exist(
                     warn!("Failed to write subdir schema for '{}': {}", dir_name, e);
                 }
 
-                // Push empty schema to server for the new directory
-                if let Err(e) =
-                    push_schema_to_server(client, server, &new_node_id, &schema_str, author).await
-                {
-                    warn!("Failed to push subdir schema for '{}': {}", dir_name, e);
+                // Push empty schema to server for the new directory (skip when CRDT/MQTT sync handles this)
+                if !skip_http_schema_push {
+                    if let Err(e) =
+                        push_schema_to_server(client, server, &new_node_id, &schema_str, author)
+                            .await
+                    {
+                        warn!("Failed to push subdir schema for '{}': {}", dir_name, e);
+                    }
                 }
             } else {
                 debug!(
@@ -405,6 +421,7 @@ pub async fn handle_file_created(
         options,
         author,
         written_schemas,
+        false, // skip_http_schema_push: HTTP path needs to push schema
     )
     .await
     {

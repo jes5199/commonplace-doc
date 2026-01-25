@@ -347,3 +347,42 @@ Request inline code review comments from GitHub Codex bot:
 **CRITICAL: DO NOT MERGE UNTIL CODEX REVIEW SAYS IT IS ALL CLEAR**
 
 P1 issues are blocking and MUST be fixed before merging. If a P1 is found after merge, immediately create a bead to track the fix.
+
+## Subagent Development Pattern
+
+For complex debugging or implementation tasks, use specialized subagents via the Task tool. This pattern has proven highly effective for this codebase.
+
+### When to Use Subagents
+
+- **Exploration**: Use `subagent_type=Explore` to investigate codebase structure, find all call sites, trace data flow
+- **Implementation**: Use `subagent_type=general-purpose` for focused coding tasks with clear specifications
+- **Parallel work**: Launch multiple subagents simultaneously for independent tasks
+
+### Pattern for Debugging
+
+1. **Investigate** with Explore agent:
+   ```
+   Task(subagent_type=Explore, prompt="Find all places where X is called and identify the race condition...")
+   ```
+
+2. **Implement fix** with general-purpose agent:
+   ```
+   Task(subagent_type=general-purpose, prompt="Implement Y to fix Z. Here's the spec: ...")
+   ```
+
+3. **Test** in the main conversation or with another agent
+
+### Example: Race Condition Fix
+
+The `SubdirStateCache` fix was developed using this pattern:
+
+1. **Explore agent** identified 8 different code paths calling `DirectorySyncState::load_or_create()` independently, causing race conditions
+2. **General-purpose agent** implemented the cache solution with full specification
+3. **Main conversation** ran tests to verify
+
+### Tips
+
+- Give subagents **detailed context** - they don't see the full conversation
+- Include **specific file paths** and line numbers when known
+- For implementation tasks, provide **code snippets** showing the expected structure
+- Request subagents to **run builds** to verify their changes compile
