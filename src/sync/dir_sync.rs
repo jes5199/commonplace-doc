@@ -285,12 +285,55 @@ pub async fn handle_subdir_schema_cleanup(
     mqtt_schema: Option<(FsSchema, String)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Use provided schema or fetch from server
+    // IMPORTANT: For DELETE operations, MQTT decode produces empty schema (delta applied to
+    // fresh doc). We detect this by checking if MQTT schema is empty but files exist on disk.
+    // In that case, fall back to HTTP which has the authoritative state.
     let (schema, schema_json) = if let Some((s, json)) = mqtt_schema {
-        debug!(
-            "Using MQTT-decoded schema for subdir {} cleanup (avoids HTTP race)",
-            subdir_path
-        );
-        (s, json)
+        // Check if MQTT schema is empty
+        let mqtt_entry_count = if let Some(Entry::Dir(ref root)) = s.root {
+            root.entries.as_ref().map(|e| e.len()).unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Check if there are files on disk (excluding hidden/schema files)
+        let has_files_on_disk = if let Ok(mut entries) = tokio::fs::read_dir(subdir_directory).await
+        {
+            let mut found_file = false;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Ok(name) = entry.file_name().into_string() {
+                    if !name.starts_with('.') && entry.path().is_file() {
+                        found_file = true;
+                        break;
+                    }
+                }
+            }
+            found_file
+        } else {
+            false
+        };
+
+        // If MQTT schema is empty but files exist, this is likely a DELETE operation.
+        // Fall back to HTTP for authoritative state.
+        if mqtt_entry_count == 0 && has_files_on_disk {
+            debug!(
+                "MQTT schema empty but files on disk for subdir {} - falling back to HTTP (DELETE operation)",
+                subdir_path
+            );
+            // Fetch, parse, and validate schema from server
+            let fetched =
+                match fetch_and_validate_schema(client, server, subdir_node_id, true).await {
+                    Some(f) => f,
+                    None => return Ok(()), // Logged inside fetch_and_validate_schema
+                };
+            (fetched.schema, fetched.content)
+        } else {
+            debug!(
+                "Using MQTT-decoded schema for subdir {} cleanup (avoids HTTP race)",
+                subdir_path
+            );
+            (s, json)
+        }
     } else {
         // Fetch, parse, and validate schema from server
         let fetched = match fetch_and_validate_schema(client, server, subdir_node_id, true).await {
@@ -304,6 +347,20 @@ pub async fn handle_subdir_schema_cleanup(
     if let Err(e) = write_schema_file(subdir_directory, &schema_json, None).await {
         warn!("Failed to write subdir schema file: {}", e);
     }
+
+    // Extract filenames from the MQTT/local schema for deletion checks.
+    // This is critical: we must use the schema we received (which reflects the delete)
+    // rather than fetching from HTTP which may still have the old state due to race conditions.
+    let schema_entry_names: std::collections::HashSet<String> =
+        if let Some(Entry::Dir(root_dir)) = &schema.root {
+            if let Some(ref entries) = root_dir.entries {
+                entries.keys().cloned().collect()
+            } else {
+                std::collections::HashSet::new()
+            }
+        } else {
+            std::collections::HashSet::new()
+        };
 
     // Check if schema has any entries at all
     // If schema has entries but UUID map is empty, something is wrong (e.g., docs awaiting node_id)
@@ -324,17 +381,20 @@ pub async fn handle_subdir_schema_cleanup(
 
     // Safety checks for deletion:
     // 1. If ANY fetch failed → map may be incomplete, skip deletions
-    // 2. If schema has entries but UUID map is empty → entries may be waiting for node_id
-    //    assignment by the reconciler, skip deletions during this race window
+    // 2. If schema has entries but BOTH UUID map AND schema_entry_names are empty → something is wrong
+    //    (Note: schema_entry_names includes all entries, UUID map only those with node_id.
+    //    Files without node_id are valid and should not cause deletion skip.)
     let skip_deletions = if !all_fetches_succeeded {
         debug!(
             "Subdir {} had fetch failures during UUID map building - skipping file deletion to avoid data loss",
             subdir_path
         );
         true
-    } else if schema_has_entries && subdir_uuid_map.is_empty() {
+    } else if schema_has_entries && subdir_uuid_map.is_empty() && schema_entry_names.is_empty() {
+        // Only skip if both sources are empty - this indicates a potential race condition
+        // where entries exist but couldn't be extracted from either source
         debug!(
-            "Subdir {} schema has entries but UUID map is empty - entries may be awaiting node_id, skipping deletions",
+            "Subdir {} schema has entries but both UUID map and entry names are empty - potential race, skipping deletions",
             subdir_path
         );
         true
@@ -345,10 +405,6 @@ pub async fn handle_subdir_schema_cleanup(
     if skip_deletions {
         // Don't proceed with deletions, just clean up orphaned directories
     } else {
-        // Collect schema-relative paths (filenames in this subdir's schema)
-        let schema_filenames: std::collections::HashSet<String> =
-            subdir_uuid_map.keys().cloned().collect();
-
         // Convert subdir-relative paths to root-relative paths for comparison with file_states
         let schema_paths: std::collections::HashSet<String> = subdir_uuid_map
             .keys()
@@ -383,6 +439,10 @@ pub async fn handle_subdir_schema_cleanup(
         // This is critical for sandbox sync: files may exist on disk (written via MQTT)
         // but not be tracked in file_states. Without this disk scan, such files would
         // never be deleted when removed from the schema.
+        //
+        // IMPORTANT: Use schema_entry_names (derived from the MQTT/local schema we received)
+        // rather than schema_filenames (derived from HTTP UUID map). The MQTT schema reflects
+        // the actual delete, while HTTP may still have stale data due to race conditions.
         let disk_deleted_paths: Vec<String> = {
             let mut paths = Vec::new();
             if let Ok(mut entries) = tokio::fs::read_dir(subdir_directory).await {
@@ -399,10 +459,11 @@ pub async fn handle_subdir_schema_cleanup(
                     if filename.starts_with('.') {
                         continue;
                     }
-                    // If this file is not in the schema, mark for deletion
-                    if !schema_filenames.contains(&filename) {
+                    // If this file is not in the MQTT schema, mark for deletion
+                    // Use schema_entry_names from the MQTT payload, not HTTP-fetched schema_filenames
+                    if !schema_entry_names.contains(&filename) {
                         let full_path = if subdir_path.is_empty() {
-                            filename
+                            filename.clone()
                         } else {
                             format!("{}/{}", subdir_path, filename)
                         };
@@ -492,26 +553,30 @@ pub async fn handle_subdir_new_files(
     author: &str,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     crdt_context: Option<&CrdtFileSyncContext>,
+    mqtt_schema: Option<(crate::fs::FsSchema, String)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Don't pull if push_only mode
     if push_only {
         return Ok(());
     }
 
-    // Fetch and parse schema from server (validation only, no root check needed)
-    if fetch_and_validate_schema(client, server, subdir_node_id, false)
-        .await
-        .is_none()
-    {
-        return Ok(()); // Logged inside fetch_and_validate_schema
-    }
+    // Use MQTT schema if provided, otherwise fetch from HTTP
+    let schema = if let Some((schema, _content)) = mqtt_schema {
+        schema
+    } else {
+        // Fetch and parse schema from server (validation only, no root check needed)
+        match fetch_and_validate_schema(client, server, subdir_node_id, false).await {
+            Some(fetched) => fetched.schema,
+            None => return Ok(()), // Logged inside fetch_and_validate_schema
+        }
+    };
 
-    // Build UUID map for the subdirectory
+    // Build UUID map for the subdirectory (for files with explicit node_id)
     let subdir_uuid_map = build_uuid_map_recursive(client, server, subdir_node_id).await;
 
-    // Convert to path -> (subdir_relative_path, node_id) pairs
+    // Convert to path -> (root_relative_path, subdir_relative_path, Option<node_id>) tuples
     // We need the subdir-relative path for API calls but root-relative path for file_states
-    let schema_paths: Vec<(String, String, String)> = subdir_uuid_map
+    let mut schema_paths: Vec<(String, String, Option<String>)> = subdir_uuid_map
         .into_iter()
         .map(|(subdir_relative_path, node_id)| {
             let root_relative_path = if subdir_path.is_empty() {
@@ -519,9 +584,37 @@ pub async fn handle_subdir_new_files(
             } else {
                 format!("{}/{}", subdir_path, subdir_relative_path)
             };
-            (root_relative_path, subdir_relative_path, node_id)
+            (root_relative_path, subdir_relative_path, Some(node_id))
         })
         .collect();
+
+    // Also add files from schema.root.entries that don't have node_id
+    // These files exist in the schema but haven't been assigned UUIDs yet
+    if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
+        if let Some(ref entries) = root.entries {
+            for (name, entry) in entries {
+                if name.starts_with('.') {
+                    continue; // Skip hidden files/schema
+                }
+                if let crate::fs::Entry::Doc(doc) = entry {
+                    if doc.node_id.is_none() {
+                        // File without node_id - add with None if not already present
+                        let root_relative_path = if subdir_path.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{}/{}", subdir_path, name)
+                        };
+                        if !schema_paths
+                            .iter()
+                            .any(|(p, _, _)| p == &root_relative_path)
+                        {
+                            schema_paths.push((root_relative_path, name.clone(), None));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Get known paths from file_states
     let known_paths: Vec<String> = {
@@ -603,11 +696,13 @@ pub async fn handle_subdir_new_files(
         }
 
         // When use_paths=true, use path for /files/* API
-        // When use_paths=false, use node_id for /docs/* API
+        // When use_paths=false, use node_id for /docs/* API, or derive from fs_root:path
         let identifier = if use_paths {
             root_relative_path.clone()
         } else {
-            node_id.clone()
+            node_id
+                .clone()
+                .unwrap_or_else(|| format!("{}:{}", subdir_node_id, root_relative_path))
         };
 
         // Fetch content from server
@@ -1072,6 +1167,19 @@ pub async fn handle_schema_change(
     };
     let schema = fetched.schema;
 
+    // Log schema entries for debugging
+    let entry_count = if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
+        root.entries.as_ref().map(|e| e.len()).unwrap_or(0)
+    } else {
+        0
+    };
+    debug!(
+        "handle_schema_change: fs_root={} entry_count={} dir={}",
+        fs_root_id,
+        entry_count,
+        directory.display()
+    );
+
     // Write valid schema to local .commonplace.json file
     if let Err(e) = write_schema_file(directory, &fetched.content, written_schemas).await {
         warn!("Failed to write schema file: {}", e);
@@ -1083,10 +1191,31 @@ pub async fn handle_schema_change(
     let (uuid_map, _all_succeeded) =
         build_uuid_map_and_write_schemas(client, server, fs_root_id, directory, written_schemas)
             .await;
-    let schema_paths: Vec<(String, Option<String>)> = uuid_map
+    let mut schema_paths: Vec<(String, Option<String>)> = uuid_map
         .into_iter()
         .map(|(path, node_id)| (path, Some(node_id)))
         .collect();
+
+    // Also add files from schema.root.entries that don't have node_id
+    // These files exist in the schema but haven't been assigned UUIDs yet (e.g., newly created)
+    // We need to include them so they get created on disk using path-based fetch
+    if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
+        if let Some(ref entries) = root.entries {
+            for (name, entry) in entries {
+                if name.starts_with('.') {
+                    continue; // Skip hidden files/schema
+                }
+                if let crate::fs::Entry::Doc(doc) = entry {
+                    if doc.node_id.is_none() {
+                        // File without node_id - add with None if not already present
+                        if !schema_paths.iter().any(|(p, _)| p == name) {
+                            schema_paths.push((name.clone(), None));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Check for new paths not in our state
     let known_paths: Vec<String> = {
@@ -1380,22 +1509,42 @@ pub async fn handle_schema_change(
         schema_paths.iter().map(|(p, _)| p).collect();
 
     // Build a set of schema filenames for disk scanning (for root directory files)
-    let schema_filenames: std::collections::HashSet<String> = schema_paths
-        .iter()
-        .filter_map(|(p, _)| {
-            // Only include root-level files (no path separator)
-            if !p.contains('/') {
-                Some(p.clone())
+    // IMPORTANT: Derive from schema.root.entries directly, NOT from uuid_map/schema_paths.
+    // The uuid_map only contains files with explicit node_id, but files without node_id
+    // (using path-based identification) are valid and should not be deleted.
+    let schema_filenames: std::collections::HashSet<String> =
+        if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
+            if let Some(ref entries) = root.entries {
+                entries
+                    .keys()
+                    .filter(|k| !k.starts_with('.')) // Skip hidden files/schema
+                    .cloned()
+                    .collect()
             } else {
-                None
+                std::collections::HashSet::new()
             }
-        })
-        .collect();
+        } else {
+            std::collections::HashSet::new()
+        };
 
     // Find files that exist in file_states but not in schema
+    // IMPORTANT: Check both schema_path_set (for files with node_id) AND schema_filenames
+    // (for root-level files without node_id). A file should only be deleted if it's not
+    // in the schema at all.
     let deleted_paths: Vec<String> = known_paths
         .iter()
-        .filter(|p| !schema_path_set.contains(p))
+        .filter(|p| {
+            // Not in uuid_map (schema_path_set)
+            if schema_path_set.contains(p) {
+                return false;
+            }
+            // For root-level files, also check schema_filenames
+            // (which includes files without explicit node_id)
+            if !p.contains('/') && schema_filenames.contains(p.as_str()) {
+                return false;
+            }
+            true
+        })
         .cloned()
         .collect();
 
@@ -1430,6 +1579,11 @@ pub async fn handle_schema_change(
         }
         paths
     };
+
+    debug!(
+        "delete check: schema_filenames={:?} disk_scan={:?} deleted_paths={:?}",
+        schema_filenames, disk_deleted_paths, deleted_paths
+    );
 
     // Combine paths from file_states and disk scan
     let all_deleted_paths: Vec<String> = deleted_paths

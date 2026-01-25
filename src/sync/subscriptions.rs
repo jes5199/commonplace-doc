@@ -68,6 +68,9 @@ pub async fn handle_subdir_edit(
     crdt_context: Option<&CrdtFileSyncContext>,
     mqtt_schema: Option<(FsSchema, String)>,
 ) {
+    // Clone mqtt_schema to pass to new files sync
+    let mqtt_schema_for_new_files = mqtt_schema.clone();
+
     // First, cleanup deleted files and orphaned directories
     match handle_subdir_schema_cleanup(
         client,
@@ -112,6 +115,7 @@ pub async fn handle_subdir_edit(
         #[cfg(unix)]
         inode_tracker,
         crdt_context,
+        mqtt_schema_for_new_files,
     )
     .await
     {
@@ -1614,12 +1618,24 @@ pub async fn subdir_mqtt_task(
 
             // Decode schema from MQTT payload to avoid HTTP race condition.
             // The MQTT payload contains the actual CRDT update - using it directly
-            // ensures we have the correct state even before the server processes it.
+            // ensures we have the correct state for ADD operations.
+            //
+            // NOTE: For DELETE operations, MQTT decode doesn't work reliably because
+            // the delta is applied to a fresh Y.Doc. DELETE has no effect on empty doc.
+            // We handle this by passing None to handle_subdir_schema_cleanup (forces HTTP).
+            //
+            // TODO: Maintain a Y.Doc for schema and apply deltas incrementally.
             let mqtt_schema = decode_schema_from_mqtt_payload(&msg.payload);
-            if mqtt_schema.is_some() {
+            if let Some((ref schema, _)) = mqtt_schema {
+                // Log what we decoded
+                let entry_count = if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
+                    root.entries.as_ref().map(|e| e.len()).unwrap_or(0)
+                } else {
+                    0
+                };
                 info!(
-                    "[SANDBOX-TRACE] Decoded schema from MQTT payload for subdir={} (avoids HTTP race)",
-                    subdir_path
+                    "[SANDBOX-TRACE] Decoded schema from MQTT payload for subdir={} entry_count={} (used for new files)",
+                    subdir_path, entry_count
                 );
             } else {
                 debug!(
