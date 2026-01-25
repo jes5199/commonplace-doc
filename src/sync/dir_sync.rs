@@ -499,15 +499,23 @@ pub async fn handle_subdir_schema_cleanup(
             })
             .collect();
 
-        // Add recursive paths from subdir_uuid_map for nested files in node-backed directories.
-        // The uuid_map keys are relative to subdir, so convert to root-relative paths.
+        // Add ONLY nested paths from subdir_uuid_map (files in node-backed subdirectories).
+        // We skip top-level files because:
+        // 1. They're already covered by schema_entry_names (MQTT-authoritative)
+        // 2. HTTP may be stale after an MQTT delete, so using HTTP paths for top-level
+        //    files would prevent deletions from working correctly
+        // Nested paths (containing "/") are safe because they exist in nested schemas
+        // that schema_entry_names doesn't capture.
         for rel_path in subdir_uuid_map.keys() {
-            let root_relative = if subdir_path.is_empty() {
-                rel_path.clone()
-            } else {
-                format!("{}/{}", subdir_path, rel_path)
-            };
-            schema_paths.insert(root_relative);
+            // Only include paths that are nested (contain a "/" separator)
+            if rel_path.contains('/') {
+                let root_relative = if subdir_path.is_empty() {
+                    rel_path.clone()
+                } else {
+                    format!("{}/{}", subdir_path, rel_path)
+                };
+                schema_paths.insert(root_relative);
+            }
         }
 
         // Find files in file_states that are under this subdir but no longer in schema
