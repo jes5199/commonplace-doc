@@ -93,7 +93,7 @@ pub use schema_io::{
 };
 pub use subscriptions::{
     directory_mqtt_task, directory_sse_task, spawn_subdir_mqtt_task, spawn_subdir_sse_task,
-    subdir_mqtt_task, subdir_sse_task, CrdtFileSyncContext,
+    subdir_mqtt_task, subdir_sse_task, trace_timeline, CrdtFileSyncContext, TimelineMilestone,
 };
 pub use uuid_map::{
     build_uuid_map_and_write_schemas, build_uuid_map_from_doc, build_uuid_map_recursive,

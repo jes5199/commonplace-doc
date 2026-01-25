@@ -22,6 +22,81 @@ fn trace_log(msg: &str) {
     }
 }
 
+/// Timeline milestones for sandbox sync readiness tracing.
+///
+/// These milestones track the ordering of key events during sandbox sync startup.
+/// The expected ordering is:
+/// 1. UUID_READY - when file UUID is known (from schema)
+/// 2. CRDT_INIT_COMPLETE - when CRDT state is initialized from server
+/// 3. TASK_SPAWN - when sync tasks are spawned for a file
+/// 4. EXEC_START - when sandbox exec process starts
+/// 5. FIRST_WRITE - when first file write occurs (optional, only if process writes)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineMilestone {
+    /// File UUID has been resolved from schema
+    UuidReady,
+    /// CRDT state has been initialized from server
+    CrdtInitComplete,
+    /// Sync tasks have been spawned for this file
+    TaskSpawn,
+    /// Sandbox exec process has started
+    ExecStart,
+    /// First write to file has occurred
+    FirstWrite,
+}
+
+impl std::fmt::Display for TimelineMilestone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TimelineMilestone::UuidReady => write!(f, "UUID_READY"),
+            TimelineMilestone::CrdtInitComplete => write!(f, "CRDT_INIT_COMPLETE"),
+            TimelineMilestone::TaskSpawn => write!(f, "TASK_SPAWN"),
+            TimelineMilestone::ExecStart => write!(f, "EXEC_START"),
+            TimelineMilestone::FirstWrite => write!(f, "FIRST_WRITE"),
+        }
+    }
+}
+
+/// Emit a structured timeline trace event.
+///
+/// Format: `[TIMELINE] milestone=<MILESTONE> path=<path> uuid=<uuid> timestamp=<millis>`
+///
+/// These events can be captured in tests to verify ordering of sandbox sync milestones.
+pub fn trace_timeline(milestone: TimelineMilestone, path: &str, uuid: Option<&str>) {
+    use std::fs::OpenOptions;
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let pid = std::process::id();
+
+    let uuid_str = uuid.unwrap_or("-");
+
+    // Log to tracing for normal observation
+    tracing::info!(
+        "[TIMELINE] milestone={} path={} uuid={} timestamp={} pid={}",
+        milestone,
+        path,
+        uuid_str,
+        timestamp,
+        pid
+    );
+
+    // Also write to trace file for test capture
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/sandbox-trace.log")
+    {
+        let _ = writeln!(
+            file,
+            "[TIMELINE] milestone={} path={} uuid={} timestamp={} pid={}",
+            milestone, path, uuid_str, timestamp, pid
+        );
+    }
+}
+
 use crate::events::{recv_broadcast_with_lag, BroadcastRecvResult};
 use crate::fs::FsSchema;
 use crate::mqtt::{MqttClient, Topic};
@@ -31,7 +106,9 @@ use crate::sync::dir_sync::{
     handle_subdir_schema_cleanup,
 };
 use crate::sync::subdir_spawn::{spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport};
-use crate::sync::{encode_node_id, spawn_file_sync_tasks_crdt, FileSyncState, SharedLastContent};
+use crate::sync::{
+    encode_node_id, fetch_head, spawn_file_sync_tasks_crdt, FileSyncState, SharedLastContent,
+};
 use futures::StreamExt;
 use reqwest::{Client, StatusCode};
 use reqwest_eventsource::{Error as SseError, Event as SseEvent, EventSource};
@@ -661,6 +738,21 @@ pub async fn directory_mqtt_task(
                 )
                 .await;
 
+                // Also resync schema CRDT state to recover missed schema updates.
+                // Without this, the local schema Y.Doc can drift from server state,
+                // causing issues with subsequent deltas that reference missing items.
+                if let Some(ref ctx) = crdt_context {
+                    resync_schema_from_server(
+                        &http_client,
+                        &server,
+                        &fs_root_id,
+                        ctx,
+                        &directory,
+                        written_schemas.as_ref(),
+                    )
+                    .await;
+                }
+
                 // Process the next message if available
                 match next_message {
                     Some(m) => m,
@@ -701,6 +793,8 @@ pub async fn directory_mqtt_task(
                 // Apply MQTT delta to persistent CRDT state
                 let mut state = ctx.crdt_state.write().await;
                 let mqtt_schema = apply_schema_update_to_state(&mut state.schema, &msg.payload);
+                // Extract the updated CID before releasing the lock (for ancestry tracking)
+                let updated_cid = state.schema.head_cid.clone();
                 drop(state); // Release lock before doing I/O
 
                 if let Some((ref schema, ref schema_json)) = mqtt_schema {
@@ -803,8 +897,12 @@ pub async fn directory_mqtt_task(
                             warn!("MQTT: Failed to ensure CRDT tasks: {}", e);
                         }
 
-                        // Update dedup state
+                        // Update dedup state (hash and CID for ancestry tracking)
                         last_schema_hash = Some(current_hash);
+                        // Sync last_schema_cid from CRDT state to maintain ancestry checks
+                        if updated_cid.is_some() {
+                            last_schema_cid = updated_cid.clone();
+                        }
                     } else {
                         debug!("MQTT: Schema unchanged (same hash), skipped processing");
                     }
@@ -1539,6 +1637,246 @@ async fn resync_subscribed_files(
     info!("Resync completed for subscribed file UUIDs");
 }
 
+/// Resync schema CRDT state from server after broadcast lag.
+///
+/// When the broadcast channel lags, we may have missed schema CRDT updates.
+/// Without resyncing, the local schema Y.Doc state can drift from the server's
+/// authoritative state, causing issues with subsequent deltas (e.g., delete
+/// operations that reference items we don't have).
+///
+/// This function:
+/// 1. Marks the schema state as needing resync (clears yjs_state)
+/// 2. Fetches the authoritative schema HEAD from server (including Yjs state)
+/// 3. Re-initializes the local CRDT state with the server's state
+///
+/// # Arguments
+/// * `http_client` - HTTP client for server requests
+/// * `server` - Server base URL
+/// * `fs_root_id` - The fs-root document ID (schema document)
+/// * `crdt_context` - CRDT context containing the schema state to resync
+/// * `directory` - Local directory path (for writing schema file)
+/// * `written_schemas` - Schema write tracking for deduplication
+async fn resync_schema_from_server(
+    http_client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    crdt_context: &CrdtFileSyncContext,
+    directory: &Path,
+    written_schemas: Option<&crate::sync::WrittenSchemas>,
+) {
+    warn!(
+        "Resyncing schema CRDT state from server after broadcast lag for {}",
+        fs_root_id
+    );
+
+    // Step 1: Mark schema state as needing resync
+    {
+        let mut state_guard = crdt_context.crdt_state.write().await;
+        state_guard.schema.mark_needs_resync();
+        debug!(
+            "Marked schema {} as needing resync - cleared CRDT state",
+            fs_root_id
+        );
+    }
+
+    // Step 2: Fetch authoritative schema HEAD from server
+    let head = match fetch_head(http_client, server, &encode_node_id(fs_root_id), false).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            warn!(
+                "Schema resync: Document {} not found on server, skipping",
+                fs_root_id
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                "Schema resync: Failed to fetch HEAD for {}: {}",
+                fs_root_id, e
+            );
+            return;
+        }
+    };
+
+    // Step 3: Re-initialize CRDT state with server's Yjs state
+    if let Some(ref server_state) = head.state {
+        let cid = head.cid.as_deref().unwrap_or("unknown");
+        {
+            let mut state_guard = crdt_context.crdt_state.write().await;
+            state_guard.schema.initialize_from_server(server_state, cid);
+            info!(
+                "Schema resync: Re-initialized CRDT state from server for {} at cid={}",
+                fs_root_id, cid
+            );
+        }
+    } else {
+        // Server has no Yjs state - initialize as empty
+        {
+            let mut state_guard = crdt_context.crdt_state.write().await;
+            state_guard.schema.initialize_empty();
+            info!(
+                "Schema resync: Initialized empty CRDT state for {} (server has no state)",
+                fs_root_id
+            );
+        }
+    }
+
+    // Step 4: Also write the schema content to disk to ensure consistency
+    if !head.content.is_empty() {
+        if let Err(e) =
+            crate::sync::write_schema_file(directory, &head.content, written_schemas).await
+        {
+            warn!(
+                "Schema resync: Failed to write schema file for {}: {}",
+                fs_root_id, e
+            );
+        } else {
+            debug!(
+                "Schema resync: Wrote schema file to {}",
+                directory.display()
+            );
+        }
+    }
+
+    info!("Schema resync completed for {}", fs_root_id);
+}
+
+/// Resync subdirectory schema CRDT state from server after broadcast lag.
+///
+/// Similar to `resync_schema_from_server` but operates on the subdirectory's
+/// cached CRDT state (via `subdir_cache`) instead of the root schema state.
+///
+/// # Arguments
+/// * `http_client` - HTTP client for server requests
+/// * `server` - Server base URL
+/// * `subdir_node_id` - The subdirectory's document ID
+/// * `subdir_path` - Relative path to subdirectory
+/// * `crdt_context` - CRDT context containing the subdir state cache
+/// * `directory` - Root local directory path
+async fn resync_subdir_schema_from_server(
+    http_client: &Client,
+    server: &str,
+    subdir_node_id: &str,
+    subdir_path: &str,
+    crdt_context: &CrdtFileSyncContext,
+    directory: &Path,
+) {
+    warn!(
+        "Resyncing subdirectory schema CRDT state from server after broadcast lag for {} ({})",
+        subdir_path, subdir_node_id
+    );
+
+    // Parse subdir_node_id as UUID for cache lookup
+    let subdir_uuid = match Uuid::parse_str(subdir_node_id) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(
+                "Subdir schema resync: Failed to parse subdir_node_id {} as UUID: {}, skipping",
+                subdir_node_id, e
+            );
+            return;
+        }
+    };
+
+    let subdir_full_path = directory.join(subdir_path);
+
+    // Step 1: Get or load the subdirectory's cached state and mark as needing resync
+    {
+        match crdt_context
+            .subdir_cache
+            .get_or_load(&subdir_full_path, subdir_uuid)
+            .await
+        {
+            Ok(subdir_state) => {
+                let mut state = subdir_state.write().await;
+                state.schema.mark_needs_resync();
+                debug!(
+                    "Marked subdir schema {} as needing resync - cleared CRDT state",
+                    subdir_node_id
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Subdir schema resync: Failed to load cached state for {}: {}",
+                    subdir_path, e
+                );
+                return;
+            }
+        }
+    }
+
+    // Step 2: Fetch authoritative schema HEAD from server
+    let head = match fetch_head(http_client, server, &encode_node_id(subdir_node_id), false).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            warn!(
+                "Subdir schema resync: Document {} not found on server, skipping",
+                subdir_node_id
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                "Subdir schema resync: Failed to fetch HEAD for {}: {}",
+                subdir_node_id, e
+            );
+            return;
+        }
+    };
+
+    // Step 3: Re-initialize CRDT state with server's Yjs state
+    {
+        match crdt_context
+            .subdir_cache
+            .get_or_load(&subdir_full_path, subdir_uuid)
+            .await
+        {
+            Ok(subdir_state) => {
+                let mut state = subdir_state.write().await;
+                if let Some(ref server_state) = head.state {
+                    let cid = head.cid.as_deref().unwrap_or("unknown");
+                    state.schema.initialize_from_server(server_state, cid);
+                    info!(
+                        "Subdir schema resync: Re-initialized CRDT state from server for {} at cid={}",
+                        subdir_path, cid
+                    );
+                } else {
+                    state.schema.initialize_empty();
+                    info!(
+                        "Subdir schema resync: Initialized empty CRDT state for {} (server has no state)",
+                        subdir_path
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Subdir schema resync: Failed to reload cached state for {}: {}",
+                    subdir_path, e
+                );
+                return;
+            }
+        }
+    }
+
+    // Step 4: Write the schema content to disk
+    if !head.content.is_empty() {
+        if let Err(e) = crate::sync::write_schema_file(&subdir_full_path, &head.content, None).await
+        {
+            warn!(
+                "Subdir schema resync: Failed to write schema file for {}: {}",
+                subdir_path, e
+            );
+        } else {
+            debug!(
+                "Subdir schema resync: Wrote schema file to {}",
+                subdir_full_path.display()
+            );
+        }
+    }
+
+    info!("Subdir schema resync completed for {}", subdir_path);
+}
+
 /// Helper to spawn MQTT tasks for subdirectories.
 /// This is separate from subdir_mqtt_task to avoid recursive type issues with tokio::spawn.
 #[allow(clippy::too_many_arguments)]
@@ -1743,6 +2081,20 @@ pub async fn subdir_mqtt_task(
                     &author,
                 )
                 .await;
+
+                // Resync subdirectory schema CRDT state to recover missed schema updates.
+                // Without this, the local subdirectory Y.Doc can drift from server state.
+                if let Some(ref ctx) = crdt_context {
+                    resync_subdir_schema_from_server(
+                        &http_client,
+                        &server,
+                        &subdir_node_id,
+                        &subdir_path,
+                        ctx,
+                        &directory,
+                    )
+                    .await;
+                }
 
                 match next_message {
                     Some(m) => m,

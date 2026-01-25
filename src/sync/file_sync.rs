@@ -17,8 +17,9 @@ use crate::sync::{
     build_edit_url, build_replace_url, create_yjs_text_update, detect_from_path, error::SyncResult,
     file_watcher_task, flock_state::record_upload_result, is_binary_content,
     looks_like_base64_binary, push_json_content, push_jsonl_content, push_schema_to_server,
-    refresh_from_head, sse_task, EditRequest, EditResponse, FileEvent, FlockSyncState,
-    ReplaceResponse, SharedLastContent, SyncState, PENDING_WRITE_TIMEOUT,
+    refresh_from_head, sse_task, trace_timeline, EditRequest, EditResponse, FileEvent,
+    FlockSyncState, ReplaceResponse, SharedLastContent, SyncState, TimelineMilestone,
+    PENDING_WRITE_TIMEOUT,
 };
 use reqwest::Client;
 use rumqttc::QoS;
@@ -2965,6 +2966,14 @@ pub async fn receive_task_crdt(
 
                         match tokio::fs::write(&file_path, &content).await {
                             Ok(()) => {
+                                // Trace FIRST_WRITE milestone for sync readiness timeline
+                                // Note: This traces every write for debugging; the "first" is
+                                // the one that appears first in chronological order
+                                trace_timeline(
+                                    TimelineMilestone::FirstWrite,
+                                    &file_path.display().to_string(),
+                                    Some(&node_id_str),
+                                );
                                 info!(
                                     "[SANDBOX-TRACE] receive_task_crdt DISK_WRITE file={} uuid={} content_len={}",
                                     file_path.display(),

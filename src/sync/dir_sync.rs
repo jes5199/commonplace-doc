@@ -3,6 +3,7 @@
 //! This module contains helper functions for syncing a directory
 //! with a server document, including schema traversal and UUID mapping.
 
+use crate::commit::Commit;
 use crate::fs::{Entry, FsSchema};
 use crate::sync::client::fetch_head;
 use crate::sync::crdt_merge::parse_edit_message;
@@ -192,6 +193,31 @@ pub fn apply_schema_update_to_state(
 
     // Save the updated doc back to state
     state.update_from_doc(&doc);
+
+    // Compute the CID for this edit and update state tracking.
+    // This mirrors the logic in crdt_merge::process_received_edit to ensure
+    // ancestry checks work correctly for CRDT-based schema processing.
+    let commit = Commit::with_timestamp(
+        edit_msg.parents.clone(),
+        edit_msg.update.clone(),
+        edit_msg.author.clone(),
+        edit_msg.message.clone(),
+        edit_msg.timestamp,
+    );
+    let received_cid = commit.calculate_cid();
+
+    // Update head_cid to track what we've received from the server.
+    // Also update local_head_cid if we don't have local changes ahead of this.
+    // This is a simplified fast-forward since schema changes from MQTT are
+    // typically server-authoritative.
+    state.head_cid = Some(received_cid.clone());
+    if state.local_head_cid.is_none() || state.local_head_cid == state.head_cid {
+        state.local_head_cid = Some(received_cid.clone());
+    }
+    debug!(
+        "[CRDT-DEBUG] Updated schema CID tracking: head_cid={}",
+        received_cid
+    );
 
     // Convert YMap format to FsSchema
     let schema = ymap_schema::to_fs_schema(&doc);

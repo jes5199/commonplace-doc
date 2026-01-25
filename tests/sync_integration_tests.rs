@@ -1303,3 +1303,94 @@ fn test_initial_sync_creates_documents_before_schema() {
         nested_file_entry
     );
 }
+
+/// CP-29n3.1: Test timeline milestone ordering assertions.
+///
+/// This test validates that the TimelineMilestone enum has the correct ordering
+/// for sandbox sync readiness. The expected ordering is:
+///
+/// 1. UUID_READY - when file UUID is known (from schema)
+/// 2. CRDT_INIT_COMPLETE - when CRDT state is initialized from server
+/// 3. TASK_SPAWN - when sync tasks are spawned for a file
+/// 4. EXEC_START - when sandbox exec process starts
+/// 5. FIRST_WRITE - when first file write occurs (optional)
+///
+/// This is a unit test that validates the timeline constants and parsing.
+#[test]
+fn test_timeline_milestone_ordering_invariants() {
+    use commonplace_doc::sync::{trace_timeline, TimelineMilestone};
+    use std::fs;
+    use std::io::{BufRead, BufReader};
+
+    // Clear trace log before test
+    let trace_path = "/tmp/sandbox-trace.log";
+    let _ = fs::remove_file(trace_path);
+
+    // Emit timeline events in correct order
+    trace_timeline(TimelineMilestone::UuidReady, "test.txt", Some("uuid-123"));
+    trace_timeline(
+        TimelineMilestone::CrdtInitComplete,
+        "test.txt",
+        Some("uuid-123"),
+    );
+    trace_timeline(TimelineMilestone::TaskSpawn, "test.txt", Some("uuid-123"));
+    trace_timeline(TimelineMilestone::ExecStart, "test_exec", None);
+    trace_timeline(TimelineMilestone::FirstWrite, "test.txt", Some("uuid-123"));
+
+    // Read and parse the trace log
+    let file = fs::File::open(trace_path).expect("Failed to open trace log");
+    let reader = BufReader::new(file);
+
+    let mut milestones: Vec<(u128, String)> = Vec::new();
+    for line in reader.lines() {
+        let line = line.expect("Failed to read line");
+        if line.contains("[TIMELINE]") {
+            // Parse: [TIMELINE] milestone=X path=Y uuid=Z timestamp=T pid=P
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            let mut milestone = String::new();
+            let mut timestamp: u128 = 0;
+            for part in parts {
+                if let Some(m) = part.strip_prefix("milestone=") {
+                    milestone = m.to_string();
+                }
+                if let Some(t) = part.strip_prefix("timestamp=") {
+                    timestamp = t.parse().unwrap_or(0);
+                }
+            }
+            if !milestone.is_empty() {
+                milestones.push((timestamp, milestone));
+            }
+        }
+    }
+
+    // Verify we captured all 5 milestones
+    assert_eq!(
+        milestones.len(),
+        5,
+        "Expected 5 timeline milestones, got: {:?}",
+        milestones
+    );
+
+    // Verify ordering by milestone name (not timestamp since they may be same)
+    let milestone_names: Vec<&str> = milestones.iter().map(|(_, m)| m.as_str()).collect();
+    assert_eq!(milestone_names[0], "UUID_READY");
+    assert_eq!(milestone_names[1], "CRDT_INIT_COMPLETE");
+    assert_eq!(milestone_names[2], "TASK_SPAWN");
+    assert_eq!(milestone_names[3], "EXEC_START");
+    assert_eq!(milestone_names[4], "FIRST_WRITE");
+
+    // Verify timestamps are non-decreasing (milestones emitted in order)
+    for i in 1..milestones.len() {
+        assert!(
+            milestones[i].0 >= milestones[i - 1].0,
+            "Timestamp ordering violated: {} < {} for milestones {} and {}",
+            milestones[i].0,
+            milestones[i - 1].0,
+            milestones[i].1,
+            milestones[i - 1].1
+        );
+    }
+
+    // Cleanup
+    let _ = fs::remove_file(trace_path);
+}

@@ -27,6 +27,11 @@ pub const STABILITY_CHECK_INTERVAL_MS: u64 = 50;
 /// Maximum time to wait for file stability (5 seconds)
 pub const STABILITY_MAX_WAIT_MS: u64 = 5000;
 
+/// Number of consecutive stable snapshots required before considering file stable.
+/// Requiring multiple checks reduces the risk of reading partial data during
+/// long writes or same-size in-place updates.
+pub const STABILITY_REQUIRED_SNAPSHOTS: u32 = 3;
+
 /// Timeout for acquiring shared lock before reading (500ms)
 /// Short timeout to avoid blocking too long, but enough to wait for quick writes
 pub const FLOCK_READ_TIMEOUT_MS: u64 = 500;
@@ -117,11 +122,12 @@ impl FileSnapshot {
 /// Wait for file content to stabilize by checking size/mtime.
 ///
 /// This function polls the file's metadata (size and modification time) until
-/// it remains unchanged for at least one stability interval (50ms). This ensures
+/// it remains unchanged for multiple consecutive stability intervals. This ensures
 /// that file content is fully written before reading, handling:
 /// - Partial writes where notify fires before content is complete
 /// - Atomic writes with temp files
 /// - Editor save patterns that write in multiple steps
+/// - Same-size in-place updates where mtime changes but size stays constant
 ///
 /// # Arguments
 ///
@@ -131,6 +137,13 @@ impl FileSnapshot {
 ///
 /// * `Ok(())` - File is stable and ready to read
 /// * `Err(&str)` - File disappeared during stability check
+///
+/// # Stability Criteria
+///
+/// The file is considered stable when `STABILITY_REQUIRED_SNAPSHOTS` (3)
+/// consecutive checks show the same size AND modification time, with
+/// `STABILITY_CHECK_INTERVAL_MS` (50ms) between each check. This means
+/// stability requires ~150ms of unchanged metadata.
 ///
 /// # Timeout Behavior
 ///
@@ -147,14 +160,18 @@ pub async fn wait_for_file_stability(path: &PathBuf) -> Result<(), &'static str>
         None => return Err("file disappeared before stability check"),
     };
 
+    // Track consecutive stable snapshots
+    let mut stable_count: u32 = 0;
+
     loop {
         tokio::time::sleep(stability_interval).await;
 
         if start.elapsed() > max_wait {
             // Max wait exceeded, proceed anyway to avoid infinite loop
             debug!(
-                "Stability check timeout for {}, proceeding anyway",
-                path.display()
+                "Stability check timeout for {}, proceeding anyway (stable_count={})",
+                path.display(),
+                stable_count
             );
             return Ok(());
         }
@@ -165,18 +182,37 @@ pub async fn wait_for_file_stability(path: &PathBuf) -> Result<(), &'static str>
         };
 
         if current_snapshot == last_snapshot {
-            // File is stable
-            return Ok(());
+            stable_count += 1;
+            if stable_count >= STABILITY_REQUIRED_SNAPSHOTS {
+                // File is stable after multiple consecutive checks
+                debug!(
+                    "File {} stable after {} consecutive checks",
+                    path.display(),
+                    stable_count
+                );
+                return Ok(());
+            }
+        } else {
+            // File still changing, reset counter and update snapshot
+            if stable_count > 0 {
+                debug!(
+                    "File {} stability reset (size: {} -> {}, had {} stable)",
+                    path.display(),
+                    last_snapshot.size,
+                    current_snapshot.size,
+                    stable_count
+                );
+            } else {
+                debug!(
+                    "File {} still changing (size: {} -> {}), waiting...",
+                    path.display(),
+                    last_snapshot.size,
+                    current_snapshot.size
+                );
+            }
+            stable_count = 0;
+            last_snapshot = current_snapshot;
         }
-
-        // File still changing, update snapshot and continue waiting
-        debug!(
-            "File {} still changing (size: {} -> {}), waiting...",
-            path.display(),
-            last_snapshot.size,
-            current_snapshot.size
-        );
-        last_snapshot = current_snapshot;
     }
 }
 

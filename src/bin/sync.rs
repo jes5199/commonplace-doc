@@ -22,11 +22,11 @@ use commonplace_doc::sync::{
     handle_schema_modified, initial_sync, initialize_crdt_state_from_server_with_pending,
     is_binary_content, push_schema_to_server, remove_file_from_schema,
     scan_directory_with_contents, schema_to_json, spawn_command_listener,
-    spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file, upload_task,
-    wait_for_file_stability, wait_for_uuid_map_ready, write_schema_file, ymap_schema,
+    spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file, trace_timeline,
+    upload_task, wait_for_file_stability, wait_for_uuid_map_ready, write_schema_file, ymap_schema,
     CrdtFileSyncContext, DirEvent, FileEvent, FileSyncState, InodeKey, InodeTracker,
     ReplaceResponse, ScanOptions, SharedLastContent, SharedStateFile, SubdirStateCache, SyncState,
-    SCHEMA_FILENAME,
+    TimelineMilestone, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -980,6 +980,8 @@ async fn fetch_uuid_map_with_logging(
             Ok(map) => {
                 for (path, uuid) in &map {
                     debug!("  UUID map: {} -> {}", path, uuid);
+                    // Trace UUID_READY milestone for each file
+                    trace_timeline(TimelineMilestone::UuidReady, path, Some(uuid));
                 }
                 return map;
             }
@@ -1000,6 +1002,8 @@ async fn fetch_uuid_map_with_logging(
     );
     for (path, uuid) in &map {
         debug!("  UUID map: {} -> {}", path, uuid);
+        // Trace UUID_READY milestone for each file
+        trace_timeline(TimelineMilestone::UuidReady, path, Some(uuid));
     }
     map
 }
@@ -2426,11 +2430,24 @@ async fn run_directory_mode(
                     "Failed to initialize CRDT state for {}: {}",
                     relative_path, e
                 );
+            } else {
+                // Trace CRDT_INIT_COMPLETE milestone (directory mode)
+                trace_timeline(
+                    TimelineMilestone::CrdtInitComplete,
+                    relative_path,
+                    Some(&file_state.identifier),
+                );
             }
             file_state.crdt_last_content = Some(shared_last_content.clone());
             // Note: file_states is None here because we're in the initial setup phase
             // iterating through all files - deduplication not needed since we're
             // creating tasks for files that don't have tasks yet
+            // Trace TASK_SPAWN milestone before spawning tasks (directory mode)
+            trace_timeline(
+                TimelineMilestone::TaskSpawn,
+                relative_path,
+                Some(&file_state.identifier),
+            );
             file_state.task_handles = spawn_file_sync_tasks_crdt(
                 mqtt_client.clone(),
                 client.clone(),
@@ -3025,11 +3042,24 @@ async fn run_exec_mode(
                     "Failed to initialize CRDT state for {}: {}",
                     relative_path, e
                 );
+            } else {
+                // Trace CRDT_INIT_COMPLETE milestone
+                trace_timeline(
+                    TimelineMilestone::CrdtInitComplete,
+                    relative_path,
+                    Some(&file_state.identifier),
+                );
             }
             file_state.crdt_last_content = Some(shared_last_content.clone());
             // Note: file_states is None here because we're in the initial setup phase
             // iterating through all files - deduplication not needed since we're
             // creating tasks for files that don't have tasks yet
+            // Trace TASK_SPAWN milestone before spawning tasks
+            trace_timeline(
+                TimelineMilestone::TaskSpawn,
+                relative_path,
+                Some(&file_state.identifier),
+            );
             file_state.task_handles = spawn_file_sync_tasks_crdt(
                 mqtt_client.clone(),
                 client.clone(),
@@ -3255,6 +3285,9 @@ async fn run_exec_mode(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn command '{}': {}", program, e))?;
+
+    // Trace EXEC_START milestone - exec process has been spawned
+    trace_timeline(TimelineMilestone::ExecStart, &exec_name, None);
 
     // In sandbox mode, emit stdout/stderr as MQTT events and spawn command listener
     if sandbox {
