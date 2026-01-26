@@ -710,6 +710,41 @@ pub async fn directory_mqtt_task(
         debug!("Wrote MQTT readiness marker to {}", ready_marker.display());
     }
 
+    // Bootstrap schema from HTTP before entering MQTT loop.
+    // This ensures we have initial state even if no retained MQTT messages exist
+    // for the directory schema. Without this, files that exist on the server but
+    // not locally would never get CRDT tasks spawned.
+    if let Some(ref ctx) = crdt_context {
+        if !push_only {
+            info!(
+                "Bootstrapping schema from HTTP for {} before MQTT loop",
+                fs_root_id
+            );
+            if let Err(e) = handle_subdir_new_files(
+                &http_client,
+                &server,
+                &fs_root_id,
+                "", // root directory = empty subdir_path
+                &directory,
+                &directory,
+                &file_states,
+                use_paths,
+                push_only,
+                pull_only,
+                shared_state_file.as_ref(),
+                &author,
+                #[cfg(unix)]
+                inode_tracker.clone(),
+                Some(ctx),
+                None, // No MQTT schema yet - fetch from HTTP
+            )
+            .await
+            {
+                warn!("Failed to bootstrap schema from HTTP: {}", e);
+            }
+        }
+    }
+
     // Track last processed schema to prevent redundant processing
     let mut last_schema_hash: Option<String> = None;
     // Track last applied schema CID for ancestry checking.
