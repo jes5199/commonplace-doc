@@ -3877,3 +3877,241 @@ mod edit_propagation_tests {
         );
     }
 }
+
+// =============================================================================
+// Guardrails Tests (CP-29n3.3)
+//
+// These tests validate the sync guardrails for queue overflow and duplicate
+// task spawn detection. The SyncGuardrails struct provides visibility into
+// potential sync issues without changing core behavior.
+// =============================================================================
+
+mod guardrails_tests {
+    use commonplace_doc::sync::crdt_state::{CrdtPeerState, SyncGuardrails, MAX_PENDING_EDITS};
+    use uuid::Uuid;
+
+    /// Test: SyncGuardrails tracks queue overflow events.
+    #[test]
+    fn guardrails_tracks_queue_overflow() {
+        let guardrails = SyncGuardrails::new();
+
+        // Initially no overflows
+        assert_eq!(guardrails.queue_overflow_count(), 0);
+
+        // Record some overflows
+        let node_id = Uuid::new_v4();
+        guardrails.record_queue_overflow(&node_id, 100);
+        assert_eq!(guardrails.queue_overflow_count(), 1);
+
+        guardrails.record_queue_overflow(&node_id, 100);
+        assert_eq!(guardrails.queue_overflow_count(), 2);
+
+        guardrails.record_queue_overflow(&Uuid::new_v4(), 100);
+        assert_eq!(guardrails.queue_overflow_count(), 3);
+    }
+
+    /// Test: SyncGuardrails detects duplicate spawn attempts.
+    #[test]
+    fn guardrails_detects_duplicate_spawn() {
+        let guardrails = SyncGuardrails::new();
+        let node_id = Uuid::new_v4();
+
+        // First spawn should succeed
+        let is_duplicate = guardrails.check_and_record_spawn(&node_id, "test/file.txt");
+        assert!(
+            !is_duplicate,
+            "First spawn should not be considered duplicate"
+        );
+        assert_eq!(guardrails.active_spawn_count(), 1);
+
+        // Second spawn with same node_id and path should be duplicate
+        let is_duplicate = guardrails.check_and_record_spawn(&node_id, "test/file.txt");
+        assert!(
+            is_duplicate,
+            "Second spawn with same node_id+path should be duplicate"
+        );
+        assert_eq!(guardrails.duplicate_spawn_count(), 1);
+        assert_eq!(
+            guardrails.active_spawn_count(),
+            1,
+            "Active count should not increase for duplicate"
+        );
+
+        // Different path is not a duplicate
+        let is_duplicate = guardrails.check_and_record_spawn(&node_id, "other/file.txt");
+        assert!(
+            !is_duplicate,
+            "Different path should not be considered duplicate"
+        );
+        assert_eq!(guardrails.active_spawn_count(), 2);
+
+        // Different node_id is not a duplicate
+        let other_node = Uuid::new_v4();
+        let is_duplicate = guardrails.check_and_record_spawn(&other_node, "test/file.txt");
+        assert!(
+            !is_duplicate,
+            "Different node_id should not be considered duplicate"
+        );
+        assert_eq!(guardrails.active_spawn_count(), 3);
+    }
+
+    /// Test: SyncGuardrails unregister allows re-spawning.
+    #[test]
+    fn guardrails_unregister_allows_respawn() {
+        let guardrails = SyncGuardrails::new();
+        let node_id = Uuid::new_v4();
+
+        // Register spawn
+        guardrails.check_and_record_spawn(&node_id, "test/file.txt");
+        assert_eq!(guardrails.active_spawn_count(), 1);
+
+        // Unregister
+        guardrails.unregister_spawn(&node_id, "test/file.txt");
+        assert_eq!(guardrails.active_spawn_count(), 0);
+
+        // Re-register should succeed (not be duplicate)
+        let is_duplicate = guardrails.check_and_record_spawn(&node_id, "test/file.txt");
+        assert!(
+            !is_duplicate,
+            "Spawn after unregister should not be duplicate"
+        );
+        assert_eq!(guardrails.active_spawn_count(), 1);
+    }
+
+    /// Test: Queue overflow updates global guardrails counter.
+    #[test]
+    fn queue_overflow_updates_global_guardrails() {
+        // Reset the global guardrails before test
+        SyncGuardrails::global().reset();
+
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Fill queue to capacity
+        for i in 0..MAX_PENDING_EDITS {
+            state.queue_pending_edit(vec![i as u8]);
+        }
+
+        let initial_count = SyncGuardrails::global().queue_overflow_count();
+
+        // This should trigger overflow
+        let result = state.queue_pending_edit(vec![255]);
+        assert!(
+            !result,
+            "queue_pending_edit should return false on overflow"
+        );
+
+        assert_eq!(
+            SyncGuardrails::global().queue_overflow_count(),
+            initial_count + 1,
+            "Global guardrails should record the overflow"
+        );
+
+        // Another overflow
+        state.queue_pending_edit(vec![254]);
+        assert_eq!(
+            SyncGuardrails::global().queue_overflow_count(),
+            initial_count + 2,
+            "Global guardrails should record multiple overflows"
+        );
+    }
+
+    /// Test: Intentional queue overflow scenario.
+    ///
+    /// This test intentionally overflows the queue multiple times to verify:
+    /// 1. Oldest edits are dropped correctly
+    /// 2. Guardrails metrics are updated
+    /// 3. Queue remains functional after overflow
+    #[test]
+    fn intentional_queue_overflow_maintains_invariants() {
+        // Reset the global guardrails before test
+        SyncGuardrails::global().reset();
+
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Fill queue to capacity with indexed edits
+        for i in 0..MAX_PENDING_EDITS {
+            let edit = vec![(i % 256) as u8, ((i / 256) % 256) as u8];
+            state.queue_pending_edit(edit);
+        }
+
+        assert_eq!(state.pending_edits.len(), MAX_PENDING_EDITS);
+        let initial_overflow_count = SyncGuardrails::global().queue_overflow_count();
+
+        // Overflow 10 times
+        let overflow_count = 10;
+        for i in 0..overflow_count {
+            let edit = vec![200 + i as u8, 0, 0, 0]; // Distinguishable marker
+            state.queue_pending_edit(edit);
+        }
+
+        // Verify invariants
+        assert_eq!(
+            state.pending_edits.len(),
+            MAX_PENDING_EDITS,
+            "Queue size should remain at MAX_PENDING_EDITS"
+        );
+
+        assert_eq!(
+            SyncGuardrails::global().queue_overflow_count(),
+            initial_overflow_count + overflow_count as u64,
+            "Guardrails should track all overflow events"
+        );
+
+        // Verify oldest edits were dropped (first 10 edits should be gone)
+        // The first remaining edit should have index 10 (0-9 were dropped)
+        let first_edit = &state.pending_edits[0].payload;
+        let expected_first = vec![(10 % 256) as u8, ((10 / 256) % 256) as u8];
+        assert_eq!(
+            first_edit, &expected_first,
+            "First edit should be index 10 after overflow"
+        );
+
+        // Verify newest edits are at the end
+        let last_edit = &state.pending_edits[MAX_PENDING_EDITS - 1].payload;
+        assert_eq!(
+            last_edit[0], 209,
+            "Last edit should be the final overflow marker"
+        );
+
+        // Queue should still be functional
+        let pending = state.take_pending_edits();
+        assert_eq!(pending.len(), MAX_PENDING_EDITS);
+        assert!(
+            !state.has_pending_edits(),
+            "Queue should be empty after take"
+        );
+
+        // Can still queue new edits
+        state.queue_pending_edit(vec![1, 2, 3]);
+        assert!(state.has_pending_edits());
+    }
+
+    /// Test: Guardrails log_summary doesn't panic.
+    #[test]
+    fn guardrails_log_summary_does_not_panic() {
+        let guardrails = SyncGuardrails::new();
+
+        // With no events
+        guardrails.log_summary();
+
+        // With some events
+        guardrails.record_queue_overflow(&Uuid::new_v4(), 100);
+        guardrails.check_and_record_spawn(&Uuid::new_v4(), "path");
+        guardrails.check_and_record_spawn(&Uuid::new_v4(), "path"); // Not duplicate (different node_id)
+
+        guardrails.log_summary();
+    }
+
+    /// Test: Global singleton returns same instance.
+    #[test]
+    fn guardrails_global_is_singleton() {
+        let g1 = SyncGuardrails::global();
+        let g2 = SyncGuardrails::global();
+
+        // Both should point to same instance (same address)
+        assert!(
+            std::ptr::eq(g1, g2),
+            "SyncGuardrails::global() should return the same instance"
+        );
+    }
+}

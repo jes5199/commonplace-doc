@@ -2436,6 +2436,8 @@ pub async fn initialize_crdt_state_from_server_with_pending(
 /// If `file_states` and `relative_path` are provided, checks for existing active
 /// tasks before spawning. Returns empty Vec if tasks are already running to prevent
 /// duplicate publish/receive loops.
+///
+/// Uses global `SyncGuardrails` to track and warn about duplicate spawn attempts.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_file_sync_tasks_crdt(
     mqtt_client: Arc<MqttClient>,
@@ -2452,10 +2454,14 @@ pub fn spawn_file_sync_tasks_crdt(
     file_states: Option<&std::collections::HashMap<String, crate::sync::FileSyncState>>,
     relative_path: Option<&str>,
 ) -> Vec<JoinHandle<()>> {
-    // Check for existing active tasks to prevent duplicates
+    use crate::sync::crdt_state::SyncGuardrails;
+
+    // Check for existing active tasks to prevent duplicates using file_states
     if let (Some(states), Some(path)) = (file_states, relative_path) {
         if let Some(existing_state) = states.get(path) {
             if !existing_state.task_handles.is_empty() {
+                // Record in guardrails metrics
+                SyncGuardrails::global().check_and_record_spawn(&node_id, path);
                 warn!(
                     "Skipping CRDT task spawn for {} (node_id={}): {} tasks already running",
                     path,
@@ -2464,6 +2470,14 @@ pub fn spawn_file_sync_tasks_crdt(
                 );
                 return Vec::new();
             }
+        }
+    }
+
+    // Also check global guardrails for cross-path duplicates (same node_id)
+    if let Some(path) = relative_path {
+        if SyncGuardrails::global().check_and_record_spawn(&node_id, path) {
+            // Duplicate detected via guardrails (different code path may have registered it)
+            return Vec::new();
         }
     }
 

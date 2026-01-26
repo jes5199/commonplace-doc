@@ -369,6 +369,56 @@ Bridge process (optional):
 - Subscribes: `astrolabe/clock.json/events/#`
 - Publishes: `astrolabe/history.json/edits` (appends events)
 
+## Quality of Service (QoS) Decisions
+
+MQTT provides three QoS levels:
+- **QoS 0 (At Most Once)**: Fire and forget, no acknowledgment
+- **QoS 1 (At Least Once)**: Acknowledged delivery, may duplicate
+- **QoS 2 (Exactly Once)**: Four-way handshake, guaranteed single delivery
+
+### Port QoS Assignments
+
+| Port | QoS | Rationale |
+|------|-----|-----------|
+| **edits** | QoS 1 | Critical for data integrity. Edits must be persisted. Duplicates are harmless (CRDTs merge idempotently). |
+| **sync** | QoS 0 | Ephemeral catch-up. If messages are lost, client retries the sync request. Duplicates are handled by request correlation. |
+| **events** | QoS 0 | Ephemeral notifications. Missing an event is acceptable; events are not persisted. |
+| **commands** | QoS 1 | Commands should be delivered reliably. Duplicate commands may need application-level idempotency. |
+
+### Sync Port QoS Rationale
+
+The sync port uses **QoS 0** intentionally:
+
+1. **Ephemeral by design**: Sync is for catch-up, not persistence. The doc store is the authoritative source. If a sync response is lost, the client simply re-requests.
+
+2. **Request-response correlation**: All sync messages include a `req` field. Clients can detect missing responses via timeout and retry the request.
+
+3. **Performance**: Sync operations can involve many commits (full clone). QoS 0 avoids per-message acknowledgment overhead.
+
+4. **No data loss risk**: The underlying commit data is persisted in the doc store. Sync just transfers existing data; losing a sync message doesn't lose data.
+
+5. **Client-driven retry**: Clients control their sync state. If they don't receive an expected `done` message, they retry with the same `have` set.
+
+### When to Consider QoS Changes
+
+Consider raising sync to QoS 1 if:
+- Network is unreliable and retries are expensive
+- Sync operations are time-critical
+- Clients cannot easily retry (e.g., constrained devices)
+
+For most deployments, QoS 0 for sync is optimal because:
+- Local networks have low packet loss
+- Retry overhead is minimal compared to re-transfer overhead
+- CRDTs are idempotent, so duplicate handling is free
+
+### Implementation Notes
+
+The sync handler (`src/mqtt/sync.rs`) uses QoS 0 for both:
+- Subscribing to sync wildcard topics (`{path}/sync/+`)
+- Publishing sync responses
+
+This is consistent with the "ephemeral catch-up" semantics. The edits handler uses QoS 1 for persistent data flow.
+
 ## Summary
 
 | Concept | Implementation |
@@ -381,3 +431,4 @@ Bridge process (optional):
 | Persistence | Doc store (just another subscriber) |
 | History | Sync port (private, ephemeral) |
 | Devices | Red ports only (events/commands) |
+| QoS | Edits/commands: QoS 1; Sync/events: QoS 0 |

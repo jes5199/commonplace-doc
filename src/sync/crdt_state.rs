@@ -8,13 +8,14 @@
 use crate::sync::error::{SyncError, SyncResult};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, ReadTxn, Transact, Update};
@@ -26,6 +27,146 @@ pub const CRDT_STATE_FILENAME: &str = ".commonplace-sync.json";
 /// Maximum number of edits to queue while waiting for CRDT initialization.
 /// Beyond this limit, older edits are dropped with a warning.
 pub const MAX_PENDING_EDITS: usize = 100;
+
+// =============================================================================
+// Sync Guardrails - Metrics and visibility for diagnosing sync issues
+// =============================================================================
+
+/// Global metrics for sync guardrails.
+///
+/// These counters track events that indicate potential issues:
+/// - Queue overflows: edits dropped due to queue capacity limits
+/// - Duplicate task spawns: attempts to spawn tasks for already-running files
+///
+/// Use `SyncGuardrails::global()` to access the singleton instance.
+pub struct SyncGuardrails {
+    /// Number of edits dropped due to queue overflow
+    queue_overflow_count: AtomicU64,
+    /// Number of duplicate task spawn attempts blocked
+    duplicate_spawn_count: AtomicU64,
+    /// Active task spawns (node_id + path combinations currently running)
+    /// This is protected by a RwLock for safe concurrent access
+    active_spawns: std::sync::RwLock<HashSet<String>>,
+}
+
+impl SyncGuardrails {
+    /// Create a new SyncGuardrails instance.
+    pub fn new() -> Self {
+        Self {
+            queue_overflow_count: AtomicU64::new(0),
+            duplicate_spawn_count: AtomicU64::new(0),
+            active_spawns: std::sync::RwLock::new(HashSet::new()),
+        }
+    }
+
+    /// Get the global singleton instance.
+    pub fn global() -> &'static SyncGuardrails {
+        static INSTANCE: std::sync::OnceLock<SyncGuardrails> = std::sync::OnceLock::new();
+        INSTANCE.get_or_init(SyncGuardrails::new)
+    }
+
+    /// Record a queue overflow event.
+    ///
+    /// Called when an edit is dropped due to queue capacity limits.
+    pub fn record_queue_overflow(&self, node_id: &Uuid, queue_size: usize) {
+        let count = self.queue_overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
+        warn!(
+            "[GUARDRAIL] Queue overflow #{}: node_id={} queue_size={} - oldest edit dropped",
+            count, node_id, queue_size
+        );
+    }
+
+    /// Get the total number of queue overflow events.
+    pub fn queue_overflow_count(&self) -> u64 {
+        self.queue_overflow_count.load(Ordering::Relaxed)
+    }
+
+    /// Record a duplicate task spawn attempt.
+    ///
+    /// Called when an attempt is made to spawn tasks for a file that already has tasks running.
+    /// Returns true if this is a duplicate (spawn should be blocked), false if spawn is allowed.
+    pub fn check_and_record_spawn(&self, node_id: &Uuid, path: &str) -> bool {
+        let key = format!("{}:{}", node_id, path);
+        let mut spawns = self.active_spawns.write().unwrap();
+
+        if spawns.contains(&key) {
+            let count = self.duplicate_spawn_count.fetch_add(1, Ordering::Relaxed) + 1;
+            warn!(
+                "[GUARDRAIL] Duplicate spawn attempt #{}: node_id={} path={} - spawn blocked",
+                count, node_id, path
+            );
+            true // is duplicate
+        } else {
+            spawns.insert(key);
+            debug!(
+                "[GUARDRAIL] Task spawn registered: node_id={} path={} (active_count={})",
+                node_id,
+                path,
+                spawns.len()
+            );
+            false // not duplicate, spawn allowed
+        }
+    }
+
+    /// Unregister a task spawn when tasks complete or are aborted.
+    pub fn unregister_spawn(&self, node_id: &Uuid, path: &str) {
+        let key = format!("{}:{}", node_id, path);
+        let mut spawns = self.active_spawns.write().unwrap();
+        if spawns.remove(&key) {
+            debug!(
+                "[GUARDRAIL] Task spawn unregistered: node_id={} path={} (active_count={})",
+                node_id,
+                path,
+                spawns.len()
+            );
+        }
+    }
+
+    /// Get the total number of duplicate spawn attempts.
+    pub fn duplicate_spawn_count(&self) -> u64 {
+        self.duplicate_spawn_count.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of currently active task spawns.
+    pub fn active_spawn_count(&self) -> usize {
+        self.active_spawns.read().unwrap().len()
+    }
+
+    /// Log a summary of guardrail metrics.
+    pub fn log_summary(&self) {
+        let queue_overflows = self.queue_overflow_count();
+        let duplicate_spawns = self.duplicate_spawn_count();
+        let active_spawns = self.active_spawn_count();
+
+        if queue_overflows > 0 || duplicate_spawns > 0 {
+            warn!(
+                "[GUARDRAIL SUMMARY] queue_overflows={} duplicate_spawns={} active_spawns={}",
+                queue_overflows, duplicate_spawns, active_spawns
+            );
+        } else {
+            info!(
+                "[GUARDRAIL SUMMARY] All clear: queue_overflows=0 duplicate_spawns=0 active_spawns={}",
+                active_spawns
+            );
+        }
+    }
+
+    /// Reset all counters (for testing).
+    ///
+    /// This is intended for use in test suites to isolate test cases.
+    /// In production, counters accumulate for the lifetime of the process.
+    pub fn reset(&self) {
+        self.queue_overflow_count.store(0, Ordering::Relaxed);
+        self.duplicate_spawn_count.store(0, Ordering::Relaxed);
+        self.active_spawns.write().unwrap().clear();
+    }
+}
+
+impl Default for SyncGuardrails {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// A queued edit message waiting to be applied after CRDT initialization.
 #[derive(Debug, Clone)]
@@ -265,15 +406,14 @@ impl CrdtPeerState {
     /// This prevents unbounded memory growth while still handling the common
     /// case of a few edits arriving during initialization.
     ///
-    /// Returns true if the edit was queued, false if it was dropped due to overflow.
+    /// Returns true if the edit was queued, false if an edit was dropped due to overflow.
     pub fn queue_pending_edit(&mut self, payload: Vec<u8>) -> bool {
-        if self.pending_edits.len() >= MAX_PENDING_EDITS {
+        let overflow = self.pending_edits.len() >= MAX_PENDING_EDITS;
+        if overflow {
             // Drop the oldest edit to make room
             self.pending_edits.remove(0);
-            warn!(
-                "Pending edit queue overflow for {} - dropped oldest edit (queue at {} edits)",
-                self.node_id, MAX_PENDING_EDITS
-            );
+            // Record in global guardrails metrics
+            SyncGuardrails::global().record_queue_overflow(&self.node_id, MAX_PENDING_EDITS);
         }
         self.pending_edits.push(PendingEdit { payload });
         debug!(
@@ -281,7 +421,7 @@ impl CrdtPeerState {
             self.node_id,
             self.pending_edits.len()
         );
-        true
+        !overflow
     }
 
     /// Take all pending edits from the queue.
