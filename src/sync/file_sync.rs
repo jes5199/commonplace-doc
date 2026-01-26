@@ -645,11 +645,25 @@ pub async fn upload_task(
                                     // Update state and persist to state file
                                     // Hash the raw file bytes, not the (possibly base64) content
                                     let cid = result.cid.clone();
-                                    let file_bytes = tokio::fs::read(&file_path).await.ok();
-                                    let content_hash = file_bytes
-                                        .as_ref()
-                                        .map(|b| compute_content_hash(b))
-                                        .unwrap_or_default();
+                                    let content_hash = match tokio::fs::read(&file_path).await {
+                                        Ok(bytes) => compute_content_hash(&bytes),
+                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                            // File was deleted between upload and hash
+                                            warn!(
+                                                "File {} deleted after upload, using empty hash",
+                                                file_path.display()
+                                            );
+                                            String::new()
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Failed to read {} for hash: {}",
+                                                file_path.display(),
+                                                e
+                                            );
+                                            String::new()
+                                        }
+                                    };
                                     let file_name = file_path
                                         .file_name()
                                         .map(|n| n.to_string_lossy().to_string())
@@ -711,11 +725,25 @@ pub async fn upload_task(
                                     // Update state and persist to state file
                                     // Hash the raw file bytes, not the (possibly base64) content
                                     let cid = result.cid.clone();
-                                    let file_bytes = tokio::fs::read(&file_path).await.ok();
-                                    let content_hash = file_bytes
-                                        .as_ref()
-                                        .map(|b| compute_content_hash(b))
-                                        .unwrap_or_default();
+                                    let content_hash = match tokio::fs::read(&file_path).await {
+                                        Ok(bytes) => compute_content_hash(&bytes),
+                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                            // File was deleted between commit and hash
+                                            warn!(
+                                                "File {} deleted after commit, using empty hash",
+                                                file_path.display()
+                                            );
+                                            String::new()
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Failed to read {} for hash: {}",
+                                                file_path.display(),
+                                                e
+                                            );
+                                            String::new()
+                                        }
+                                    };
                                     let file_name = file_path
                                         .file_name()
                                         .map(|n| n.to_string_lossy().to_string())
@@ -1233,11 +1261,24 @@ pub async fn upload_task_with_flock(
                                     );
 
                                     let cid = result.cid.clone();
-                                    let file_bytes = tokio::fs::read(&file_path).await.ok();
-                                    let content_hash = file_bytes
-                                        .as_ref()
-                                        .map(|b| compute_content_hash(b))
-                                        .unwrap_or_default();
+                                    let content_hash = match tokio::fs::read(&file_path).await {
+                                        Ok(bytes) => compute_content_hash(&bytes),
+                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                            warn!(
+                                                "File {} deleted after upload, using empty hash",
+                                                file_path.display()
+                                            );
+                                            String::new()
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Failed to read {} for hash: {}",
+                                                file_path.display(),
+                                                e
+                                            );
+                                            String::new()
+                                        }
+                                    };
                                     let file_name = file_path
                                         .file_name()
                                         .map(|n| n.to_string_lossy().to_string())
@@ -1300,11 +1341,24 @@ pub async fn upload_task_with_flock(
                                     );
 
                                     let cid = result.cid.clone();
-                                    let file_bytes = tokio::fs::read(&file_path).await.ok();
-                                    let content_hash = file_bytes
-                                        .as_ref()
-                                        .map(|b| compute_content_hash(b))
-                                        .unwrap_or_default();
+                                    let content_hash = match tokio::fs::read(&file_path).await {
+                                        Ok(bytes) => compute_content_hash(&bytes),
+                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                            warn!(
+                                                "File {} deleted after commit, using empty hash",
+                                                file_path.display()
+                                            );
+                                            String::new()
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Failed to read {} for hash: {}",
+                                                file_path.display(),
+                                                e
+                                            );
+                                            String::new()
+                                        }
+                                    };
                                     let file_name = file_path
                                         .file_name()
                                         .map(|n| n.to_string_lossy().to_string())
@@ -1952,16 +2006,25 @@ pub async fn upload_task_crdt(
     {
         let mut shared = shared_last_content.write().await;
         if shared.is_none() {
-            *shared = tokio::fs::read_to_string(&file_path)
-                .await
-                .ok()
-                .filter(|s| !s.is_empty());
-            if shared.is_some() {
-                debug!(
-                    "CRDT upload_task initialized with existing content for {}",
-                    file_path.display()
-                );
-            }
+            *shared = match tokio::fs::read_to_string(&file_path).await {
+                Ok(s) if !s.is_empty() => {
+                    debug!(
+                        "CRDT upload_task initialized with existing content for {}",
+                        file_path.display()
+                    );
+                    Some(s)
+                }
+                Ok(_) => None, // Empty file
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    error!(
+                        "Failed to read initial content for {}: {}",
+                        file_path.display(),
+                        e
+                    );
+                    None
+                }
+            };
         }
     }
 

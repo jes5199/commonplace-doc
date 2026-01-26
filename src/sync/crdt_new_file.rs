@@ -10,6 +10,7 @@
 use crate::commit::Commit;
 use crate::mqtt::{EditMessage, MqttClient, Topic};
 use crate::sync::crdt_state::{CrdtPeerState, DirectorySyncState};
+use crate::sync::error::{SyncError, SyncResult};
 use crate::sync::ymap_schema;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rumqttc::QoS;
@@ -54,7 +55,7 @@ pub async fn create_new_file(
     filename: &str,
     content: &str,
     author: &str,
-) -> Result<NewFileResult, String> {
+) -> SyncResult<NewFileResult> {
     // 1. Generate UUID locally
     let file_uuid = generate_file_uuid();
     let file_uuid_str = file_uuid.to_string();
@@ -129,9 +130,9 @@ async fn update_schema_with_new_file(
     filename: &str,
     file_uuid: &str,
     author: &str,
-) -> Result<String, String> {
+) -> SyncResult<String> {
     // Load schema Y.Doc
-    let doc = schema_state.to_doc().map_err(|e| e.to_string())?;
+    let doc = schema_state.to_doc()?;
 
     // Migrate from JSON text format if needed
     if ymap_schema::is_json_text_format(&doc) && !ymap_schema::is_ymap_format(&doc) {
@@ -195,8 +196,7 @@ async fn update_schema_with_new_file(
 
     let schema_node_id = schema_state.node_id.to_string();
     let topic = Topic::edits(workspace, &schema_node_id).to_topic_string();
-    let payload = serde_json::to_vec(&edit_msg)
-        .map_err(|e| format!("Failed to serialize schema edit: {}", e))?;
+    let payload = serde_json::to_vec(&edit_msg)?;
 
     // Trace log for debugging
     {
@@ -222,7 +222,7 @@ async fn update_schema_with_new_file(
     mqtt_client
         .publish_retained(&topic, &payload, QoS::AtLeastOnce)
         .await
-        .map_err(|e| format!("Failed to publish schema edit: {}", e))?;
+        .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
 
     debug!(
         "Published schema commit {} for new file '{}' (retained)",
@@ -240,7 +240,7 @@ async fn publish_file_content(
     file_state: &mut CrdtPeerState,
     content: &str,
     author: &str,
-) -> Result<String, String> {
+) -> SyncResult<String> {
     // Create Y.Doc with content
     let doc = Doc::new();
     let update_bytes = {
@@ -274,8 +274,7 @@ async fn publish_file_content(
     };
 
     let topic = Topic::edits(workspace, file_uuid).to_topic_string();
-    let payload = serde_json::to_vec(&edit_msg)
-        .map_err(|e| format!("Failed to serialize file edit: {}", e))?;
+    let payload = serde_json::to_vec(&edit_msg)?;
 
     // Use retained message so new subscribers get the content immediately.
     // This is critical for the sandbox sync race: the sandbox may subscribe
@@ -284,7 +283,7 @@ async fn publish_file_content(
     mqtt_client
         .publish_retained(&topic, &payload, QoS::AtLeastOnce)
         .await
-        .map_err(|e| format!("Failed to publish file edit: {}", e))?;
+        .map_err(|e| SyncError::mqtt(format!("Failed to publish file edit: {}", e)))?;
 
     debug!(
         "Published initial content commit {} for file {} (retained)",
@@ -301,9 +300,9 @@ pub async fn remove_file_from_schema(
     dir_state: &mut DirectorySyncState,
     filename: &str,
     author: &str,
-) -> Result<String, String> {
+) -> SyncResult<String> {
     // Load schema Y.Doc
-    let doc = dir_state.schema.to_doc().map_err(|e| e.to_string())?;
+    let doc = dir_state.schema.to_doc()?;
 
     // Migrate from JSON text format if needed
     if ymap_schema::is_json_text_format(&doc) && !ymap_schema::is_ymap_format(&doc) {
@@ -322,7 +321,10 @@ pub async fn remove_file_from_schema(
 
     // Check if entry exists before removing
     if ymap_schema::get_entry(&doc, filename).is_none() {
-        return Err(format!("File '{}' not found in schema", filename));
+        return Err(SyncError::NotFound(format!(
+            "File '{}' not found in schema",
+            filename
+        )));
     }
 
     // Remove file using YMap operations (provides proper CRDT merge semantics)
@@ -374,8 +376,7 @@ pub async fn remove_file_from_schema(
     };
 
     let topic = Topic::edits(workspace, &schema_node_id).to_topic_string();
-    let payload = serde_json::to_vec(&edit_msg)
-        .map_err(|e| format!("Failed to serialize schema edit: {}", e))?;
+    let payload = serde_json::to_vec(&edit_msg)?;
 
     // Use retained message so new subscribers get the latest schema state immediately.
     // This is critical for sync: subscribers may join after schema updates are published,
@@ -383,7 +384,7 @@ pub async fn remove_file_from_schema(
     mqtt_client
         .publish_retained(&topic, &payload, QoS::AtLeastOnce)
         .await
-        .map_err(|e| format!("Failed to publish schema edit: {}", e))?;
+        .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
 
     info!(
         "Published schema commit {} to remove file '{}' (retained)",

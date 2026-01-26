@@ -105,6 +105,7 @@ use crate::sync::dir_sync::{
     decode_schema_from_mqtt_payload, handle_schema_change_with_dedup, handle_subdir_new_files,
     handle_subdir_schema_cleanup,
 };
+use crate::sync::error::SyncResult;
 use crate::sync::subdir_spawn::{spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport};
 use crate::sync::{
     encode_node_id, fetch_head, spawn_file_sync_tasks_crdt, FileSyncState, SharedLastContent,
@@ -1194,7 +1195,7 @@ async fn ensure_crdt_tasks_for_files(
     pull_only: bool,
     author: &str,
     context: &CrdtFileSyncContext,
-) -> Result<(), String> {
+) -> SyncResult<()> {
     let pending: Vec<(String, String)> = {
         let states = file_states.read().await;
         states
@@ -1225,10 +1226,19 @@ async fn ensure_crdt_tasks_for_files(
 
         // Create shared_last_content BEFORE init so we can update it during init
         // This prevents the file watcher from detecting init writes as local changes
-        let initial_content = tokio::fs::read_to_string(&file_path)
-            .await
-            .ok()
-            .filter(|s| !s.is_empty());
+        let initial_content = match tokio::fs::read_to_string(&file_path).await {
+            Ok(s) if !s.is_empty() => Some(s),
+            Ok(_) => None, // Empty file treated as no initial content
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                error!(
+                    "Failed to read initial content from {}: {}",
+                    file_path.display(),
+                    e
+                );
+                None
+            }
+        };
         let shared_last_content: SharedLastContent = Arc::new(RwLock::new(initial_content));
 
         if let Err(e) = crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
@@ -1245,10 +1255,13 @@ async fn ensure_crdt_tasks_for_files(
         )
         .await
         {
-            warn!(
-                "Failed to initialize CRDT state for {}: {}",
+            // Log as error and skip spawning sync tasks - continuing without proper
+            // initialization risks data divergence or loss
+            error!(
+                "Failed to initialize CRDT state for {}: {} - skipping sync task spawn",
                 relative_path, e
             );
+            continue;
         }
 
         let old_handles = {

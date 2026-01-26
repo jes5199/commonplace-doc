@@ -265,26 +265,19 @@ pub async fn ensure_parent_directories_exist(
 
                 let updated_json = serde_json::to_string(&schema)?;
 
-                // Write locally
-                if let Err(e) =
-                    write_schema_file(&current_dir, &updated_json, written_schemas).await
-                {
-                    warn!("Failed to write local schema for '{}': {}", dir_name, e);
-                }
+                // Write locally - propagate errors since schema write failures can cause divergence
+                write_schema_file(&current_dir, &updated_json, written_schemas).await?;
 
                 // Push to server (skip when CRDT/MQTT sync handles schema propagation)
                 if !skip_http_schema_push {
-                    if let Err(e) = push_schema_to_server(
+                    push_schema_to_server(
                         client,
                         server,
                         &current_parent_id,
                         &updated_json,
                         author,
                     )
-                    .await
-                    {
-                        warn!("Failed to push parent schema for '{}': {}", dir_name, e);
-                    }
+                    .await?;
                 }
             }
 
@@ -293,7 +286,17 @@ pub async fn ensure_parent_directories_exist(
             // overwriting a schema that already has file entries from scan_directory
             let subdir_path = current_dir.join(dir_name);
             let subdir_schema_path = subdir_path.join(SCHEMA_FILENAME);
-            let existing_schema = std::fs::read_to_string(&subdir_schema_path).ok();
+            let existing_schema = match std::fs::read_to_string(&subdir_schema_path) {
+                Ok(content) => Some(content),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to read schema at {:?}: {}",
+                        subdir_schema_path, e
+                    )
+                    .into());
+                }
+            };
 
             // Only write and push schema if no schema exists yet
             // If a schema exists, it may already have file entries from scan_directory
@@ -308,20 +311,13 @@ pub async fn ensure_parent_directories_exist(
                 });
                 let schema_str = serde_json::to_string(&empty_schema)?;
 
-                // Write local schema for the new directory
-                if let Err(e) = write_schema_file(&subdir_path, &schema_str, written_schemas).await
-                {
-                    warn!("Failed to write subdir schema for '{}': {}", dir_name, e);
-                }
+                // Write local schema for the new directory - propagate errors
+                write_schema_file(&subdir_path, &schema_str, written_schemas).await?;
 
                 // Push empty schema to server for the new directory (skip when CRDT/MQTT sync handles this)
                 if !skip_http_schema_push {
-                    if let Err(e) =
-                        push_schema_to_server(client, server, &new_node_id, &schema_str, author)
-                            .await
-                    {
-                        warn!("Failed to push subdir schema for '{}': {}", dir_name, e);
-                    }
+                    push_schema_to_server(client, server, &new_node_id, &schema_str, author)
+                        .await?;
                 }
             } else {
                 debug!(

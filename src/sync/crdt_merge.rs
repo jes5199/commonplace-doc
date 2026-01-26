@@ -11,6 +11,7 @@
 use crate::commit::Commit;
 use crate::mqtt::{EditMessage, MqttClient, Topic};
 use crate::sync::crdt_state::CrdtPeerState;
+use crate::sync::error::{SyncError, SyncResult};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rumqttc::QoS;
 use std::sync::Arc;
@@ -63,7 +64,7 @@ pub async fn process_received_edit(
     state: &mut CrdtPeerState,
     edit_msg: &EditMessage,
     author: &str,
-) -> Result<(MergeResult, Option<String>), String> {
+) -> SyncResult<(MergeResult, Option<String>)> {
     // Compute CID for the received commit using the original timestamp
     // This ensures we get the same CID as when the commit was created
     let commit = Commit::with_timestamp(
@@ -82,18 +83,17 @@ pub async fn process_received_edit(
     }
 
     // Load current Y.Doc
-    let doc = state.to_doc().map_err(|e| e.to_string())?;
+    let doc = state.to_doc()?;
 
     // Decode and apply the update (if non-empty)
     // Merge commits have empty updates - they just record parent CIDs
     if !edit_msg.update.is_empty() {
-        let update_bytes = STANDARD
-            .decode(&edit_msg.update)
-            .map_err(|e| format!("Failed to decode update: {}", e))?;
+        let update_bytes = STANDARD.decode(&edit_msg.update)?;
 
         if !update_bytes.is_empty() {
-            let update = Update::decode_v1(&update_bytes)
-                .map_err(|e| format!("Failed to decode Yjs update: {}", e))?;
+            let update = Update::decode_v1(&update_bytes).map_err(|e| {
+                SyncError::yjs_decode(format!("Failed to decode Yjs update: {}", e))
+            })?;
 
             // Apply the update (merges with our local state)
             let mut txn = doc.transact_mut();
@@ -267,7 +267,7 @@ fn is_ancestor(cid: &Option<String>, parents: &[String]) -> bool {
 ///
 /// Using empty merge updates avoids feedback loops where peers keep
 /// re-sending full state to each other.
-fn create_merge_update(_doc: &Doc) -> Result<Vec<u8>, String> {
+fn create_merge_update(_doc: &Doc) -> SyncResult<Vec<u8>> {
     // Empty update - the merge is recorded by the commit's parent CIDs,
     // and state is reconstructed by replaying ancestors
     Ok(Vec::new())
@@ -282,7 +282,7 @@ async fn publish_merge_commit(
     remote_parent: &str,
     update_bytes: &[u8],
     author: &str,
-) -> Result<String, String> {
+) -> SyncResult<String> {
     let parents = vec![local_parent.to_string(), remote_parent.to_string()];
     let update_b64 = STANDARD.encode(update_bytes);
 
@@ -308,13 +308,12 @@ async fn publish_merge_commit(
     };
 
     let topic = Topic::edits(workspace, node_id).to_topic_string();
-    let payload = serde_json::to_vec(&edit_msg)
-        .map_err(|e| format!("Failed to serialize merge commit: {}", e))?;
+    let payload = serde_json::to_vec(&edit_msg)?;
 
     mqtt_client
         .publish_retained(&topic, &payload, QoS::AtLeastOnce)
         .await
-        .map_err(|e| format!("Failed to publish merge commit: {}", e))?;
+        .map_err(|e| SyncError::mqtt(format!("Failed to publish merge commit: {}", e)))?;
 
     info!(
         "Published merge commit {} for {} (parents: {}, {})",
@@ -334,8 +333,8 @@ fn get_doc_text_content(doc: &Doc) -> String {
 }
 
 /// Parse an MQTT edit message payload.
-pub fn parse_edit_message(payload: &[u8]) -> Result<EditMessage, String> {
-    serde_json::from_slice(payload).map_err(|e| format!("Failed to parse edit message: {}", e))
+pub fn parse_edit_message(payload: &[u8]) -> SyncResult<EditMessage> {
+    serde_json::from_slice(payload).map_err(SyncError::from)
 }
 
 #[cfg(test)]

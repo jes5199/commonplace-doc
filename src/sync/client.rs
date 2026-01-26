@@ -118,8 +118,8 @@ pub async fn push_schema_to_server(
     // First fetch current server content and state
     let (old_content, base_state) = match fetch_head(client, server, fs_root_id, false).await {
         Ok(Some(head)) => (Some(head.content), head.state),
-        Ok(None) | Err(FetchHeadError::Status(_, _)) => {
-            // Document doesn't exist, create it first
+        Ok(None) => {
+            // Document doesn't exist (404), create it first
             info!("Creating document {} before pushing schema", fs_root_id);
             let create_url = format!("{}/docs", server);
             let create_resp = client
@@ -144,6 +144,13 @@ pub async fn push_schema_to_server(
         }
         Err(FetchHeadError::Request(e)) => return Err(e.into()),
         Err(FetchHeadError::Parse(e)) => return Err(e.into()),
+        Err(FetchHeadError::Status(code, body)) => {
+            return Err(format!(
+                "Failed to fetch HEAD for {}: {} - {}",
+                fs_root_id, code, body
+            )
+            .into());
+        }
     };
 
     // Skip update if schema hasn't changed (prevents feedback loops)
@@ -199,10 +206,16 @@ pub async fn delete_schema_entry(
     // Fetch current server state
     let base_state = match fetch_head(client, server, fs_root_id, false).await {
         Ok(Some(head)) => head.state,
-        Ok(None) => None,
-        Err(FetchHeadError::Status(_, _)) => None,
+        Ok(None) => None, // Document doesn't exist (404), proceed with None state
         Err(FetchHeadError::Request(e)) => return Err(e.into()),
         Err(FetchHeadError::Parse(e)) => return Err(e.into()),
+        Err(FetchHeadError::Status(code, body)) => {
+            return Err(format!(
+                "Failed to fetch HEAD for {}: {} - {}",
+                fs_root_id, code, body
+            )
+            .into());
+        }
     };
 
     // Create an update that deletes just this entry
