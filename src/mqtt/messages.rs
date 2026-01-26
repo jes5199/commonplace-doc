@@ -7,6 +7,76 @@
 //! - Commands: Commands to nodes
 
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+// =============================================================================
+// Peer Fallback Configuration
+// =============================================================================
+
+/// Default timeout waiting for primary (doc store) response before peers may respond.
+pub const PRIMARY_TIMEOUT_MS: u64 = 100;
+
+/// Maximum random jitter peers add before responding (to prevent thundering herd).
+pub const PEER_JITTER_MAX_MS: u64 = 500;
+
+/// Configuration for peer fallback behavior on sync requests.
+///
+/// When a client sends a sync request (Get, Pull, Ancestors), it normally expects
+/// the doc store to respond. If the doc store is slow or unavailable, peers that
+/// have the requested commits can respond instead after a timeout.
+///
+/// ## Protocol Flow
+///
+/// 1. Client publishes sync request with correlation ID
+/// 2. Client and peers both subscribe to response topic
+/// 3. Doc store has `primary_timeout` to respond
+/// 4. If no response arrives, peers wait random jitter (0 to `peer_jitter_max`)
+/// 5. First peer to respond publishes commits
+/// 6. Other peers see the response and cancel their pending response
+///
+/// ## Duplicate Suppression
+///
+/// Peers watch the response topic for their correlation ID. Once any response
+/// arrives (from doc store or another peer), they cancel pending responses.
+#[derive(Debug, Clone, Copy)]
+pub struct PeerFallbackConfig {
+    /// Time to wait for primary (doc store) response before peers may respond.
+    pub primary_timeout: Duration,
+    /// Maximum random jitter peers add before responding.
+    /// Actual delay is random between 0 and this value.
+    pub peer_jitter_max: Duration,
+    /// Whether peer fallback is enabled.
+    pub enabled: bool,
+}
+
+impl Default for PeerFallbackConfig {
+    fn default() -> Self {
+        Self {
+            primary_timeout: Duration::from_millis(PRIMARY_TIMEOUT_MS),
+            peer_jitter_max: Duration::from_millis(PEER_JITTER_MAX_MS),
+            enabled: true,
+        }
+    }
+}
+
+impl PeerFallbackConfig {
+    /// Create a new config with custom timeouts.
+    pub fn new(primary_timeout: Duration, peer_jitter_max: Duration) -> Self {
+        Self {
+            primary_timeout,
+            peer_jitter_max,
+            enabled: true,
+        }
+    }
+
+    /// Create a disabled config (no peer fallback).
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Default::default()
+        }
+    }
+}
 
 /// Message published to the edits port.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +198,10 @@ pub enum SyncMessage {
         /// Optional message
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        /// Source of this response (None = doc store, Some(client_id) = peer)
+        /// Used for peer fallback protocol to identify who provided the data.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
 
     /// All requested commits have been sent
@@ -136,6 +210,10 @@ pub enum SyncMessage {
         req: String,
         /// List of commit IDs that were sent
         commits: Vec<String>,
+        /// Source of this response (None = doc store, Some(client_id) = peer)
+        /// Used for peer fallback protocol to identify who provided the data.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
 
     /// Response to IsAncestor request
@@ -449,11 +527,31 @@ mod tests {
             timestamp: 1704067200000,
             author: "user".to_string(),
             message: None,
+            source: None,
         };
 
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"commit\""));
         assert!(json.contains("\"id\":\"def456\""));
+        // source should be omitted when None
+        assert!(!json.contains("\"source\""));
+    }
+
+    #[test]
+    fn test_sync_commit_response_with_source() {
+        let msg = SyncMessage::Commit {
+            req: "r-003".to_string(),
+            id: "def456".to_string(),
+            parents: vec!["abc123".to_string()],
+            data: "base64update".to_string(),
+            timestamp: 1704067200000,
+            author: "user".to_string(),
+            message: None,
+            source: Some("peer-123".to_string()),
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"source\":\"peer-123\""));
     }
 
     #[test]
@@ -520,7 +618,8 @@ mod tests {
         .is_request());
         assert!(!SyncMessage::Done {
             req: "r".to_string(),
-            commits: vec![]
+            commits: vec![],
+            source: None,
         }
         .is_request());
     }

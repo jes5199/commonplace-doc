@@ -196,6 +196,7 @@ impl SyncHandler {
                         timestamp: commit.timestamp,
                         author: commit.author,
                         message: commit.message,
+                        source: None, // Doc store response
                     };
 
                     self.send_response(path, client_id, &response).await?;
@@ -212,6 +213,7 @@ impl SyncHandler {
         let done = SyncMessage::Done {
             req: req.to_string(),
             commits: sent_commits,
+            source: None, // Doc store response
         };
 
         self.send_response(path, client_id, &done).await
@@ -246,6 +248,7 @@ impl SyncHandler {
                     let done = SyncMessage::Done {
                         req: req.to_string(),
                         commits: vec![],
+                        source: None, // Doc store response
                     };
                     return self.send_response(path, client_id, &done).await;
                 }
@@ -272,6 +275,7 @@ impl SyncHandler {
                         timestamp: commit.timestamp,
                         author: commit.author,
                         message: commit.message,
+                        source: None, // Doc store response
                     };
 
                     self.send_response(path, client_id, &response).await?;
@@ -287,6 +291,7 @@ impl SyncHandler {
         let done = SyncMessage::Done {
             req: req.to_string(),
             commits: sent_commits,
+            source: None, // Doc store response
         };
 
         self.send_response(path, client_id, &done).await
@@ -321,6 +326,7 @@ impl SyncHandler {
                     let done = SyncMessage::Done {
                         req: req.to_string(),
                         commits: vec![],
+                        source: None, // Doc store response
                     };
                     return self.send_response(path, client_id, &done).await;
                 }
@@ -346,6 +352,7 @@ impl SyncHandler {
                         timestamp: commit.timestamp,
                         author: commit.author,
                         message: commit.message,
+                        source: None, // Doc store response
                     };
 
                     self.send_response(path, client_id, &response).await?;
@@ -361,6 +368,7 @@ impl SyncHandler {
         let done = SyncMessage::Done {
             req: req.to_string(),
             commits: sent_commits,
+            source: None, // Doc store response
         };
 
         self.send_response(path, client_id, &done).await

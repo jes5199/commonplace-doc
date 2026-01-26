@@ -187,6 +187,80 @@ Fields:
 
 This mechanism complements the sync port by enabling cooperative recovery. See `src/sync/missing_parent.rs` for implementation.
 
+#### Peer Fallback for Sync Requests
+
+When the doc store is slow or unavailable, peers can respond to sync requests. This provides resilience and improved performance through cooperative data sharing.
+
+**Protocol Flow**:
+
+1. **Client publishes sync request** (Get, Pull, or Ancestors) with correlation ID
+2. **Primary wait period** (100ms): Doc store has priority to respond
+3. **Peer response window**: If no response arrives, eligible peers wait random jitter (0-500ms)
+4. **First responder wins**: First peer to publish cancels others' pending responses
+5. **Duplicate suppression**: All peers watch for responses and cancel if one arrives
+
+**Response Format**:
+
+Peer responses include a `source` field identifying the responder:
+
+```json
+{
+  "type": "commit",
+  "req": "r-003",
+  "id": "def456",
+  "parents": ["abc123"],
+  "data": "<base64>",
+  "timestamp": 1704067200000,
+  "author": "peer-client-42",
+  "source": "client-42"
+}
+```
+
+```json
+{
+  "type": "done",
+  "req": "r-003",
+  "commits": ["def456"],
+  "source": "client-42"
+}
+```
+
+When `source` is absent (null), the response is from the authoritative doc store.
+
+**Timing Constants**:
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `PRIMARY_TIMEOUT_MS` | 100ms | Time to wait for doc store response |
+| `PEER_JITTER_MAX_MS` | 500ms | Maximum random jitter before peer responds |
+| Rate limit interval | 30s | Minimum time between serving same commit |
+
+**Rate Limiting**:
+
+- Each peer tracks when it last served each commit
+- Won't serve the same commit within 30 seconds
+- Prevents spam when multiple clients request the same data
+
+**Eligibility Criteria**:
+
+A peer may respond if:
+1. It has the requested commit data locally
+2. The primary timeout has elapsed
+3. No response has been received yet
+4. It hasn't already responded to this request
+5. It hasn't served this commit recently (rate limiting)
+
+**Implementation**:
+
+- `src/sync/peer_fallback.rs` - Core handler and protocol logic
+- `src/mqtt/messages.rs` - `PeerFallbackConfig` for timing parameters
+- Use `handle_peer_sync_request()` to process incoming requests
+- Use `subscribe_for_peer_fallback()` to subscribe to sync request topics
+
+**Current Limitations**:
+
+Without a full commit store (see CP-cj9e), peers can only serve commits that match their current HEAD. Future enhancements will allow serving any commit from local history.
+
 ### events (red)
 
 Broadcasts from a node. The node is the authority.
