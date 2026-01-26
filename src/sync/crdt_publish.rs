@@ -467,4 +467,48 @@ mod tests {
         let content = get_doc_text_content(&apply_doc);
         assert_eq!(content, "hello");
     }
+
+    #[test]
+    fn test_compute_text_update_preserves_newlines() {
+        use yrs::{Doc, Text, Update, WriteTxn};
+
+        // Test that newlines are preserved through CRDT updates
+        let base_doc = Doc::new();
+        {
+            let mut txn = base_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "");
+        }
+
+        let current = get_doc_text_content(&base_doc);
+        let new_content = "/typing\nHello World\nLine 2\n/unset typing\n";
+        let update = compute_text_update(&base_doc, &current, new_content)
+            .unwrap()
+            .expect("expected update");
+
+        // Apply to a fresh doc
+        let base_state = {
+            let txn = base_doc.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+        let apply_doc = Doc::new();
+        {
+            let update = Update::decode_v1(&base_state).unwrap();
+            let mut txn = apply_doc.transact_mut();
+            txn.apply_update(update);
+        }
+        {
+            let update = Update::decode_v1(&update).unwrap();
+            let mut txn = apply_doc.transact_mut();
+            txn.apply_update(update);
+        }
+
+        let content = get_doc_text_content(&apply_doc);
+        assert_eq!(
+            content, new_content,
+            "Newlines should be preserved in CRDT text updates"
+        );
+        assert!(content.contains('\n'), "Content should contain newlines");
+        assert_eq!(content.matches('\n').count(), 4, "Should have 4 newlines");
+    }
 }

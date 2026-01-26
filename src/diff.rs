@@ -778,4 +778,60 @@ mod tests {
 
         assert_eq!(inner, r#"<filetree><file name="test.txt"/></filetree>"#);
     }
+
+    #[test]
+    fn test_newlines_preserved() {
+        // Test that newlines are preserved in content
+        let old = "";
+        let new = "/typing\nHello World\n/unset typing\n";
+
+        let result = compute_diff_update(old, new).unwrap();
+
+        // Verify the update applies correctly and preserves newlines
+        let doc = Doc::with_client_id(1);
+        let text = doc.get_or_insert_text(TEXT_ROOT_NAME);
+        {
+            let mut txn = doc.transact_mut();
+            text.push(&mut txn, old);
+        }
+
+        {
+            let update = yrs::Update::decode_v1(&result.update_bytes).unwrap();
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update);
+        }
+
+        let txn = doc.transact();
+        let final_text = text.get_string(&txn);
+        assert_eq!(final_text, new, "Newlines should be preserved in CRDT text");
+    }
+
+    #[test]
+    fn test_newlines_in_replacement() {
+        // Test replacing content that has newlines
+        let old = "line1\nline2\nline3";
+        let new = "line1\nmodified\nline3\nline4";
+
+        let result = compute_diff_update(old, new).unwrap();
+
+        let doc = Doc::with_client_id(1);
+        let text = doc.get_or_insert_text(TEXT_ROOT_NAME);
+        {
+            let mut txn = doc.transact_mut();
+            text.push(&mut txn, old);
+        }
+
+        {
+            let update = yrs::Update::decode_v1(&result.update_bytes).unwrap();
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update);
+        }
+
+        let txn = doc.transact();
+        let final_text = text.get_string(&txn);
+        assert_eq!(
+            final_text, new,
+            "Newlines should be preserved after replacement"
+        );
+    }
 }

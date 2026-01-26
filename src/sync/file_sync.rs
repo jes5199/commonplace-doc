@@ -2,7 +2,7 @@
 //!
 //! This module contains functions for syncing a single file with a server document.
 
-use crate::events::{recv_broadcast_with_lag, BroadcastRecvResult};
+// Note: recv_broadcast_with_lag was replaced with direct tokio::select! in receive_task_crdt
 use crate::mqtt::{IncomingMessage, MqttClient, Topic};
 use crate::sync::client::fetch_head;
 use crate::sync::crdt_merge::{parse_edit_message, process_received_edit};
@@ -36,6 +36,11 @@ use uuid::Uuid;
 pub const BARRIER_RETRY_COUNT: u32 = 5;
 /// Delay between retries when checking for stable content
 pub const BARRIER_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// Interval between periodic divergence checks (seconds).
+/// This ensures sync clients detect when they've diverged from the server
+/// even if MQTT messages are missed.
+pub const DIVERGENCE_CHECK_INTERVAL_SECS: u64 = 30;
 
 /// Handle refresh logic after an upload attempt.
 ///
@@ -2822,63 +2827,104 @@ pub async fn receive_task_crdt(
         node_id
     );
 
+    // Set up periodic divergence check timer
+    let mut divergence_check_interval =
+        tokio::time::interval(Duration::from_secs(DIVERGENCE_CHECK_INTERVAL_SECS));
+    divergence_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the first tick which fires immediately
+    divergence_check_interval.tick().await;
+
     loop {
-        let msg = match recv_broadcast_with_lag(&mut message_rx, &context).await {
-            BroadcastRecvResult::Message(m) => m,
-            BroadcastRecvResult::Lagged {
-                missed_count,
-                next_message,
-            } => {
-                // Resync from server to recover missed edits
-                info!(
-                    "CRDT receive_task: {} lagged by {} messages, triggering resync from server",
-                    file_path.display(),
-                    missed_count
+        // Use select! to either receive a message or trigger the periodic divergence check
+        let msg = tokio::select! {
+            // Periodic divergence check
+            _ = divergence_check_interval.tick() => {
+                debug!(
+                    "CRDT receive_task: periodic divergence check for {}",
+                    file_path.display()
                 );
-
-                // Mark state as needing re-init so the fetch actually happens
-                {
-                    let mut state_guard = crdt_state.write().await;
-                    if let Some(file_state) = state_guard.get_file_mut(&filename) {
-                        file_state.mark_needs_resync();
-                    }
-                }
-
-                // Re-initialize from server to get the latest state
-                if let Err(e) = initialize_crdt_state_from_server_with_pending(
+                let diverged = check_and_resolve_divergence(
                     &http_client,
                     &server,
                     node_id,
+                    &file_path,
                     &crdt_state,
                     &filename,
-                    &file_path,
                     Some(&mqtt_client),
                     Some(&workspace),
                     Some(&author),
                     Some(&shared_last_content),
                 )
-                .await
-                {
-                    warn!(
-                        "CRDT receive_task: failed to resync {} from server after lag: {}",
-                        file_path.display(),
-                        e
-                    );
-                } else {
+                .await;
+                if diverged {
                     info!(
-                        "CRDT receive_task: successfully resynced {} from server after lag",
+                        "CRDT receive_task: divergence detected and resolved for {}",
                         file_path.display()
                     );
                 }
+                continue; // Go back to waiting for messages
+            }
+            // Receive MQTT message
+            recv_result = message_rx.recv() => {
+                match recv_result {
+                    Ok(m) => m,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Handle lag - same logic as recv_broadcast_with_lag
+                        tracing::warn!("{} lagged by {} messages", context, n);
+                        // Resync from server to recover missed edits
+                        info!(
+                            "CRDT receive_task: {} lagged by {} messages, triggering resync from server",
+                            file_path.display(),
+                            n
+                        );
 
-                // Process the next message if available
-                match next_message {
-                    Some(m) => m,
-                    None => break, // Channel closed after lag
+                        // Mark state as needing re-init so the fetch actually happens
+                        {
+                            let mut state_guard = crdt_state.write().await;
+                            if let Some(file_state) = state_guard.get_file_mut(&filename) {
+                                file_state.mark_needs_resync();
+                            }
+                        }
+
+                        // Re-initialize from server to get the latest state
+                        if let Err(e) = initialize_crdt_state_from_server_with_pending(
+                            &http_client,
+                            &server,
+                            node_id,
+                            &crdt_state,
+                            &filename,
+                            &file_path,
+                            Some(&mqtt_client),
+                            Some(&workspace),
+                            Some(&author),
+                            Some(&shared_last_content),
+                        )
+                        .await
+                        {
+                            warn!(
+                                "CRDT receive_task: failed to resync {} from server after lag: {}",
+                                file_path.display(),
+                                e
+                            );
+                        } else {
+                            info!(
+                                "CRDT receive_task: successfully resynced {} from server after lag",
+                                file_path.display()
+                            );
+                        }
+
+                        // Try to get the next message
+                        match message_rx.recv().await {
+                            Ok(m) => m,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-            BroadcastRecvResult::Closed => break,
         };
+
         // Check if this message is for our topic
         if msg.topic != topic {
             continue;
@@ -3167,4 +3213,175 @@ pub async fn receive_task_crdt(
         "CRDT receive_task: shutting down for {}",
         file_path.display()
     );
+}
+
+/// Check for divergence between local and server state, and resolve if needed.
+///
+/// This is called periodically to detect when MQTT messages were missed and
+/// the local state has diverged from the server. It handles three cases:
+/// 1. Server ahead: Pull and merge server state
+/// 2. Local ahead: Re-publish local commits
+/// 3. True divergence: Perform CRDT merge
+///
+/// Returns true if divergence was detected and handled, false otherwise.
+#[allow(clippy::too_many_arguments)]
+async fn check_and_resolve_divergence(
+    http_client: &Client,
+    server: &str,
+    node_id: Uuid,
+    file_path: &Path,
+    crdt_state: &Arc<RwLock<DirectorySyncState>>,
+    filename: &str,
+    mqtt_client: Option<&Arc<MqttClient>>,
+    workspace: Option<&str>,
+    author: Option<&str>,
+    shared_last_content: Option<&SharedLastContent>,
+) -> bool {
+    let node_id_str = node_id.to_string();
+
+    // Get our current state
+    let (local_head_cid, server_head_cid_known) = {
+        let state_guard = crdt_state.read().await;
+        let file_state = state_guard.get_file(filename);
+        match file_state {
+            Some(f) => (f.head_cid.clone(), f.local_head_cid.clone()),
+            None => return false, // File not tracked
+        }
+    };
+
+    // Fetch server HEAD
+    let server_head = match fetch_head(http_client, server, &node_id_str, false).await {
+        Ok(Some(head)) => head,
+        Ok(None) => {
+            debug!(
+                "Divergence check: no server HEAD for {}",
+                file_path.display()
+            );
+            return false;
+        }
+        Err(e) => {
+            warn!(
+                "Divergence check: failed to fetch server HEAD for {}: {}",
+                file_path.display(),
+                e
+            );
+            return false;
+        }
+    };
+
+    let server_cid = match &server_head.cid {
+        Some(cid) => cid.clone(),
+        None => return false, // No server commit yet
+    };
+
+    // Check if we're in sync
+    let local_cid = match &local_head_cid {
+        Some(cid) => cid,
+        None => {
+            // We have no local head, server has content - need to pull
+            info!(
+                "Divergence check: no local HEAD for {}, server has {}, pulling",
+                file_path.display(),
+                server_cid
+            );
+            // Mark as needing resync and pull
+            {
+                let mut state_guard = crdt_state.write().await;
+                if let Some(file_state) = state_guard.get_file_mut(filename) {
+                    file_state.mark_needs_resync();
+                }
+            }
+            if let Err(e) = initialize_crdt_state_from_server_with_pending(
+                http_client,
+                server,
+                node_id,
+                crdt_state,
+                filename,
+                file_path,
+                mqtt_client,
+                workspace,
+                author,
+                shared_last_content,
+            )
+            .await
+            {
+                warn!(
+                    "Divergence check: failed to pull server state for {}: {}",
+                    file_path.display(),
+                    e
+                );
+            }
+            return true;
+        }
+    };
+
+    if local_cid == &server_cid {
+        // In sync - nothing to do
+        return false;
+    }
+
+    // Divergence detected!
+    info!(
+        "Divergence check: {} has local HEAD {} but server HEAD {}",
+        file_path.display(),
+        local_cid,
+        server_cid
+    );
+
+    // Check if we have local changes that haven't been synced
+    let has_local_changes = server_head_cid_known.as_ref() != Some(&server_cid);
+
+    if has_local_changes {
+        // We have local changes AND server has different content
+        // This is true divergence - need to merge
+        info!(
+            "Divergence check: true divergence for {} (local_head_cid={:?}), triggering resync with merge",
+            file_path.display(),
+            server_head_cid_known
+        );
+    } else {
+        // Server is ahead and we don't have local changes - just pull
+        info!(
+            "Divergence check: server ahead for {}, pulling",
+            file_path.display()
+        );
+    }
+
+    // Mark as needing resync
+    {
+        let mut state_guard = crdt_state.write().await;
+        if let Some(file_state) = state_guard.get_file_mut(filename) {
+            file_state.mark_needs_resync();
+        }
+    }
+
+    // Resync from server - the merge logic in initialize_crdt_state_from_server_with_pending
+    // will handle merging local changes with server state
+    if let Err(e) = initialize_crdt_state_from_server_with_pending(
+        http_client,
+        server,
+        node_id,
+        crdt_state,
+        filename,
+        file_path,
+        mqtt_client,
+        workspace,
+        author,
+        shared_last_content,
+    )
+    .await
+    {
+        warn!(
+            "Divergence check: failed to resync {} from server: {}",
+            file_path.display(),
+            e
+        );
+    } else {
+        info!(
+            "Divergence check: successfully resynced {} from server",
+            file_path.display()
+        );
+    }
+
+    true
 }
