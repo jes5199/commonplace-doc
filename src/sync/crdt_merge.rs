@@ -10,13 +10,14 @@
 
 use crate::commit::Commit;
 use crate::mqtt::{EditMessage, MqttClient, Topic};
+use crate::store::CommitStore;
 use crate::sync::crdt_state::CrdtPeerState;
 use crate::sync::error::{SyncError, SyncResult};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rumqttc::QoS;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, GetString, ReadTxn, Transact, Update};
 
@@ -45,6 +46,15 @@ pub enum MergeResult {
     },
     /// Commit was applied but we can't write to disk (our local is ahead)
     LocalAhead,
+    /// Intermediate commits are missing - cannot fast-forward.
+    /// The received commit is not an immediate descendant of our current head.
+    /// A resync from server is needed to obtain the missing history.
+    MissingHistory {
+        /// The received commit CID that we cannot fast-forward to
+        received_cid: String,
+        /// Our current head that is not in the received commit's parents
+        current_head: String,
+    },
 }
 
 /// Process a received MQTT edit message.
@@ -64,6 +74,7 @@ pub async fn process_received_edit(
     state: &mut CrdtPeerState,
     edit_msg: &EditMessage,
     author: &str,
+    commit_store: Option<&Arc<CommitStore>>,
 ) -> SyncResult<(MergeResult, Option<String>)> {
     // Compute CID for the received commit using the original timestamp
     // This ensures we get the same CID as when the commit was created
@@ -75,6 +86,22 @@ pub async fn process_received_edit(
         edit_msg.timestamp,
     );
     let received_cid = commit.calculate_cid();
+
+    // Persist the received commit locally if store is provided
+    if let Some(store) = commit_store {
+        match store.store_commit(&commit).await {
+            Ok(cid) => {
+                debug!("Persisted received commit {} to local store", cid);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to persist commit {} to local store: {}",
+                    received_cid, e
+                );
+                // Continue processing even if local persistence fails
+            }
+        }
+    }
 
     // Check if we already know this commit
     if state.is_cid_known(&received_cid) {
@@ -125,6 +152,17 @@ pub async fn process_received_edit(
                 state.local_head_cid = Some(new_head.clone());
             }
             state.update_from_doc(&doc);
+
+            // Record this commit as known so future fast-forwards can reference it
+            state.record_known_cid(&new_head);
+
+            // Update document head in local store
+            if let Some(store) = commit_store {
+                if let Err(e) = store.set_document_head(node_id, &new_head).await {
+                    warn!("Failed to update document head in local store: {}", e);
+                }
+            }
+
             info!("Fast-forward to commit {}", new_head);
             MergeResult::FastForward { new_head }
         }
@@ -140,29 +178,73 @@ pub async fn process_received_edit(
             let merge_update = create_merge_update(&doc)?;
             let local_cid = state.local_head_cid.clone().unwrap_or_default();
 
-            // Create the merge commit to get the ACTUAL CID
-            let actual_merge_cid = if let Some(mqtt) = mqtt_client {
-                publish_merge_commit(
-                    mqtt,
-                    workspace,
-                    node_id,
-                    &local_cid,
-                    &remote_cid,
-                    &merge_update,
-                    author,
-                )
-                .await?
-            } else {
-                // No MQTT client - compute what the CID would be
-                let parents = vec![local_cid.clone(), remote_cid.clone()];
-                let update_b64 = STANDARD.encode(&merge_update);
-                let commit = Commit::new(parents, update_b64, author.to_string(), None);
-                commit.calculate_cid()
-            };
+            // Create the merge commit
+            let parents = vec![local_cid.clone(), remote_cid.clone()];
+            let update_b64 = STANDARD.encode(&merge_update);
+            let merge_commit = Commit::new(
+                parents,
+                update_b64,
+                author.to_string(),
+                Some("Merge commit".to_string()),
+            );
+            let actual_merge_cid = merge_commit.calculate_cid();
+
+            // Persist merge commit to local store if provided
+            if let Some(store) = commit_store {
+                match store
+                    .store_commit_and_set_head(node_id, &merge_commit)
+                    .await
+                {
+                    Ok(_) => {
+                        debug!("Persisted merge commit {} to local store", actual_merge_cid);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to persist merge commit {} to local store: {}",
+                            actual_merge_cid, e
+                        );
+                    }
+                }
+            }
+
+            // Publish via MQTT if client is provided
+            if let Some(mqtt) = mqtt_client {
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+
+                let publish_msg = EditMessage {
+                    update: merge_commit.update.clone(),
+                    parents: merge_commit.parents.clone(),
+                    author: author.to_string(),
+                    message: Some("Merge commit".to_string()),
+                    timestamp,
+                };
+
+                let topic = Topic::edits(workspace, node_id).to_topic_string();
+                let payload = serde_json::to_vec(&publish_msg)?;
+
+                mqtt.publish_retained(&topic, &payload, QoS::AtLeastOnce)
+                    .await
+                    .map_err(|e| {
+                        SyncError::mqtt(format!("Failed to publish merge commit: {}", e))
+                    })?;
+
+                info!(
+                    "Published merge commit {} for {} (parents: {}, {})",
+                    actual_merge_cid, node_id, local_cid, remote_cid
+                );
+            }
 
             state.head_cid = Some(actual_merge_cid.clone());
             state.local_head_cid = Some(actual_merge_cid.clone());
             state.update_from_doc(&doc);
+
+            // Record both the merge commit and the remote commit as known
+            state.record_known_cid(&actual_merge_cid);
+            state.record_known_cid(&remote_cid);
+
             info!(
                 "Created merge commit {} (local + remote {})",
                 actual_merge_cid, remote_cid
@@ -181,8 +263,27 @@ pub async fn process_received_edit(
             // Apply the remote update to our doc but don't update local_head_cid
             state.head_cid = Some(received_cid.clone());
             state.update_from_doc(&doc);
+
+            // Record this commit as known even though we're ahead
+            state.record_known_cid(&received_cid);
+
             debug!("Applied remote commit {} but local is ahead", received_cid);
             MergeResult::LocalAhead
+        }
+        MergeResult::MissingHistory {
+            received_cid: ref cid,
+            ref current_head,
+        } => {
+            // Intermediate commits are missing - cannot fast-forward.
+            // Don't update state - the caller should trigger a resync.
+            info!(
+                "Missing intermediate commits between head {} and received {}. Resync needed.",
+                current_head, cid
+            );
+            MergeResult::MissingHistory {
+                received_cid: cid.clone(),
+                current_head: current_head.clone(),
+            }
         }
     };
 
@@ -210,30 +311,51 @@ fn determine_merge_strategy(
     let local_head = state.local_head_cid.as_deref();
     let server_head = state.head_cid.as_deref();
 
-    // Case 1: No local state - this is a fast-forward
+    // Case 1: No local state - this is a fast-forward from empty
     if local_head.is_none() && server_head.is_none() {
         return MergeResult::FastForward {
             new_head: received_cid.to_string(),
         };
     }
 
-    // Case 2: Received commit is descendant of both our heads - fast-forward
-    if is_ancestor(&local_head.map(String::from), received_parents)
-        && is_ancestor(&server_head.map(String::from), received_parents)
-    {
-        return MergeResult::FastForward {
-            new_head: received_cid.to_string(),
+    // Case 2: Received commit has no parents but we have SYNCHRONIZED state.
+    // If we have a server_head (meaning we've synced with the server before), and we receive
+    // a commit with no parents, this indicates missing history - how does this new branch
+    // connect to our existing history?
+    // However, if we only have local_head but no server_head, this could be a valid
+    // concurrent edit scenario where both parties started from empty.
+    if received_parents.is_empty() && server_head.is_some() {
+        let current = local_head.or(server_head).unwrap_or("(none)").to_string();
+        return MergeResult::MissingHistory {
+            received_cid: received_cid.to_string(),
+            current_head: current,
         };
     }
 
-    // Case 3: Our local_head equals server_head - we're in sync, fast-forward
-    if local_head == server_head {
-        return MergeResult::FastForward {
-            new_head: received_cid.to_string(),
-        };
+    // Check if all parents of the received commit are known to us.
+    // This ensures we have the full history before accepting the commit.
+    let all_parents_known = received_parents.iter().all(|p| state.is_cid_known(p));
+
+    // Case 3: All parents are known - we can fast-forward if appropriate
+    if all_parents_known {
+        // If local and server heads are ancestors (or same as) parents, fast-forward
+        if is_ancestor(&local_head.map(String::from), received_parents)
+            && is_ancestor(&server_head.map(String::from), received_parents)
+        {
+            return MergeResult::FastForward {
+                new_head: received_cid.to_string(),
+            };
+        }
+
+        // Case 4: Our local_head equals server_head - we're in sync, fast-forward
+        if local_head == server_head {
+            return MergeResult::FastForward {
+                new_head: received_cid.to_string(),
+            };
+        }
     }
 
-    // Case 4: We have local changes not on server
+    // Case 5: We have local changes not on server (local_head != server_head)
     if let Some(local) = local_head {
         if Some(local) != server_head {
             // Check if received commit is based on server_head
@@ -244,6 +366,17 @@ fn determine_merge_strategy(
                 };
             }
         }
+    }
+
+    // Case 6: Parents are not all known - missing history
+    // This check comes late to allow the NeedsMerge case to work even with
+    // unknown parents on the local branch.
+    if !all_parents_known {
+        let current = local_head.or(server_head).unwrap_or("(none)").to_string();
+        return MergeResult::MissingHistory {
+            received_cid: received_cid.to_string(),
+            current_head: current,
+        };
     }
 
     // Default: local is ahead, just track the remote
@@ -273,56 +406,6 @@ fn create_merge_update(_doc: &Doc) -> SyncResult<Vec<u8>> {
     Ok(Vec::new())
 }
 
-/// Publish a merge commit via MQTT.
-async fn publish_merge_commit(
-    mqtt_client: &Arc<MqttClient>,
-    workspace: &str,
-    node_id: &str,
-    local_parent: &str,
-    remote_parent: &str,
-    update_bytes: &[u8],
-    author: &str,
-) -> SyncResult<String> {
-    let parents = vec![local_parent.to_string(), remote_parent.to_string()];
-    let update_b64 = STANDARD.encode(update_bytes);
-
-    let commit = Commit::new(
-        parents.clone(),
-        update_b64.clone(),
-        author.to_string(),
-        None,
-    );
-    let cid = commit.calculate_cid();
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
-    let edit_msg = EditMessage {
-        update: update_b64,
-        parents,
-        author: author.to_string(),
-        message: Some("Merge commit".to_string()),
-        timestamp,
-    };
-
-    let topic = Topic::edits(workspace, node_id).to_topic_string();
-    let payload = serde_json::to_vec(&edit_msg)?;
-
-    mqtt_client
-        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
-        .await
-        .map_err(|e| SyncError::mqtt(format!("Failed to publish merge commit: {}", e)))?;
-
-    info!(
-        "Published merge commit {} for {} (parents: {}, {})",
-        cid, node_id, local_parent, remote_parent
-    );
-
-    Ok(cid)
-}
-
 /// Get text content from a Y.Doc.
 fn get_doc_text_content(doc: &Doc) -> String {
     let txn = doc.transact();
@@ -346,14 +429,23 @@ mod tests {
     #[test]
     fn test_merge_result_local_ahead() {
         let mut state = CrdtPeerState::new(Uuid::new_v4());
-        // Only head_cid set, not local_head_cid - indicates we received a commit
-        // but haven't made local changes based on it
-        state.head_cid = Some("abc123".to_string());
+        // We have both head_cid and local_head_cid set to different values,
+        // indicating we have local changes not yet on server.
+        // The parent is known (in our known_cids set).
+        state.head_cid = Some("server_head".to_string());
+        state.local_head_cid = Some("local_head".to_string());
+        state.record_known_cid("some_parent");
 
-        // Received commit with different parent - local is ahead
-        let result = determine_merge_strategy(&state, "new_commit", &["other_parent".to_string()]);
-        // This should be LocalAhead since local_head is None but head_cid is set
-        assert!(matches!(result, MergeResult::LocalAhead));
+        // Received commit with known parent that doesn't include our local_head
+        // and server_head is not in parents either - this triggers LocalAhead
+        let result = determine_merge_strategy(&state, "new_commit", &["some_parent".to_string()]);
+        // This should be LocalAhead since local is different from server and commit
+        // doesn't acknowledge either of them as parent
+        assert!(
+            matches!(result, MergeResult::LocalAhead),
+            "Expected LocalAhead, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -396,6 +488,97 @@ mod tests {
             &Some("other".to_string()),
             &["parent".to_string()]
         ));
+    }
+
+    #[test]
+    fn test_missing_history_when_head_not_in_parents() {
+        // Scenario: We're at commit A, receive commit D with parent C.
+        // A -> B -> C -> D (but we only have A, skipped B and C)
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+        state.head_cid = Some("commit_a".to_string());
+        state.local_head_cid = Some("commit_a".to_string());
+
+        // Received commit D has parent C, not A - intermediate commits are missing
+        let result = determine_merge_strategy(&state, "commit_d", &["commit_c".to_string()]);
+
+        assert!(
+            matches!(
+                &result,
+                MergeResult::MissingHistory {
+                    received_cid,
+                    current_head
+                } if received_cid == "commit_d" && current_head == "commit_a"
+            ),
+            "Expected MissingHistory, got {:?}",
+            &result
+        );
+    }
+
+    #[test]
+    fn test_missing_history_with_unknown_parents() {
+        // Scenario: We're at commit A, receive commit B with an unknown parent C.
+        // We don't have commit C so we can't fast-forward.
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+        state.head_cid = Some("commit_a".to_string());
+        state.local_head_cid = Some("commit_a".to_string());
+        state.record_known_cid("commit_a");
+
+        // Received commit has parent "commit_c" which we don't know
+        let result = determine_merge_strategy(&state, "commit_b", &["commit_c".to_string()]);
+
+        assert!(
+            matches!(
+                &result,
+                MergeResult::MissingHistory {
+                    received_cid,
+                    current_head
+                } if received_cid == "commit_b" && current_head == "commit_a"
+            ),
+            "Expected MissingHistory, got {:?}",
+            &result
+        );
+    }
+
+    #[test]
+    fn test_fast_forward_when_head_is_parent() {
+        // Scenario: We're at commit A, receive commit B with parent A.
+        // This is a valid fast-forward (immediate descendant).
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+        state.head_cid = Some("commit_a".to_string());
+        state.local_head_cid = Some("commit_a".to_string());
+
+        // Received commit has our head as parent - valid fast-forward
+        let result = determine_merge_strategy(&state, "commit_b", &["commit_a".to_string()]);
+
+        assert!(
+            matches!(&result, MergeResult::FastForward { ref new_head } if new_head == "commit_b"),
+            "Expected FastForward, got {:?}",
+            &result
+        );
+    }
+
+    #[test]
+    fn test_missing_history_with_empty_parents_and_server_head() {
+        // Scenario: We have synchronized state (server_head set), receive a genesis commit.
+        // This is missing history - how does the new branch connect to our history?
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+        state.head_cid = Some("commit_a".to_string());
+        state.local_head_cid = Some("commit_a".to_string());
+
+        // Received commit has no parents - cannot be a descendant
+        let result = determine_merge_strategy(&state, "commit_b", &[]);
+
+        assert!(
+            matches!(
+                &result,
+                MergeResult::MissingHistory {
+                    received_cid,
+                    current_head
+                } if received_cid == "commit_b" && current_head == "commit_a"
+            ),
+            "Expected MissingHistory, got {:?}",
+            &result
+        );
     }
 
     #[test]
@@ -519,6 +702,7 @@ mod tests {
             &mut state_a,
             &edit_from_b,
             "user_a",
+            None, // No commit store in tests
         )
         .await
         .expect("Should process edit");
@@ -548,6 +732,7 @@ mod tests {
             &mut state_b,
             &edit_from_a,
             "user_b",
+            None, // No commit store in tests
         )
         .await
         .expect("Should process edit");
@@ -629,10 +814,17 @@ mod tests {
             timestamp,
         };
 
-        let (result, _) =
-            process_received_edit(None, "workspace", "node1", &mut state, &echo_msg, "me")
-                .await
-                .expect("Should process edit");
+        let (result, _) = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &echo_msg,
+            "me",
+            None,
+        )
+        .await
+        .expect("Should process edit");
 
         // Should recognize it's already known
         assert_eq!(result, MergeResult::AlreadyKnown, "Should detect echo");
@@ -655,18 +847,26 @@ mod tests {
             txn.encode_update_v1()
         };
         let update1_b64 = STANDARD.encode(&update1);
-        let commit1 = Commit::new(vec![], update1_b64.clone(), "user".to_string(), None);
+        // Use explicit timestamp so CID calculation is deterministic
+        let timestamp1 = 1000u64;
+        let commit1 = Commit::with_timestamp(
+            vec![],
+            update1_b64.clone(),
+            "user".to_string(),
+            None,
+            timestamp1,
+        );
         let cid1 = commit1.calculate_cid();
 
-        // Receive first commit
+        // Receive first commit (using same timestamp as commit calculation)
         let msg1 = EditMessage {
             update: update1_b64,
             parents: vec![],
             author: "user".to_string(),
             message: None,
-            timestamp: 1000,
+            timestamp: timestamp1,
         };
-        let (result1, _) = process_received_edit(None, "ws", "n1", &mut state, &msg1, "user")
+        let (result1, _) = process_received_edit(None, "ws", "n1", &mut state, &msg1, "user", None)
             .await
             .unwrap();
         assert!(matches!(result1, MergeResult::FastForward { .. }));
@@ -690,14 +890,15 @@ mod tests {
         // Receive second commit (child of first)
         let msg2 = EditMessage {
             update: update2_b64,
-            parents: vec![cid1], // Parent is first commit
+            parents: vec![cid1], // Parent is first commit (with matching timestamp)
             author: "user".to_string(),
             message: None,
             timestamp: 1001,
         };
-        let (result2, content) = process_received_edit(None, "ws", "n1", &mut state, &msg2, "user")
-            .await
-            .unwrap();
+        let (result2, content) =
+            process_received_edit(None, "ws", "n1", &mut state, &msg2, "user", None)
+                .await
+                .unwrap();
 
         // Should be fast-forward since it's a descendant
         assert!(
@@ -755,9 +956,10 @@ mod tests {
             timestamp: 1000,
         };
 
-        let (result, _) = process_received_edit(None, "ws", "n1", &mut state, &remote_msg, "me")
-            .await
-            .unwrap();
+        let (result, _) =
+            process_received_edit(None, "ws", "n1", &mut state, &remote_msg, "me", None)
+                .await
+                .unwrap();
 
         // Should trigger merge or LocalAhead since we have divergent local changes
         assert!(

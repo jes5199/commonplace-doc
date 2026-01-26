@@ -22,6 +22,7 @@ pub mod file_sync;
 #[cfg(unix)]
 pub mod flock;
 pub mod flock_state;
+pub mod missing_parent;
 pub mod schema_io;
 pub mod sse;
 pub mod state;
@@ -167,7 +168,13 @@ pub use crdt_publish::{
     publish_yjs_update, PublishResult,
 };
 pub use crdt_state::{
-    load_or_migrate, migrate_from_old_state, CrdtPeerState, DirectorySyncState, PendingEdit,
-    QueueReason, SubdirStateCache, SyncGuardrails, CRDT_STATE_FILENAME, MAX_PENDING_EDITS,
+    load_or_migrate, migrate_from_old_state, CrdtPeerState, DirectorySyncState, MqttOnlySyncConfig,
+    PendingEdit, QueueReason, SubdirStateCache, SyncGuardrails, CRDT_STATE_FILENAME,
+    MAX_PENDING_EDITS,
 };
 pub use error::{SyncError, SyncResult};
+pub use missing_parent::{
+    check_and_alert_missing_parents, handle_missing_parent_alert, new_rate_limiter,
+    publish_missing_parent_alert, subscribe_to_missing_parent_alerts, RebroadcastRateLimiter,
+    SharedRateLimiter, REBROADCAST_MAX_JITTER_MS, REBROADCAST_MIN_INTERVAL,
+};

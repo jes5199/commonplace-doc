@@ -7,6 +7,7 @@
 use clap::Parser;
 use commonplace_doc::events::recv_broadcast;
 use commonplace_doc::mqtt::{MqttClient, MqttConfig, Topic};
+use commonplace_doc::store::CommitStore;
 use commonplace_doc::sync::crdt_state::DirectorySyncState;
 use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
 use commonplace_doc::sync::subdir_spawn::{
@@ -25,8 +26,8 @@ use commonplace_doc::sync::{
     spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file, trace_timeline,
     upload_task, wait_for_file_stability, wait_for_uuid_map_ready, write_schema_file, ymap_schema,
     CrdtFileSyncContext, DirEvent, FileEvent, FileSyncState, InodeKey, InodeTracker,
-    ReplaceResponse, ScanOptions, SharedLastContent, SharedStateFile, SubdirStateCache, SyncState,
-    TimelineMilestone, SCHEMA_FILENAME,
+    MqttOnlySyncConfig, ReplaceResponse, ScanOptions, SharedLastContent, SharedStateFile,
+    SubdirStateCache, SyncState, TimelineMilestone, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -1140,6 +1141,20 @@ struct Args {
     /// Default: 10 seconds.
     #[arg(long, default_value = "10")]
     sandbox_timeout: u64,
+
+    /// Path to a local redb commit store for persisting commits locally.
+    /// When enabled, the sync client stores all received and created commits
+    /// to this database, enabling commit rebroadcast and restart resilience.
+    /// Example: ~/.commonplace/sync-commits.redb
+    #[arg(long, env = "COMMONPLACE_COMMIT_STORE")]
+    commit_store: Option<PathBuf>,
+
+    /// Enable MQTT-only sync mode (deprecated HTTP fallback).
+    /// When enabled, HTTP calls for sync operations log warnings.
+    /// This is a transitional flag for gradual migration to MQTT-only sync.
+    /// Default: false (HTTP fallback enabled)
+    #[arg(long, default_value = "false", env = "COMMONPLACE_MQTT_ONLY_SYNC")]
+    mqtt_only_sync: bool,
 }
 
 /// Resolve a path relative to fs-root to a UUID.
@@ -1414,6 +1429,34 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Initialize local commit store if path provided
+    // TODO: Wire commit_store through to sync tasks (receive_task_crdt, etc.)
+    // For now, the store is initialized but not yet passed to CRDT processing.
+    let _commit_store: Option<Arc<CommitStore>> = if let Some(ref path) = args.commit_store {
+        info!("Initializing local commit store at: {}", path.display());
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    error!("Failed to create commit store directory: {}", e);
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        match CommitStore::new(path) {
+            Ok(store) => {
+                info!("Local commit store initialized");
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                error!("Failed to create commit store: {}", e);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
+
     // Determine the node ID to sync with
     // Priority: --node > --path > --fork-from > --use-paths discovery
     let node_id = if let Some(ref node) = args.node {
@@ -1593,6 +1636,7 @@ async fn main() -> ExitCode {
                 args.workspace,
                 args.path.clone(),
                 args.sandbox_timeout,
+                args.mqtt_only_sync,
             )
             .await
         };
@@ -1664,6 +1708,7 @@ async fn main() -> ExitCode {
                 args.workspace,
                 args.path.clone(),
                 args.sandbox_timeout,
+                args.mqtt_only_sync,
             )
             .await
         } else {
@@ -1682,6 +1727,7 @@ async fn main() -> ExitCode {
                 mqtt_client,
                 args.workspace,
                 args.name.clone(),
+                args.mqtt_only_sync,
             )
             .await
             .map(|_| 0u8)
@@ -2018,6 +2064,7 @@ async fn run_directory_mode(
     mqtt_client: Arc<MqttClient>,
     workspace: String,
     name: Option<String>,
+    mqtt_only_sync: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Derive author from name parameter, defaulting to "sync-client"
     let author = name.unwrap_or_else(|| "sync-client".to_string());
@@ -2305,11 +2352,17 @@ async fn run_directory_mode(
             .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
     ));
     let subdir_cache = Arc::new(SubdirStateCache::new());
+    let mqtt_only_config = if mqtt_only_sync {
+        MqttOnlySyncConfig::mqtt_only()
+    } else {
+        MqttOnlySyncConfig::with_http_fallback()
+    };
     let crdt_context = Some(CrdtFileSyncContext {
         mqtt_client: mqtt_client.clone(),
         workspace: workspace.clone(),
         crdt_state: crdt_state.clone(),
         subdir_cache: subdir_cache.clone(),
+        mqtt_only_config,
     });
 
     // Start subscription task for fs-root (skip if push-only)
@@ -2613,6 +2666,7 @@ async fn run_exec_mode(
     workspace: String,
     command_path: Option<String>,
     sandbox_timeout_secs: u64,
+    mqtt_only_sync: bool,
 ) -> Result<u8, Box<dyn std::error::Error + Send + Sync>> {
     // Derive author from process_name, defaulting to "sync-client"
     let author = process_name
@@ -2919,11 +2973,17 @@ async fn run_exec_mode(
             .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
     ));
     let subdir_cache = Arc::new(SubdirStateCache::new());
+    let mqtt_only_config = if mqtt_only_sync {
+        MqttOnlySyncConfig::mqtt_only()
+    } else {
+        MqttOnlySyncConfig::with_http_fallback()
+    };
     let crdt_context = Some(CrdtFileSyncContext {
         mqtt_client: mqtt_client.clone(),
         workspace: workspace.clone(),
         crdt_state: crdt_state.clone(),
         subdir_cache: subdir_cache.clone(),
+        mqtt_only_config,
     });
 
     // Start subscription task for fs-root (skip if push-only)

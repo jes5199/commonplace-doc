@@ -2213,6 +2213,11 @@ pub async fn initialize_crdt_state_from_server(
 /// This extended version accepts optional MQTT client, workspace, and author
 /// to process pending edits that arrived before initialization completed.
 ///
+/// **Note**: This function uses HTTP to fetch HEAD from server, which can
+/// race with MQTT messages causing stale data issues. Consider using
+/// MQTT retained messages for initialization in MQTT-only mode.
+/// See CP-cpcu for the deprecation plan.
+///
 /// # Arguments
 /// * `client` - HTTP client for fetching from server
 /// * `server` - Server URL
@@ -2251,6 +2256,9 @@ pub async fn initialize_crdt_state_from_server_with_pending(
     }
 
     // Fetch HEAD from server
+    // NOTE: This HTTP call can race with MQTT messages. See MqttOnlySyncConfig
+    // for deprecation tracking. In the future, initial state should come from
+    // MQTT retained messages.
     let identifier = node_id.to_string();
     match fetch_head(client, server, &identifier, false).await {
         Ok(Some(head)) => {
@@ -2323,6 +2331,7 @@ pub async fn initialize_crdt_state_from_server_with_pending(
                                 file_state,
                                 &edit_msg,
                                 author.unwrap_or(""),
+                                None, // commit_store not available in file_sync init context
                             )
                             .await
                             {
@@ -2406,6 +2415,7 @@ pub async fn initialize_crdt_state_from_server_with_pending(
                                 file_state,
                                 &edit_msg,
                                 author.unwrap_or(""),
+                                None, // commit_store not available in file_sync empty-state context
                             )
                             .await
                             {
@@ -2666,6 +2676,7 @@ pub async fn receive_task_crdt(
                     file_state,
                     &edit_msg,
                     &author,
+                    None, // commit_store not available in receive_task_crdt
                 )
                 .await
                 {
@@ -2931,6 +2942,7 @@ pub async fn receive_task_crdt(
             file_state,
             &edit_msg,
             &author,
+            None, // commit_store not available in receive_task_crdt main loop
         )
         .await
         {
@@ -2979,6 +2991,60 @@ pub async fn receive_task_crdt(
                         // NeedsMerge is only used internally by determine_merge_strategy
                         // and is converted to Merged by process_received_edit
                         unreachable!("process_received_edit should not return NeedsMerge")
+                    }
+                    MergeResult::MissingHistory {
+                        received_cid,
+                        current_head,
+                    } => {
+                        // Intermediate commits are missing - trigger a resync from server
+                        warn!(
+                            "CRDT receive_task: missing history for {} (head: {}, received: {}). Triggering resync.",
+                            file_path.display(),
+                            current_head,
+                            received_cid
+                        );
+
+                        // Drop state_guard to release the write lock before resyncing.
+                        // The resync function will acquire its own lock.
+                        drop(state_guard);
+
+                        // Mark state as needing resync
+                        {
+                            let mut resync_guard = crdt_state.write().await;
+                            if let Some(file_state) = resync_guard.get_file_mut(&filename) {
+                                file_state.mark_needs_resync();
+                            }
+                        }
+
+                        // Re-fetch state from server
+                        if let Err(e) = initialize_crdt_state_from_server_with_pending(
+                            &http_client,
+                            &server,
+                            node_id,
+                            &crdt_state,
+                            &filename,
+                            &file_path,
+                            Some(&mqtt_client),
+                            Some(&workspace),
+                            Some(&author),
+                            Some(&shared_last_content),
+                        )
+                        .await
+                        {
+                            warn!(
+                                "CRDT receive_task: failed to resync {} from server after missing history: {}",
+                                file_path.display(),
+                                e
+                            );
+                        } else {
+                            info!(
+                                "CRDT receive_task: successfully resynced {} from server after missing history",
+                                file_path.display()
+                            );
+                        }
+
+                        // Continue to next message - state has been reset
+                        continue;
                     }
                 }
 

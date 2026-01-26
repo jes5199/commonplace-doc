@@ -155,6 +155,26 @@ pub enum SyncMessage {
         /// Error message
         message: String,
     },
+
+    // ========== Alerts (broadcast to notify peers of issues) ==========
+    /// Alert that parent commits are missing.
+    ///
+    /// Published when a client receives a commit but doesn't have one or more
+    /// of its parent commits. Peers can respond by publishing the missing
+    /// commits or triggering a sync request.
+    ///
+    /// Topic pattern: `{workspace}/sync/{path}/missing`
+    #[serde(rename = "missing_parent")]
+    MissingParent {
+        /// Request ID for correlation (optional - can be used to track recovery)
+        req: String,
+        /// The commit ID that has missing parents
+        commit_id: String,
+        /// List of parent commit IDs that are missing
+        missing_parents: Vec<String>,
+        /// Client ID of the sender (so responders know who to help)
+        client_id: String,
+    },
 }
 
 /// Request to create a new document.
@@ -311,6 +331,7 @@ impl SyncMessage {
             SyncMessage::Done { req, .. } => req,
             SyncMessage::IsAncestorResponse { req, .. } => req,
             SyncMessage::Error { req, .. } => req,
+            SyncMessage::MissingParent { req, .. } => req,
         }
     }
 
@@ -336,6 +357,11 @@ impl SyncMessage {
                 | SyncMessage::IsAncestorResponse { .. }
                 | SyncMessage::Error { .. }
         )
+    }
+
+    /// Check if this is an alert message (broadcast to peers).
+    pub fn is_alert(&self) -> bool {
+        matches!(self, SyncMessage::MissingParent { .. })
     }
 }
 

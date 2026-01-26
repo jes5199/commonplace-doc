@@ -175,6 +175,44 @@ pub struct PendingEdit {
     pub payload: Vec<u8>,
 }
 
+/// Configuration for MQTT-only sync mode.
+///
+/// When enabled, HTTP is deprecated for sync operations.
+/// All state initialization comes from MQTT retained messages.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MqttOnlySyncConfig {
+    /// If true, HTTP calls during sync are deprecated and logged as warnings.
+    /// State initialization relies on MQTT retained messages instead of HTTP fetch.
+    pub mqtt_only: bool,
+}
+
+impl MqttOnlySyncConfig {
+    /// Create a new config with MQTT-only mode enabled.
+    pub fn mqtt_only() -> Self {
+        Self { mqtt_only: true }
+    }
+
+    /// Create a new config with HTTP fallback enabled (default behavior).
+    pub fn with_http_fallback() -> Self {
+        Self { mqtt_only: false }
+    }
+
+    /// Check if HTTP calls should be logged as deprecated.
+    pub fn http_deprecated(&self) -> bool {
+        self.mqtt_only
+    }
+
+    /// Log a deprecation warning for HTTP usage if MQTT-only mode is enabled.
+    pub fn log_http_deprecation(&self, operation: &str) {
+        if self.mqtt_only {
+            warn!(
+                "[DEPRECATED] HTTP {} called in MQTT-only mode - this may cause race conditions",
+                operation
+            );
+        }
+    }
+}
+
 /// Reason why edits are being queued (for logging/debugging).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueReason {
@@ -203,6 +241,7 @@ impl QueueReason {
 /// - The serialized Y.Doc state
 /// - A queue of pending edits received before initialization
 /// - A flag indicating whether the receive task is ready
+/// - A set of known commit IDs (for detecting missing parents)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrdtPeerState {
     /// UUID for this document
@@ -216,6 +255,10 @@ pub struct CrdtPeerState {
     /// Serialized Y.Doc state (base64 encoded)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub yjs_state: Option<String>,
+    /// Set of known commit IDs (for detecting missing parents).
+    /// This is persisted to survive restarts.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub known_cids: HashSet<String>,
     /// Queue of edits received before CRDT initialization completed
     /// AND receive task became ready. Edits are queued until both
     /// conditions are met.
@@ -235,6 +278,7 @@ impl CrdtPeerState {
             head_cid: None,
             local_head_cid: None,
             yjs_state: None,
+            known_cids: HashSet::new(),
             pending_edits: Vec::new(),
             receive_task_ready: false,
         }
@@ -252,6 +296,7 @@ impl CrdtPeerState {
             head_cid: None,
             local_head_cid: None,
             yjs_state: Some(yjs_state),
+            known_cids: HashSet::new(),
             pending_edits: Vec::new(),
             receive_task_ready: false,
         }
@@ -291,9 +336,38 @@ impl CrdtPeerState {
         self.yjs_state = Some(STANDARD.encode(&update));
     }
 
-    /// Check if this commit CID is already known (either as head or local_head).
+    /// Check if this commit CID is already known.
+    ///
+    /// Returns true if the CID is in the known_cids set, or is the current
+    /// head_cid or local_head_cid. This is used to detect echo commits
+    /// that we should skip processing.
     pub fn is_cid_known(&self, cid: &str) -> bool {
-        self.head_cid.as_deref() == Some(cid) || self.local_head_cid.as_deref() == Some(cid)
+        self.known_cids.contains(cid)
+            || self.head_cid.as_deref() == Some(cid)
+            || self.local_head_cid.as_deref() == Some(cid)
+    }
+
+    /// Record a commit CID as known.
+    ///
+    /// This should be called after successfully processing a commit
+    /// to track that we have its data in our history.
+    pub fn record_known_cid(&mut self, cid: &str) {
+        self.known_cids.insert(cid.to_string());
+    }
+
+    /// Check which parents of a commit are missing (not known to us).
+    ///
+    /// Returns a list of parent CIDs that we don't have in our history.
+    /// An empty list means all parents are known.
+    ///
+    /// Note: This only checks our local knowledge. For a commit with no
+    /// parents (the initial commit), this returns an empty list.
+    pub fn find_missing_parents(&self, parents: &[String]) -> Vec<String> {
+        parents
+            .iter()
+            .filter(|p| !p.is_empty() && !self.is_cid_known(p))
+            .cloned()
+            .collect()
     }
 
     /// Initialize this state from server's Yjs state.
@@ -310,6 +384,8 @@ impl CrdtPeerState {
         self.yjs_state = Some(server_state_b64.to_string());
         self.head_cid = Some(server_cid.to_string());
         self.local_head_cid = Some(server_cid.to_string());
+        // Record the initial commit as known
+        self.record_known_cid(server_cid);
         debug!(
             "Initialized CRDT state from server: cid={}, state_len={}",
             server_cid,
@@ -386,8 +462,9 @@ impl CrdtPeerState {
     /// state. Clears the yjs_state so that `needs_server_init()` returns true
     /// and the next initialization will fetch fresh state from server.
     ///
-    /// Also clears head_cid and local_head_cid to allow fresh ancestry checks.
-    /// Does NOT reset receive_task_ready since the task is still running.
+    /// Also clears head_cid, local_head_cid, and known_cids to allow fresh
+    /// ancestry checks. Does NOT reset receive_task_ready since the task is
+    /// still running.
     pub fn mark_needs_resync(&mut self) {
         debug!(
             "Marking {} as needing resync - clearing CRDT state",
@@ -396,6 +473,7 @@ impl CrdtPeerState {
         self.yjs_state = None;
         self.head_cid = None;
         self.local_head_cid = None;
+        self.known_cids.clear();
         // Keep pending_edits - they may still be applicable after resync
         // Keep receive_task_ready - the task is still running and subscribed
     }

@@ -178,6 +178,23 @@ impl Topic {
         format!("{}/sync/{}/+", workspace, path)
     }
 
+    /// Construct a sync missing parent alert topic.
+    /// Returns `{workspace}/sync/{path}/missing`
+    pub fn sync_missing(workspace: &str, path: &str) -> Self {
+        Topic {
+            workspace: workspace.to_string(),
+            path: path.to_string(),
+            port: Port::Sync,
+            qualifier: Some("missing".to_string()),
+        }
+    }
+
+    /// Get the topic pattern for subscribing to missing parent alerts for a path.
+    /// Returns `{workspace}/sync/{path}/missing`
+    pub fn sync_missing_pattern(workspace: &str, path: &str) -> String {
+        format!("{}/sync/{}/missing", workspace, path)
+    }
+
     /// Get the wildcard pattern for subscribing to all events in a workspace.
     /// Returns `{workspace}/events/#`
     pub fn events_wildcard_all(workspace: &str) -> String {

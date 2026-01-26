@@ -130,6 +130,9 @@ pub struct CrdtFileSyncContext {
     pub workspace: String,
     pub crdt_state: Arc<RwLock<crate::sync::DirectorySyncState>>,
     pub subdir_cache: Arc<crate::sync::SubdirStateCache>,
+    /// Configuration for MQTT-only sync mode.
+    /// When enabled, HTTP calls are deprecated and state is initialized from MQTT.
+    pub mqtt_only_config: crate::sync::MqttOnlySyncConfig,
 }
 
 // ============================================================================
@@ -1083,6 +1086,7 @@ pub async fn directory_mqtt_task(
                                     file_state,
                                     &edit_msg,
                                     &author,
+                                    None, // No local commit store in subscription context
                                 )
                                 .await
                                 {
@@ -1545,6 +1549,10 @@ async fn handle_file_uuid_edit(
 ///
 /// For CRDT-managed files, it re-initializes the CRDT state from server.
 /// For non-CRDT files, it fetches and writes the content directly.
+///
+/// **DEPRECATED in MQTT-only mode**: This function uses HTTP which can race with MQTT.
+/// When `mqtt_only_config.mqtt_only` is true, this logs a deprecation warning.
+/// In the future, resync should rely on MQTT retained messages.
 #[allow(clippy::too_many_arguments)]
 async fn resync_subscribed_files(
     http_client: &Client,
@@ -1557,6 +1565,12 @@ async fn resync_subscribed_files(
     crdt_context: Option<&CrdtFileSyncContext>,
     author: &str,
 ) {
+    // Log deprecation warning if MQTT-only mode is enabled
+    if let Some(ctx) = crdt_context {
+        ctx.mqtt_only_config
+            .log_http_deprecation("resync_subscribed_files");
+    }
+
     info!(
         "Resyncing {} subscribed file UUIDs after broadcast lag",
         subscribed_uuids.len()
@@ -1662,6 +1676,10 @@ async fn resync_subscribed_files(
 /// 2. Fetches the authoritative schema HEAD from server (including Yjs state)
 /// 3. Re-initializes the local CRDT state with the server's state
 ///
+/// **DEPRECATED in MQTT-only mode**: This function uses HTTP which can race with MQTT.
+/// When `mqtt_only_config.mqtt_only` is true, this logs a deprecation warning.
+/// In the future, resync should rely on MQTT retained messages.
+///
 /// # Arguments
 /// * `http_client` - HTTP client for server requests
 /// * `server` - Server base URL
@@ -1677,6 +1695,11 @@ async fn resync_schema_from_server(
     directory: &Path,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
 ) {
+    // Log deprecation warning if MQTT-only mode is enabled
+    crdt_context
+        .mqtt_only_config
+        .log_http_deprecation("resync_schema_from_server");
+
     warn!(
         "Resyncing schema CRDT state from server after broadcast lag for {}",
         fs_root_id
@@ -2388,6 +2411,7 @@ pub async fn subdir_mqtt_task(
                                     file_state,
                                     &edit_msg,
                                     &author,
+                                    None, // No local commit store in subscription context
                                 )
                                 .await
                                 {

@@ -148,6 +148,45 @@ All messages include a `req` field for correlation.
 { "type": "error", "req": "r-003", "message": "commit not found" }
 ```
 
+#### Missing Parent Alerts
+
+When a client receives a commit but doesn't have one or more of its parent commits, it can publish a **missing_parent** alert. This enables peer-to-peer recovery without requiring a full resync from the server.
+
+Topic pattern:
+```
+{path}/sync/missing
+```
+
+**missing_parent** — Alert that parent commits are missing:
+```json
+{
+  "type": "missing_parent",
+  "req": "r-006",
+  "commit_id": "def456",
+  "missing_parents": ["abc123", "xyz789"],
+  "client_id": "client-42"
+}
+```
+
+Fields:
+- `req`: Request ID for correlation (optional, useful for tracking recovery)
+- `commit_id`: The commit ID that has missing parents
+- `missing_parents`: List of parent commit IDs that the sender doesn't have
+- `client_id`: ID of the sender (so responders know who to help)
+
+**Response Behavior**:
+- Peers that have the missing commits may rebroadcast them on the edits topic
+- Rate limiting prevents spam (30-second minimum between rebroadcasts)
+- Random jitter prevents thundering herd (multiple peers responding simultaneously)
+- The alert is published with QoS 1 to ensure delivery
+
+**Use Cases**:
+1. **Partition recovery**: When network splits rejoin, clients may have divergent histories
+2. **Late joiners**: New clients may receive commits before catching up fully
+3. **Message loss**: MQTT QoS 0 sync messages may occasionally be lost
+
+This mechanism complements the sync port by enabling cooperative recovery. See `src/sync/missing_parent.rs` for implementation.
+
 ### events (red)
 
 Broadcasts from a node. The node is the authority.
