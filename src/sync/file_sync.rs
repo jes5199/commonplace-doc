@@ -31,6 +31,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+use yrs::{GetString, ReadTxn, Transact};
 
 /// Number of retries when content differs during a pending write (handles partial writes)
 pub const BARRIER_RETRY_COUNT: u32 = 5;
@@ -2307,6 +2308,72 @@ pub async fn initialize_crdt_state_from_server_with_pending(
                                 file_path.display(),
                                 head.content.len()
                             );
+                        }
+                    }
+                } else {
+                    // Server returned empty content but has CRDT state - extract from state.
+                    // This happens when content was only written via CRDT operations
+                    // (not full content replacement), leaving the content field empty.
+                    let extracted_content = {
+                        let state = crdt_state.read().await;
+                        if let Some(file_state) = state.get_file(filename) {
+                            match file_state.to_doc() {
+                                Ok(doc) => {
+                                    let txn = doc.transact();
+                                    let content = txn
+                                        .get_text("content")
+                                        .map(|text| text.get_string(&txn))
+                                        .unwrap_or_default();
+                                    if content.is_empty() {
+                                        None
+                                    } else {
+                                        info!(
+                                            "Extracted {} bytes from CRDT state for {} (server content was empty)",
+                                            content.len(),
+                                            filename
+                                        );
+                                        Some(content)
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to convert file_state to doc for {}: {}",
+                                        filename, e
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    }; // state lock and transaction dropped here
+
+                    if let Some(content) = extracted_content {
+                        // Read current local content
+                        let local_content = tokio::fs::read_to_string(file_path)
+                            .await
+                            .unwrap_or_default();
+
+                        // Only write if local differs from extracted content
+                        if local_content != content {
+                            // Update shared_last_content BEFORE writing to prevent echo
+                            if let Some(slc) = shared_last_content {
+                                let mut shared = slc.write().await;
+                                *shared = Some(content.clone());
+                            }
+                            if let Err(e) = tokio::fs::write(file_path, &content).await {
+                                warn!(
+                                    "Failed to write CRDT-extracted content to {}: {}",
+                                    file_path.display(),
+                                    e
+                                );
+                            } else {
+                                info!(
+                                    "Wrote CRDT-extracted content to {} ({} bytes)",
+                                    file_path.display(),
+                                    content.len()
+                                );
+                            }
                         }
                     }
                 }
