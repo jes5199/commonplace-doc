@@ -40,12 +40,23 @@ use uuid::Uuid;
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, Transact, Update};
 
-/// Decode an MQTT schema update payload into an FsSchema.
+/// Decode an MQTT schema update payload into an FsSchema (stateless fallback).
 ///
-/// This parses the EditMessage from the MQTT payload, decodes the Yrs update,
-/// applies it to a fresh Y.Doc, and converts to FsSchema. This allows us to
-/// use the MQTT payload directly instead of fetching from HTTP, which avoids
-/// race conditions where the server hasn't processed the MQTT edit yet.
+/// **WARNING: This function cannot correctly handle DELETE operations!**
+///
+/// This function creates a fresh empty Y.Doc and applies the delta update to it.
+/// DELETE operations in the delta have no effect because the content being deleted
+/// doesn't exist in the empty doc. This causes deleted files to reappear locally.
+///
+/// **Prefer using `apply_schema_update_to_state()` instead**, which loads the existing
+/// Y.Doc state before applying the delta, allowing DELETE operations to work correctly.
+///
+/// This function should only be used as a last-resort fallback when:
+/// 1. CRDT context is not available, AND
+/// 2. Loading state from disk fails, AND
+/// 3. The caller can tolerate DELETE operations being ignored (will fall back to HTTP)
+///
+/// See bug CP-hwg2 for details on this limitation.
 ///
 /// Returns None if decoding fails (caller should fall back to HTTP fetch).
 pub fn decode_schema_from_mqtt_payload(payload: &[u8]) -> Option<(FsSchema, String)> {

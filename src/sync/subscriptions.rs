@@ -2302,19 +2302,68 @@ pub async fn subdir_mqtt_task(
                     }
                 }
             } else {
-                // No CRDT context - use stateless decode (may not work for DELETE)
-                let result = decode_schema_from_mqtt_payload(&msg.payload);
-                if let Some((ref schema, _)) = result {
-                    let entry_count = if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
-                        root.entries.as_ref().map(|e| e.len()).unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    info!(
-                        "[SANDBOX-TRACE] Decoded schema from MQTT payload for subdir={} entry_count={} (stateless)",
-                        subdir_path, entry_count
-                    );
+                // No CRDT context - try loading state from disk to properly handle DELETEs.
+                // The stateless decode (Doc::new()) breaks DELETE operations because the
+                // fresh Y.Doc doesn't have the server's operation history - deletions
+                // reference specific client IDs that don't exist in the fresh doc.
+                // See CP-hwg2 for details.
+                let subdir_uuid = Uuid::parse_str(&subdir_node_id).ok();
+
+                let result = if let Some(uuid) = subdir_uuid {
+                    // Try to load state from disk
+                    match crate::sync::DirectorySyncState::load_or_create(&subdir_full_path, uuid)
+                        .await
+                    {
+                        Ok(mut state) => {
+                            // Use the correct pattern: load state first, then apply update
+                            let schema_result =
+                                apply_schema_update_to_state(&mut state.schema, &msg.payload);
+                            if let Some((ref schema, _)) = schema_result {
+                                let entry_count =
+                                    if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
+                                        root.entries.as_ref().map(|e| e.len()).unwrap_or(0)
+                                    } else {
+                                        0
+                                    };
+                                info!(
+                                    "[SANDBOX-TRACE] Applied schema update to disk-loaded state for subdir={} entry_count={}",
+                                    subdir_path, entry_count
+                                );
+
+                                // Persist the updated state back to disk
+                                if let Err(e) = state.save(&subdir_full_path).await {
+                                    warn!(
+                                        "Failed to save subdir CRDT state for {}: {}",
+                                        subdir_path, e
+                                    );
+                                }
+                            }
+                            schema_result
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to load subdir state from disk for {}: {}, using stateless decode (DELETE operations may fail - see CP-hwg2)",
+                                subdir_path, e
+                            );
+                            // Fall through to stateless decode.
+                            // WARNING: decode_schema_from_mqtt_payload cannot handle DELETE
+                            // operations correctly because it uses a fresh Y.Doc. Deletions
+                            // will be ignored and must be handled via HTTP fallback.
+                            decode_schema_from_mqtt_payload(&msg.payload)
+                        }
+                    }
                 } else {
+                    warn!(
+                        "Failed to parse subdir_node_id {} as UUID, using stateless decode (DELETE operations may fail - see CP-hwg2)",
+                        subdir_node_id
+                    );
+                    // WARNING: decode_schema_from_mqtt_payload cannot handle DELETE
+                    // operations correctly because it uses a fresh Y.Doc. Deletions
+                    // will be ignored and must be handled via HTTP fallback.
+                    decode_schema_from_mqtt_payload(&msg.payload)
+                };
+
+                if result.is_none() {
                     debug!(
                         "Failed to decode schema from MQTT payload for subdir={}, will fetch from HTTP",
                         subdir_path
