@@ -300,6 +300,7 @@ async fn rebroadcast_current_state(
         author: format!("rebroadcast-{}", state.node_id),
         message: Some("Rebroadcast for missing parent recovery".to_string()),
         timestamp,
+        req: None,
     };
 
     let topic = Topic::edits(workspace, path).to_topic_string();

@@ -30,6 +30,7 @@ pub mod state;
 pub mod state_file;
 pub mod subdir_spawn;
 pub mod subscriptions;
+pub mod sync_state_machine;
 pub mod types;
 pub mod urls;
 pub mod uuid_map;
@@ -182,4 +183,7 @@ pub use missing_parent::{
 pub use peer_fallback::{
     handle_peer_sync_request, new_peer_fallback_handler, subscribe_for_peer_fallback,
     PeerFallbackHandler, PeerFallbackStats, PendingRequest, SharedPeerFallbackHandler,
+};
+pub use sync_state_machine::{
+    transition, ClientSyncState, InvalidTransition, SyncEvent, SyncStateMachine,
 };

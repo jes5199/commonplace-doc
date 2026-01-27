@@ -101,6 +101,10 @@ impl CommitStore {
     /// Returns (cid, timestamp) for optional broadcast.
     /// This is the preferred method for persisting commits as it keeps
     /// storage and head-update behavior aligned across ingress paths.
+    ///
+    /// NOTE: This method always advances HEAD. For cyan sync protocol compliance,
+    /// use `store_commit_with_head_advancement` which implements the proper
+    /// fast-forward/merge rules.
     pub async fn store_commit_and_set_head(
         &self,
         doc_id: &str,
@@ -110,6 +114,68 @@ impl CommitStore {
         let cid = self.store_commit(commit).await?;
         self.set_document_head(doc_id, &cid).await?;
         Ok((cid, timestamp))
+    }
+
+    /// Store a commit and conditionally advance HEAD based on cyan sync protocol rules.
+    ///
+    /// HEAD advancement rules:
+    /// - **Fast-forward**: If the new commit's parents include the current HEAD, advance HEAD
+    /// - **Merge**: If the commit has 2+ parents AND current HEAD is an ancestor, advance HEAD
+    /// - **Otherwise**: Persist the commit but don't advance HEAD (divergent branch)
+    ///
+    /// Returns `(cid, timestamp, head_advanced)` where `head_advanced` indicates whether
+    /// HEAD was updated. This is useful for ack messages in the sync protocol.
+    ///
+    /// # Arguments
+    /// * `doc_id` - The document ID
+    /// * `commit` - The commit to store
+    ///
+    /// # Returns
+    /// * `Ok((cid, timestamp, head_advanced))` on success
+    /// * `Err(StoreError)` on failure
+    pub async fn store_commit_with_head_advancement(
+        &self,
+        doc_id: &str,
+        commit: &Commit,
+    ) -> Result<(String, u64, bool), StoreError> {
+        let timestamp = commit.timestamp;
+        let cid = commit.calculate_cid();
+
+        // First, store the commit (always persisted regardless of HEAD advancement)
+        self.store_commit(commit).await?;
+
+        // Get current HEAD
+        let current_head = self.get_document_head(doc_id).await?;
+
+        // Determine if HEAD should be advanced
+        let should_advance = match &current_head {
+            None => {
+                // No HEAD yet - always advance for first commit
+                true
+            }
+            Some(head_cid) => {
+                // Check if this is a fast-forward: commit's parents include current HEAD
+                let is_fast_forward = commit.parents.contains(head_cid);
+
+                if is_fast_forward {
+                    true
+                } else if commit.parents.len() >= 2 {
+                    // Merge commit: check if current HEAD is an ancestor of this commit
+                    // For a merge to advance HEAD, current HEAD must be reachable from the commit
+                    self.is_ancestor(head_cid, &cid).await?
+                } else {
+                    // Single-parent commit that doesn't include current HEAD
+                    // This is a divergent branch - don't advance HEAD
+                    false
+                }
+            }
+        };
+
+        if should_advance {
+            self.set_document_head(doc_id, &cid).await?;
+        }
+
+        Ok((cid, timestamp, should_advance))
     }
 
     /// Set the head commit for a document
@@ -365,5 +431,335 @@ mod tests {
             .validate_monotonic_descent(doc_id, &cid3)
             .await
             .is_err());
+    }
+
+    // ========================================================================
+    // Tests for HEAD advancement logic (cyan sync protocol)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_head_advancement_first_commit() {
+        // First commit should always advance HEAD
+        let temp_file = NamedTempFile::new().unwrap();
+        let store = CommitStore::new(temp_file.path()).unwrap();
+
+        let doc_id = "doc1";
+
+        // First commit to a document - should advance HEAD
+        let c1 = Commit::new(vec![], "u1".to_string(), "alice".to_string(), None);
+        let (cid1, _ts, advanced) = store
+            .store_commit_with_head_advancement(doc_id, &c1)
+            .await
+            .unwrap();
+
+        assert!(advanced, "First commit should advance HEAD");
+        assert_eq!(store.get_document_head(doc_id).await.unwrap(), Some(cid1));
+    }
+
+    #[tokio::test]
+    async fn test_head_advancement_fast_forward() {
+        // Fast-forward: commit's parents include current HEAD
+        let temp_file = NamedTempFile::new().unwrap();
+        let store = CommitStore::new(temp_file.path()).unwrap();
+
+        let doc_id = "doc1";
+
+        // Initial commit
+        let c1 = Commit::new(vec![], "u1".to_string(), "alice".to_string(), None);
+        let (cid1, _, _) = store
+            .store_commit_with_head_advancement(doc_id, &c1)
+            .await
+            .unwrap();
+
+        // Fast-forward commit (parent is current HEAD)
+        let c2 = Commit::new(
+            vec![cid1.clone()],
+            "u2".to_string(),
+            "alice".to_string(),
+            None,
+        );
+        let (cid2, _ts, advanced) = store
+            .store_commit_with_head_advancement(doc_id, &c2)
+            .await
+            .unwrap();
+
+        assert!(advanced, "Fast-forward should advance HEAD");
+        assert_eq!(store.get_document_head(doc_id).await.unwrap(), Some(cid2));
+    }
+
+    #[tokio::test]
+    async fn test_head_advancement_divergent_no_advance() {
+        // Divergent commit: single-parent commit that doesn't include current HEAD
+        // Should NOT advance HEAD
+        let temp_file = NamedTempFile::new().unwrap();
+        let store = CommitStore::new(temp_file.path()).unwrap();
+
+        let doc_id = "doc1";
+
+        // Initial commit A
+        let c_a = Commit::new(vec![], "uA".to_string(), "alice".to_string(), None);
+        let (cid_a, _, _) = store
+            .store_commit_with_head_advancement(doc_id, &c_a)
+            .await
+            .unwrap();
+
+        // Commit B fast-forwards from A
+        let c_b = Commit::new(
+            vec![cid_a.clone()],
+            "uB".to_string(),
+            "alice".to_string(),
+            None,
+        );
+        let (cid_b, _, _) = store
+            .store_commit_with_head_advancement(doc_id, &c_b)
+            .await
+            .unwrap();
+
+        // HEAD is now B
+
+        // Commit C branches from A (parent is A, not B)
+        // This is a divergent branch - should NOT advance HEAD
+        let c_c = Commit::new(
+            vec![cid_a.clone()],
+            "uC".to_string(),
+            "bob".to_string(),
+            None,
+        );
+        let (cid_c, _ts, advanced) = store
+            .store_commit_with_head_advancement(doc_id, &c_c)
+            .await
+            .unwrap();
+
+        assert!(!advanced, "Divergent commit should NOT advance HEAD");
+        assert_eq!(
+            store.get_document_head(doc_id).await.unwrap(),
+            Some(cid_b.clone()),
+            "HEAD should still be B"
+        );
+
+        // Verify C was still persisted
+        let commit_c = store.get_commit(&cid_c).await;
+        assert!(commit_c.is_ok(), "Commit C should still be persisted");
+    }
+
+    #[tokio::test]
+    async fn test_head_advancement_merge_advances() {
+        // Merge commit: 2 parents, and current HEAD is an ancestor
+        // Should advance HEAD
+        let temp_file = NamedTempFile::new().unwrap();
+        let store = CommitStore::new(temp_file.path()).unwrap();
+
+        let doc_id = "doc1";
+
+        // Initial commit A
+        let c_a = Commit::new(vec![], "uA".to_string(), "alice".to_string(), None);
+        let (cid_a, _, _) = store
+            .store_commit_with_head_advancement(doc_id, &c_a)
+            .await
+            .unwrap();
+
+        // Commit B fast-forwards from A (HEAD = B)
+        let c_b = Commit::new(
+            vec![cid_a.clone()],
+            "uB".to_string(),
+            "alice".to_string(),
+            None,
+        );
+        let (cid_b, _, _) = store
+            .store_commit_with_head_advancement(doc_id, &c_b)
+            .await
+            .unwrap();
+
+        // Commit C branches from A (persisted but doesn't advance HEAD)
+        let c_c = Commit::new(
+            vec![cid_a.clone()],
+            "uC".to_string(),
+            "bob".to_string(),
+            None,
+        );
+        let (cid_c, _, advanced_c) = store
+            .store_commit_with_head_advancement(doc_id, &c_c)
+            .await
+            .unwrap();
+        assert!(!advanced_c, "C should not advance HEAD");
+
+        // Merge commit M with parents [B, C]
+        // Current HEAD is B, which is a parent of M, so this should advance
+        let c_m = Commit::new(
+            vec![cid_b.clone(), cid_c.clone()],
+            String::new(), // Empty update for merge
+            "system".to_string(),
+            Some("Merge".to_string()),
+        );
+        let (cid_m, _ts, advanced) = store
+            .store_commit_with_head_advancement(doc_id, &c_m)
+            .await
+            .unwrap();
+
+        assert!(advanced, "Merge commit should advance HEAD");
+        assert_eq!(
+            store.get_document_head(doc_id).await.unwrap(),
+            Some(cid_m),
+            "HEAD should be the merge commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_head_advancement_merge_from_diverged_no_advance() {
+        // Merge commit where current HEAD is NOT an ancestor
+        // Example: HEAD=B, merge has parents [C, D] where neither includes B
+        // Should NOT advance HEAD
+        let temp_file = NamedTempFile::new().unwrap();
+        let store = CommitStore::new(temp_file.path()).unwrap();
+
+        let doc_id = "doc1";
+
+        // Build a DAG where we have two divergent branches
+        // A -> B (HEAD)
+        // A -> C -> D
+        // Merge [C, D] should NOT advance HEAD since B is not an ancestor
+
+        let c_a = Commit::new(vec![], "uA".to_string(), "alice".to_string(), None);
+        let (cid_a, _, _) = store
+            .store_commit_with_head_advancement(doc_id, &c_a)
+            .await
+            .unwrap();
+
+        // B from A (this will be HEAD)
+        let c_b = Commit::new(
+            vec![cid_a.clone()],
+            "uB".to_string(),
+            "alice".to_string(),
+            None,
+        );
+        let (cid_b, _, _) = store
+            .store_commit_with_head_advancement(doc_id, &c_b)
+            .await
+            .unwrap();
+
+        // C from A (divergent, doesn't advance HEAD)
+        let c_c = Commit::new(
+            vec![cid_a.clone()],
+            "uC".to_string(),
+            "bob".to_string(),
+            None,
+        );
+        let (cid_c, _, _) = store
+            .store_commit_with_head_advancement(doc_id, &c_c)
+            .await
+            .unwrap();
+
+        // D from C (also divergent)
+        let c_d = Commit::new(
+            vec![cid_c.clone()],
+            "uD".to_string(),
+            "bob".to_string(),
+            None,
+        );
+        let (cid_d, _, _) = store
+            .store_commit_with_head_advancement(doc_id, &c_d)
+            .await
+            .unwrap();
+
+        // Merge [C, D] - this does NOT include B, so should NOT advance HEAD
+        let c_merge_cd = Commit::new(
+            vec![cid_c.clone(), cid_d.clone()],
+            String::new(),
+            "system".to_string(),
+            Some("Merge C+D".to_string()),
+        );
+        let (_cid_merge_cd, _ts, advanced) = store
+            .store_commit_with_head_advancement(doc_id, &c_merge_cd)
+            .await
+            .unwrap();
+
+        assert!(
+            !advanced,
+            "Merge that doesn't include HEAD as ancestor should NOT advance HEAD"
+        );
+        assert_eq!(
+            store.get_document_head(doc_id).await.unwrap(),
+            Some(cid_b),
+            "HEAD should still be B"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_head_advancement_full_scenario() {
+        // Full scenario from the cyan sync protocol example:
+        // Initial: HEAD = A
+        // Client 1 pushes B (parent: A) -> HEAD = B (fast-forward)
+        // Client 2 pushes C (parent: A) -> C persisted, HEAD stays B (divergent)
+        // Client 2 pushes M (parents: B, C) -> HEAD = M (merge includes B)
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let store = CommitStore::new(temp_file.path()).unwrap();
+
+        let doc_id = "doc1";
+
+        // A: initial commit
+        let c_a = Commit::new(vec![], "uA".to_string(), "init".to_string(), None);
+        let (cid_a, _, advanced_a) = store
+            .store_commit_with_head_advancement(doc_id, &c_a)
+            .await
+            .unwrap();
+        assert!(advanced_a);
+        assert_eq!(
+            store.get_document_head(doc_id).await.unwrap(),
+            Some(cid_a.clone())
+        );
+
+        // B: fast-forward from A
+        let c_b = Commit::new(
+            vec![cid_a.clone()],
+            "uB".to_string(),
+            "client1".to_string(),
+            None,
+        );
+        let (cid_b, _, advanced_b) = store
+            .store_commit_with_head_advancement(doc_id, &c_b)
+            .await
+            .unwrap();
+        assert!(advanced_b, "B should fast-forward");
+        assert_eq!(
+            store.get_document_head(doc_id).await.unwrap(),
+            Some(cid_b.clone())
+        );
+
+        // C: divergent from A (doesn't include B as parent)
+        let c_c = Commit::new(
+            vec![cid_a.clone()],
+            "uC".to_string(),
+            "client2".to_string(),
+            None,
+        );
+        let (cid_c, _, advanced_c) = store
+            .store_commit_with_head_advancement(doc_id, &c_c)
+            .await
+            .unwrap();
+        assert!(!advanced_c, "C should NOT advance HEAD (divergent)");
+        assert_eq!(
+            store.get_document_head(doc_id).await.unwrap(),
+            Some(cid_b.clone()),
+            "HEAD should still be B"
+        );
+
+        // M: merge commit with parents [B, C]
+        let c_m = Commit::new(
+            vec![cid_b.clone(), cid_c.clone()],
+            String::new(),
+            "client2".to_string(),
+            Some("Merge".to_string()),
+        );
+        let (cid_m, _, advanced_m) = store
+            .store_commit_with_head_advancement(doc_id, &c_m)
+            .await
+            .unwrap();
+        assert!(advanced_m, "M should advance HEAD (merge includes B)");
+        assert_eq!(
+            store.get_document_head(doc_id).await.unwrap(),
+            Some(cid_m),
+            "HEAD should be M"
+        );
     }
 }

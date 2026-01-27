@@ -220,6 +220,7 @@ pub async fn process_received_edit(
                     author: author.to_string(),
                     message: Some("Merge commit".to_string()),
                     timestamp,
+                    req: None,
                 };
 
                 let topic = Topic::edits(workspace, node_id).to_topic_string();
@@ -609,6 +610,7 @@ mod tests {
             author: "user".to_string(),
             message: None,
             timestamp: 12345,
+            req: None,
         };
         let payload = serde_json::to_vec(&msg).unwrap();
 
@@ -694,6 +696,7 @@ mod tests {
             author: "user_b".to_string(),
             message: None,
             timestamp: 1000,
+            req: None,
         };
         let (result_a, _content_a) = process_received_edit(
             None, // No MQTT client needed for test
@@ -724,6 +727,7 @@ mod tests {
             author: "user_a".to_string(),
             message: None,
             timestamp: 1001,
+            req: None,
         };
         let (result_b, _content_b) = process_received_edit(
             None,
@@ -812,6 +816,7 @@ mod tests {
             author: "me".to_string(),
             message: None,
             timestamp,
+            req: None,
         };
 
         let (result, _) = process_received_edit(
@@ -865,6 +870,7 @@ mod tests {
             author: "user".to_string(),
             message: None,
             timestamp: timestamp1,
+            req: None,
         };
         let (result1, _) = process_received_edit(None, "ws", "n1", &mut state, &msg1, "user", None)
             .await
@@ -894,6 +900,7 @@ mod tests {
             author: "user".to_string(),
             message: None,
             timestamp: 1001,
+            req: None,
         };
         let (result2, content) =
             process_received_edit(None, "ws", "n1", &mut state, &msg2, "user", None)
@@ -954,6 +961,7 @@ mod tests {
             author: "other".to_string(),
             message: None,
             timestamp: 1000,
+            req: None,
         };
 
         let (result, _) =

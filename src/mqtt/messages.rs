@@ -10,6 +10,115 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 // =============================================================================
+// Structured Sync Errors
+// =============================================================================
+
+/// Structured error types for sync protocol.
+///
+/// These errors enable clients to programmatically recover from failures
+/// rather than parsing error message strings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum SyncError {
+    /// Parent commits are missing - client should push these commits first.
+    MissingParents {
+        /// List of parent commit IDs that the server doesn't have.
+        parents: Vec<String>,
+    },
+
+    /// Computed CID doesn't match the claimed CID - indicates a bug.
+    CidMismatch {
+        /// The CID claimed by the client.
+        expected: String,
+        /// The CID computed by the server.
+        computed: String,
+    },
+
+    /// Commit validation failed - malformed commit data.
+    InvalidCommit {
+        /// The field that failed validation.
+        field: String,
+        /// Description of the validation error.
+        message: String,
+    },
+
+    /// Requested commits not found on server.
+    NotFound {
+        /// List of commit IDs that were not found.
+        commits: Vec<String>,
+    },
+
+    /// No common ancestor found between client's have set and server's history.
+    NoCommonAncestor {
+        /// The commit IDs the client reported having.
+        have: Vec<String>,
+        /// The server's current HEAD commit.
+        server_head: String,
+    },
+}
+
+impl SyncError {
+    /// Create a missing_parents error.
+    pub fn missing_parents(parents: Vec<String>) -> Self {
+        SyncError::MissingParents { parents }
+    }
+
+    /// Create a cid_mismatch error.
+    pub fn cid_mismatch(expected: String, computed: String) -> Self {
+        SyncError::CidMismatch { expected, computed }
+    }
+
+    /// Create an invalid_commit error.
+    pub fn invalid_commit(field: impl Into<String>, message: impl Into<String>) -> Self {
+        SyncError::InvalidCommit {
+            field: field.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Create a not_found error.
+    pub fn not_found(commits: Vec<String>) -> Self {
+        SyncError::NotFound { commits }
+    }
+
+    /// Create a no_common_ancestor error.
+    pub fn no_common_ancestor(have: Vec<String>, server_head: String) -> Self {
+        SyncError::NoCommonAncestor { have, server_head }
+    }
+}
+
+impl std::fmt::Display for SyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyncError::MissingParents { parents } => {
+                write!(f, "missing parents: {}", parents.join(", "))
+            }
+            SyncError::CidMismatch { expected, computed } => {
+                write!(
+                    f,
+                    "CID mismatch: expected {}, computed {}",
+                    expected, computed
+                )
+            }
+            SyncError::InvalidCommit { field, message } => {
+                write!(f, "invalid commit field '{}': {}", field, message)
+            }
+            SyncError::NotFound { commits } => {
+                write!(f, "commits not found: {}", commits.join(", "))
+            }
+            SyncError::NoCommonAncestor { have, server_head } => {
+                write!(
+                    f,
+                    "no common ancestor found (have: {}, server_head: {})",
+                    have.join(", "),
+                    server_head
+                )
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Peer Fallback Configuration
 // =============================================================================
 
@@ -92,6 +201,10 @@ pub struct EditMessage {
     pub message: Option<String>,
     /// Timestamp in milliseconds since Unix epoch
     pub timestamp: u64,
+    /// Optional correlation ID for request/response matching.
+    /// When present, ack messages will include this ID to correlate with the original edit.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub req: Option<String>,
 }
 
 /// Message published to the events port.
@@ -214,6 +327,10 @@ pub enum SyncMessage {
         /// Used for peer fallback protocol to identify who provided the data.
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<String>,
+        /// Common ancestor found during pull (first commit in client's "have" set
+        /// that exists in server's history). Only set for pull responses.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ancestor: Option<String>,
     },
 
     /// Response to IsAncestor request
@@ -230,8 +347,11 @@ pub enum SyncMessage {
     Error {
         /// Request ID for correlation
         req: String,
-        /// Error message
+        /// Human-readable error message (for backwards compatibility)
         message: String,
+        /// Structured error for programmatic recovery (optional for backwards compat)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<SyncError>,
     },
 
     // ========== Alerts (broadcast to notify peers of issues) ==========
@@ -441,6 +561,24 @@ impl SyncMessage {
     pub fn is_alert(&self) -> bool {
         matches!(self, SyncMessage::MissingParent { .. })
     }
+
+    /// Create an error response with both human-readable message and structured error.
+    pub fn error(req: impl Into<String>, error: SyncError) -> Self {
+        SyncMessage::Error {
+            req: req.into(),
+            message: error.to_string(),
+            error: Some(error),
+        }
+    }
+
+    /// Create an error response with only a human-readable message (for backwards compat).
+    pub fn error_message(req: impl Into<String>, message: impl Into<String>) -> Self {
+        SyncMessage::Error {
+            req: req.into(),
+            message: message.into(),
+            error: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -455,11 +593,39 @@ mod tests {
             author: "user@example.com".to_string(),
             message: Some("Update content".to_string()),
             timestamp: 1704067200000,
+            req: None,
         };
 
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"update\":\"base64data\""));
         assert!(json.contains("\"author\":\"user@example.com\""));
+        // req should be omitted when None
+        assert!(!json.contains("\"req\""));
+    }
+
+    #[test]
+    fn test_edit_message_with_req() {
+        let msg = EditMessage {
+            update: "base64data".to_string(),
+            parents: vec!["abc123".to_string()],
+            author: "user@example.com".to_string(),
+            message: None,
+            timestamp: 1704067200000,
+            req: Some("correlation-123".to_string()),
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"req\":\"correlation-123\""));
+    }
+
+    #[test]
+    fn test_edit_message_deserialize_without_req() {
+        // Old messages without req field should still parse
+        let json =
+            r#"{"update":"base64data","parents":["abc123"],"author":"user","timestamp":123456}"#;
+        let msg: EditMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.update, "base64data");
+        assert!(msg.req.is_none());
     }
 
     #[test]
@@ -620,6 +786,7 @@ mod tests {
             req: "r".to_string(),
             commits: vec![],
             source: None,
+            ancestor: None,
         }
         .is_request());
     }
@@ -797,5 +964,153 @@ mod tests {
         // id and content_type should be omitted when None
         assert!(!json.contains("\"id\":"));
         assert!(!json.contains("\"content_type\":"));
+    }
+
+    // ========== SyncError Tests ==========
+
+    #[test]
+    fn test_sync_error_missing_parents() {
+        let err = SyncError::missing_parents(vec!["abc123".to_string(), "def456".to_string()]);
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("\"code\":\"missing_parents\""));
+        assert!(json.contains("\"parents\":[\"abc123\",\"def456\"]"));
+
+        // Round-trip test
+        let parsed: SyncError = serde_json::from_str(&json).unwrap();
+        assert_eq!(err, parsed);
+    }
+
+    #[test]
+    fn test_sync_error_cid_mismatch() {
+        let err = SyncError::cid_mismatch("expected123".to_string(), "computed456".to_string());
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("\"code\":\"cid_mismatch\""));
+        assert!(json.contains("\"expected\":\"expected123\""));
+        assert!(json.contains("\"computed\":\"computed456\""));
+
+        // Round-trip test
+        let parsed: SyncError = serde_json::from_str(&json).unwrap();
+        assert_eq!(err, parsed);
+    }
+
+    #[test]
+    fn test_sync_error_invalid_commit() {
+        let err = SyncError::invalid_commit("parents", "must be an array");
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("\"code\":\"invalid_commit\""));
+        assert!(json.contains("\"field\":\"parents\""));
+        assert!(json.contains("\"message\":\"must be an array\""));
+
+        // Round-trip test
+        let parsed: SyncError = serde_json::from_str(&json).unwrap();
+        assert_eq!(err, parsed);
+    }
+
+    #[test]
+    fn test_sync_error_not_found() {
+        let err = SyncError::not_found(vec!["nonexistent1".to_string()]);
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("\"code\":\"not_found\""));
+        assert!(json.contains("\"commits\":[\"nonexistent1\"]"));
+
+        // Round-trip test
+        let parsed: SyncError = serde_json::from_str(&json).unwrap();
+        assert_eq!(err, parsed);
+    }
+
+    #[test]
+    fn test_sync_error_no_common_ancestor() {
+        let err = SyncError::no_common_ancestor(
+            vec!["abc".to_string(), "def".to_string()],
+            "xyz".to_string(),
+        );
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("\"code\":\"no_common_ancestor\""));
+        assert!(json.contains("\"have\":[\"abc\",\"def\"]"));
+        assert!(json.contains("\"server_head\":\"xyz\""));
+
+        // Round-trip test
+        let parsed: SyncError = serde_json::from_str(&json).unwrap();
+        assert_eq!(err, parsed);
+    }
+
+    #[test]
+    fn test_sync_message_error_with_structured_error() {
+        let err = SyncError::not_found(vec!["abc123".to_string()]);
+        let msg = SyncMessage::error("r-001", err.clone());
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"error\""));
+        assert!(json.contains("\"req\":\"r-001\""));
+        assert!(json.contains("\"message\":\"commits not found: abc123\""));
+        assert!(json.contains("\"error\":{\"code\":\"not_found\""));
+
+        // Verify it can be deserialized back
+        let parsed: SyncMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SyncMessage::Error {
+                req,
+                message,
+                error,
+            } => {
+                assert_eq!(req, "r-001");
+                assert_eq!(message, "commits not found: abc123");
+                assert_eq!(error, Some(err));
+            }
+            _ => panic!("Expected Error message"),
+        }
+    }
+
+    #[test]
+    fn test_sync_message_error_without_structured_error() {
+        // Test backwards compatibility with plain error messages
+        let msg = SyncMessage::error_message("r-001", "Something went wrong");
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"error\""));
+        assert!(json.contains("\"req\":\"r-001\""));
+        assert!(json.contains("\"message\":\"Something went wrong\""));
+        // error field should be omitted when None
+        assert!(!json.contains("\"error\":"));
+
+        // Verify it can be deserialized back
+        let parsed: SyncMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SyncMessage::Error {
+                req,
+                message,
+                error,
+            } => {
+                assert_eq!(req, "r-001");
+                assert_eq!(message, "Something went wrong");
+                assert!(error.is_none());
+            }
+            _ => panic!("Expected Error message"),
+        }
+    }
+
+    #[test]
+    fn test_sync_error_display() {
+        // Test Display impl for all error types
+        assert_eq!(
+            SyncError::missing_parents(vec!["a".to_string(), "b".to_string()]).to_string(),
+            "missing parents: a, b"
+        );
+        assert_eq!(
+            SyncError::cid_mismatch("expected".to_string(), "computed".to_string()).to_string(),
+            "CID mismatch: expected expected, computed computed"
+        );
+        assert_eq!(
+            SyncError::invalid_commit("field", "msg").to_string(),
+            "invalid commit field 'field': msg"
+        );
+        assert_eq!(
+            SyncError::not_found(vec!["x".to_string()]).to_string(),
+            "commits not found: x"
+        );
+        assert_eq!(
+            SyncError::no_common_ancestor(vec!["a".to_string()], "z".to_string()).to_string(),
+            "no common ancestor found (have: a, server_head: z)"
+        );
     }
 }

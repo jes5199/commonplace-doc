@@ -268,6 +268,7 @@ mod isolated {
             author: "test@example.com".to_string(),
             message: Some("Test edit".to_string()),
             timestamp: 1704067200000,
+            req: None,
         };
 
         let json = serde_json::to_vec(&msg).expect("serialize should succeed");
@@ -311,6 +312,7 @@ mod isolated {
             timestamp: 1704067200000,
             author: "author@example.com".to_string(),
             message: Some("Commit message".to_string()),
+            source: None,
         };
 
         let json = serde_json::to_vec(&msg).expect("serialize should succeed");
@@ -326,6 +328,7 @@ mod isolated {
                 timestamp,
                 author,
                 message,
+                source,
             } => {
                 assert_eq!(req, "req-002");
                 assert_eq!(id, "commit-abc");
@@ -334,6 +337,7 @@ mod isolated {
                 assert_eq!(timestamp, 1704067200000);
                 assert_eq!(author, "author@example.com");
                 assert_eq!(message, Some("Commit message".to_string()));
+                assert!(source.is_none());
             }
             _ => panic!("Expected Commit message"),
         }
@@ -950,6 +954,7 @@ mod stage2_tests {
             author: "system".to_string(),
             message: None,
             timestamp: 0,
+            req: None,
         };
 
         let json = serde_json::to_vec(&msg).expect("serialize empty update");
@@ -973,6 +978,7 @@ mod stage2_tests {
             author: "bulk-importer".to_string(),
             message: Some("Bulk import operation".to_string()),
             timestamp: 1704067200000,
+            req: None,
         };
 
         let json = serde_json::to_vec(&msg).expect("serialize large update");
@@ -993,6 +999,7 @@ mod stage2_tests {
             author: "merger@example.com".to_string(),
             message: Some("Merge branch-b into branch-a".to_string()),
             timestamp: 1704153600000,
+            req: None,
         };
 
         let json = serde_json::to_vec(&msg).expect("serialize merge commit");
@@ -1014,6 +1021,7 @@ mod stage2_tests {
             author: "creator@example.com".to_string(),
             message: Some("Initial document creation".to_string()),
             timestamp: 1704000000000,
+            req: None,
         };
 
         let json = serde_json::to_vec(&msg).expect("serialize initial commit");
@@ -1038,6 +1046,7 @@ mod stage2_tests {
             author: "user@example.com <\"Test User\">".to_string(),
             message: Some("Fix \"bug\" with\nnewlines\tand\ttabs".to_string()),
             timestamp: 1704067200000,
+            req: None,
         };
 
         let json = serde_json::to_vec(&msg).expect("serialize special chars");
@@ -1060,6 +1069,7 @@ mod stage2_tests {
             author: "utilisateur@exemple.fr".to_string(),
             message: Some("Ajout de contenu en francais avec des accents".to_string()),
             timestamp: 1704067200000,
+            req: None,
         };
 
         let json = serde_json::to_vec(&msg).expect("serialize unicode");
@@ -1079,6 +1089,7 @@ mod stage2_tests {
             author: "test".to_string(),
             message: None,
             timestamp: u64::MAX,
+            req: None,
         };
 
         let json = serde_json::to_vec(&msg).expect("serialize max timestamp");
@@ -1101,6 +1112,7 @@ mod stage2_tests {
             author: "octopus@example.com".to_string(),
             message: Some("Octopus merge of 8 branches".to_string()),
             timestamp: 1704067200000,
+            req: None,
         };
 
         let json = serde_json::to_vec(&msg).expect("serialize octopus merge");
@@ -1333,6 +1345,7 @@ mod stage2_tests {
         let error = SyncMessage::Error {
             req: "r-fail".to_string(),
             message: "Commit not found: abc123".to_string(),
+            error: None,
         };
 
         let json = serde_json::to_string(&error).unwrap();

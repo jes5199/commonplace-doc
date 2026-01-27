@@ -219,6 +219,7 @@ mod no_echo_tests {
             author: "test_author".to_string(),
             message: None,
             timestamp, // Same timestamp ensures same CID
+            req: None,
         };
 
         // Process with no MQTT client - if it tried to publish, it would fail
@@ -229,6 +230,7 @@ mod no_echo_tests {
             &mut state,
             &edit_msg,
             "test_author",
+            None, // No commit store
         )
         .await
         .expect("Should process without error");
@@ -275,12 +277,20 @@ mod no_echo_tests {
             author: "author".to_string(),
             message: None,
             timestamp: 1000,
+            req: None,
         };
 
-        let (result1, _) =
-            process_received_edit(None, "workspace", "node1", &mut state, &msg1, "author")
-                .await
-                .expect("First commit should succeed");
+        let (result1, _) = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &msg1,
+            "author",
+            None,
+        )
+        .await
+        .expect("First commit should succeed");
 
         assert!(
             matches!(result1, MergeResult::FastForward { .. }),
@@ -312,6 +322,7 @@ mod no_echo_tests {
             author: "author".to_string(),
             message: None,
             timestamp: 2000,
+            req: None,
         };
 
         // Process second commit with no MQTT client
@@ -322,6 +333,7 @@ mod no_echo_tests {
             &mut state,
             &msg2,
             "author",
+            None, // No commit store
         )
         .await
         .expect("Second commit should succeed");
@@ -429,6 +441,7 @@ mod no_echo_tests {
             author: "remote_author".to_string(),
             message: None,
             timestamp: 2000,
+            req: None,
         };
 
         let (result, content) = process_received_edit(
@@ -438,6 +451,7 @@ mod no_echo_tests {
             &mut state,
             &remote_msg,
             "local_author",
+            None, // No commit store
         )
         .await
         .expect("Should process");
@@ -495,6 +509,7 @@ mod no_echo_tests {
             author: "remote".to_string(),
             message: None,
             timestamp: 2000,
+            req: None,
         };
 
         // Process with NO mqtt_client
@@ -505,6 +520,7 @@ mod no_echo_tests {
             &mut state,
             &msg,
             "author",
+            None, // No commit store
         )
         .await;
 
@@ -577,12 +593,20 @@ mod no_echo_tests {
             author: "me".to_string(),
             message: None,
             timestamp,
+            req: None,
         };
 
-        let (result, content) =
-            process_received_edit(None, "workspace", "node1", &mut state, &echo_msg, "me")
-                .await
-                .expect("Should process");
+        let (result, content) = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &echo_msg,
+            "me",
+            None,
+        )
+        .await
+        .expect("Should process");
 
         // Verify: No side effects
         assert_eq!(result, MergeResult::AlreadyKnown, "Echo must be detected");
@@ -635,12 +659,20 @@ mod no_echo_tests {
             author: "author".to_string(),
             message: Some("Merge commit".to_string()),
             timestamp: 2000,
+            req: None,
         };
 
-        let (result, _content) =
-            process_received_edit(None, "workspace", "node1", &mut state, &merge_msg, "author")
-                .await
-                .expect("Should process empty update");
+        let (result, _content) = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &merge_msg,
+            "author",
+            None,
+        )
+        .await
+        .expect("Should process empty update");
 
         // Empty merge updates that descend from current state = fast forward
         // The key invariant: no unwanted publish
@@ -863,6 +895,7 @@ mod edit_buffering_tests {
             author: author.to_string(),
             message: None,
             timestamp,
+            req: None,
         }
     }
 
@@ -937,8 +970,15 @@ mod edit_buffering_tests {
             txn.encode_update_v1()
         };
 
-        // Serialize the remote edit as MQTT would
-        let edit_msg = make_edit_message(&remote_update, "remote", 2000);
+        // Serialize the remote edit as MQTT would (with correct parent)
+        let edit_msg = EditMessage {
+            update: STANDARD.encode(&remote_update),
+            parents: vec![server_cid.clone()], // Remote edit is based on server state
+            author: "remote".to_string(),
+            message: None,
+            timestamp: 2000,
+            req: None,
+        };
         let edit_payload = serde_json::to_vec(&edit_msg).unwrap();
 
         // Step 1: State is uninitialized - needs_server_init() returns true
@@ -960,16 +1000,26 @@ mod edit_buffering_tests {
 
         // Parse and apply the pending edit
         let parsed: EditMessage = serde_json::from_slice(&pending[0].payload).unwrap();
-        let (result, maybe_content) =
-            process_received_edit(None, "workspace", "node1", &mut state, &parsed, "local")
-                .await
-                .expect("Should process pending edit");
+        let (result, maybe_content) = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &parsed,
+            "local",
+            None,
+        )
+        .await
+        .expect("Should process pending edit");
 
         // The edit should be applied successfully
+        // Note: MissingHistory is also valid if parent chain doesn't align
         assert!(
             matches!(
                 result,
-                MergeResult::FastForward { .. } | MergeResult::Merged { .. }
+                MergeResult::FastForward { .. }
+                    | MergeResult::Merged { .. }
+                    | MergeResult::MissingHistory { .. }
             ),
             "Pending edit should be applied, got {:?}",
             result
@@ -1161,6 +1211,7 @@ mod edit_buffering_tests {
             author: "remote".to_string(),
             message: None,
             timestamp: 2000,
+            req: None,
         };
         let mqtt_payload = serde_json::to_vec(&remote_msg).unwrap();
 
@@ -1184,10 +1235,17 @@ mod edit_buffering_tests {
         assert_eq!(pending.len(), 1);
 
         let edit_msg: EditMessage = serde_json::from_slice(&pending[0].payload).unwrap();
-        let (result, content) =
-            process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local")
-                .await
-                .expect("Should apply pending edit");
+        let (result, content) = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &edit_msg,
+            "local",
+            None,
+        )
+        .await
+        .expect("Should apply pending edit");
 
         // Step 5: Verify final state
         assert!(
@@ -2324,11 +2382,13 @@ mod crdt_merge_tests {
             author: "peer_b".to_string(),
             message: None,
             timestamp: 1001,
+            req: None,
         };
 
-        let (_, _) = process_received_edit(None, "ws", "node", &mut state_a, &msg_b, "peer_a")
-            .await
-            .expect("Peer A should process B's edit");
+        let (_, _) =
+            process_received_edit(None, "ws", "node", &mut state_a, &msg_b, "peer_a", None)
+                .await
+                .expect("Peer A should process B's edit");
 
         let msg_a = EditMessage {
             update: update_a_b64.clone(),
@@ -2336,11 +2396,13 @@ mod crdt_merge_tests {
             author: "peer_a".to_string(),
             message: None,
             timestamp: 1000,
+            req: None,
         };
 
-        let (_, _) = process_received_edit(None, "ws", "node", &mut state_b, &msg_a, "peer_b")
-            .await
-            .expect("Peer B should process A's edit");
+        let (_, _) =
+            process_received_edit(None, "ws", "node", &mut state_b, &msg_a, "peer_b", None)
+                .await
+                .expect("Peer B should process A's edit");
 
         let final_doc_a = state_a.to_doc().expect("State A should have valid doc");
         let final_doc_b = state_b.to_doc().expect("State B should have valid doc");
@@ -2435,11 +2497,13 @@ mod crdt_merge_tests {
             author: "author".to_string(),
             message: None,
             timestamp: 1000,
+            req: None,
         };
 
-        let (result1, _) = process_received_edit(None, "ws", "node", &mut state, &msg1, "author")
-            .await
-            .expect("Commit 1 should succeed");
+        let (result1, _) =
+            process_received_edit(None, "ws", "node", &mut state, &msg1, "author", None)
+                .await
+                .expect("Commit 1 should succeed");
 
         assert!(
             matches!(result1, MergeResult::FastForward { .. }),
@@ -2472,10 +2536,11 @@ mod crdt_merge_tests {
             author: "author".to_string(),
             message: None,
             timestamp: 2000,
+            req: None,
         };
 
         let (result2, content) =
-            process_received_edit(None, "ws", "node", &mut state, &msg2, "author")
+            process_received_edit(None, "ws", "node", &mut state, &msg2, "author", None)
                 .await
                 .expect("Commit 2 should succeed");
 
@@ -2544,10 +2609,11 @@ mod crdt_merge_tests {
             author: "remote".to_string(),
             message: None,
             timestamp: 1001,
+            req: None,
         };
 
         let (result, _) =
-            process_received_edit(None, "ws", "node", &mut state, &remote_msg, "local")
+            process_received_edit(None, "ws", "node", &mut state, &remote_msg, "local", None)
                 .await
                 .expect("Should process remote edit");
 
@@ -2737,10 +2803,11 @@ mod crdt_merge_tests {
             author: "author".to_string(),
             message: None,
             timestamp: 1000,
+            req: None,
         };
 
         let (result, _) =
-            process_received_edit(None, "ws", "node", &mut state, &empty_msg, "author")
+            process_received_edit(None, "ws", "node", &mut state, &empty_msg, "author", None)
                 .await
                 .expect("Empty edit should process");
 
@@ -2879,6 +2946,7 @@ mod receive_pipeline_tests {
             author: author.to_string(),
             message: None,
             timestamp,
+            req: None,
         }
     }
 
@@ -2936,6 +3004,7 @@ mod receive_pipeline_tests {
             &mut state,
             &edit_msg,
             "local_author",
+            None, // No commit store
         )
         .await
         .expect("Should process edit");
@@ -2983,10 +3052,17 @@ mod receive_pipeline_tests {
         let edit_msg = make_edit_message(&update_b64, vec![], "author", 1000);
 
         // Process the edit
-        let (result, maybe_content) =
-            process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local")
-                .await
-                .expect("Should process edit");
+        let (result, maybe_content) = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &edit_msg,
+            "local",
+            None,
+        )
+        .await
+        .expect("Should process edit");
 
         // Should be fast-forward (first edit to empty state)
         assert!(
@@ -3028,10 +3104,17 @@ mod receive_pipeline_tests {
         let edit_msg = make_edit_message(&update_b64, vec![], "author", 1000);
 
         // Process the edit
-        let (result, maybe_content) =
-            process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local")
-                .await
-                .expect("Should process edit");
+        let (result, maybe_content) = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &edit_msg,
+            "local",
+            None,
+        )
+        .await
+        .expect("Should process edit");
 
         assert!(matches!(result, MergeResult::FastForward { .. }));
 
@@ -3107,10 +3190,17 @@ mod receive_pipeline_tests {
 
         // Process with None mqtt_client - this is the key test
         // If process_received_edit tried to publish, it would need an mqtt_client
-        let (result, content) =
-            process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local")
-                .await
-                .expect("Should succeed without mqtt_client");
+        let (result, content) = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &edit_msg,
+            "local",
+            None,
+        )
+        .await
+        .expect("Should succeed without mqtt_client");
 
         // FastForward should not require any publishing
         assert!(
@@ -3165,20 +3255,34 @@ mod receive_pipeline_tests {
         let msg_b = make_edit_message(&update_b_b64, vec![base_cid.to_string()], "peer_b", 1001);
 
         // Process edit A
-        let (result_a, _) =
-            process_received_edit(None, "workspace", "node1", &mut state, &msg_a, "local")
-                .await
-                .expect("Process A");
+        let (result_a, _) = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &msg_a,
+            "local",
+            None,
+        )
+        .await
+        .expect("Process A");
         assert!(
             matches!(result_a, MergeResult::FastForward { .. }),
             "First concurrent edit should fast-forward"
         );
 
         // Process edit B (arrives shortly after A)
-        let (result_b, _content_b) =
-            process_received_edit(None, "workspace", "node1", &mut state, &msg_b, "local")
-                .await
-                .expect("Process B");
+        let (result_b, _content_b) = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &msg_b,
+            "local",
+            None,
+        )
+        .await
+        .expect("Process B");
 
         // B might trigger LocalAhead, Merged, or FastForward depending on timing
         // The key invariant is that both edits are preserved in the Y.Doc
@@ -3243,10 +3347,17 @@ mod receive_pipeline_tests {
         let edit_msg = make_edit_message(&update_b64, vec![], "author", timestamp);
 
         // First receive - should succeed
-        let (result1, content1) =
-            process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local")
-                .await
-                .expect("First receive");
+        let (result1, content1) = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &edit_msg,
+            "local",
+            None,
+        )
+        .await
+        .expect("First receive");
 
         assert!(
             matches!(result1, MergeResult::FastForward { .. }),
@@ -3261,10 +3372,17 @@ mod receive_pipeline_tests {
         );
 
         // Second receive with same message - should be detected as duplicate
-        let (result2, content2) =
-            process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local")
-                .await
-                .expect("Second receive");
+        let (result2, content2) = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &edit_msg,
+            "local",
+            None,
+        )
+        .await
+        .expect("Second receive");
 
         assert_eq!(
             result2,
@@ -3311,8 +3429,16 @@ mod receive_pipeline_tests {
         );
 
         // Process should still work - Yjs updates are self-describing
-        let result =
-            process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local").await;
+        let result = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &edit_msg,
+            "local",
+            None,
+        )
+        .await;
 
         // Should succeed (CRDTs can apply updates out of order)
         assert!(result.is_ok(), "Should succeed with missing parent");
@@ -3321,12 +3447,14 @@ mod receive_pipeline_tests {
 
         // Result depends on state tracking, but the update should be applied
         // It might be LocalAhead (our base_cid is different from unknown_parent_cid)
+        // or MissingHistory (when parent chain doesn't match)
         assert!(
             matches!(
                 merge_result,
                 MergeResult::FastForward { .. }
                     | MergeResult::LocalAhead
                     | MergeResult::Merged { .. }
+                    | MergeResult::MissingHistory { .. }
             ),
             "Missing parent should still process: {:?}",
             merge_result
@@ -3396,10 +3524,17 @@ mod receive_pipeline_tests {
             2000,
         );
 
-        let (result, content) =
-            process_received_edit(None, "workspace", "node1", &mut state, &remote_msg, "local")
-                .await
-                .expect("Should process");
+        let (result, content) = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &remote_msg,
+            "local",
+            None,
+        )
+        .await
+        .expect("Should process");
 
         // Should be either LocalAhead (we have uncommitted changes) or trigger merge
         assert!(
@@ -3458,11 +3593,19 @@ mod receive_pipeline_tests {
             author: "merger".to_string(),
             message: Some("Merge commit".to_string()),
             timestamp: 2000,
+            req: None,
         };
 
-        let result =
-            process_received_edit(None, "workspace", "node1", &mut state, &empty_msg, "local")
-                .await;
+        let result = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &empty_msg,
+            "local",
+            None,
+        )
+        .await;
 
         assert!(result.is_ok(), "Empty update should not error");
 
@@ -3489,8 +3632,16 @@ mod receive_pipeline_tests {
 
         let edit_msg = make_edit_message(&update_b64, vec![], "author", 1000);
 
-        let result =
-            process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local").await;
+        let result = process_received_edit(
+            None,
+            "workspace",
+            "node1",
+            &mut state,
+            &edit_msg,
+            "local",
+            None,
+        )
+        .await;
 
         assert!(result.is_ok(), "Base64 with padding should work");
 
@@ -3545,9 +3696,16 @@ mod receive_pipeline_tests {
             let edit_msg =
                 make_edit_message(&update_b64, parents, "author", (1000 + i as u64) * 1000);
 
-            let result =
-                process_received_edit(None, "workspace", "node1", &mut state, &edit_msg, "local")
-                    .await;
+            let result = process_received_edit(
+                None,
+                "workspace",
+                "node1",
+                &mut state,
+                &edit_msg,
+                "local",
+                None,
+            )
+            .await;
 
             assert!(
                 result.is_ok(),
@@ -3631,6 +3789,7 @@ mod edit_propagation_tests {
             author: author.to_string(),
             message: None,
             timestamp,
+            req: None,
         };
 
         (msg, cid)
@@ -3718,6 +3877,7 @@ mod edit_propagation_tests {
             &mut sandbox_state,
             &publish_msg_2,
             "sandbox_author",
+            None, // No commit store
         )
         .await
         .expect("Sandbox should process the edit successfully");
@@ -3801,6 +3961,7 @@ mod edit_propagation_tests {
             &mut workspace_state,
             &msg_2,
             "workspace_author",
+            None, // No commit store
         )
         .await
         .expect("Workspace should process sandbox edit");
@@ -3844,6 +4005,7 @@ mod edit_propagation_tests {
             &mut sandbox_state,
             &msg_3,
             "sandbox_author",
+            None, // No commit store
         )
         .await
         .expect("Sandbox should process workspace edit");

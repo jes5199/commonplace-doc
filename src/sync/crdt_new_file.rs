@@ -192,6 +192,7 @@ async fn update_schema_with_new_file(
         author: author.to_string(),
         message: Some(format!("Add file: {}", filename)),
         timestamp,
+        req: None,
     };
 
     let schema_node_id = schema_state.node_id.to_string();
@@ -271,6 +272,7 @@ async fn publish_file_content(
         author: author.to_string(),
         message: Some("Initial content".to_string()),
         timestamp,
+        req: None,
     };
 
     let topic = Topic::edits(workspace, file_uuid).to_topic_string();
@@ -373,6 +375,7 @@ pub async fn remove_file_from_schema(
         author: author.to_string(),
         message: Some(format!("Remove file: {}", filename)),
         timestamp,
+        req: None,
     };
 
     let topic = Topic::edits(workspace, &schema_node_id).to_topic_string();

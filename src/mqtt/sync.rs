@@ -5,7 +5,7 @@
 
 use crate::document::resolve_path_to_uuid;
 use crate::mqtt::client::MqttClient;
-use crate::mqtt::messages::SyncMessage;
+use crate::mqtt::messages::{SyncError, SyncMessage};
 use crate::mqtt::topics::Topic;
 use crate::mqtt::MqttError;
 use crate::store::CommitStore;
@@ -14,6 +14,15 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
+
+/// Result of finding commits between have and want.
+struct FindCommitsResult {
+    /// Commits to send (topological order, oldest first).
+    commits: Vec<String>,
+    /// The common ancestor found (first commit in client's "have" set
+    /// that exists in server's history), or None if no common ancestor found.
+    ancestor: Option<String>,
+}
 
 /// Handler for the sync port.
 pub struct SyncHandler {
@@ -184,6 +193,7 @@ impl SyncHandler {
             .ok_or_else(|| MqttError::Node("Commit store not initialized".to_string()))?;
 
         let mut sent_commits = Vec::new();
+        let mut not_found = Vec::new();
 
         for cid in commit_ids {
             match store.get_commit(&cid).await {
@@ -204,16 +214,23 @@ impl SyncHandler {
                 }
                 Err(e) => {
                     warn!("Commit {} not found: {}", cid, e);
-                    // Continue with other commits
+                    not_found.push(cid);
                 }
             }
         }
 
-        // Send done message
+        // If any commits were not found, send a structured error
+        if !not_found.is_empty() {
+            let error_response = SyncMessage::error(req, SyncError::not_found(not_found));
+            self.send_response(path, client_id, &error_response).await?;
+        }
+
+        // Send done message with commits that were found
         let done = SyncMessage::Done {
             req: req.to_string(),
             commits: sent_commits,
-            source: None, // Doc store response
+            source: None,   // Doc store response
+            ancestor: None, // No ancestor for get requests (only for pull)
         };
 
         self.send_response(path, client_id, &done).await
@@ -248,7 +265,8 @@ impl SyncHandler {
                     let done = SyncMessage::Done {
                         req: req.to_string(),
                         commits: vec![],
-                        source: None, // Doc store response
+                        source: None,   // Doc store response
+                        ancestor: None, // No ancestor for empty documents
                     };
                     return self.send_response(path, client_id, &done).await;
                 }
@@ -258,13 +276,17 @@ impl SyncHandler {
         };
 
         // Find commits between 'have' and 'want'
-        // This is a simplified implementation - for a proper git-like protocol,
-        // we'd do a proper DAG traversal
-        let commits_to_send = self.find_commits_between(store, &have, &target_cid).await?;
+        let find_result = self.find_commits_between(store, &have, &target_cid).await?;
+
+        // If have set was non-empty but no common ancestor was found, return error
+        if !have.is_empty() && find_result.ancestor.is_none() {
+            let error = SyncMessage::error(req, SyncError::no_common_ancestor(have, target_cid));
+            return self.send_response(path, client_id, &error).await;
+        }
 
         let mut sent_commits = Vec::new();
 
-        for cid in commits_to_send {
+        for cid in find_result.commits {
             match store.get_commit(&cid).await {
                 Ok(commit) => {
                     let response = SyncMessage::Commit {
@@ -287,11 +309,12 @@ impl SyncHandler {
             }
         }
 
-        // Send done message
+        // Send done message with ancestor (if found during pull)
         let done = SyncMessage::Done {
             req: req.to_string(),
             commits: sent_commits,
             source: None, // Doc store response
+            ancestor: find_result.ancestor,
         };
 
         self.send_response(path, client_id, &done).await
@@ -326,7 +349,8 @@ impl SyncHandler {
                     let done = SyncMessage::Done {
                         req: req.to_string(),
                         commits: vec![],
-                        source: None, // Doc store response
+                        source: None,   // Doc store response
+                        ancestor: None, // No ancestor for empty documents
                     };
                     return self.send_response(path, client_id, &done).await;
                 }
@@ -368,7 +392,8 @@ impl SyncHandler {
         let done = SyncMessage::Done {
             req: req.to_string(),
             commits: sent_commits,
-            source: None, // Doc store response
+            source: None,   // Doc store response
+            ancestor: None, // No ancestor for ancestors request (only for pull)
         };
 
         self.send_response(path, client_id, &done).await
@@ -392,11 +417,9 @@ impl SyncHandler {
         let result = match store.is_ancestor(ancestor, descendant).await {
             Ok(is_ancestor) => is_ancestor,
             Err(e) => {
-                // Send error response
-                let error = SyncMessage::Error {
-                    req: req.to_string(),
-                    message: format!("Ancestry check failed: {}", e),
-                };
+                // Send error response - use error_message for generic errors
+                let error =
+                    SyncMessage::error_message(req, format!("Ancestry check failed: {}", e));
                 return self.send_response(path, client_id, &error).await;
             }
         };
@@ -428,20 +451,32 @@ impl SyncHandler {
     }
 
     /// Find commits between 'have' set and 'want' commit.
-    /// Returns commits in topological order (dependencies first).
+    /// Returns commits in topological order (dependencies first) and the
+    /// common ancestor found (if any).
     async fn find_commits_between(
         &self,
         store: &CommitStore,
         have: &[String],
         want: &str,
-    ) -> Result<Vec<String>, MqttError> {
+    ) -> Result<FindCommitsResult, MqttError> {
         let have_set: HashSet<&str> = have.iter().map(|s| s.as_str()).collect();
         let mut result = Vec::new();
         let mut to_visit = vec![want.to_string()];
         let mut visited = HashSet::new();
+        // Track the first common ancestor found (first commit in have set we encounter)
+        let mut ancestor: Option<String> = None;
 
         while let Some(cid) = to_visit.pop() {
-            if visited.contains(&cid) || have_set.contains(cid.as_str()) {
+            if visited.contains(&cid) {
+                continue;
+            }
+
+            // Check if this commit is in the have set (common ancestor found)
+            if have_set.contains(cid.as_str()) {
+                // Record the first ancestor found (there may be multiple in divergent DAGs)
+                if ancestor.is_none() {
+                    ancestor = Some(cid.clone());
+                }
                 continue;
             }
 
@@ -450,6 +485,14 @@ impl SyncHandler {
             match store.get_commit(&cid).await {
                 Ok(commit) => {
                     result.push(cid);
+                    // If this commit has no parents, we've reached the root
+                    if commit.parents.is_empty() {
+                        // Reaching root without finding have commits means:
+                        // - Either we found all commits (have was empty)
+                        // - Or there's no common ancestor
+                        // For empty have set, we consider root as the implicit ancestor
+                        // (no ancestor field needed in response)
+                    }
                     for parent in commit.parents {
                         to_visit.push(parent);
                     }
@@ -462,7 +505,10 @@ impl SyncHandler {
 
         // Reverse to get oldest first
         result.reverse();
-        Ok(result)
+        Ok(FindCommitsResult {
+            commits: result,
+            ancestor,
+        })
     }
 
     /// Collect ancestors of a commit up to a depth limit.

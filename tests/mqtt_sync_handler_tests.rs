@@ -536,6 +536,7 @@ fn test_sync_message_commit_response() {
         timestamp: 1704067200000,
         author: "test-user".to_string(),
         message: Some("Test commit".to_string()),
+        source: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains(r#""type":"commit""#));
@@ -565,6 +566,8 @@ fn test_sync_message_done_response() {
     let msg = SyncMessage::Done {
         req: "req-006".to_string(),
         commits: vec!["c1".to_string(), "c2".to_string(), "c3".to_string()],
+        source: None,
+        ancestor: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains(r#""type":"done""#));
@@ -576,6 +579,7 @@ fn test_sync_message_error_response() {
     let msg = SyncMessage::Error {
         req: "req-007".to_string(),
         message: "Commit not found".to_string(),
+        error: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains(r#""type":"error""#));
@@ -626,17 +630,21 @@ fn test_sync_message_is_request() {
         data: "d".to_string(),
         timestamp: 0,
         author: "a".to_string(),
-        message: None
+        message: None,
+        source: None,
     }
     .is_request());
     assert!(!SyncMessage::Done {
         req: "r".to_string(),
-        commits: vec![]
+        commits: vec![],
+        source: None,
+        ancestor: None,
     }
     .is_request());
     assert!(!SyncMessage::Error {
         req: "r".to_string(),
-        message: "e".to_string()
+        message: "e".to_string(),
+        error: None,
     }
     .is_request());
 }

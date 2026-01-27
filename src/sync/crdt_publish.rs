@@ -126,6 +126,7 @@ pub async fn publish_text_change(
         author: author.to_string(),
         message: None,
         timestamp,
+        req: None,
     };
 
     let topic = Topic::edits(workspace, node_id).to_topic_string();
@@ -209,6 +210,7 @@ pub async fn publish_yjs_update(
         author: author.to_string(),
         message: None,
         timestamp,
+        req: None,
     };
 
     let topic = Topic::edits(workspace, node_id).to_topic_string();

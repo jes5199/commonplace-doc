@@ -106,6 +106,7 @@ async fn send_edit(
         parents: vec![], // Store will determine parents
         message: None,
         timestamp,
+        req: None,
     };
 
     // Build the topic

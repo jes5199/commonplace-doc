@@ -385,6 +385,7 @@ impl PeerFallbackHandler {
                 req: req_id.to_string(),
                 commits: commit_ids.into_iter().take(sent_count).collect(),
                 source: Some(self.client_id.clone()),
+                ancestor: None, // Peer fallback doesn't track ancestor
             };
 
             let topic = Topic::sync(workspace, path, client_id).to_topic_string();

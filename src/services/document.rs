@@ -237,6 +237,7 @@ impl DocumentService {
                 author: author.to_string(),
                 message: message.map(String::from),
                 timestamp,
+                req: None,
             };
             match serde_json::to_vec(&edit_msg) {
                 Ok(payload) => {
