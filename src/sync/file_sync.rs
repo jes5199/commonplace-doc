@@ -3181,15 +3181,17 @@ pub async fn receive_task_crdt(
                     // Determine if this is a rollback write that would lose data
                     // We use a threshold to distinguish legitimate edits from merge conflicts:
                     // - Legitimate edits may shorten content (deleting text)
-                    // - Merge conflicts often produce drastically shorter content (50%+ reduction)
+                    // - Merge conflicts often produce drastically shorter content (90%+ reduction)
+                    // Note: 50% was too aggressive - legitimate large edits exist
                     let is_rollback = if content.is_empty() && !existing_content.is_empty() {
-                        // Writing empty content when file has content is a rollback
+                        // Writing empty content when file has content - could be legitimate delete
+                        // Log at debug level since this can happen legitimately
                         true
                     } else if !content.is_empty()
                         && !existing_content.is_empty()
-                        && content.len() < existing_content.len() / 2
+                        && content.len() < existing_content.len() / 10
                     {
-                        // Content reduced by more than 50% - likely a merge conflict, not an edit.
+                        // Content reduced by more than 90% - likely a merge conflict, not an edit.
                         // This prevents sync loops where clients flip-flop between versions
                         // while still allowing legitimate edits that shorten content.
                         true
@@ -3198,13 +3200,15 @@ pub async fn receive_task_crdt(
                     };
 
                     if is_rollback {
-                        warn!(
+                        debug!(
                             "CRDT receive_task: refusing rollback write for {} (existing {} bytes, new {} bytes)",
                             file_path.display(),
                             existing_content.len(),
                             content.len()
                         );
-                        // Don't write - continue processing other messages
+                        // Don't write AND don't save state - skip to next message
+                        // This prevents divergence between file and CRDT state
+                        continue;
                     } else {
                         // Update shared last_content BEFORE writing to avoid echo publishes.
                         let previous_content = {
@@ -3251,12 +3255,17 @@ pub async fn receive_task_crdt(
                                     file_path.display(),
                                     e
                                 );
+                                // Don't save CRDT state - prevents divergence between file and state.
+                                // On restart, we'll re-receive the edit and try again.
+                                continue;
                             }
                         }
                     }
                 }
 
-                // Save the updated state
+                // Save the updated state - only reached if:
+                // 1. No content to write (AlreadyKnown, LocalAhead), or
+                // 2. File write succeeded
                 drop(state_guard);
                 let state_guard = crdt_state.read().await;
                 if let Err(e) = state_guard

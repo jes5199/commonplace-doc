@@ -307,7 +307,7 @@ pub async fn process_received_edit(
     // Only return content if we should write to disk
     let should_write = matches!(
         final_result,
-        MergeResult::FastForward { .. } | MergeResult::Merged { .. }
+        MergeResult::FastForward { .. } | MergeResult::Merged { .. } | MergeResult::LocalAhead
     );
 
     Ok((
