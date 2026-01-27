@@ -834,6 +834,16 @@ pub async fn directory_mqtt_task(
                 let mqtt_schema = apply_schema_update_to_state(&mut state.schema, &msg.payload);
                 // Extract the updated CID before releasing the lock (for ancestry tracking)
                 let updated_cid = state.schema.head_cid.clone();
+
+                // Persist the updated CRDT state to disk so it survives restarts
+                if mqtt_schema.is_some() {
+                    if let Err(e) = state.save(&directory).await {
+                        warn!("Failed to save root CRDT state: {}", e);
+                    } else {
+                        debug!("[SANDBOX-TRACE] Persisted schema CRDT state for root directory");
+                    }
+                }
+
                 drop(state); // Release lock before doing I/O
 
                 if let Some((ref schema, ref schema_json)) = mqtt_schema {
@@ -2261,6 +2271,19 @@ pub async fn subdir_mqtt_task(
                                     "[SANDBOX-TRACE] Applied schema update to subdir cached state for subdir={} entry_count={}",
                                     subdir_path, entry_count
                                 );
+
+                                // Persist the updated CRDT state to disk so it survives restarts
+                                if let Err(e) = state.save(&subdir_full_path).await {
+                                    warn!(
+                                        "Failed to save subdir CRDT state for {}: {}",
+                                        subdir_path, e
+                                    );
+                                } else {
+                                    debug!(
+                                        "[SANDBOX-TRACE] Persisted schema CRDT state for subdir={}",
+                                        subdir_path
+                                    );
+                                }
                             } else {
                                 debug!(
                                     "Failed to apply schema update for subdir={}, will fetch from HTTP",
