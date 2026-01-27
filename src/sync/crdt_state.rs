@@ -986,8 +986,9 @@ impl DirectorySyncState {
                 }
             };
 
-            // Check if we have this file in sync state with a different UUID
+            // Check if we have this file in sync state
             if let Some(file_state) = self.files.get_mut(filename) {
+                // Correct UUID if it drifted
                 if file_state.node_id != schema_uuid {
                     warn!(
                         "UUID drift detected for '{}': sync state has {}, schema has {} - correcting",
@@ -1001,13 +1002,22 @@ impl DirectorySyncState {
                     file_state.known_cids.clear();
                     corrections += 1;
                 }
+            } else {
+                // Create new entry for files in schema but not in local sync state
+                // This handles files added via API that the client hasn't seen yet
+                info!(
+                    "Creating sync state entry for new server file '{}' with UUID {}",
+                    filename, schema_uuid
+                );
+                self.files
+                    .insert(filename.clone(), CrdtPeerState::new(schema_uuid));
+                corrections += 1;
             }
-            // Note: We don't create new entries here - that's handled by the normal sync flow
         }
 
         if corrections > 0 {
             info!(
-                "Reconciled {} UUID drift(s) with schema in {}",
+                "Reconciled {} correction(s)/addition(s) with schema in {}",
                 corrections,
                 directory.display()
             );
@@ -1029,8 +1039,10 @@ impl DirectorySyncState {
 /// - file states with Y.Docs
 ///
 /// Migration creates empty Y.Docs but preserves CID information.
-pub fn migrate_from_old_state(
+/// File UUIDs are looked up from the `.commonplace.json` schema file.
+pub async fn migrate_from_old_state(
     old_state: &crate::sync::state_file::SyncStateFile,
+    directory: &Path,
 ) -> SyncResult<DirectorySyncState> {
     // Parse the node_id as UUID
     let schema_node_id = Uuid::parse_str(&old_state.node_id)?;
@@ -1042,12 +1054,84 @@ pub fn migrate_from_old_state(
     new_state.schema.head_cid = old_state.last_synced_cid.clone();
     new_state.schema.local_head_cid = old_state.last_synced_cid.clone();
 
+    // Load schema to look up file UUIDs
+    let schema_path = directory.join(SCHEMA_FILENAME);
+    let schema_entries: Option<HashMap<String, Entry>> = if schema_path.exists() {
+        match fs::read_to_string(&schema_path).await {
+            Ok(content) => match serde_json::from_str::<FsSchema>(&content) {
+                Ok(fs_schema) => match &fs_schema.root {
+                    Some(Entry::Dir(dir)) => dir.entries.clone(),
+                    _ => None,
+                },
+                Err(e) => {
+                    warn!(
+                        "Failed to parse {} during migration: {}",
+                        schema_path.display(),
+                        e
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                warn!(
+                    "Failed to read {} during migration: {}",
+                    schema_path.display(),
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        debug!(
+            "No schema file at {} during migration",
+            schema_path.display()
+        );
+        None
+    };
+
     // Migrate file states
     for (path, file_state) in &old_state.files {
-        // For files, we don't have the node_id in the old format
-        // We'll need to generate a placeholder or fetch from schema
-        // For now, generate a new UUID (will be updated on first sync)
-        let file_node_id = Uuid::new_v4();
+        // Look up the UUID from the schema (authoritative source)
+        let file_node_id = if let Some(ref entries) = schema_entries {
+            if let Some(Entry::Doc(doc)) = entries.get(path) {
+                if let Some(ref node_id_str) = doc.node_id {
+                    match Uuid::parse_str(node_id_str) {
+                        Ok(uuid) => {
+                            debug!(
+                                "Using schema UUID {} for file '{}' during migration",
+                                uuid, path
+                            );
+                            uuid
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Invalid UUID '{}' for '{}' in schema: {}, generating new one",
+                                node_id_str, path, e
+                            );
+                            Uuid::new_v4()
+                        }
+                    }
+                } else {
+                    warn!(
+                        "File '{}' in schema has no node_id, generating new UUID",
+                        path
+                    );
+                    Uuid::new_v4()
+                }
+            } else {
+                warn!(
+                    "File '{}' not found in schema during migration, generating new UUID",
+                    path
+                );
+                Uuid::new_v4()
+            }
+        } else {
+            warn!(
+                "No schema available during migration for '{}', generating new UUID",
+                path
+            );
+            Uuid::new_v4()
+        };
 
         let mut peer_state = CrdtPeerState::new(file_node_id);
         peer_state.head_cid = file_state.last_cid.clone();
@@ -1081,7 +1165,7 @@ pub async fn load_or_migrate(
         if let Some(old_state) =
             crate::sync::state_file::SyncStateFile::load(&old_state_path).await?
         {
-            match migrate_from_old_state(&old_state) {
+            match migrate_from_old_state(&old_state, directory).await {
                 Ok(new_state) => {
                     // Save the migrated state
                     new_state.save(directory).await?;
