@@ -2351,6 +2351,15 @@ async fn run_directory_mode(
             .await
             .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
     ));
+
+    // Reconcile sync state UUIDs with schema to detect and fix drift
+    {
+        let mut state = crdt_state.write().await;
+        if let Err(e) = state.reconcile_with_schema(&directory).await {
+            warn!("Failed to reconcile UUIDs with schema: {}", e);
+        }
+    }
+
     let subdir_cache = Arc::new(SubdirStateCache::new());
     let mqtt_only_config = if mqtt_only_sync {
         MqttOnlySyncConfig::mqtt_only()
@@ -2972,6 +2981,15 @@ async fn run_exec_mode(
             .await
             .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
     ));
+
+    // Reconcile sync state UUIDs with schema to detect and fix drift
+    {
+        let mut state = crdt_state.write().await;
+        if let Err(e) = state.reconcile_with_schema(&directory).await {
+            warn!("Failed to reconcile UUIDs with schema: {}", e);
+        }
+    }
+
     let subdir_cache = Arc::new(SubdirStateCache::new());
     let mqtt_only_config = if mqtt_only_sync {
         MqttOnlySyncConfig::mqtt_only()

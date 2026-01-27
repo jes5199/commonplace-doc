@@ -1693,6 +1693,14 @@ pub async fn handle_schema_change(
         }
     }
 
+    // Reconcile UUIDs after schema fetch to fix any drift
+    if let Some(ctx) = crdt_context {
+        let mut state = ctx.crdt_state.write().await;
+        if let Err(e) = state.reconcile_with_schema(directory).await {
+            warn!("Failed to reconcile UUIDs after schema change: {}", e);
+        }
+    }
+
     // Check for new paths not in our state
     let known_paths: Vec<String> = {
         let states = file_states.read().await;

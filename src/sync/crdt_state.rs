@@ -5,7 +5,9 @@
 //!
 //! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
 
+use crate::fs::{Entry, FsSchema};
 use crate::sync::error::{SyncError, SyncResult};
+use crate::sync::schema_io::SCHEMA_FILENAME;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -777,6 +779,103 @@ impl DirectorySyncState {
             }
         }
     }
+
+    /// Reconcile file UUIDs in sync state with the authoritative schema.
+    ///
+    /// Reads the `.commonplace.json` schema and compares each file's node_id
+    /// against the corresponding entry in `self.files`. If they differ, updates
+    /// the sync state to use the schema's UUID and clears stale CRDT state.
+    ///
+    /// This prevents "split-brain" sync where the client writes to a different
+    /// server document than what the schema specifies.
+    ///
+    /// Returns the number of corrections made.
+    pub async fn reconcile_with_schema(&mut self, directory: &Path) -> io::Result<usize> {
+        let schema_path = directory.join(SCHEMA_FILENAME);
+        if !schema_path.exists() {
+            debug!(
+                "No schema at {} for reconciliation, skipping",
+                schema_path.display()
+            );
+            return Ok(0);
+        }
+
+        let content = fs::read_to_string(&schema_path).await?;
+        let fs_schema: FsSchema = serde_json::from_str(&content)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // Extract file entries from root directory
+        let entries = match &fs_schema.root {
+            Some(Entry::Dir(dir)) => dir.entries.as_ref(),
+            _ => None,
+        };
+
+        let Some(entries) = entries else {
+            debug!("Schema has no entries to reconcile");
+            return Ok(0);
+        };
+
+        info!(
+            "Reconciling {} schema entries with sync state in {}",
+            entries.len(),
+            directory.display()
+        );
+
+        let mut corrections = 0;
+
+        for (filename, entry) in entries {
+            // Only process document entries (not subdirectories)
+            let schema_node_id = match entry {
+                Entry::Doc(doc) => doc.node_id.as_ref(),
+                Entry::Dir(_) => continue, // Skip subdirectories
+            };
+
+            let Some(schema_node_id_str) = schema_node_id else {
+                continue; // No node_id in schema, skip
+            };
+
+            let schema_uuid = match Uuid::parse_str(schema_node_id_str) {
+                Ok(uuid) => uuid,
+                Err(e) => {
+                    warn!(
+                        "Invalid UUID '{}' for '{}' in schema: {}",
+                        schema_node_id_str, filename, e
+                    );
+                    continue;
+                }
+            };
+
+            // Check if we have this file in sync state with a different UUID
+            if let Some(file_state) = self.files.get_mut(filename) {
+                if file_state.node_id != schema_uuid {
+                    warn!(
+                        "UUID drift detected for '{}': sync state has {}, schema has {} - correcting",
+                        filename, file_state.node_id, schema_uuid
+                    );
+                    file_state.node_id = schema_uuid;
+                    // Clear stale CRDT state since we're now tracking a different document
+                    file_state.yjs_state = None;
+                    file_state.head_cid = None;
+                    file_state.local_head_cid = None;
+                    file_state.known_cids.clear();
+                    corrections += 1;
+                }
+            }
+            // Note: We don't create new entries here - that's handled by the normal sync flow
+        }
+
+        if corrections > 0 {
+            info!(
+                "Reconciled {} UUID drift(s) with schema in {}",
+                corrections,
+                directory.display()
+            );
+            // Save the corrected state
+            self.save(directory).await?;
+        }
+
+        Ok(corrections)
+    }
 }
 
 /// Migrate from old SyncStateFile format to new DirectorySyncState.
@@ -919,7 +1018,13 @@ impl SubdirStateCache {
         }
 
         // Load from disk (no lock held during async I/O)
-        let state = DirectorySyncState::load_or_create(directory, schema_node_id).await?;
+        let mut state = DirectorySyncState::load_or_create(directory, schema_node_id).await?;
+
+        // Reconcile UUIDs with schema to fix any drift
+        if let Err(e) = state.reconcile_with_schema(directory).await {
+            warn!("Failed to reconcile subdir UUIDs with schema: {}", e);
+        }
+
         let arc_state = Arc::new(RwLock::new(state));
 
         // Insert into cache (acquire write lock again)

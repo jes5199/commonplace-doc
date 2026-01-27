@@ -903,6 +903,12 @@ pub async fn directory_mqtt_task(
                             {
                                 warn!("MQTT: Failed to sync new files: {}", e);
                             }
+
+                            // Reconcile UUIDs after schema update to fix any drift
+                            let mut state = ctx.crdt_state.write().await;
+                            if let Err(e) = state.reconcile_with_schema(&directory).await {
+                                warn!("MQTT: Failed to reconcile UUIDs after schema update: {}", e);
+                            }
                         }
 
                         // Handle deletions using MQTT schema
