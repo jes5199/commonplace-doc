@@ -432,7 +432,7 @@ mod tests {
         }
 
         // Wait for all dispatches
-        while let Some(_) = dispatch_tasks.join_next().await {}
+        while dispatch_tasks.join_next().await.is_some() {}
 
         // Verify all requests received correct responses
         for (i, _req_id, rx) in registered {

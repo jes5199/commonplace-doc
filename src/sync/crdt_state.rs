@@ -866,6 +866,7 @@ impl DirectorySyncState {
     /// This preserves existing schema entries when creating a new state or
     /// recovering from corrupted state, preventing data loss when the Y.Doc
     /// is later written back to disk.
+    #[allow(dead_code)]
     async fn initialize_schema_from_local_file(state: &mut Self, directory: &Path) {
         use crate::fs::FsSchema;
         use crate::sync::ymap_schema;

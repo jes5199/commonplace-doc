@@ -754,8 +754,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_expired() {
-        let mut config = PeerFallbackConfig::default();
-        config.primary_timeout = Duration::from_millis(1); // Very short for testing
+        let config = PeerFallbackConfig {
+            primary_timeout: Duration::from_millis(1), // Very short for testing
+            ..Default::default()
+        };
         let handler = PeerFallbackHandler::new("client-1".to_string(), config);
 
         // Register a request

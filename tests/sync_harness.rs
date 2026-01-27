@@ -781,13 +781,10 @@ mod broadcast_lag_tests {
         // Process with lag detection
         let result = recv_broadcast_with_lag(&mut rx, "test").await;
 
-        match result {
-            BroadcastRecvResult::Lagged { missed_count, .. } => {
-                // In real code, this is where resync would be triggered
-                resync_count_clone.fetch_add(1, Ordering::SeqCst);
-                assert!(missed_count >= 1);
-            }
-            _ => {}
+        if let BroadcastRecvResult::Lagged { missed_count, .. } = result {
+            // In real code, this is where resync would be triggered
+            resync_count_clone.fetch_add(1, Ordering::SeqCst);
+            assert!(missed_count >= 1);
         }
 
         assert_eq!(
@@ -3628,7 +3625,7 @@ mod receive_pipeline_tests {
         let update_b64 = STANDARD.encode(&update);
 
         // Verify it has the expected base64 characteristics
-        assert!(update_b64.len() > 0);
+        assert!(!update_b64.is_empty());
 
         let edit_msg = make_edit_message(&update_b64, vec![], "author", 1000);
 
@@ -4222,7 +4219,7 @@ mod guardrails_tests {
         // Verify oldest edits were dropped (first 10 edits should be gone)
         // The first remaining edit should have index 10 (0-9 were dropped)
         let first_edit = &state.pending_edits[0].payload;
-        let expected_first = vec![(10 % 256) as u8, ((10 / 256) % 256) as u8];
+        let expected_first = vec![10_u8, 0_u8];
         assert_eq!(
             first_edit, &expected_first,
             "First edit should be index 10 after overflow"
