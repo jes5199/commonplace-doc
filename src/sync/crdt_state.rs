@@ -8,6 +8,7 @@
 use crate::fs::{Entry, FsSchema};
 use crate::sync::error::{SyncError, SyncResult};
 use crate::sync::schema_io::SCHEMA_FILENAME;
+use crate::sync::sync_state_machine::SyncStateMachine;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -177,6 +178,19 @@ pub struct PendingEdit {
     pub payload: Vec<u8>,
 }
 
+/// An edit buffered during active sync.
+///
+/// When the client is in an active sync state (PULLING, DIVERGED, MERGING,
+/// APPLYING, PUSHING), incoming edits are buffered here instead of being
+/// processed immediately. After sync completes, these edits are processed.
+#[derive(Debug, Clone)]
+pub struct SyncBufferedEdit {
+    /// The raw MQTT payload (serialized EditMessage)
+    pub payload: Vec<u8>,
+    /// Parent CIDs from the edit message (for fast-forward detection)
+    pub parents: Vec<String>,
+}
+
 /// Configuration for MQTT-only sync mode.
 ///
 /// When enabled, HTTP is deprecated for sync operations.
@@ -244,6 +258,8 @@ impl QueueReason {
 /// - A queue of pending edits received before initialization
 /// - A flag indicating whether the receive task is ready
 /// - A set of known commit IDs (for detecting missing parents)
+/// - A sync state machine for cyan sync protocol
+/// - A buffer for edits received during active sync
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrdtPeerState {
     /// UUID for this document
@@ -270,6 +286,16 @@ pub struct CrdtPeerState {
     /// Edits are queued until this is true (even after CRDT init completes).
     #[serde(skip)]
     pub receive_task_ready: bool,
+    /// Sync state machine for the cyan sync protocol.
+    /// Tracks the current sync state (IDLE, PULLING, DIVERGED, etc.)
+    /// Not serialized - resets to IDLE on restart.
+    #[serde(skip)]
+    pub sync_state_machine: SyncStateMachine,
+    /// Buffer for edits received during active sync.
+    /// These are processed after sync completes, checking if they
+    /// extend the new HEAD (fast-forward) or need another sync cycle.
+    #[serde(skip)]
+    pub sync_buffered_edits: Vec<SyncBufferedEdit>,
 }
 
 impl CrdtPeerState {
@@ -283,6 +309,8 @@ impl CrdtPeerState {
             known_cids: HashSet::new(),
             pending_edits: Vec::new(),
             receive_task_ready: false,
+            sync_state_machine: SyncStateMachine::new(node_id.to_string()),
+            sync_buffered_edits: Vec::new(),
         }
     }
 
@@ -301,6 +329,8 @@ impl CrdtPeerState {
             known_cids: HashSet::new(),
             pending_edits: Vec::new(),
             receive_task_ready: false,
+            sync_state_machine: SyncStateMachine::new(node_id.to_string()),
+            sync_buffered_edits: Vec::new(),
         }
     }
 
@@ -515,6 +545,116 @@ impl CrdtPeerState {
     /// Check if there are pending edits waiting to be applied.
     pub fn has_pending_edits(&self) -> bool {
         !self.pending_edits.is_empty()
+    }
+
+    // =========================================================================
+    // Sync State Machine Methods
+    // =========================================================================
+
+    /// Check if edits should be buffered due to active sync.
+    ///
+    /// During active sync states (PULLING, DIVERGED, MERGING, APPLYING, PUSHING),
+    /// incoming edits should be buffered instead of processed immediately.
+    /// This prevents race conditions where incoming edits interfere with sync.
+    pub fn should_buffer_for_sync(&self) -> bool {
+        self.sync_state_machine.should_buffer_edits()
+    }
+
+    /// Buffer an edit received during active sync.
+    ///
+    /// The edit is stored with its parent CIDs for later fast-forward detection.
+    /// If the buffer exceeds MAX_PENDING_EDITS, the oldest edit is dropped.
+    ///
+    /// # Arguments
+    /// * `payload` - The raw MQTT payload (serialized EditMessage)
+    /// * `parents` - Parent CIDs from the edit message
+    ///
+    /// # Returns
+    /// True if the edit was buffered, false if an edit was dropped due to overflow.
+    pub fn buffer_sync_edit(&mut self, payload: Vec<u8>, parents: Vec<String>) -> bool {
+        let overflow = self.sync_buffered_edits.len() >= MAX_PENDING_EDITS;
+        if overflow {
+            // Drop the oldest edit to make room
+            self.sync_buffered_edits.remove(0);
+            warn!(
+                "Sync buffer overflow for {}: dropped oldest edit (buffer size: {})",
+                self.node_id, MAX_PENDING_EDITS
+            );
+        }
+        self.sync_buffered_edits
+            .push(SyncBufferedEdit { payload, parents });
+        debug!(
+            "Buffered sync edit for {} (buffer size: {})",
+            self.node_id,
+            self.sync_buffered_edits.len()
+        );
+        !overflow
+    }
+
+    /// Check if there are edits buffered during sync.
+    pub fn has_sync_buffered_edits(&self) -> bool {
+        !self.sync_buffered_edits.is_empty()
+    }
+
+    /// Drain buffered sync edits, classifying them by whether they extend the new HEAD.
+    ///
+    /// After sync completes with a new HEAD, this method returns two groups:
+    /// 1. Fast-forward edits: These have the new HEAD as their parent and can be applied
+    /// 2. Stale edits: These are based on the old HEAD and need another sync cycle
+    ///
+    /// # Arguments
+    /// * `new_head` - The HEAD CID after sync completed
+    ///
+    /// # Returns
+    /// A tuple of (fast_forward_edits, stale_edits)
+    pub fn drain_sync_buffer(
+        &mut self,
+        new_head: &str,
+    ) -> (Vec<SyncBufferedEdit>, Vec<SyncBufferedEdit>) {
+        let all_edits = std::mem::take(&mut self.sync_buffered_edits);
+
+        let mut fast_forward = Vec::new();
+        let mut stale = Vec::new();
+
+        for edit in all_edits {
+            // Check if this edit's parent is the new HEAD (fast-forward case)
+            let is_fast_forward = edit.parents.len() == 1
+                && edit.parents.first().map(|p| p.as_str()) == Some(new_head);
+
+            if is_fast_forward {
+                fast_forward.push(edit);
+            } else {
+                stale.push(edit);
+            }
+        }
+
+        if !fast_forward.is_empty() || !stale.is_empty() {
+            debug!(
+                "Drained sync buffer for {}: {} fast-forward, {} stale",
+                self.node_id,
+                fast_forward.len(),
+                stale.len()
+            );
+        }
+
+        (fast_forward, stale)
+    }
+
+    /// Take all buffered sync edits without classification.
+    ///
+    /// Used when all buffered edits should be processed regardless of parent.
+    pub fn take_sync_buffered_edits(&mut self) -> Vec<SyncBufferedEdit> {
+        std::mem::take(&mut self.sync_buffered_edits)
+    }
+
+    /// Get a reference to the sync state machine.
+    pub fn sync_state(&self) -> &SyncStateMachine {
+        &self.sync_state_machine
+    }
+
+    /// Get a mutable reference to the sync state machine.
+    pub fn sync_state_mut(&mut self) -> &mut SyncStateMachine {
+        &mut self.sync_state_machine
     }
 }
 
@@ -1459,5 +1599,192 @@ mod tests {
         assert!(state.head_cid.is_none());
         // But receive_task_ready should still be true (task is still running)
         assert!(state.receive_task_ready);
+    }
+
+    // =========================================================================
+    // Sync Buffering Tests (CP-mlgz)
+    // =========================================================================
+
+    #[test]
+    fn test_should_buffer_for_sync_in_idle() {
+        let state = CrdtPeerState::new(Uuid::new_v4());
+
+        // In IDLE state, should NOT buffer edits
+        assert!(!state.should_buffer_for_sync());
+    }
+
+    #[test]
+    fn test_should_buffer_for_sync_in_active_states() {
+        use crate::sync::sync_state_machine::SyncEvent;
+
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Transition to COMPARING
+        state.sync_state_mut().apply(SyncEvent::StartSync).unwrap();
+        assert!(state.should_buffer_for_sync());
+
+        // Transition to PULLING
+        state
+            .sync_state_mut()
+            .apply(SyncEvent::ServerAhead)
+            .unwrap();
+        assert!(state.should_buffer_for_sync());
+
+        // Transition to APPLYING
+        state
+            .sync_state_mut()
+            .apply(SyncEvent::CommitsReceived)
+            .unwrap();
+        assert!(state.should_buffer_for_sync());
+
+        // Transition back to IDLE
+        state
+            .sync_state_mut()
+            .apply(SyncEvent::CommitsApplied {
+                has_local_commits: false,
+            })
+            .unwrap();
+        assert!(!state.should_buffer_for_sync());
+    }
+
+    #[test]
+    fn test_buffer_sync_edit() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        assert!(!state.has_sync_buffered_edits());
+
+        // Buffer an edit
+        let result = state.buffer_sync_edit(vec![1, 2, 3], vec!["parent1".to_string()]);
+        assert!(result); // No overflow
+        assert!(state.has_sync_buffered_edits());
+        assert_eq!(state.sync_buffered_edits.len(), 1);
+
+        // Buffer another edit
+        state.buffer_sync_edit(vec![4, 5, 6], vec!["parent2".to_string()]);
+        assert_eq!(state.sync_buffered_edits.len(), 2);
+    }
+
+    #[test]
+    fn test_sync_buffer_overflow() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Fill buffer to max capacity
+        for i in 0..MAX_PENDING_EDITS {
+            state.buffer_sync_edit(vec![i as u8], vec!["parent".to_string()]);
+        }
+        assert_eq!(state.sync_buffered_edits.len(), MAX_PENDING_EDITS);
+
+        // Buffer one more - should drop oldest
+        let result = state.buffer_sync_edit(vec![255], vec!["new_parent".to_string()]);
+        assert!(!result); // Overflow occurred
+        assert_eq!(state.sync_buffered_edits.len(), MAX_PENDING_EDITS);
+
+        // First edit should now be [1] (was [0] but got dropped)
+        assert_eq!(state.sync_buffered_edits[0].payload, vec![1]);
+
+        // Last edit should be the new one
+        assert_eq!(
+            state.sync_buffered_edits[MAX_PENDING_EDITS - 1].payload,
+            vec![255]
+        );
+    }
+
+    #[test]
+    fn test_drain_sync_buffer_fast_forward() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Buffer edits with various parents
+        state.buffer_sync_edit(vec![1], vec!["new_head".to_string()]); // Fast-forward
+        state.buffer_sync_edit(vec![2], vec!["old_head".to_string()]); // Stale
+        state.buffer_sync_edit(vec![3], vec!["new_head".to_string()]); // Fast-forward
+
+        let (fast_forward, stale) = state.drain_sync_buffer("new_head");
+
+        // Check fast-forward edits
+        assert_eq!(fast_forward.len(), 2);
+        assert_eq!(fast_forward[0].payload, vec![1]);
+        assert_eq!(fast_forward[1].payload, vec![3]);
+
+        // Check stale edits
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].payload, vec![2]);
+
+        // Buffer should be empty after drain
+        assert!(!state.has_sync_buffered_edits());
+    }
+
+    #[test]
+    fn test_drain_sync_buffer_merge_edits_are_stale() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Merge commit with 2 parents is NOT a fast-forward
+        state.buffer_sync_edit(
+            vec![1],
+            vec!["new_head".to_string(), "other_branch".to_string()],
+        );
+
+        let (fast_forward, stale) = state.drain_sync_buffer("new_head");
+
+        // Merge edits should be stale (need full sync)
+        assert_eq!(fast_forward.len(), 0);
+        assert_eq!(stale.len(), 1);
+    }
+
+    #[test]
+    fn test_take_sync_buffered_edits() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        state.buffer_sync_edit(vec![1], vec!["p1".to_string()]);
+        state.buffer_sync_edit(vec![2], vec!["p2".to_string()]);
+
+        let edits = state.take_sync_buffered_edits();
+
+        assert_eq!(edits.len(), 2);
+        assert!(!state.has_sync_buffered_edits());
+    }
+
+    #[test]
+    fn test_sync_state_machine_access() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Access immutable reference
+        assert_eq!(
+            state.sync_state().state(),
+            crate::sync::sync_state_machine::ClientSyncState::Idle
+        );
+
+        // Access mutable reference and make transition
+        use crate::sync::sync_state_machine::SyncEvent;
+        state.sync_state_mut().apply(SyncEvent::StartSync).unwrap();
+
+        assert_eq!(
+            state.sync_state().state(),
+            crate::sync::sync_state_machine::ClientSyncState::Comparing
+        );
+    }
+
+    #[test]
+    fn test_sync_state_not_serialized() {
+        use crate::sync::sync_state_machine::SyncEvent;
+
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+
+        // Change sync state
+        state.sync_state_mut().apply(SyncEvent::StartSync).unwrap();
+
+        // Buffer some edits
+        state.buffer_sync_edit(vec![1, 2, 3], vec!["parent".to_string()]);
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&state).unwrap();
+
+        // sync_state_machine and sync_buffered_edits should not be in the JSON
+        assert!(!json.contains("sync_state_machine"));
+        assert!(!json.contains("sync_buffered_edits"));
+
+        // When deserialized, sync state should be IDLE and buffer empty
+        let loaded: CrdtPeerState = serde_json::from_str(&json).unwrap();
+        assert!(!loaded.should_buffer_for_sync()); // IDLE state
+        assert!(!loaded.has_sync_buffered_edits());
     }
 }

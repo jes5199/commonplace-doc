@@ -6,6 +6,7 @@ use std::io;
 use std::path::Path;
 use tracing::{error, info};
 
+pub mod ack_handler;
 pub mod ancestry;
 pub mod client;
 pub mod commands;
@@ -160,8 +161,16 @@ pub use yjs::{
     create_yjs_text_diff_update, create_yjs_text_update, json_value_to_any, TEXT_ROOT_NAME,
 };
 
+pub use ack_handler::{
+    handle_ack_message, process_ack, AckResult, PendingCommit, PendingCommitTracker, MAX_RETRIES,
+    PENDING_COMMIT_TIMEOUT,
+};
 pub use commands::{spawn_command_listener, CommandEntry};
-pub use crdt_merge::{parse_edit_message, process_received_edit, MergeResult};
+pub use crdt_merge::{
+    apply_commits_to_doc, create_and_publish_merge_commit, create_merge_commit,
+    find_common_ancestor, parse_edit_message, process_received_edit, MergeCommitInput,
+    MergeCommitResult, MergeResult,
+};
 pub use crdt_new_file::{
     create_new_file, generate_file_uuid, remove_file_from_schema, NewFileResult,
 };
@@ -171,8 +180,8 @@ pub use crdt_publish::{
 };
 pub use crdt_state::{
     load_or_migrate, migrate_from_old_state, CrdtPeerState, DirectorySyncState, MqttOnlySyncConfig,
-    PendingEdit, QueueReason, SubdirStateCache, SyncGuardrails, CRDT_STATE_FILENAME,
-    MAX_PENDING_EDITS,
+    PendingEdit, QueueReason, SubdirStateCache, SyncBufferedEdit, SyncGuardrails,
+    CRDT_STATE_FILENAME, MAX_PENDING_EDITS,
 };
 pub use error::{SyncError, SyncResult};
 pub use missing_parent::{

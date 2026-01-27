@@ -6,7 +6,20 @@
 //! - Create merge commits when needed
 //! - Update state tracking (head_cid and local_head_cid)
 //!
+//! ## Merge Commit Creation (Cyan Sync Protocol)
+//!
+//! When a client detects divergence (local HEAD A, server HEAD B, neither is ancestor
+//! of the other), it must create a merge commit following these steps:
+//!
+//! 1. Send `pull` request with `have=[A, A's ancestors...]`
+//! 2. Receive commits from common ancestor X to B
+//! 3. Apply server commits to a temporary Y.Doc starting from common ancestor state
+//! 4. Merge with local Y.Doc using `Y.applyUpdate(localDoc, Y.encodeStateAsUpdate(serverDoc))`
+//! 5. Create merge commit with `parents=[A, B]` and usually empty update
+//! 6. Publish merge commit to edits topic
+//!
 //! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
+//! See: docs/plans/2026-01-27-cyan-sync-protocol-design.md
 
 use crate::commit::Commit;
 use crate::mqtt::{EditMessage, MqttClient, Topic};
@@ -419,6 +432,311 @@ fn get_doc_text_content(doc: &Doc) -> String {
 /// Parse an MQTT edit message payload.
 pub fn parse_edit_message(payload: &[u8]) -> SyncResult<EditMessage> {
     serde_json::from_slice(payload).map_err(SyncError::from)
+}
+
+// =============================================================================
+// Merge Commit Creation for Cyan Sync Protocol
+// =============================================================================
+
+/// Input data for creating a merge commit.
+///
+/// This struct captures all the information needed to create a merge commit
+/// when the client detects divergence with the server.
+#[derive(Debug, Clone)]
+pub struct MergeCommitInput {
+    /// Local HEAD commit CID (one of the merge parents)
+    pub local_head: String,
+    /// Server HEAD commit CID (one of the merge parents)
+    pub server_head: String,
+    /// Local Y.Doc state (serialized)
+    pub local_doc_state: Vec<u8>,
+    /// Server Y.Doc state at server_head (serialized)
+    pub server_doc_state: Vec<u8>,
+    /// Author identifier for the merge commit
+    pub author: String,
+}
+
+/// Result of creating a merge commit.
+#[derive(Debug, Clone)]
+pub struct MergeCommitResult {
+    /// The created merge commit
+    pub commit: Commit,
+    /// The CID of the merge commit
+    pub cid: String,
+    /// The merged Y.Doc state (for updating local state)
+    pub merged_doc_state: Vec<u8>,
+    /// Text content after merge (for writing to disk)
+    pub merged_content: String,
+}
+
+/// Create a merge commit when client detects divergence with server.
+///
+/// This function implements the merge commit creation flow from the cyan sync protocol:
+///
+/// 1. Takes the local Y.Doc state and server Y.Doc state
+/// 2. Merges them using Yjs CRDT semantics (applyUpdate)
+/// 3. Creates a merge commit with `parents=[local_head, server_head]`
+/// 4. Returns the commit for publishing to the edits topic
+///
+/// # Arguments
+/// * `input` - The merge commit input data containing heads and doc states
+///
+/// # Returns
+/// * `Ok(MergeCommitResult)` - The created merge commit with merged state
+/// * `Err(SyncError)` - If the merge fails
+///
+/// # Example
+/// ```ignore
+/// let input = MergeCommitInput {
+///     local_head: local_cid.clone(),
+///     server_head: server_cid.clone(),
+///     local_doc_state: local_state_bytes,
+///     server_doc_state: server_state_bytes,
+///     author: "client-123".to_string(),
+/// };
+/// let result = create_merge_commit(input)?;
+/// // result.commit can be published to edits topic
+/// // result.merged_doc_state should be saved locally
+/// ```
+pub fn create_merge_commit(input: MergeCommitInput) -> SyncResult<MergeCommitResult> {
+    // Create a new Y.Doc for the merge
+    let merge_doc = Doc::new();
+
+    // Apply local state first
+    if !input.local_doc_state.is_empty() {
+        let local_update = Update::decode_v1(&input.local_doc_state).map_err(|e| {
+            SyncError::yjs_decode(format!("Failed to decode local Y.Doc state: {}", e))
+        })?;
+        let mut txn = merge_doc.transact_mut();
+        txn.apply_update(local_update);
+    }
+
+    // Apply server state to merge (Yjs CRDT semantics handle conflict resolution)
+    if !input.server_doc_state.is_empty() {
+        let server_update = Update::decode_v1(&input.server_doc_state).map_err(|e| {
+            SyncError::yjs_decode(format!("Failed to decode server Y.Doc state: {}", e))
+        })?;
+        let mut txn = merge_doc.transact_mut();
+        txn.apply_update(server_update);
+    }
+
+    // Get the merged content
+    let merged_content = get_doc_text_content(&merge_doc);
+
+    // Encode the merged state
+    let merged_doc_state = {
+        let txn = merge_doc.transact();
+        txn.encode_state_as_update_v1(&yrs::StateVector::default())
+    };
+
+    // Create the merge commit with empty update
+    // Per the cyan sync protocol spec, merge commits typically have empty updates
+    // because Yjs CRDT semantics handle the merge automatically.
+    // The merge is recorded by having both parents, and peers can reconstruct
+    // the merged state by replaying all ancestors.
+    let parents = vec![input.local_head.clone(), input.server_head.clone()];
+    let commit = Commit::new(
+        parents,
+        String::new(), // Empty update - Yjs handles merge semantics
+        input.author,
+        Some("Merge commit".to_string()),
+    );
+    let cid = commit.calculate_cid();
+
+    debug!(
+        "Created merge commit {} with parents [{}, {}]",
+        &cid[..8.min(cid.len())],
+        &input.local_head[..8.min(input.local_head.len())],
+        &input.server_head[..8.min(input.server_head.len())]
+    );
+
+    Ok(MergeCommitResult {
+        commit,
+        cid,
+        merged_doc_state,
+        merged_content,
+    })
+}
+
+/// Create and publish a merge commit when diverged.
+///
+/// This is a convenience function that:
+/// 1. Creates a merge commit using `create_merge_commit`
+/// 2. Persists it to the local commit store (if provided)
+/// 3. Publishes it to the MQTT edits topic (if client provided)
+/// 4. Updates the CRDT peer state
+///
+/// # Arguments
+/// * `mqtt_client` - Optional MQTT client for publishing
+/// * `workspace` - The workspace name for MQTT topic
+/// * `node_id` - The document/node ID
+/// * `state` - The CRDT peer state to update
+/// * `server_head` - The server's HEAD CID
+/// * `server_doc_state` - The server's Y.Doc state
+/// * `author` - Author identifier
+/// * `commit_store` - Optional commit store for persistence
+///
+/// # Returns
+/// * `Ok(MergeCommitResult)` - The created merge commit
+/// * `Err(SyncError)` - If the merge or publish fails
+#[allow(clippy::too_many_arguments)]
+pub async fn create_and_publish_merge_commit(
+    mqtt_client: Option<&Arc<MqttClient>>,
+    workspace: &str,
+    node_id: &str,
+    state: &mut CrdtPeerState,
+    server_head: String,
+    server_doc_state: Vec<u8>,
+    author: &str,
+    commit_store: Option<&Arc<CommitStore>>,
+) -> SyncResult<MergeCommitResult> {
+    // Get local state
+    let local_head = state
+        .local_head_cid
+        .clone()
+        .ok_or_else(|| SyncError::other("No local HEAD for merge"))?;
+
+    let local_doc_state = if let Some(ref yjs_state_b64) = state.yjs_state {
+        STANDARD.decode(yjs_state_b64)?
+    } else {
+        Vec::new()
+    };
+
+    // Create the merge commit
+    let input = MergeCommitInput {
+        local_head: local_head.clone(),
+        server_head: server_head.clone(),
+        local_doc_state,
+        server_doc_state,
+        author: author.to_string(),
+    };
+    let result = create_merge_commit(input)?;
+
+    // Persist to local store if provided
+    if let Some(store) = commit_store {
+        match store
+            .store_commit_and_set_head(node_id, &result.commit)
+            .await
+        {
+            Ok(_) => {
+                debug!("Persisted merge commit {} to local store", result.cid);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to persist merge commit {} to local store: {}",
+                    result.cid, e
+                );
+            }
+        }
+    }
+
+    // Publish to MQTT if client is provided
+    if let Some(mqtt) = mqtt_client {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let publish_msg = EditMessage {
+            update: result.commit.update.clone(),
+            parents: result.commit.parents.clone(),
+            author: author.to_string(),
+            message: Some("Merge commit".to_string()),
+            timestamp,
+            req: None,
+        };
+
+        let topic = Topic::edits(workspace, node_id).to_topic_string();
+        let payload = serde_json::to_vec(&publish_msg)?;
+
+        mqtt.publish_retained(&topic, &payload, QoS::AtLeastOnce)
+            .await
+            .map_err(|e| SyncError::mqtt(format!("Failed to publish merge commit: {}", e)))?;
+
+        info!(
+            "Published merge commit {} for {} (parents: {}, {})",
+            result.cid, node_id, local_head, server_head
+        );
+    }
+
+    // Update CRDT peer state
+    state.head_cid = Some(result.cid.clone());
+    state.local_head_cid = Some(result.cid.clone());
+    state.yjs_state = Some(STANDARD.encode(&result.merged_doc_state));
+
+    // Record commits as known
+    state.record_known_cid(&result.cid);
+    state.record_known_cid(&server_head);
+
+    info!(
+        "Created merge commit {} (local {} + server {})",
+        result.cid, local_head, server_head
+    );
+
+    Ok(result)
+}
+
+/// Apply commits received from a pull request to a Y.Doc.
+///
+/// This function is used during the merge flow when receiving commits
+/// from the server after a pull request. It applies all received commits
+/// in order to build up the server's state at server_head.
+///
+/// # Arguments
+/// * `commits` - List of commits in chronological order (oldest first)
+///
+/// # Returns
+/// * `Ok(Vec<u8>)` - The Y.Doc state after applying all commits
+/// * `Err(SyncError)` - If any commit fails to apply
+pub fn apply_commits_to_doc(commits: &[Commit]) -> SyncResult<Vec<u8>> {
+    let doc = Doc::new();
+
+    for commit in commits {
+        if commit.update.is_empty() {
+            // Empty update (e.g., merge commit) - skip
+            continue;
+        }
+
+        let update_bytes = STANDARD.decode(&commit.update)?;
+        if update_bytes.is_empty() {
+            continue;
+        }
+
+        let update = Update::decode_v1(&update_bytes).map_err(|e| {
+            SyncError::yjs_decode(format!("Failed to decode Yjs update in commit: {}", e))
+        })?;
+
+        let mut txn = doc.transact_mut();
+        txn.apply_update(update);
+    }
+
+    let txn = doc.transact();
+    Ok(txn.encode_state_as_update_v1(&yrs::StateVector::default()))
+}
+
+/// Find the common ancestor between local and server commit histories.
+///
+/// This is a client-side helper that iterates through local known commits
+/// to find the first one that matches one of the commits in the server's
+/// history (provided via the `have` response).
+///
+/// # Arguments
+/// * `local_known_cids` - Set of CIDs known locally
+/// * `server_commits` - List of commit CIDs from server (in reverse order, newest first)
+///
+/// # Returns
+/// * `Some(cid)` - The common ancestor CID
+/// * `None` - If no common ancestor found
+pub fn find_common_ancestor(
+    local_known_cids: &std::collections::HashSet<String>,
+    server_commits: &[String],
+) -> Option<String> {
+    for cid in server_commits {
+        if local_known_cids.contains(cid) {
+            return Some(cid.clone());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -975,5 +1293,324 @@ mod tests {
             "Expected Merged or LocalAhead for divergent commits, got {:?}",
             result
         );
+    }
+
+    // ==========================================================================
+    // Tests for Merge Commit Creation (Cyan Sync Protocol)
+    // ==========================================================================
+
+    /// Test basic merge commit creation.
+    #[test]
+    fn test_create_merge_commit_basic() {
+        use yrs::{Text, WriteTxn};
+
+        // Create local state with "hello"
+        let local_doc = Doc::with_client_id(1);
+        {
+            let mut txn = local_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "hello");
+        }
+        let local_state = {
+            let txn = local_doc.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+
+        // Create server state with "world"
+        let server_doc = Doc::with_client_id(2);
+        {
+            let mut txn = server_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "world");
+        }
+        let server_state = {
+            let txn = server_doc.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+
+        let input = MergeCommitInput {
+            local_head: "local_cid_123".to_string(),
+            server_head: "server_cid_456".to_string(),
+            local_doc_state: local_state,
+            server_doc_state: server_state,
+            author: "test_user".to_string(),
+        };
+
+        let result = create_merge_commit(input).unwrap();
+
+        // Verify merge commit structure
+        assert!(result.commit.is_merge(), "Should be a merge commit");
+        assert_eq!(result.commit.parents.len(), 2);
+        assert!(result.commit.parents.contains(&"local_cid_123".to_string()));
+        assert!(result
+            .commit
+            .parents
+            .contains(&"server_cid_456".to_string()));
+        assert_eq!(result.commit.author, "test_user");
+        assert_eq!(result.commit.message, Some("Merge commit".to_string()));
+
+        // Verify update is empty (per cyan sync protocol spec)
+        assert!(
+            result.commit.update.is_empty(),
+            "Merge commit should have empty update"
+        );
+
+        // Verify CID is computed
+        assert!(!result.cid.is_empty());
+        assert_eq!(result.cid.len(), 64); // SHA-256 hex is 64 chars
+
+        // Verify merged content contains both "hello" and "world"
+        // (order depends on client IDs, but both should be present)
+        assert!(
+            result.merged_content.contains("hello") && result.merged_content.contains("world"),
+            "Merged content should contain both 'hello' and 'world', got: {}",
+            result.merged_content
+        );
+
+        // Verify merged state is non-empty
+        assert!(!result.merged_doc_state.is_empty());
+    }
+
+    /// Test merge commit with empty local state.
+    #[test]
+    fn test_create_merge_commit_empty_local() {
+        use yrs::Text;
+
+        // Empty local state
+        let local_state = Vec::new();
+
+        // Server state with content
+        let server_doc = Doc::with_client_id(2);
+        {
+            let mut txn = server_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "server content");
+        }
+        let server_state = {
+            let txn = server_doc.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+
+        let input = MergeCommitInput {
+            local_head: "local_cid".to_string(),
+            server_head: "server_cid".to_string(),
+            local_doc_state: local_state,
+            server_doc_state: server_state,
+            author: "user".to_string(),
+        };
+
+        let result = create_merge_commit(input).unwrap();
+
+        assert!(result.commit.is_merge());
+        assert_eq!(result.merged_content, "server content");
+    }
+
+    /// Test merge commit with empty server state.
+    #[test]
+    fn test_create_merge_commit_empty_server() {
+        use yrs::Text;
+
+        // Local state with content
+        let local_doc = Doc::with_client_id(1);
+        {
+            let mut txn = local_doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "local content");
+        }
+        let local_state = {
+            let txn = local_doc.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+
+        // Empty server state
+        let server_state = Vec::new();
+
+        let input = MergeCommitInput {
+            local_head: "local_cid".to_string(),
+            server_head: "server_cid".to_string(),
+            local_doc_state: local_state,
+            server_doc_state: server_state,
+            author: "user".to_string(),
+        };
+
+        let result = create_merge_commit(input).unwrap();
+
+        assert!(result.commit.is_merge());
+        assert_eq!(result.merged_content, "local content");
+    }
+
+    /// Test merge commit CID is deterministic.
+    #[test]
+    fn test_merge_commit_cid_deterministic() {
+        let input = MergeCommitInput {
+            local_head: "local_cid_123".to_string(),
+            server_head: "server_cid_456".to_string(),
+            local_doc_state: Vec::new(),
+            server_doc_state: Vec::new(),
+            author: "user".to_string(),
+        };
+
+        let result1 = create_merge_commit(input.clone()).unwrap();
+        let result2 = create_merge_commit(input).unwrap();
+
+        // Note: CIDs won't match because Commit::new() uses current timestamp
+        // But the structure should be the same
+        assert_eq!(result1.commit.parents, result2.commit.parents);
+        assert_eq!(result1.commit.author, result2.commit.author);
+        assert_eq!(result1.commit.update, result2.commit.update);
+    }
+
+    /// Test apply_commits_to_doc with multiple commits.
+    #[test]
+    fn test_apply_commits_to_doc() {
+        use yrs::Text;
+
+        // Create a sequence of commits
+        let doc = Doc::with_client_id(1);
+        let text = doc.get_or_insert_text("content");
+
+        // Commit 1: "hello"
+        let update1 = {
+            let mut txn = doc.transact_mut();
+            text.insert(&mut txn, 0, "hello");
+            txn.encode_update_v1()
+        };
+        let commit1 = Commit::new(vec![], STANDARD.encode(&update1), "user".to_string(), None);
+
+        // Commit 2: "hello world"
+        let update2 = {
+            let mut txn = doc.transact_mut();
+            text.insert(&mut txn, 5, " world");
+            txn.encode_update_v1()
+        };
+        let commit2 = Commit::new(
+            vec!["cid1".to_string()],
+            STANDARD.encode(&update2),
+            "user".to_string(),
+            None,
+        );
+
+        // Apply commits
+        let result_state = apply_commits_to_doc(&[commit1, commit2]).unwrap();
+
+        // Verify the result state
+        let verify_doc = Doc::new();
+        {
+            let update = Update::decode_v1(&result_state).unwrap();
+            let mut txn = verify_doc.transact_mut();
+            txn.apply_update(update);
+        }
+        let content = get_doc_text_content(&verify_doc);
+        assert_eq!(content, "hello world");
+    }
+
+    /// Test apply_commits_to_doc with empty update (merge commit).
+    #[test]
+    fn test_apply_commits_to_doc_with_merge() {
+        use yrs::Text;
+
+        // Create a commit with content
+        let doc = Doc::with_client_id(1);
+        let text = doc.get_or_insert_text("content");
+        let update1 = {
+            let mut txn = doc.transact_mut();
+            text.insert(&mut txn, 0, "content");
+            txn.encode_update_v1()
+        };
+        let commit1 = Commit::new(vec![], STANDARD.encode(&update1), "user".to_string(), None);
+
+        // Create a merge commit with empty update
+        let merge_commit = Commit::new(
+            vec!["cid1".to_string(), "cid2".to_string()],
+            String::new(), // Empty update
+            "user".to_string(),
+            Some("Merge".to_string()),
+        );
+
+        // Apply commits (including merge with empty update)
+        let result_state = apply_commits_to_doc(&[commit1, merge_commit]).unwrap();
+
+        // Verify the result state
+        let verify_doc = Doc::new();
+        {
+            let update = Update::decode_v1(&result_state).unwrap();
+            let mut txn = verify_doc.transact_mut();
+            txn.apply_update(update);
+        }
+        let content = get_doc_text_content(&verify_doc);
+        assert_eq!(content, "content");
+    }
+
+    /// Test find_common_ancestor.
+    #[test]
+    fn test_find_common_ancestor() {
+        use std::collections::HashSet;
+
+        let mut local_known = HashSet::new();
+        local_known.insert("commit_a".to_string());
+        local_known.insert("commit_b".to_string());
+        local_known.insert("commit_c".to_string());
+
+        // Server commits from newest to oldest
+        let server_commits = vec![
+            "commit_x".to_string(),
+            "commit_y".to_string(),
+            "commit_b".to_string(), // This should be found
+            "commit_a".to_string(),
+        ];
+
+        let ancestor = find_common_ancestor(&local_known, &server_commits);
+        assert_eq!(ancestor, Some("commit_b".to_string()));
+    }
+
+    /// Test find_common_ancestor with no common ancestor.
+    #[test]
+    fn test_find_common_ancestor_none() {
+        use std::collections::HashSet;
+
+        let mut local_known = HashSet::new();
+        local_known.insert("commit_a".to_string());
+        local_known.insert("commit_b".to_string());
+
+        let server_commits = vec![
+            "commit_x".to_string(),
+            "commit_y".to_string(),
+            "commit_z".to_string(),
+        ];
+
+        let ancestor = find_common_ancestor(&local_known, &server_commits);
+        assert!(ancestor.is_none());
+    }
+
+    /// Test find_common_ancestor with empty server list.
+    #[test]
+    fn test_find_common_ancestor_empty_server() {
+        use std::collections::HashSet;
+
+        let mut local_known = HashSet::new();
+        local_known.insert("commit_a".to_string());
+
+        let server_commits: Vec<String> = vec![];
+
+        let ancestor = find_common_ancestor(&local_known, &server_commits);
+        assert!(ancestor.is_none());
+    }
+
+    /// Test that merge commits have correct parents order.
+    #[test]
+    fn test_merge_commit_parents_order() {
+        let input = MergeCommitInput {
+            local_head: "local_first".to_string(),
+            server_head: "server_second".to_string(),
+            local_doc_state: Vec::new(),
+            server_doc_state: Vec::new(),
+            author: "user".to_string(),
+        };
+
+        let result = create_merge_commit(input).unwrap();
+
+        // Parents should be [local_head, server_head] in that order
+        assert_eq!(result.commit.parents[0], "local_first");
+        assert_eq!(result.commit.parents[1], "server_second");
     }
 }

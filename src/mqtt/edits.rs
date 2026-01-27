@@ -8,7 +8,7 @@
 use crate::commit::Commit;
 use crate::document::{resolve_path_to_uuid, ContentType, DocumentStore};
 use crate::mqtt::client::MqttClient;
-use crate::mqtt::messages::EditMessage;
+use crate::mqtt::messages::{EditMessage, SyncMessage};
 use crate::mqtt::topics::{content_type_for_path, Topic};
 use crate::mqtt::{parse_json, MqttError};
 use crate::store::CommitStore;
@@ -16,7 +16,7 @@ use rumqttc::QoS;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Handler for the edits port.
 pub struct EditsHandler {
@@ -179,15 +179,55 @@ impl EditsHandler {
         };
 
         // Store the commit if we have a commit store
-        let cid = if let Some(store) = &self.commit_store {
-            let (cid, _timestamp) = store
-                .store_commit_and_set_head(&document_id, &commit)
+        // Use store_commit_with_head_advancement for cyan sync protocol compliance
+        let (cid, head_advanced) = if let Some(store) = &self.commit_store {
+            let (cid, _timestamp, head_advanced) = store
+                .store_commit_with_head_advancement(&document_id, &commit)
                 .await?;
-            debug!("Stored commit {} for document {}", cid, document_id);
-            Some(cid)
+            debug!(
+                "Stored commit {} for document {} (head_advanced: {})",
+                cid, document_id, head_advanced
+            );
+            (Some(cid), Some(head_advanced))
         } else {
-            None
+            (None, None)
         };
+
+        // Publish ack to the client's sync topic (cyan sync protocol)
+        // The topic format is: {workspace}/sync/{path}/{client-id}
+        // The client-id is the edit message author
+        if let (Some(ref cid_str), Some(advanced)) = (&cid, head_advanced) {
+            let ack_msg =
+                SyncMessage::ack_success(edit_msg.req.as_deref().unwrap_or(""), cid_str, advanced);
+
+            // Construct the sync topic for this client
+            let sync_topic = Topic::sync(&self.workspace, &document_id, &edit_msg.author);
+            let topic_str = sync_topic.to_topic_string();
+
+            // Serialize and publish the ack
+            match serde_json::to_vec(&ack_msg) {
+                Ok(payload) => {
+                    if let Err(e) = self
+                        .client
+                        .publish(&topic_str, &payload, QoS::AtLeastOnce)
+                        .await
+                    {
+                        warn!(
+                            "Failed to publish ack for commit {} to {}: {:?}",
+                            cid_str, topic_str, e
+                        );
+                    } else {
+                        debug!(
+                            "Published ack for commit {} to {} (head_advanced: {})",
+                            cid_str, topic_str, advanced
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to serialize ack message: {:?}", e);
+                }
+            }
+        }
 
         // Get the content type and ensure document exists
         // If path is a UUID (from wildcard subscription), check if document exists first

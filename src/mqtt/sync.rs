@@ -152,6 +152,7 @@ impl SyncHandler {
             | SyncMessage::Done { .. }
             | SyncMessage::IsAncestorResponse { .. }
             | SyncMessage::Error { .. }
+            | SyncMessage::Ack { .. }
             | SyncMessage::MissingParent { .. } => {
                 // Response messages shouldn't be received by the doc store
                 warn!("Received unexpected sync response message: {:?}", message);

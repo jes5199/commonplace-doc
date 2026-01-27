@@ -354,6 +354,42 @@ pub enum SyncMessage {
         error: Option<SyncError>,
     },
 
+    /// Acknowledgment after persisting a commit from the edits topic.
+    ///
+    /// Sent to the client's sync topic after the doc store persists a commit.
+    /// The `req` field correlates with the `req` from the original `EditMessage`.
+    ///
+    /// Example success (fast-forward):
+    /// ```json
+    /// { "type": "ack", "req": "e-001", "commit": "xyz789", "accepted": true, "head_advanced": true }
+    /// ```
+    ///
+    /// Example success (divergent branch persisted):
+    /// ```json
+    /// { "type": "ack", "req": "e-001", "commit": "xyz789", "accepted": true, "head_advanced": false }
+    /// ```
+    ///
+    /// Example failure (missing parents):
+    /// ```json
+    /// { "type": "ack", "req": "e-001", "commit": "xyz789", "accepted": false,
+    ///   "error": { "code": "missing_parents", "parents": ["abc123"] } }
+    /// ```
+    Ack {
+        /// Correlation ID from the original EditMessage (empty string if not provided).
+        req: String,
+        /// The CID that was persisted (or attempted to persist).
+        commit: String,
+        /// Whether the commit was accepted and persisted.
+        accepted: bool,
+        /// Whether HEAD moved forward (only meaningful when accepted=true).
+        /// False when the commit creates a divergent branch.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        head_advanced: Option<bool>,
+        /// Structured error if accepted=false.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<SyncError>,
+    },
+
     // ========== Alerts (broadcast to notify peers of issues) ==========
     /// Alert that parent commits are missing.
     ///
@@ -529,6 +565,7 @@ impl SyncMessage {
             SyncMessage::Done { req, .. } => req,
             SyncMessage::IsAncestorResponse { req, .. } => req,
             SyncMessage::Error { req, .. } => req,
+            SyncMessage::Ack { req, .. } => req,
             SyncMessage::MissingParent { req, .. } => req,
         }
     }
@@ -554,6 +591,7 @@ impl SyncMessage {
                 | SyncMessage::Done { .. }
                 | SyncMessage::IsAncestorResponse { .. }
                 | SyncMessage::Error { .. }
+                | SyncMessage::Ack { .. }
         )
     }
 
@@ -577,6 +615,46 @@ impl SyncMessage {
             req: req.into(),
             message: message.into(),
             error: None,
+        }
+    }
+
+    /// Create a success ack message after persisting a commit.
+    ///
+    /// # Arguments
+    /// * `req` - Correlation ID from the original EditMessage (use empty string if none)
+    /// * `commit` - The CID that was persisted
+    /// * `head_advanced` - Whether HEAD moved forward
+    pub fn ack_success(
+        req: impl Into<String>,
+        commit: impl Into<String>,
+        head_advanced: bool,
+    ) -> Self {
+        SyncMessage::Ack {
+            req: req.into(),
+            commit: commit.into(),
+            accepted: true,
+            head_advanced: Some(head_advanced),
+            error: None,
+        }
+    }
+
+    /// Create a failure ack message when commit persistence failed.
+    ///
+    /// # Arguments
+    /// * `req` - Correlation ID from the original EditMessage (use empty string if none)
+    /// * `commit` - The CID that failed to persist
+    /// * `error` - The structured error explaining the failure
+    pub fn ack_failure(
+        req: impl Into<String>,
+        commit: impl Into<String>,
+        error: SyncError,
+    ) -> Self {
+        SyncMessage::Ack {
+            req: req.into(),
+            commit: commit.into(),
+            accepted: false,
+            head_advanced: None,
+            error: Some(error),
         }
     }
 }
@@ -1112,5 +1190,165 @@ mod tests {
             SyncError::no_common_ancestor(vec!["a".to_string()], "z".to_string()).to_string(),
             "no common ancestor found (have: a, server_head: z)"
         );
+    }
+
+    // ========== Ack Message Tests ==========
+
+    #[test]
+    fn test_ack_success_head_advanced() {
+        let msg = SyncMessage::ack_success("e-001", "xyz789", true);
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"ack\""));
+        assert!(json.contains("\"req\":\"e-001\""));
+        assert!(json.contains("\"commit\":\"xyz789\""));
+        assert!(json.contains("\"accepted\":true"));
+        assert!(json.contains("\"head_advanced\":true"));
+        // error should be omitted when None
+        assert!(!json.contains("\"error\""));
+
+        // Verify round-trip
+        let parsed: SyncMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SyncMessage::Ack {
+                req,
+                commit,
+                accepted,
+                head_advanced,
+                error,
+            } => {
+                assert_eq!(req, "e-001");
+                assert_eq!(commit, "xyz789");
+                assert!(accepted);
+                assert_eq!(head_advanced, Some(true));
+                assert!(error.is_none());
+            }
+            _ => panic!("Expected Ack message"),
+        }
+    }
+
+    #[test]
+    fn test_ack_success_divergent() {
+        // Commit persisted but HEAD didn't advance (divergent branch)
+        let msg = SyncMessage::ack_success("e-002", "abc123", false);
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"ack\""));
+        assert!(json.contains("\"accepted\":true"));
+        assert!(json.contains("\"head_advanced\":false"));
+
+        // Verify round-trip
+        let parsed: SyncMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SyncMessage::Ack {
+                accepted,
+                head_advanced,
+                ..
+            } => {
+                assert!(accepted);
+                assert_eq!(head_advanced, Some(false));
+            }
+            _ => panic!("Expected Ack message"),
+        }
+    }
+
+    #[test]
+    fn test_ack_failure_missing_parents() {
+        let err = SyncError::missing_parents(vec!["def456".to_string()]);
+        let msg = SyncMessage::ack_failure("e-003", "xyz789", err.clone());
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"ack\""));
+        assert!(json.contains("\"req\":\"e-003\""));
+        assert!(json.contains("\"commit\":\"xyz789\""));
+        assert!(json.contains("\"accepted\":false"));
+        // head_advanced should be omitted for failures
+        assert!(!json.contains("\"head_advanced\""));
+        assert!(json.contains("\"error\":{\"code\":\"missing_parents\""));
+
+        // Verify round-trip
+        let parsed: SyncMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SyncMessage::Ack {
+                req,
+                commit,
+                accepted,
+                head_advanced,
+                error,
+            } => {
+                assert_eq!(req, "e-003");
+                assert_eq!(commit, "xyz789");
+                assert!(!accepted);
+                assert!(head_advanced.is_none());
+                assert_eq!(error, Some(err));
+            }
+            _ => panic!("Expected Ack message"),
+        }
+    }
+
+    #[test]
+    fn test_ack_is_response() {
+        let msg = SyncMessage::ack_success("e-001", "xyz789", true);
+        assert!(msg.is_response());
+        assert!(!msg.is_request());
+        assert!(!msg.is_alert());
+    }
+
+    #[test]
+    fn test_ack_req() {
+        let msg = SyncMessage::ack_success("correlation-id", "xyz789", true);
+        assert_eq!(msg.req(), "correlation-id");
+    }
+
+    #[test]
+    fn test_ack_deserialize_from_spec() {
+        // Test deserialization from exact JSON format in the spec
+        let json = r#"{"type":"ack","req":"e-001","commit":"xyz789","accepted":true,"head_advanced":true}"#;
+        let msg: SyncMessage = serde_json::from_str(json).unwrap();
+
+        match msg {
+            SyncMessage::Ack {
+                req,
+                commit,
+                accepted,
+                head_advanced,
+                error,
+            } => {
+                assert_eq!(req, "e-001");
+                assert_eq!(commit, "xyz789");
+                assert!(accepted);
+                assert_eq!(head_advanced, Some(true));
+                assert!(error.is_none());
+            }
+            _ => panic!("Expected Ack message"),
+        }
+    }
+
+    #[test]
+    fn test_ack_deserialize_failure_from_spec() {
+        // Test deserialization of failure ack from spec
+        let json = r#"{"type":"ack","req":"e-001","commit":"xyz789","accepted":false,"error":{"code":"missing_parents","parents":["def456","abc123"]}}"#;
+        let msg: SyncMessage = serde_json::from_str(json).unwrap();
+
+        match msg {
+            SyncMessage::Ack {
+                accepted,
+                head_advanced,
+                error,
+                ..
+            } => {
+                assert!(!accepted);
+                assert!(head_advanced.is_none());
+                assert!(error.is_some());
+                if let Some(SyncError::MissingParents { parents }) = error {
+                    assert_eq!(parents.len(), 2);
+                    assert!(parents.contains(&"def456".to_string()));
+                    assert!(parents.contains(&"abc123".to_string()));
+                } else {
+                    panic!("Expected MissingParents error");
+                }
+            }
+            _ => panic!("Expected Ack message"),
+        }
     }
 }
