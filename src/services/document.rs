@@ -214,8 +214,12 @@ impl DocumentService {
 
     /// Publish a commit to MQTT for real-time sync.
     ///
-    /// This publishes an EditMessage to the `{workspace}/edits/{doc_id}` topic,
-    /// allowing MQTT subscribers to receive document updates.
+    /// This publishes an EditMessage to the `{workspace}/edits/{doc_id}` topic
+    /// as a **retained** message, allowing MQTT subscribers to receive document
+    /// updates. Using retained messages ensures that new subscribers (like
+    /// restarted sandbox sync processes) receive the latest state immediately
+    /// upon subscribing, rather than missing updates that occurred while
+    /// disconnected.
     async fn publish_commit_to_mqtt(
         &self,
         doc_id: &str,
@@ -236,10 +240,17 @@ impl DocumentService {
             };
             match serde_json::to_vec(&edit_msg) {
                 Ok(payload) => {
-                    if let Err(e) = mqtt.publish(&topic, &payload, QoS::AtLeastOnce).await {
-                        tracing::warn!("Failed to publish commit to MQTT topic {}: {}", topic, e);
+                    if let Err(e) = mqtt
+                        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to publish retained commit to MQTT topic {}: {}",
+                            topic,
+                            e
+                        );
                     } else {
-                        tracing::debug!("Published commit to MQTT topic: {}", topic);
+                        tracing::debug!("Published retained commit to MQTT topic: {}", topic);
                     }
                 }
                 Err(e) => {
