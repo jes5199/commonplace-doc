@@ -2068,11 +2068,18 @@ pub async fn subdir_mqtt_task(
         return;
     }
 
-    // Build initial UUID map from the subdirectory's schema
+    // Build initial UUID map from the subdirectory's schema AND write schemas locally.
+    // This ensures local .commonplace.json files exist with correct UUIDs from server.
     // The subdir_path is the prefix for paths within this subdirectory
-    let initial_uuid_map =
-        crate::sync::uuid_map::build_uuid_map_recursive(&http_client, &server, &subdir_node_id)
-            .await;
+    let subdir_full_path = directory.join(&subdir_path);
+    let (initial_uuid_map, _) = crate::sync::uuid_map::build_uuid_map_and_write_schemas(
+        &http_client,
+        &server,
+        &subdir_node_id,
+        &subdir_full_path,
+        None,
+    )
+    .await;
 
     // Build reverse map (uuid -> paths) and subscribe to all file UUIDs
     // Paths need to be prefixed with subdir_path since they're relative to the subdir
