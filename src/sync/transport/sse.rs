@@ -4,17 +4,19 @@
 //! edit events and managing reconnection logic.
 
 #[cfg(unix)]
+use super::ancestry::all_are_ancestors;
+use super::ancestry::{determine_sync_direction, SyncDirection};
+use super::client::fetch_head;
+use super::urls::build_sse_url;
 use crate::sync::{
-    ancestry::all_are_ancestors,
+    detect_from_path, flock_state::process_pending_inbound_after_confirm, is_binary_content,
+    is_default_content, looks_like_base64_binary, EditEventData, FlockSyncState, PendingWrite,
+    SyncState,
+};
+#[cfg(unix)]
+use crate::sync::{
     flock::{try_flock_exclusive, FlockResult},
     flock_state::PathState,
-};
-use crate::sync::{
-    ancestry::{determine_sync_direction, SyncDirection},
-    build_sse_url, detect_from_path, fetch_head,
-    flock_state::process_pending_inbound_after_confirm,
-    is_binary_content, is_default_content, looks_like_base64_binary, EditEventData, FlockSyncState,
-    PendingWrite, SyncState,
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -1350,7 +1352,7 @@ pub async fn handle_shadow_write(
     // Push update using replace endpoint with old commit as parent
     // This creates a CRDT update that merges with HEAD
     let replace_url =
-        crate::sync::build_replace_url(server, &identifier, &commit_id, use_paths, author);
+        super::urls::build_replace_url(server, &identifier, &commit_id, use_paths, author);
 
     info!(
         "Pushing shadow write for inode {:x}-{:x} (parent: {}, {} bytes)",

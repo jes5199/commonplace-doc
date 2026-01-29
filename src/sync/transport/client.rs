@@ -3,10 +3,11 @@
 //! This module contains functions for interacting with the Commonplace server
 //! via HTTP: forking nodes, pushing content, and syncing schemas.
 
+use super::urls::{build_edit_url, build_fork_url, build_head_url, build_replace_url};
 use crate::sync::{
-    build_edit_url, build_fork_url, build_head_url, build_replace_url, create_yjs_json_delete_key,
-    create_yjs_json_merge, create_yjs_json_update, create_yjs_jsonl_update, create_yjs_text_update,
-    EditRequest, EditResponse, ForkResponse, HeadResponse, ReplaceResponse, SyncState,
+    create_yjs_json_delete_key, create_yjs_json_merge, create_yjs_json_update,
+    create_yjs_jsonl_update, create_yjs_text_update, EditRequest, EditResponse, ForkResponse,
+    HeadResponse, ReplaceResponse, SyncState,
 };
 use reqwest::Client;
 use std::sync::Arc;

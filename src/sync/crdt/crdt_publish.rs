@@ -7,10 +7,10 @@
 //!
 //! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
 
+use super::crdt_state::CrdtPeerState;
 use crate::commit::Commit;
 use crate::diff;
 use crate::mqtt::{EditMessage, MqttClient, Topic};
-use crate::sync::crdt_state::CrdtPeerState;
 use crate::sync::error::{SyncError, SyncResult};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rumqttc::QoS;

@@ -3,6 +3,8 @@
 //! This module handles file creation, modification, and deletion events
 //! during directory synchronization.
 
+use super::state::SyncState;
+use super::watcher::wait_for_file_stability;
 use crate::fs::{Entry, FsSchema};
 use crate::sync::directory::{scan_directory_to_json, ScanOptions};
 use crate::sync::schema_io::{write_schema_file, SCHEMA_FILENAME};
@@ -11,7 +13,7 @@ use crate::sync::uuid_map::fetch_subdir_node_id;
 use crate::sync::{
     delete_schema_entry, detect_from_path, fork_node, is_allowed_extension, is_binary_content,
     normalize_path, push_content_by_type, push_schema_to_server, remove_file_state_and_abort,
-    spawn_file_sync_tasks, wait_for_file_stability, FileSyncState, SyncState,
+    spawn_file_sync_tasks, FileSyncState,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -368,7 +370,7 @@ pub async fn handle_file_created(
     pull_only: bool,
     shared_state_file: Option<&crate::sync::SharedStateFile>,
     author: &str,
-    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<super::state::InodeTracker>>>,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
 ) {
     debug!("Directory event: file created: {}", path.display());

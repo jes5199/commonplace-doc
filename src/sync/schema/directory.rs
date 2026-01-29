@@ -1,8 +1,8 @@
 //! Directory scanning and FS JSON generation.
 
+use super::content_type::{detect_from_path, is_allowed_extension, is_binary_content};
+use super::schema_io::SCHEMA_FILENAME;
 use crate::fs::{DirEntry, DocEntry, Entry, FsSchema};
-use crate::sync::content_type::{detect_from_path, is_allowed_extension, is_binary_content};
-use crate::sync::schema_io::SCHEMA_FILENAME;
 use crate::sync::urls::normalize_path;
 use serde_json::Value;
 use std::collections::HashMap;

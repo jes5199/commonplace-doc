@@ -21,10 +21,10 @@
 //! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
 //! See: docs/plans/2026-01-27-cyan-sync-protocol-design.md
 
+use super::crdt_state::CrdtPeerState;
 use crate::commit::Commit;
 use crate::mqtt::{EditMessage, MqttClient, Topic};
 use crate::store::CommitStore;
-use crate::sync::crdt_state::CrdtPeerState;
 use crate::sync::error::{SyncError, SyncResult};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rumqttc::QoS;

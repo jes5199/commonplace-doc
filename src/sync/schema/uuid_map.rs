@@ -3,9 +3,10 @@
 //! This module handles building maps of relative paths to UUIDs by
 //! fetching schemas from the server and traversing node-backed directories.
 
+use super::schema_io::write_schema_file;
 use crate::fs::{Entry, FsSchema};
 use crate::sync::client::fetch_head;
-use crate::sync::{write_schema_file, WrittenSchemas};
+use crate::sync::types::WrittenSchemas;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::path::Path;
@@ -67,8 +68,7 @@ pub async fn fetch_subdir_node_id(
     parent_doc_id: &str,
     subdir_name: &str,
 ) -> Option<String> {
-    use crate::sync::fetch_head;
-    use crate::sync::FetchHeadError;
+    use crate::sync::client::{fetch_head, FetchHeadError};
 
     let head = match fetch_head(client, server, parent_doc_id, false).await {
         Ok(Some(h)) => h,

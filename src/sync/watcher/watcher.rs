@@ -4,7 +4,7 @@
 //! using the `notify` crate, with debouncing to handle rapid file modifications.
 
 #[cfg(unix)]
-use crate::sync::flock::{try_flock_shared, FlockResult};
+use super::flock::{try_flock_shared, FlockResult};
 use crate::sync::{DirEvent, FileEvent, ScanOptions};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -678,7 +678,7 @@ pub async fn directory_watcher_task(
 #[derive(Debug)]
 pub struct ShadowWriteEvent {
     /// The inode key parsed from the shadow filename.
-    pub inode_key: crate::sync::InodeKey,
+    pub inode_key: super::state::InodeKey,
     /// Path to the shadow file.
     pub shadow_path: PathBuf,
     /// Content of the shadow file.
@@ -704,7 +704,7 @@ pub struct ShadowWriteEvent {
 /// - Exits when receiver is dropped
 #[cfg(unix)]
 pub async fn shadow_watcher_task(shadow_dir: PathBuf, tx: mpsc::Sender<ShadowWriteEvent>) {
-    use crate::sync::InodeKey;
+    use super::state::InodeKey;
 
     // Ensure shadow directory exists
     if let Err(e) = tokio::fs::create_dir_all(&shadow_dir).await {
@@ -834,7 +834,7 @@ pub const SHADOW_GC_INTERVAL: Duration = Duration::from_secs(300);
 ///
 /// Exits when the tracker Arc is the last reference (sync shutdown).
 #[cfg(unix)]
-pub async fn shadow_gc_task(tracker: Arc<RwLock<crate::sync::InodeTracker>>) {
+pub async fn shadow_gc_task(tracker: Arc<RwLock<super::state::InodeTracker>>) {
     use tokio::time::interval;
 
     let mut gc_interval = interval(SHADOW_GC_INTERVAL);
@@ -882,7 +882,7 @@ pub fn spawn_shadow_tasks(
     shadow_dir: PathBuf,
     client: reqwest::Client,
     server: String,
-    tracker: Arc<RwLock<crate::sync::InodeTracker>>,
+    tracker: Arc<RwLock<super::state::InodeTracker>>,
     use_paths: bool,
     author: String,
 ) -> (
@@ -890,8 +890,8 @@ pub fn spawn_shadow_tasks(
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<()>,
 ) {
+    use super::watcher::ShadowWriteEvent;
     use crate::sync::sse::shadow_write_handler_task;
-    use crate::sync::ShadowWriteEvent;
 
     // Create channel for shadow write events
     let (shadow_tx, shadow_rx) = mpsc::channel::<ShadowWriteEvent>(100);

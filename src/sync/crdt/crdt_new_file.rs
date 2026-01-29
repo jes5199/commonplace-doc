@@ -7,11 +7,11 @@
 //!
 //! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
 
+use super::crdt_state::{CrdtPeerState, DirectorySyncState};
+use super::ymap_schema;
 use crate::commit::Commit;
 use crate::mqtt::{EditMessage, MqttClient, Topic};
-use crate::sync::crdt_state::{CrdtPeerState, DirectorySyncState};
 use crate::sync::error::{SyncError, SyncResult};
-use crate::sync::ymap_schema;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rumqttc::QoS;
 use std::sync::Arc;
@@ -661,7 +661,7 @@ mod tests {
     /// Test that DirectorySyncState properly tracks file creation.
     #[test]
     fn test_directory_sync_state_tracks_new_file() {
-        use crate::sync::crdt_state::DirectorySyncState;
+        use super::super::DirectorySyncState;
 
         let mut dir_state = DirectorySyncState::new(Uuid::new_v4());
 
@@ -691,7 +691,7 @@ mod tests {
     /// Test that DirectorySyncState properly tracks file deletion.
     #[test]
     fn test_directory_sync_state_tracks_file_deletion() {
-        use crate::sync::crdt_state::DirectorySyncState;
+        use super::super::DirectorySyncState;
 
         let mut dir_state = DirectorySyncState::new(Uuid::new_v4());
 

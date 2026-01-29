@@ -97,6 +97,8 @@ pub fn trace_timeline(milestone: TimelineMilestone, path: &str, uuid: Option<&st
     }
 }
 
+use super::client::fetch_head;
+use super::urls::encode_node_id;
 use crate::events::{recv_broadcast_with_lag, BroadcastRecvResult};
 use crate::fs::FsSchema;
 use crate::mqtt::{MqttClient, Topic};
@@ -107,9 +109,7 @@ use crate::sync::dir_sync::{
 };
 use crate::sync::error::SyncResult;
 use crate::sync::subdir_spawn::{spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport};
-use crate::sync::{
-    encode_node_id, fetch_head, spawn_file_sync_tasks_crdt, FileSyncState, SharedLastContent,
-};
+use crate::sync::{spawn_file_sync_tasks_crdt, FileSyncState, SharedLastContent};
 use futures::StreamExt;
 use reqwest::{Client, StatusCode};
 use reqwest_eventsource::{Error as SseError, Event as SseEvent, EventSource};

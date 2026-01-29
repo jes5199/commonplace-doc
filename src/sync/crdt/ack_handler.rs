@@ -21,9 +21,9 @@
 //! - `invalid_commit` → Log as bug, fix and retry
 //! - `no_common_ancestor` → Retry with deeper have set
 
+use super::crdt_state::CrdtPeerState;
+use super::sync_state_machine::SyncEvent;
 use crate::mqtt::messages::{SyncError, SyncMessage};
-use crate::sync::crdt_state::CrdtPeerState;
-use crate::sync::sync_state_machine::SyncEvent;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};

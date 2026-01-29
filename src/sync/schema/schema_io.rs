@@ -4,7 +4,9 @@
 //! and feedback loop prevention.
 
 use crate::fs::{Entry, FsSchema};
-use crate::sync::{encode_node_id, fetch_head, WrittenSchemas};
+use crate::sync::client::fetch_head;
+use crate::sync::types::WrittenSchemas;
+use crate::sync::urls::encode_node_id;
 use reqwest::Client;
 use std::path::Path;
 use tracing::{debug, info, warn};

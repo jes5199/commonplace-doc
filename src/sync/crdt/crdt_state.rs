@@ -5,10 +5,10 @@
 //!
 //! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
 
+use super::sync_state_machine::SyncStateMachine;
 use crate::fs::{Entry, FsSchema};
 use crate::sync::error::{SyncError, SyncResult};
 use crate::sync::schema_io::SCHEMA_FILENAME;
-use crate::sync::sync_state_machine::SyncStateMachine;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -868,8 +868,8 @@ impl DirectorySyncState {
     /// is later written back to disk.
     #[allow(dead_code)]
     async fn initialize_schema_from_local_file(state: &mut Self, directory: &Path) {
+        use super::ymap_schema;
         use crate::fs::FsSchema;
-        use crate::sync::ymap_schema;
         use crate::sync::SCHEMA_FILENAME;
 
         let schema_path = directory.join(SCHEMA_FILENAME);
@@ -1700,7 +1700,7 @@ mod tests {
 
     #[test]
     fn test_should_buffer_for_sync_in_active_states() {
-        use crate::sync::sync_state_machine::SyncEvent;
+        use super::super::SyncEvent;
 
         let mut state = CrdtPeerState::new(Uuid::new_v4());
 
@@ -1835,22 +1835,22 @@ mod tests {
         // Access immutable reference
         assert_eq!(
             state.sync_state().state(),
-            crate::sync::sync_state_machine::ClientSyncState::Idle
+            super::super::ClientSyncState::Idle
         );
 
         // Access mutable reference and make transition
-        use crate::sync::sync_state_machine::SyncEvent;
+        use super::super::SyncEvent;
         state.sync_state_mut().apply(SyncEvent::StartSync).unwrap();
 
         assert_eq!(
             state.sync_state().state(),
-            crate::sync::sync_state_machine::ClientSyncState::Comparing
+            super::super::ClientSyncState::Comparing
         );
     }
 
     #[test]
     fn test_sync_state_not_serialized() {
-        use crate::sync::sync_state_machine::SyncEvent;
+        use super::super::SyncEvent;
 
         let mut state = CrdtPeerState::new(Uuid::new_v4());
 
