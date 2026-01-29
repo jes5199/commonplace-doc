@@ -13,8 +13,8 @@ use crate::sync::{
     ancestry::{determine_sync_direction, SyncDirection},
     build_sse_url, detect_from_path, fetch_head,
     flock_state::process_pending_inbound_after_confirm,
-    is_binary_content, looks_like_base64_binary, EditEventData, FlockSyncState, PendingWrite,
-    SyncState,
+    is_binary_content, is_default_content, looks_like_base64_binary, EditEventData, FlockSyncState,
+    PendingWrite, SyncState,
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -33,26 +33,6 @@ use uuid::Uuid;
 
 /// Timeout for pending write barrier (30 seconds)
 pub const PENDING_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Check if content is "default" (empty or minimal) for a given content type.
-///
-/// Used to detect server documents that have only placeholder content,
-/// which shouldn't overwrite local files that have real data.
-fn is_default_content_for_type(content: &str, content_info: &crate::sync::ContentTypeInfo) -> bool {
-    let trimmed = content.trim();
-    if content_info.is_binary {
-        return trimmed.is_empty();
-    }
-    match content_info.mime_type.as_str() {
-        "application/json" => trimmed.is_empty() || trimmed == "{}",
-        "application/x-ndjson" => trimmed.is_empty(),
-        "text/plain" => trimmed.is_empty(),
-        "application/xml" => {
-            trimmed.is_empty() || trimmed == r#"<?xml version="1.0" encoding="UTF-8"?><root/>"#
-        }
-        _ => trimmed.is_empty(),
-    }
-}
 
 /// Context for different SSE task variants.
 ///
@@ -900,7 +880,7 @@ pub async fn handle_server_edit(
     // substantive content and server has only "default" content (empty or {}),
     // skip pulling to prevent wiping local data with empty server content.
     if local_cid.is_none() {
-        let server_is_default = is_default_content_for_type(&head.content, &content_info);
+        let server_is_default = is_default_content(&head.content, &content_info);
         if server_is_default {
             // Check if local file has content
             if let Ok(local_content) = std::fs::read(file_path) {
@@ -908,7 +888,7 @@ pub async fn handle_server_edit(
                     local_content.is_empty()
                 } else {
                     let local_str = String::from_utf8_lossy(&local_content);
-                    is_default_content_for_type(local_str.trim(), &content_info)
+                    is_default_content(local_str.trim(), &content_info)
                 };
                 if !local_is_default {
                     info!(
@@ -1163,7 +1143,7 @@ pub async fn handle_server_edit_with_tracker(
     // substantive content and server has only "default" content (empty or {}),
     // skip pulling to prevent wiping local data with empty server content.
     if local_cid.is_none() {
-        let server_is_default = is_default_content_for_type(&head.content, &content_info);
+        let server_is_default = is_default_content(&head.content, &content_info);
         if server_is_default {
             // Check if local file has content
             if let Ok(local_content) = std::fs::read(file_path) {
@@ -1171,7 +1151,7 @@ pub async fn handle_server_edit_with_tracker(
                     local_content.is_empty()
                 } else {
                     let local_str = String::from_utf8_lossy(&local_content);
-                    is_default_content_for_type(local_str.trim(), &content_info)
+                    is_default_content(local_str.trim(), &content_info)
                 };
                 if !local_is_default {
                     info!(

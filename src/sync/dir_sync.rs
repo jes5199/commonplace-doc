@@ -294,57 +294,9 @@ async fn path_in_written_schemas(
                 }
             };
 
-            if schema_has_path(&schema, &relative_path) {
+            if schema.has_path(&relative_path) {
                 return true;
             }
-        }
-    }
-
-    false
-}
-
-/// Check if a schema contains an entry for the given path.
-///
-/// This only handles single-level nesting because inline subdirectories are deprecated.
-/// All directories are now node-backed, meaning each subdirectory has its own schema
-/// document stored in `written_schemas` with its own canonical path. Multi-level paths
-/// like "a/b/file.txt" are handled by checking the nested schema at "a/b/.commonplace.json".
-fn schema_has_path(schema: &FsSchema, path: &str) -> bool {
-    let Some(Entry::Dir(ref root)) = schema.root else {
-        return false;
-    };
-
-    let Some(ref entries) = root.entries else {
-        return false;
-    };
-
-    // Handle simple single-level paths
-    if !path.contains('/') {
-        return entries.contains_key(path);
-    }
-
-    // Handle nested paths (e.g., "bartleby/prompts.txt")
-    let parts: Vec<&str> = path.splitn(2, '/').collect();
-    if parts.len() != 2 {
-        return entries.contains_key(path);
-    }
-
-    let (first, rest) = (parts[0], parts[1]);
-    if let Some(Entry::Dir(subdir)) = entries.get(first) {
-        // For node-backed directories, the files are defined in a separate schema
-        // document, not in the root schema. We should NOT return true just because
-        // the directory exists - that would prevent all deletions under that directory.
-        // Instead, return false here and let the function continue to check other
-        // written schemas (the nested schema should also be in written_schemas if
-        // we wrote it).
-        if subdir.node_id.is_some() {
-            // Node-backed directory - can't determine from this schema alone
-            // Continue checking other schemas in written_schemas
-            return false;
-        }
-        // Inline directory entries
-        if let Some(ref sub_entries) = subdir.entries {
-            return sub_entries.contains_key(rest);
         }
     }
 
@@ -2745,4 +2697,132 @@ pub async fn handle_schema_modified(
     push_schema_to_server(client, server, &current_node_id, content, author).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::ymap_schema;
+    use yrs::{Doc, ReadTxn, Transact};
+
+    /// Helper to create a valid MQTT payload with a schema containing one file
+    fn create_test_payload(filename: &str, node_id: &str) -> Vec<u8> {
+        // Create a Y.Doc with schema content
+        let doc = Doc::new();
+        ymap_schema::add_file(&doc, filename, node_id);
+
+        // Get the state as an update
+        let txn = doc.transact();
+        let update = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+        let update_b64 = STANDARD.encode(&update);
+
+        // Create EditMessage JSON
+        let edit_msg = serde_json::json!({
+            "update": update_b64,
+            "parents": [],
+            "author": "test",
+            "timestamp": 1234567890000_i64
+        });
+
+        serde_json::to_vec(&edit_msg).unwrap()
+    }
+
+    #[test]
+    fn test_decode_schema_from_mqtt_payload_valid() {
+        let payload = create_test_payload("test.txt", "uuid-123");
+        let result = decode_schema_from_mqtt_payload(&payload);
+
+        assert!(result.is_some());
+        let (schema, json) = result.unwrap();
+
+        // Check schema has the file
+        assert!(schema.has_path("test.txt"));
+        assert!(!json.is_empty());
+    }
+
+    #[test]
+    fn test_decode_schema_from_mqtt_payload_multiple_files() {
+        // Create schema with multiple files
+        let doc = Doc::new();
+        ymap_schema::add_file(&doc, "file1.txt", "uuid-1");
+        ymap_schema::add_file(&doc, "file2.json", "uuid-2");
+
+        let txn = doc.transact();
+        let update = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+        let update_b64 = STANDARD.encode(&update);
+
+        let edit_msg = serde_json::json!({
+            "update": update_b64,
+            "parents": ["parent-cid"],
+            "author": "test",
+            "timestamp": 1234567890000_u64
+        });
+
+        let payload = serde_json::to_vec(&edit_msg).unwrap();
+        let result = decode_schema_from_mqtt_payload(&payload);
+
+        assert!(result.is_some());
+        let (schema, _) = result.unwrap();
+        assert!(schema.has_path("file1.txt"));
+        assert!(schema.has_path("file2.json"));
+    }
+
+    #[test]
+    fn test_decode_schema_from_mqtt_payload_invalid_json() {
+        let payload = b"not valid json";
+        let result = decode_schema_from_mqtt_payload(payload);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_decode_schema_from_mqtt_payload_invalid_base64() {
+        let edit_msg = serde_json::json!({
+            "update": "not-valid-base64!!!",
+            "parents": [],
+            "author": "test"
+        });
+        let payload = serde_json::to_vec(&edit_msg).unwrap();
+
+        let result = decode_schema_from_mqtt_payload(&payload);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_decode_schema_from_mqtt_payload_invalid_yrs_update() {
+        // Valid base64 but not a valid Yrs update
+        let edit_msg = serde_json::json!({
+            "update": STANDARD.encode(b"not a valid yrs update"),
+            "parents": [],
+            "author": "test"
+        });
+        let payload = serde_json::to_vec(&edit_msg).unwrap();
+
+        let result = decode_schema_from_mqtt_payload(&payload);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_decode_schema_from_mqtt_payload_empty_schema() {
+        // Valid update but empty schema (no files added)
+        let doc = Doc::new();
+        // Just get the empty state - ymap_schema::to_fs_schema handles empty docs
+
+        let txn = doc.transact();
+        let update = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+        let update_b64 = STANDARD.encode(&update);
+
+        let edit_msg = serde_json::json!({
+            "update": update_b64,
+            "parents": [],
+            "author": "test",
+            "timestamp": 1234567890000_u64
+        });
+        let payload = serde_json::to_vec(&edit_msg).unwrap();
+
+        let result = decode_schema_from_mqtt_payload(&payload);
+        assert!(result.is_some());
+        let (schema, _) = result.unwrap();
+        // Empty schema should not have any paths
+        assert!(!schema.has_path("anything"));
+    }
 }

@@ -59,6 +59,58 @@ pub struct DocEntry {
 }
 
 impl FsSchema {
+    /// Check if a path exists in the schema.
+    ///
+    /// Returns `true` if the path is present in the schema's entries.
+    /// For nested paths (e.g., "subdir/file.txt"), this only checks inline
+    /// entries. Node-backed directories return `false` because their contents
+    /// are defined in separate schema documents.
+    ///
+    /// # Examples
+    /// ```
+    /// use commonplace_doc::fs::FsSchema;
+    /// let json = r#"{"version": 1, "root": {"type": "dir", "entries": {"file.txt": {"type": "doc"}}}}"#;
+    /// let schema: FsSchema = serde_json::from_str(json).unwrap();
+    /// assert!(schema.has_path("file.txt"));
+    /// assert!(!schema.has_path("missing.txt"));
+    /// ```
+    pub fn has_path(&self, path: &str) -> bool {
+        let Some(Entry::Dir(ref root)) = self.root else {
+            return false;
+        };
+
+        let Some(ref entries) = root.entries else {
+            return false;
+        };
+
+        // Handle simple single-level paths
+        if !path.contains('/') {
+            return entries.contains_key(path);
+        }
+
+        // Handle nested paths (e.g., "subdir/file.txt")
+        let parts: Vec<&str> = path.splitn(2, '/').collect();
+        if parts.len() != 2 {
+            return entries.contains_key(path);
+        }
+
+        let (first, rest) = (parts[0], parts[1]);
+        if let Some(Entry::Dir(subdir)) = entries.get(first) {
+            // For node-backed directories, the files are defined in a separate schema
+            // document, not in the root schema. Return false here because we can't
+            // determine from this schema alone whether the nested path exists.
+            if subdir.node_id.is_some() {
+                return false;
+            }
+            // Inline directory entries (deprecated but may still exist)
+            if let Some(ref sub_entries) = subdir.entries {
+                return sub_entries.contains_key(rest);
+            }
+        }
+
+        false
+    }
+
     /// Validate the schema structure.
     ///
     /// This checks:
@@ -235,6 +287,83 @@ mod tests {
                 panic!("Expected Dir entry");
             }
         }
+    }
+
+    #[test]
+    fn test_has_path_simple_file() {
+        let json = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "file.txt": { "type": "doc" },
+                    "other.json": { "type": "doc" }
+                }
+            }
+        }"#;
+        let schema: FsSchema = serde_json::from_str(json).unwrap();
+        assert!(schema.has_path("file.txt"));
+        assert!(schema.has_path("other.json"));
+        assert!(!schema.has_path("missing.txt"));
+    }
+
+    #[test]
+    fn test_has_path_no_root() {
+        let schema = FsSchema {
+            version: 1,
+            root: None,
+        };
+        assert!(!schema.has_path("anything"));
+    }
+
+    #[test]
+    fn test_has_path_empty_entries() {
+        let json = r#"{
+            "version": 1,
+            "root": { "type": "dir" }
+        }"#;
+        let schema: FsSchema = serde_json::from_str(json).unwrap();
+        assert!(!schema.has_path("file.txt"));
+    }
+
+    #[test]
+    fn test_has_path_node_backed_subdir_returns_false() {
+        // Node-backed directories have their contents in a separate schema,
+        // so has_path should return false for nested paths
+        let json = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "subdir": {
+                        "type": "dir",
+                        "node_id": "some-uuid"
+                    }
+                }
+            }
+        }"#;
+        let schema: FsSchema = serde_json::from_str(json).unwrap();
+        assert!(schema.has_path("subdir")); // The directory itself exists
+        assert!(!schema.has_path("subdir/file.txt")); // But nested paths return false
+    }
+
+    #[test]
+    fn test_has_path_directory_entry() {
+        let json = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "mydir": {
+                        "type": "dir",
+                        "node_id": "uuid-123"
+                    }
+                }
+            }
+        }"#;
+        let schema: FsSchema = serde_json::from_str(json).unwrap();
+        assert!(schema.has_path("mydir"));
+        assert!(!schema.has_path("otherdir"));
     }
 
     #[test]

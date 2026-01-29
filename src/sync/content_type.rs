@@ -228,6 +228,69 @@ pub fn looks_like_base64_binary(content: &str) -> bool {
     content.len().is_multiple_of(4)
 }
 
+/// Default XML content for empty XML files.
+pub const DEFAULT_XML_CONTENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?><root/>"#;
+
+/// Check if content is "default" (empty or placeholder) for a given content type.
+///
+/// Default content is:
+/// - JSON: `{}` or empty
+/// - JSONL/NDJSON: empty
+/// - XML: empty or standard XML declaration with empty root
+/// - Text: empty
+/// - Binary: empty
+///
+/// This is used to detect newly-created files that haven't been populated yet,
+/// allowing sync to skip unnecessary uploads for placeholder content.
+pub fn is_default_content(content: &str, content_info: &ContentTypeInfo) -> bool {
+    let trimmed = content.trim();
+    if content_info.is_binary {
+        return trimmed.is_empty();
+    }
+    match content_info.mime_type.as_str() {
+        "application/json" => trimmed.is_empty() || trimmed == "{}",
+        "application/x-ndjson" => trimmed.is_empty(),
+        "text/plain" => trimmed.is_empty(),
+        "application/xml" => trimmed.is_empty() || trimmed == DEFAULT_XML_CONTENT,
+        _ => trimmed.is_empty(),
+    }
+}
+
+/// Check if content is "default" for a given MIME type string.
+///
+/// Convenience function for callers that have a MIME type string rather than
+/// a full `ContentTypeInfo`. Assumes non-binary content.
+pub fn is_default_content_for_mime(content: &str, mime_type: &str) -> bool {
+    is_default_content(
+        content,
+        &ContentTypeInfo {
+            mime_type: mime_type.to_string(),
+            is_binary: false,
+        },
+    )
+}
+
+/// Ensures text content ends with a trailing newline.
+///
+/// Many tools expect text files to end with a newline. This function
+/// adds one if missing, or returns the content unchanged if it already
+/// ends with a newline.
+///
+/// # Examples
+/// ```
+/// use commonplace_doc::sync::ensure_trailing_newline;
+/// assert_eq!(ensure_trailing_newline("hello"), "hello\n");
+/// assert_eq!(ensure_trailing_newline("hello\n"), "hello\n");
+/// assert_eq!(ensure_trailing_newline(""), "\n");
+/// ```
+pub fn ensure_trailing_newline(content: &str) -> String {
+    if content.ends_with('\n') {
+        content.to_string()
+    } else {
+        format!("{}\n", content)
+    }
+}
+
 /// Check if file content appears to be binary by sampling first bytes.
 /// Returns true if binary content detected.
 pub fn is_binary_content(content: &[u8]) -> bool {
@@ -344,6 +407,118 @@ mod tests {
             "application/xhtml+xml"
         );
         assert!(!detect_from_path(Path::new("foo.xhtml")).is_binary);
+    }
+
+    #[test]
+    fn test_ensure_trailing_newline_adds_when_missing() {
+        assert_eq!(ensure_trailing_newline("hello"), "hello\n");
+        assert_eq!(ensure_trailing_newline("line1\nline2"), "line1\nline2\n");
+        assert_eq!(ensure_trailing_newline("{}"), "{}\n");
+    }
+
+    #[test]
+    fn test_ensure_trailing_newline_preserves_existing() {
+        assert_eq!(ensure_trailing_newline("hello\n"), "hello\n");
+        assert_eq!(ensure_trailing_newline("line1\nline2\n"), "line1\nline2\n");
+        assert_eq!(ensure_trailing_newline("\n"), "\n");
+    }
+
+    #[test]
+    fn test_ensure_trailing_newline_empty_string() {
+        assert_eq!(ensure_trailing_newline(""), "\n");
+    }
+
+    #[test]
+    fn test_ensure_trailing_newline_only_whitespace() {
+        assert_eq!(ensure_trailing_newline("  "), "  \n");
+        assert_eq!(ensure_trailing_newline("\t"), "\t\n");
+        assert_eq!(ensure_trailing_newline("  \n"), "  \n");
+    }
+
+    #[test]
+    fn test_is_default_content_json() {
+        let json_info = ContentTypeInfo::text("application/json");
+        // Empty and {} are default for JSON
+        assert!(is_default_content("", &json_info));
+        assert!(is_default_content("{}", &json_info));
+        assert!(is_default_content("  {}  ", &json_info)); // with whitespace
+        assert!(is_default_content("\n{}\n", &json_info));
+
+        // Non-empty JSON is not default
+        assert!(!is_default_content("{\"key\": \"value\"}", &json_info));
+        assert!(!is_default_content("[]", &json_info));
+        assert!(!is_default_content("null", &json_info));
+    }
+
+    #[test]
+    fn test_is_default_content_jsonl() {
+        let jsonl_info = ContentTypeInfo::text("application/x-ndjson");
+        // Only empty is default for JSONL
+        assert!(is_default_content("", &jsonl_info));
+        assert!(is_default_content("  ", &jsonl_info));
+
+        // Any content is not default
+        assert!(!is_default_content("{}", &jsonl_info));
+        assert!(!is_default_content("{}\n{}", &jsonl_info));
+    }
+
+    #[test]
+    fn test_is_default_content_text() {
+        let text_info = ContentTypeInfo::text("text/plain");
+        // Only empty is default for text
+        assert!(is_default_content("", &text_info));
+        assert!(is_default_content("   ", &text_info));
+        assert!(is_default_content("\n\n", &text_info));
+
+        // Any content is not default
+        assert!(!is_default_content("hello", &text_info));
+        assert!(!is_default_content("a", &text_info));
+    }
+
+    #[test]
+    fn test_is_default_content_xml() {
+        let xml_info = ContentTypeInfo::text("application/xml");
+        // Empty or standard declaration is default
+        assert!(is_default_content("", &xml_info));
+        assert!(is_default_content(DEFAULT_XML_CONTENT, &xml_info));
+        assert!(is_default_content(
+            "  <?xml version=\"1.0\" encoding=\"UTF-8\"?><root/>  ",
+            &xml_info
+        ));
+
+        // Real XML content is not default
+        assert!(!is_default_content("<root><child/></root>", &xml_info));
+        assert!(!is_default_content(
+            "<?xml version=\"1.0\"?><data>content</data>",
+            &xml_info
+        ));
+    }
+
+    #[test]
+    fn test_is_default_content_binary() {
+        let binary_info = ContentTypeInfo::binary("application/octet-stream");
+        // Only empty is default for binary
+        assert!(is_default_content("", &binary_info));
+        assert!(is_default_content("   ", &binary_info));
+
+        // Any content is not default (even if it looks like default for text types)
+        assert!(!is_default_content("{}", &binary_info));
+    }
+
+    #[test]
+    fn test_is_default_content_unknown_mime() {
+        let unknown_info = ContentTypeInfo::text("application/x-unknown");
+        // Only empty is default for unknown types
+        assert!(is_default_content("", &unknown_info));
+        assert!(!is_default_content("anything", &unknown_info));
+    }
+
+    #[test]
+    fn test_is_default_content_for_mime() {
+        // Convenience function tests
+        assert!(is_default_content_for_mime("{}", "application/json"));
+        assert!(is_default_content_for_mime("", "text/plain"));
+        assert!(!is_default_content_for_mime("hello", "text/plain"));
     }
 
     #[test]

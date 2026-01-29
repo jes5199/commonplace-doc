@@ -109,8 +109,9 @@ pub use uuid_map::{
 pub use ancestry::{determine_sync_direction, is_ancestor, SyncDirection};
 
 pub use content_type::{
-    detect_from_path, is_allowed_extension, is_binary_content, looks_like_base64_binary,
-    ContentTypeInfo,
+    detect_from_path, ensure_trailing_newline, is_allowed_extension, is_binary_content,
+    is_default_content, is_default_content_for_mime, looks_like_base64_binary, ContentTypeInfo,
+    DEFAULT_XML_CONTENT,
 };
 pub use directory::{
     scan_directory, scan_directory_to_json, scan_directory_with_contents, schema_to_json,

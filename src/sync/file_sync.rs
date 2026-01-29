@@ -14,8 +14,9 @@ use crate::sync::state::InodeKey;
 use crate::sync::state_file::compute_content_hash;
 use crate::sync::uuid_map::fetch_node_id_from_schema;
 use crate::sync::{
-    build_edit_url, build_replace_url, create_yjs_text_update, detect_from_path, error::SyncResult,
-    file_watcher_task, flock_state::record_upload_result, is_binary_content,
+    build_edit_url, build_replace_url, create_yjs_text_update, detect_from_path,
+    ensure_trailing_newline, error::SyncResult, file_watcher_task,
+    flock_state::record_upload_result, is_binary_content, is_default_content_for_mime,
     looks_like_base64_binary, push_json_content, push_jsonl_content, push_schema_to_server,
     refresh_from_head, sse_task, trace_timeline, EditRequest, EditResponse, FileEvent,
     FlockSyncState, ReplaceResponse, SharedLastContent, SyncState, TimelineMilestone,
@@ -37,6 +38,55 @@ use yrs::{GetString, ReadTxn, Transact};
 pub const BARRIER_RETRY_COUNT: u32 = 5;
 /// Delay between retries when checking for stable content
 pub const BARRIER_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// Result of preparing file content for upload.
+///
+/// This struct consolidates the content detection and encoding logic that's
+/// shared across upload_task variants.
+#[derive(Debug)]
+pub struct PreparedContent {
+    /// The content to upload (text or base64-encoded binary)
+    pub content: String,
+    /// Whether the content is binary (base64-encoded)
+    pub is_binary: bool,
+    /// Whether this is a JSON file (application/json)
+    pub is_json: bool,
+    /// Whether this is a JSONL file (application/x-ndjson)
+    pub is_jsonl: bool,
+}
+
+/// Prepare raw file content for upload.
+///
+/// Detects content type from file path, checks for binary content,
+/// and encodes appropriately (base64 for binary, UTF-8 for text).
+///
+/// # Arguments
+/// * `raw_content` - The raw bytes read from the file
+/// * `file_path` - Path to the file (used for MIME type detection)
+///
+/// # Returns
+/// A `PreparedContent` struct with the processed content and type flags.
+pub fn prepare_content_for_upload(raw_content: &[u8], file_path: &Path) -> PreparedContent {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let content_info = detect_from_path(file_path);
+    let is_binary = content_info.is_binary || is_binary_content(raw_content);
+    let is_json = !is_binary && content_info.mime_type == "application/json";
+    let is_jsonl = !is_binary && content_info.mime_type == "application/x-ndjson";
+
+    let content = if is_binary {
+        STANDARD.encode(raw_content)
+    } else {
+        String::from_utf8_lossy(raw_content).to_string()
+    };
+
+    PreparedContent {
+        content,
+        is_binary,
+        is_json,
+        is_jsonl,
+    }
+}
 
 /// Interval between periodic divergence checks (seconds).
 /// This ensures sync clients detect when they've diverged from the server
@@ -81,34 +131,6 @@ async fn handle_upload_refresh(
     }
 }
 
-/// Ensures text content ends with a trailing newline.
-/// This is important for text files (especially JSON) to maintain proper formatting.
-fn ensure_trailing_newline(content: &str) -> String {
-    if content.ends_with('\n') {
-        content.to_string()
-    } else {
-        format!("{}\n", content)
-    }
-}
-
-/// Check if content equals the default for its content type.
-///
-/// This is used to detect newly created documents that haven't been edited yet.
-/// Default content indicates the document was created by the reconciler but not
-/// yet populated with real content - local content should take precedence.
-fn is_default_content(content: &str, mime_type: &str) -> bool {
-    let trimmed = content.trim();
-    match mime_type {
-        "application/json" => trimmed == "{}" || trimmed.is_empty(),
-        "application/x-ndjson" => trimmed.is_empty(),
-        "text/plain" => trimmed.is_empty(),
-        "application/xml" => {
-            trimmed.is_empty() || trimmed == r#"<?xml version="1.0" encoding="UTF-8"?><root/>"#
-        }
-        _ => trimmed.is_empty(),
-    }
-}
-
 /// Task that handles file changes and uploads to server
 #[allow(clippy::too_many_arguments)]
 pub async fn upload_task(
@@ -128,18 +150,12 @@ pub async fn upload_task(
         // where SSE might overwrite the file between event dispatch and us reading it.
         let FileEvent::Modified(raw_content) = event;
 
-        // Detect if file is binary and convert accordingly
-        let content_info = detect_from_path(&file_path);
-        let is_binary = content_info.is_binary || is_binary_content(&raw_content);
-        let is_json = !is_binary && content_info.mime_type == "application/json";
-        let is_jsonl = !is_binary && content_info.mime_type == "application/x-ndjson";
-
-        let mut content = if is_binary {
-            use base64::{engine::general_purpose::STANDARD, Engine};
-            STANDARD.encode(&raw_content)
-        } else {
-            String::from_utf8_lossy(&raw_content).to_string()
-        };
+        // Detect content type and encode appropriately
+        let prepared = prepare_content_for_upload(&raw_content, &file_path);
+        let mut content = prepared.content;
+        let is_binary = prepared.is_binary;
+        let is_json = prepared.is_json;
+        let is_jsonl = prepared.is_jsonl;
 
         // Log event received for debugging
         debug!(
@@ -837,18 +853,12 @@ pub async fn upload_task_with_flock(
         // Extract captured content from the event
         let FileEvent::Modified(raw_content) = event;
 
-        // Detect if file is binary and convert accordingly
-        let content_info = detect_from_path(&file_path);
-        let is_binary = content_info.is_binary || is_binary_content(&raw_content);
-        let is_json = !is_binary && content_info.mime_type == "application/json";
-        let is_jsonl = !is_binary && content_info.mime_type == "application/x-ndjson";
-
-        let mut content = if is_binary {
-            use base64::{engine::general_purpose::STANDARD, Engine};
-            STANDARD.encode(&raw_content)
-        } else {
-            String::from_utf8_lossy(&raw_content).to_string()
-        };
+        // Detect content type and encode appropriately
+        let prepared = prepare_content_for_upload(&raw_content, &file_path);
+        let mut content = prepared.content;
+        let is_binary = prepared.is_binary;
+        let is_json = prepared.is_json;
+        let is_jsonl = prepared.is_jsonl;
 
         // Check for pending write barrier and handle echo detection
         let mut echo_detected = false;
@@ -1644,7 +1654,8 @@ pub async fn sync_single_file(
                 if initial_sync_strategy == "server" {
                     // Check if server has only default content (e.g., {} for JSON)
                     // Default content indicates newly created doc that should be overwritten
-                    let server_has_default = is_default_content(&head.content, &file.content_type);
+                    let server_has_default =
+                        is_default_content_for_mime(&head.content, &file.content_type);
 
                     // Get local CID from state (if we've synced before)
                     let local_cid = {
@@ -1665,7 +1676,7 @@ pub async fn sync_single_file(
                         // Check if local content is default/empty - if so, prefer server content
                         // This fixes a bug where sandbox restarts would push empty files to server
                         let local_is_default =
-                            is_default_content(&file.content, &file.content_type);
+                            is_default_content_for_mime(&file.content, &file.content_type);
                         if file.content != head.content && !local_is_default {
                             // Local has different non-default content but no CID - push local
                             // (This handles the case where local was edited offline before first sync)
@@ -1677,7 +1688,7 @@ pub async fn sync_single_file(
                         } else {
                             // Either content matches, or local is default - pull from server
                             if local_is_default
-                                && !is_default_content(&head.content, &file.content_type)
+                                && !is_default_content_for_mime(&head.content, &file.content_type)
                             {
                                 info!(
                                     "Local has default content but server has data for {}, pulling server",
@@ -2037,11 +2048,10 @@ pub async fn upload_task_crdt(
     while let Some(event) = rx.recv().await {
         let FileEvent::Modified(raw_content) = event;
 
-        // Detect if file is binary
-        let content_info = detect_from_path(&file_path);
-        let is_binary = content_info.is_binary || is_binary_content(&raw_content);
+        // Detect content type
+        let prepared = prepare_content_for_upload(&raw_content, &file_path);
 
-        if is_binary {
+        if prepared.is_binary {
             // CRDT sync doesn't support binary files well (yet)
             // For now, skip and log a warning
             warn!(
@@ -2051,7 +2061,7 @@ pub async fn upload_task_crdt(
             continue;
         }
 
-        let new_content = String::from_utf8_lossy(&raw_content).to_string();
+        let new_content = prepared.content;
 
         // Get the old content for diff computation
         let old_content = {
@@ -3460,4 +3470,103 @@ async fn check_and_resolve_divergence(
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_prepare_content_for_upload_text() {
+        let content = b"Hello, world!";
+        let path = Path::new("test.txt");
+
+        let prepared = prepare_content_for_upload(content, path);
+
+        assert!(!prepared.is_binary);
+        assert!(!prepared.is_json);
+        assert!(!prepared.is_jsonl);
+        assert_eq!(prepared.content, "Hello, world!");
+    }
+
+    #[test]
+    fn test_prepare_content_for_upload_json() {
+        let content = br#"{"key": "value"}"#;
+        let path = Path::new("data.json");
+
+        let prepared = prepare_content_for_upload(content, path);
+
+        assert!(!prepared.is_binary);
+        assert!(prepared.is_json);
+        assert!(!prepared.is_jsonl);
+        assert_eq!(prepared.content, r#"{"key": "value"}"#);
+    }
+
+    #[test]
+    fn test_prepare_content_for_upload_jsonl() {
+        let content = b"{}\n{}\n";
+        let path = Path::new("data.jsonl");
+
+        let prepared = prepare_content_for_upload(content, path);
+
+        assert!(!prepared.is_binary);
+        assert!(!prepared.is_json);
+        assert!(prepared.is_jsonl);
+        assert_eq!(prepared.content, "{}\n{}\n");
+    }
+
+    #[test]
+    fn test_prepare_content_for_upload_binary_by_extension() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let content = b"PNG data here";
+        let path = Path::new("image.png");
+
+        let prepared = prepare_content_for_upload(content, path);
+
+        assert!(prepared.is_binary);
+        assert!(!prepared.is_json);
+        assert!(!prepared.is_jsonl);
+        // Binary content is base64 encoded
+        assert_eq!(prepared.content, STANDARD.encode(content));
+    }
+
+    #[test]
+    fn test_prepare_content_for_upload_binary_by_content() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        // Content with null bytes is binary even if extension is .txt
+        let content = b"text\x00with\x00nulls";
+        let path = Path::new("weird.txt");
+
+        let prepared = prepare_content_for_upload(content, path);
+
+        assert!(prepared.is_binary);
+        assert_eq!(prepared.content, STANDARD.encode(content));
+    }
+
+    #[test]
+    fn test_prepare_content_for_upload_empty() {
+        let content = b"";
+        let path = Path::new("empty.txt");
+
+        let prepared = prepare_content_for_upload(content, path);
+
+        assert!(!prepared.is_binary);
+        assert_eq!(prepared.content, "");
+    }
+
+    #[test]
+    fn test_prepare_content_for_upload_markdown() {
+        let content = b"# Heading\n\nParagraph text.";
+        let path = Path::new("README.md");
+
+        let prepared = prepare_content_for_upload(content, path);
+
+        assert!(!prepared.is_binary);
+        assert!(!prepared.is_json);
+        assert!(!prepared.is_jsonl);
+        assert_eq!(prepared.content, "# Heading\n\nParagraph text.");
+    }
 }
