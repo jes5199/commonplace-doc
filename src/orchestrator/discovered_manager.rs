@@ -4,8 +4,11 @@
 //! discovered from `__processes.json` files. For config parsing and discovery logic,
 //! see the `discovery` module.
 
+use super::config_reconciler::{ConfigReconciler, ReconcileResult};
 use super::discovery::{DiscoveredProcess, ProcessesConfig};
+use super::process_discovery::ProcessDiscoveryService;
 use super::process_utils::stop_process_gracefully;
+use super::script_resolver::{ScriptResolver, ScriptWatchMap};
 use super::spawn::spawn_managed_process_with_logging;
 use super::status::OrchestratorStatus;
 use crate::sync::encode_path;
@@ -67,24 +70,19 @@ pub struct DiscoveredProcessManager {
     reset_after_secs: u64,
     /// Path to the status file (scoped to config)
     status_file_path: PathBuf,
+    /// Service for discovering __processes.json files
+    discovery_service: ProcessDiscoveryService,
+    /// Resolver for script UUIDs (evaluate processes)
+    script_resolver: ScriptResolver,
 }
-
-/// Result of recursive discovery - includes both __processes.json files and all schema node_ids.
-struct DiscoveryResult {
-    /// (base_path, __processes.json node_id)
-    processes_json_files: Vec<(String, String)>,
-    /// All directory schema node_ids (for watching changes)
-    schema_node_ids: Vec<String>,
-}
-
-/// Mapping from script document UUID to the process names that use it.
-/// Used to restart evaluate processes when their script changes.
-/// Multiple processes can share the same script.
-type ScriptWatchMap = HashMap<String, Vec<String>>;
 
 impl DiscoveredProcessManager {
     /// Create a new discovered process manager.
     pub fn new(mqtt_broker: String, server_url: String, status_file_path: PathBuf) -> Self {
+        let client = Client::new();
+        let discovery_service = ProcessDiscoveryService::new(client.clone(), server_url.clone());
+        let script_resolver = ScriptResolver::new(client, server_url.clone());
+
         Self {
             mqtt_broker,
             server_url,
@@ -93,6 +91,8 @@ impl DiscoveredProcessManager {
             max_backoff_ms: 10_000,
             reset_after_secs: 30,
             status_file_path,
+            discovery_service,
+            script_resolver,
         }
     }
 
@@ -513,36 +513,31 @@ impl DiscoveredProcessManager {
         config: &ProcessesConfig,
         base_path: &str,
     ) -> Result<(), String> {
-        // Only consider processes that came from this same source (base_path)
-        let current_names_from_source: HashSet<String> = self
+        // Build a map of running processes from this source for reconciliation
+        let running_from_source: HashMap<String, DiscoveredProcess> = self
             .processes
             .iter()
             .filter(|(_, p)| p.source_path == base_path)
-            .map(|(name, _)| name.clone())
+            .map(|(name, p)| (name.clone(), p.config.clone()))
             .collect();
 
-        let new_names: HashSet<String> = config.processes.keys().cloned().collect();
+        // Compute what actions are needed
+        let result = ConfigReconciler::reconcile(&running_from_source, config, Some(base_path));
 
-        // Find processes to remove (in current from this source but not in new)
-        let to_remove: Vec<String> = current_names_from_source
-            .difference(&new_names)
-            .cloned()
-            .collect();
+        // Apply the reconciliation result
+        self.apply_reconcile_result(result, base_path).await
+    }
 
-        // Find processes to add (in new but not currently managed from this source)
-        let to_add: Vec<String> = new_names
-            .difference(&current_names_from_source)
-            .cloned()
-            .collect();
-
-        // Find processes that exist in both and may need restart
-        let to_check: Vec<String> = current_names_from_source
-            .intersection(&new_names)
-            .cloned()
-            .collect();
-
-        // Remove processes that were in this source but are no longer defined
-        for name in &to_remove {
+    /// Apply the result of a reconciliation computation.
+    ///
+    /// This method performs the actual mutations: stopping, starting, and restarting processes.
+    async fn apply_reconcile_result(
+        &mut self,
+        result: ReconcileResult,
+        base_path: &str,
+    ) -> Result<(), String> {
+        // Stop processes that were removed
+        for name in &result.to_stop {
             tracing::info!(
                 "[discovery] Removing process '{}' (no longer in config at {})",
                 name,
@@ -551,77 +546,34 @@ impl DiscoveredProcessManager {
             self.remove_process(name).await;
         }
 
-        // Check for changed processes that need restart
-        for name in &to_check {
-            let new_config = &config.processes[name];
-            let current = &self.processes[name];
+        // Restart processes with changed configuration
+        for (name, new_config) in &result.to_restart {
+            tracing::info!(
+                "[discovery] Restarting process '{}' (configuration changed)",
+                name
+            );
 
-            let needs_restart = Self::process_config_changed(&current.config, new_config);
+            // Stop the old process
+            self.remove_process(name).await;
 
-            if needs_restart {
-                tracing::info!(
-                    "[discovery] Restarting process '{}' (configuration changed)",
-                    name
-                );
+            // Add with new config
+            let document_path = ConfigReconciler::compute_document_path(new_config, base_path);
+            self.add_process(
+                name.clone(),
+                document_path,
+                base_path.to_string(),
+                new_config.clone(),
+            );
 
-                // Stop the old process
-                self.remove_process(name).await;
-
-                // Add with new config
-                // Priority: explicit path > owns > base_path (__processes.json location)
-                // sandbox-exec processes sync at the directory containing their __processes.json
-                // NOTE: evaluate processes use base_path for script URL, NOT owns (owns is just output)
-                let document_path = if let Some(ref explicit_path) = new_config.path {
-                    if explicit_path == "/" || explicit_path.is_empty() {
-                        base_path.to_string()
-                    } else {
-                        format!("{}/{}", base_path, explicit_path.trim_start_matches('/'))
-                    }
-                } else if new_config.evaluate.is_some() {
-                    // evaluate processes: script is relative to base_path, not owns
-                    base_path.to_string()
-                } else if let Some(ref owns) = new_config.owns {
-                    format!("{}/{}", base_path, owns)
-                } else {
-                    // sandbox-exec and command processes sync at base_path
-                    base_path.to_string()
-                };
-
-                self.add_process(
-                    name.clone(),
-                    document_path,
-                    base_path.to_string(),
-                    new_config.clone(),
-                );
-
-                // Start it
-                if let Err(e) = self.spawn_process(name).await {
-                    tracing::error!("[discovery] Failed to restart '{}': {}", name, e);
-                }
+            // Start it
+            if let Err(e) = self.spawn_process(name).await {
+                tracing::error!("[discovery] Failed to restart '{}': {}", name, e);
             }
         }
 
-        // Add new processes
-        for name in &to_add {
-            let new_config = &config.processes[name];
-            // Priority: explicit path > owns > base_path (processes.json location)
-            // sandbox-exec processes sync at the directory containing their processes.json
-            // NOTE: evaluate processes use base_path for script URL, NOT owns (owns is just output)
-            let document_path = if let Some(ref explicit_path) = new_config.path {
-                if explicit_path == "/" || explicit_path.is_empty() {
-                    base_path.to_string()
-                } else {
-                    format!("{}/{}", base_path, explicit_path.trim_start_matches('/'))
-                }
-            } else if new_config.evaluate.is_some() {
-                // evaluate processes: script is relative to base_path, not owns
-                base_path.to_string()
-            } else if let Some(ref owns) = new_config.owns {
-                format!("{}/{}", base_path, owns)
-            } else {
-                // sandbox-exec and command processes sync at base_path
-                base_path.to_string()
-            };
+        // Start new processes
+        for (name, new_config) in &result.to_start {
+            let document_path = ConfigReconciler::compute_document_path(new_config, base_path);
 
             tracing::info!("[discovery] Adding new process '{}' from config", name);
             self.add_process(
@@ -639,186 +591,29 @@ impl DiscoveredProcessManager {
         Ok(())
     }
 
-    /// Check if a process configuration has changed in a way that requires restart.
-    fn process_config_changed(current: &DiscoveredProcess, new: &DiscoveredProcess) -> bool {
-        // Check if command changed
-        let current_cmd = current
-            .command
-            .as_ref()
-            .map(|c| (c.program().to_string(), c.args().join(" ")));
-        let new_cmd = new
-            .command
-            .as_ref()
-            .map(|c| (c.program().to_string(), c.args().join(" ")));
-        if current_cmd != new_cmd {
-            return true;
-        }
-
-        // Check if sandbox-exec changed
-        if current.sandbox_exec != new.sandbox_exec {
-            return true;
-        }
-
-        // Check if evaluate changed
-        if current.evaluate != new.evaluate {
-            return true;
-        }
-
-        // Check if cwd changed
-        if current.cwd != new.cwd {
-            return true;
-        }
-
-        // Check if owns changed
-        if current.owns != new.owns {
-            return true;
-        }
-
-        false
-    }
-
-    // Note: find_processes_json_recursive was replaced by discover_all_processes_json
-    // which handles async fetching of subdirectory schemas.
-
-    /// Recursively discover all __processes.json files from a root schema.
-    ///
-    /// This fetches schemas for subdirectories with node_ids and finds all __processes.json.
-    /// Also returns all schema node_ids encountered for recursive watching.
-    async fn discover_all_processes_json(
-        client: &Client,
-        server_url: &str,
-        root_id: &str,
-    ) -> Result<DiscoveryResult, String> {
-        let mut processes_json_files = Vec::new();
-        let mut schema_node_ids = Vec::new();
-        let mut to_visit: Vec<(String, String)> = vec![("/".to_string(), root_id.to_string())];
-
-        while let Some((path, node_id)) = to_visit.pop() {
-            // Track this schema node_id for watching
-            schema_node_ids.push(node_id.clone());
-
-            // Fetch this node's schema
-            let url = format!("{}/docs/{}/head", server_url, node_id);
-            let resp = client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| format!("Failed to fetch {}: {}", url, e))?;
-
-            if !resp.status().is_success() {
-                tracing::warn!(
-                    "[discovery] Failed to fetch schema for {}: HTTP {}",
-                    path,
-                    resp.status()
-                );
-                continue;
-            }
-
-            #[derive(Deserialize)]
-            struct HeadResponse {
-                content: String,
-            }
-
-            let head: HeadResponse = resp
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-            let schema: serde_json::Value = serde_json::from_str(&head.content)
-                .map_err(|e| format!("Failed to parse schema: {}", e))?;
-
-            // Check for __processes.json at this level
-            if let Some(root) = schema.get("root") {
-                if let Some(entries) = root.get("entries").and_then(|e| e.as_object()) {
-                    for (name, entry) in entries {
-                        let entry_type = entry.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-                        if name == "__processes.json" && entry_type == "doc" {
-                            if let Some(pj_node_id) = entry.get("node_id").and_then(|n| n.as_str())
-                            {
-                                processes_json_files.push((path.clone(), pj_node_id.to_string()));
-                            }
-                        } else if entry_type == "dir" {
-                            // Subdirectory - check if it has a node_id to recurse into
-                            if let Some(sub_node_id) = entry.get("node_id").and_then(|n| n.as_str())
-                            {
-                                let sub_path = if path == "/" {
-                                    format!("/{}", name)
-                                } else {
-                                    format!("{}/{}", path, name)
-                                };
-                                to_visit.push((sub_path, sub_node_id.to_string()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(DiscoveryResult {
-            processes_json_files,
-            schema_node_ids,
-        })
-    }
-
-    /// Resolve a document path to its UUID by traversing the schema tree.
-    ///
-    /// For example, "bartleby/script.js" would:
-    /// 1. Fetch fs-root, find bartleby's node_id
-    /// 2. Fetch bartleby's schema, find script.js's node_id
-    async fn resolve_path_to_uuid(
-        client: &Client,
-        server_url: &str,
-        fs_root_id: &str,
-        path: &str,
-    ) -> Result<String, String> {
-        use crate::sync::resolve_path_to_uuid_http;
-
-        resolve_path_to_uuid_http(client, server_url, fs_root_id, path)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
     /// Resolve script paths for all evaluate processes and build a watch map.
     ///
     /// Returns a map of script_uuid -> process_name for all evaluate processes
     /// that have scripts that can be resolved.
-    async fn resolve_script_watches(&self, client: &Client, fs_root_id: &str) -> ScriptWatchMap {
-        let mut script_watches = ScriptWatchMap::new();
+    async fn resolve_script_watches(&self, fs_root_id: &str) -> ScriptWatchMap {
+        // Build iterator of (process_name, document_path, script_name) for evaluate processes
+        let evaluate_processes: Vec<(&str, &str, &str)> = self
+            .processes
+            .iter()
+            .filter_map(|(name, process)| {
+                process.config.evaluate.as_ref().map(|script| {
+                    (
+                        name.as_str(),
+                        process.document_path.as_str(),
+                        script.as_str(),
+                    )
+                })
+            })
+            .collect();
 
-        for (name, process) in &self.processes {
-            if let Some(ref script) = process.config.evaluate {
-                // Construct the full script path: document_path/script
-                let script_path = format!("{}/{}", process.document_path, script);
-
-                match Self::resolve_path_to_uuid(client, &self.server_url, fs_root_id, &script_path)
-                    .await
-                {
-                    Ok(script_uuid) => {
-                        tracing::info!(
-                            "[discovery] Watching script '{}' (uuid: {}) for process '{}'",
-                            script_path,
-                            script_uuid,
-                            name
-                        );
-                        script_watches
-                            .entry(script_uuid)
-                            .or_default()
-                            .push(name.clone());
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "[discovery] Could not resolve script '{}' for process '{}': {}",
-                            script_path,
-                            name,
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
-        script_watches
+        self.script_resolver
+            .build_script_watches(fs_root_id, evaluate_processes)
+            .await
     }
 
     /// Restart a process by name.
@@ -1074,8 +869,11 @@ impl DiscoveredProcessManager {
         );
 
         // Discover all __processes.json files and schema node_ids
-        let discovery =
-            Self::discover_all_processes_json(client, &self.server_url, fs_root_id).await?;
+        let discovery = self
+            .discovery_service
+            .discover_all(fs_root_id)
+            .await
+            .map_err(|e| e.to_string())?;
 
         if discovery.processes_json_files.is_empty() {
             tracing::warn!("[discovery] No __processes.json files found in filesystem tree");
@@ -1127,8 +925,7 @@ impl DiscoveredProcessManager {
 
         // Resolve and track script files for evaluate processes
         // script_uuid -> process_name
-        let mut script_watches: ScriptWatchMap =
-            self.resolve_script_watches(client, fs_root_id).await;
+        let mut script_watches: ScriptWatchMap = self.resolve_script_watches(fs_root_id).await;
 
         // Monitor interval for checking process health
         let mut monitor_interval = tokio::time::interval(Duration::from_millis(500));
@@ -1178,7 +975,7 @@ impl DiscoveredProcessManager {
 
                     // Periodic re-discovery of __processes.json files
                     _ = discovery_interval.tick() => {
-                        match Self::discover_all_processes_json(client, &self.server_url, fs_root_id).await {
+                        match self.discovery_service.discover_all(fs_root_id).await {
                             Ok(new_discovery) => {
                                 // Check for new or previously-failed __processes.json files
                                 let mut added_new_pj = false;
@@ -1238,7 +1035,7 @@ impl DiscoveredProcessManager {
                                 // Update script watches - always rebuild to catch any changes
                                 // (not just when files are added/removed, but also when existing
                                 // __processes.json files are edited to add/change evaluate entries)
-                                let new_script_watches = self.resolve_script_watches(client, fs_root_id).await;
+                                let new_script_watches = self.resolve_script_watches(fs_root_id).await;
                                 let scripts_changed = new_script_watches != script_watches;
                                 script_watches = new_script_watches;
 
@@ -1286,7 +1083,7 @@ impl DiscoveredProcessManager {
                                                 }
                                                 // After reconciling, update script watches
                                                 // (processes may have been added/removed/changed)
-                                                script_watches = self.resolve_script_watches(client, fs_root_id).await;
+                                                script_watches = self.resolve_script_watches(fs_root_id).await;
                                             } else if let Some(process_names) = script_watches.get(doc_id) {
                                                 // This is a script file change - restart all associated processes
                                                 for process_name in process_names.clone() {
