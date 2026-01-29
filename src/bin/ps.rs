@@ -75,6 +75,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&status)?);
+    } else if args.logs {
+        // Show log file paths
+        if status.processes.is_empty() {
+            println!("No processes running");
+        } else {
+            println!("{:<25} LOG FILE", "NAME");
+            println!("{}", "-".repeat(80));
+            for proc in &status.processes {
+                let log_file = proc.log_file.clone().unwrap_or_else(|| "-".to_string());
+                println!("{:<25} {}", proc.name, log_file);
+            }
+        }
     } else {
         println!(
             "Orchestrator PID: {} (started at {})",

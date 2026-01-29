@@ -6,7 +6,7 @@
 
 use super::discovery::{DiscoveredProcess, ProcessesConfig};
 use super::process_utils::stop_process_gracefully;
-use super::spawn::spawn_managed_process;
+use super::spawn::spawn_managed_process_with_logging;
 use super::status::OrchestratorStatus;
 use crate::sync::encode_path;
 use futures::StreamExt;
@@ -47,6 +47,8 @@ pub struct ManagedDiscoveredProcess {
     pub consecutive_failures: u32,
     /// When the process was last started
     pub last_start: Option<Instant>,
+    /// Path to the log file for this process
+    pub log_file: Option<String>,
 }
 
 /// Manager for processes discovered from `__processes.json` files.
@@ -131,6 +133,7 @@ impl DiscoveredProcessManager {
                 state,
                 Some(process.document_path.clone()),
                 Some(process.source_path.clone()),
+                process.log_file.clone(),
             ));
         }
 
@@ -162,6 +165,7 @@ impl DiscoveredProcessManager {
             state: DiscoveredProcessState::Stopped,
             consecutive_failures: 0,
             last_start: None,
+            log_file: None,
         };
         self.processes.insert(name, process);
     }
@@ -377,8 +381,9 @@ impl DiscoveredProcessManager {
         cmd.env("COMMONPLACE_SERVER", &self.server_url);
         cmd.env("COMMONPLACE_INITIAL_SYNC", "server");
 
-        let child = spawn_managed_process(cmd, name)?;
-        process.handle = Some(child);
+        let result = spawn_managed_process_with_logging(cmd, name)?;
+        process.handle = Some(result.child);
+        process.log_file = result.log_file.map(|p| p.to_string_lossy().to_string());
         process.state = DiscoveredProcessState::Running;
         process.last_start = Some(Instant::now());
 

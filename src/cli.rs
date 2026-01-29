@@ -187,6 +187,10 @@ pub struct PsArgs {
     #[clap(long)]
     pub json: bool,
 
+    /// Show log file paths for each process
+    #[clap(long)]
+    pub logs: bool,
+
     /// Path to orchestrator config file (to identify which orchestrator)
     /// If not specified, searches for active orchestrator status files
     #[clap(short, long, default_value = "commonplace.json")]

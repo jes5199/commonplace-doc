@@ -1,5 +1,5 @@
 use super::process_utils::stop_process_gracefully;
-use super::spawn::spawn_managed_process;
+use super::spawn::spawn_managed_process_with_logging;
 use super::status::OrchestratorStatus;
 use super::{OrchestratorConfig, ProcessConfig, RestartMode};
 use std::collections::HashMap;
@@ -14,6 +14,8 @@ pub struct ManagedProcess {
     pub state: ProcessState,
     pub consecutive_failures: u32,
     pub last_start: Option<Instant>,
+    /// Path to the log file for this process
+    pub log_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -54,6 +56,7 @@ impl ProcessManager {
                         state: ProcessState::Stopped,
                         consecutive_failures: 0,
                         last_start: None,
+                        log_file: None,
                     },
                 )
             })
@@ -96,6 +99,7 @@ impl ProcessManager {
                 state,
                 None,
                 None,
+                process.log_file.clone(),
             ));
         }
 
@@ -154,8 +158,9 @@ impl ProcessManager {
 
         tracing::info!("[orchestrator] Starting process: {}", name);
 
-        let child = spawn_managed_process(cmd, name)?;
-        process.handle = Some(child);
+        let result = spawn_managed_process_with_logging(cmd, name)?;
+        process.handle = Some(result.child);
+        process.log_file = result.log_file.map(|p| p.to_string_lossy().to_string());
         process.state = ProcessState::Running;
         process.last_start = Some(Instant::now());
 
@@ -476,6 +481,7 @@ impl ProcessManager {
                         state: ProcessState::Stopped,
                         consecutive_failures: 0,
                         last_start: None,
+                        log_file: None,
                     },
                 );
             }

@@ -28,6 +28,9 @@ pub struct ProcessStatus {
     pub document_path: Option<String>,
     /// Source path (for discovered processes, which __processes.json defined this)
     pub source_path: Option<String>,
+    /// Log file path (if logging is enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_file: Option<String>,
 }
 
 /// Full orchestrator status
@@ -135,6 +138,7 @@ impl Default for OrchestratorStatus {
 /// * `state` - Process state as string (caller maps their state enum)
 /// * `document_path` - Document path for discovered processes (None for base processes)
 /// * `source_path` - Source path for discovered processes (None for base processes)
+/// * `log_file` - Path to the process log file (if logging is enabled)
 pub fn build_process_status(
     name: String,
     pid: Option<u32>,
@@ -142,6 +146,7 @@ pub fn build_process_status(
     state: &str,
     document_path: Option<String>,
     source_path: Option<String>,
+    log_file: Option<String>,
 ) -> ProcessStatus {
     // Try to get CWD from config first, otherwise read from /proc/<pid>/cwd
     // For sandbox processes, this finds the deepest child's CWD
@@ -156,6 +161,7 @@ pub fn build_process_status(
         state: state.to_string(),
         document_path,
         source_path,
+        log_file,
     }
 }
 
