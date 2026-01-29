@@ -11,6 +11,7 @@ use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
     build_head_url, build_health_url, discover_fs_root, DiscoverFsRootError,
 };
+use commonplace_doc::DEFAULT_WORKSPACE;
 use fs2::FileExt;
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
@@ -540,11 +541,12 @@ async fn main() {
     );
 
     // Connect to MQTT if configured (for sync-complete event subscription)
+    // Use DEFAULT_WORKSPACE to match what sync client uses for MQTT topics
     let mqtt_client: Option<Arc<MqttClient>> = if !broker_raw.is_empty() {
         let mqtt_config = MqttConfig {
             broker_url: broker_raw.to_string(),
             client_id: format!("orchestrator-{}", std::process::id()),
-            workspace: fs_root_id.clone(),
+            workspace: DEFAULT_WORKSPACE.to_string(),
             keep_alive_secs: 30,
             clean_session: true,
         };
@@ -619,6 +621,11 @@ async fn main() {
         args.server.clone(),
         base_manager.status_file_path().to_path_buf(),
     );
+
+    // Set up MQTT client for discovered process manager if available
+    if let Some(ref mqtt) = mqtt_client {
+        discovered_manager.set_mqtt_client(mqtt.clone(), DEFAULT_WORKSPACE.to_string());
+    }
 
     tracing::info!(
         "[orchestrator] Starting recursive discovery with fs-root: {}",

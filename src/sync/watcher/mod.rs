@@ -39,6 +39,6 @@ pub use state::{InodeKey, InodeState, InodeTracker, PendingWrite, SyncState};
 #[cfg(unix)]
 pub use watcher::spawn_shadow_tasks;
 pub use watcher::{
-    directory_watcher_task, file_watcher_task, wait_for_file_stability, ShadowWriteEvent,
-    STABILITY_CHECK_INTERVAL_MS, STABILITY_MAX_WAIT_MS,
+    directory_watcher_task, file_watcher_task, shadow_watcher_task, wait_for_file_stability,
+    ShadowWriteEvent, FILE_DEBOUNCE_MS, STABILITY_CHECK_INTERVAL_MS, STABILITY_MAX_WAIT_MS,
 };

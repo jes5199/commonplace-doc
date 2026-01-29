@@ -286,8 +286,9 @@ fn test_orchestrator_starts_base_processes() {
             &server_url,
         ])
         .current_dir(temp_dir.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // Use Stdio::null() to prevent blocking on stdout/stderr output
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("Failed to spawn orchestrator");
 
@@ -407,8 +408,9 @@ fn test_commonplace_ps_reports_status() {
             &server_url,
         ])
         .current_dir(temp_dir.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // Use Stdio::null() to prevent blocking on stdout/stderr output
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("Failed to spawn orchestrator");
 
@@ -546,8 +548,9 @@ fn test_sandbox_process_runs_in_sandbox_cwd() {
             &server_url,
         ])
         .current_dir(temp_dir.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // Use Stdio::null() to prevent blocking on stdout/stderr output
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("Failed to spawn orchestrator");
 
