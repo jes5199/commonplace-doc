@@ -822,7 +822,120 @@ impl DiscoveredProcessManager {
         // Re-discovery interval (check for new/removed __processes.json files)
         let mut discovery_interval = tokio::time::interval(Duration::from_secs(30));
 
+        // Flag to trigger immediate discovery (set when schema changes)
+        let mut need_immediate_discovery = false;
+
         loop {
+            // Check if immediate discovery was requested (e.g., schema change)
+            if need_immediate_discovery {
+                need_immediate_discovery = false;
+                tracing::info!("[discovery] Running immediate discovery after schema change");
+                match self.discovery_service.discover_all(fs_root_id).await {
+                    Ok(new_discovery) => {
+                        let mut watches_changed = false;
+
+                        // Check for new or previously-failed __processes.json files
+                        for (base_path, node_id) in &new_discovery.processes_json_files {
+                            if !watched.contains_key(node_id) {
+                                tracing::info!(
+                                    "[discovery] Trying __processes.json at {}",
+                                    base_path
+                                );
+                                let url = format!("{}/docs/{}/head", self.server_url, node_id);
+                                match self.fetch_and_reconcile(client, &url, base_path).await {
+                                    Ok(_) => {
+                                        tracing::info!(
+                                            "[discovery] Loaded processes from {}/__processes.json",
+                                            base_path
+                                        );
+                                        watched.insert(node_id.clone(), base_path.clone());
+                                        watches_changed = true;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "[discovery] Failed to load {}: {} (will retry)",
+                                            base_path,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        // Check for removed __processes.json files
+                        let new_ids: HashSet<_> = new_discovery
+                            .processes_json_files
+                            .iter()
+                            .map(|(_, id)| id.clone())
+                            .collect();
+                        let removed_pj: Vec<_> = watched
+                            .keys()
+                            .filter(|id| !new_ids.contains(*id))
+                            .cloned()
+                            .collect();
+                        for node_id in removed_pj {
+                            if let Some(base_path) = watched.remove(&node_id) {
+                                tracing::info!(
+                                    "[discovery] __processes.json removed at {}",
+                                    base_path
+                                );
+                                let to_remove: Vec<_> = self
+                                    .processes
+                                    .iter()
+                                    .filter(|(_, p)| p.document_path.starts_with(&base_path))
+                                    .map(|(n, _)| n.clone())
+                                    .collect();
+                                for name in to_remove {
+                                    self.remove_process(&name).await;
+                                }
+                                watches_changed = true;
+                            }
+                        }
+
+                        // Check for new schema node_ids (new directories added)
+                        let new_schema_ids: HashSet<String> =
+                            new_discovery.schema_node_ids.iter().cloned().collect();
+                        if new_schema_ids != current_schema_ids {
+                            let added: Vec<_> =
+                                new_schema_ids.difference(&current_schema_ids).collect();
+                            let removed: Vec<_> =
+                                current_schema_ids.difference(&new_schema_ids).collect();
+                            tracing::info!(
+                                "[discovery] Schema set changed: +{} -{} directories",
+                                added.len(),
+                                removed.len()
+                            );
+                            current_schema_ids = new_schema_ids;
+                            watches_changed = true;
+                        }
+
+                        // Update script watches
+                        let new_script_watches = self.resolve_script_watches(fs_root_id).await;
+                        if new_script_watches != script_watches {
+                            script_watches = new_script_watches;
+                            watches_changed = true;
+                        }
+
+                        // Update MQTT subscriptions if watch set changed
+                        if watches_changed {
+                            let mut new_watch_ids: HashSet<String> = current_schema_ids.clone();
+                            for node_id in watched.keys() {
+                                new_watch_ids.insert(node_id.clone());
+                            }
+                            for script_uuid in script_watches.keys() {
+                                new_watch_ids.insert(script_uuid.clone());
+                            }
+                            if let Err(e) = watcher.update_watches(new_watch_ids).await {
+                                tracing::error!("[discovery] Failed to update MQTT watches: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("[discovery] Immediate re-discovery failed: {}", e);
+                    }
+                }
+            }
+
             tokio::select! {
                 // Periodic health check for process restarts
                 _ = monitor_interval.tick() => {
@@ -963,13 +1076,19 @@ impl DiscoveredProcessManager {
                                         );
                                     }
                                 }
-                            } else {
-                                // Schema change - trigger re-discovery
+                            } else if current_schema_ids.contains(&doc_id) {
+                                // Schema change - trigger immediate re-discovery
                                 tracing::info!(
-                                    "[discovery] Schema {} changed, re-discovering...",
+                                    "[discovery] Schema {} changed, triggering immediate re-discovery",
                                     doc_id
                                 );
-                                discovery_interval.reset();
+                                need_immediate_discovery = true;
+                            } else {
+                                // Unknown document change - might be a new schema we don't know about yet
+                                tracing::debug!(
+                                    "[discovery] Unknown document {} changed (not in current watches)",
+                                    doc_id
+                                );
                             }
                         }
                         Ok(WatchEvent::Disconnected) => {
@@ -980,7 +1099,7 @@ impl DiscoveredProcessManager {
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("[discovery] MQTT events lagged by {} messages, triggering re-discovery", n);
-                            discovery_interval.reset();
+                            need_immediate_discovery = true;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             tracing::error!("[discovery] MQTT event channel closed");
