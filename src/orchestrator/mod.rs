@@ -3,6 +3,7 @@ mod config_reconciler;
 mod discovered_manager;
 mod discovery;
 mod manager;
+mod mqtt_watcher;
 mod process_discovery;
 mod process_utils;
 mod schema_visitor;
@@ -17,6 +18,7 @@ pub use discovered_manager::{
 };
 pub use discovery::{CommandSpec, DiscoveredProcess, ProcessesConfig};
 pub use manager::{ManagedProcess, ProcessManager, ProcessState};
+pub use mqtt_watcher::{MqttDocumentWatcher, WatchEvent};
 pub use process_discovery::{DiscoveryError, DiscoveryResult, ProcessDiscoveryService};
 pub use schema_visitor::{SchemaVisitor, VisitorError};
 pub use script_resolver::{ResolverError, ScriptResolver, ScriptWatchMap};

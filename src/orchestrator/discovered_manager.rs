@@ -6,18 +6,19 @@
 
 use super::config_reconciler::{ConfigReconciler, ReconcileResult};
 use super::discovery::{DiscoveredProcess, ProcessesConfig};
+use super::mqtt_watcher::{MqttDocumentWatcher, WatchEvent};
 use super::process_discovery::ProcessDiscoveryService;
 use super::process_utils::stop_process_gracefully;
 use super::script_resolver::{ScriptResolver, ScriptWatchMap};
 use super::spawn::spawn_managed_process_with_logging;
 use super::status::OrchestratorStatus;
+use crate::mqtt::client::MqttClient;
 use crate::sync::encode_path;
-use futures::StreamExt;
 use reqwest::Client;
-use reqwest_eventsource::{Event as SseEvent, EventSource};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 
@@ -74,6 +75,10 @@ pub struct DiscoveredProcessManager {
     discovery_service: ProcessDiscoveryService,
     /// Resolver for script UUIDs (evaluate processes)
     script_resolver: ScriptResolver,
+    /// MQTT client for watching documents (required for run_with_recursive_watch)
+    mqtt_client: Option<Arc<MqttClient>>,
+    /// Workspace name for MQTT topics
+    mqtt_workspace: Option<String>,
 }
 
 impl DiscoveredProcessManager {
@@ -93,7 +98,24 @@ impl DiscoveredProcessManager {
             status_file_path,
             discovery_service,
             script_resolver,
+            mqtt_client: None,
+            mqtt_workspace: None,
         }
+    }
+
+    /// Set the MQTT client for document watching.
+    ///
+    /// Required for `run_with_recursive_watch()` to work.
+    pub fn with_mqtt_client(mut self, client: Arc<MqttClient>, workspace: String) -> Self {
+        self.mqtt_client = Some(client);
+        self.mqtt_workspace = Some(workspace);
+        self
+    }
+
+    /// Set the MQTT client for document watching (mutable reference version).
+    pub fn set_mqtt_client(&mut self, client: Arc<MqttClient>, workspace: String) {
+        self.mqtt_client = Some(client);
+        self.mqtt_workspace = Some(workspace);
     }
 
     /// Get the MQTT broker address.
@@ -643,165 +665,6 @@ impl DiscoveredProcessManager {
         self.spawn_process(name).await
     }
 
-    /// Watch a __processes.json document for changes and dynamically update processes.
-    ///
-    /// This method subscribes to the SSE stream for a document and calls
-    /// `reconcile_config` whenever the document changes.
-    ///
-    /// # Arguments
-    /// * `client` - HTTP client for making requests
-    /// * `document_path` - The document path to watch (e.g., "examples/__processes.json")
-    /// * `use_paths` - Whether to use path-based endpoints
-    pub async fn watch_document(
-        &mut self,
-        client: &Client,
-        document_path: &str,
-        use_paths: bool,
-    ) -> Result<(), String> {
-        // Build SSE URL
-        let sse_url = if use_paths {
-            format!(
-                "{}/sse/files/{}",
-                self.server_url,
-                urlencoding::encode(document_path)
-            )
-        } else {
-            format!(
-                "{}/sse/docs/{}",
-                self.server_url,
-                urlencoding::encode(document_path)
-            )
-        };
-
-        // Build HEAD URL
-        let head_url = if use_paths {
-            format!(
-                "{}/files/{}",
-                self.server_url,
-                urlencoding::encode(document_path)
-            )
-        } else {
-            format!(
-                "{}/docs/{}/head",
-                self.server_url,
-                urlencoding::encode(document_path)
-            )
-        };
-
-        // Extract base path from document path (parent directory)
-        let base_path = PathBuf::from(document_path)
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        // Do initial fetch and reconcile
-        tracing::info!("[discovery] Fetching initial config from {}", head_url);
-        match self
-            .fetch_and_reconcile(client, &head_url, &base_path)
-            .await
-        {
-            Ok(_) => tracing::info!("[discovery] Initial config loaded"),
-            Err(e) => {
-                tracing::warn!("[discovery] Failed to load initial config: {}", e);
-                // Continue anyway - we'll get updates via SSE
-            }
-        }
-
-        // Subscribe to SSE for updates
-        tracing::info!("[discovery] Watching document via SSE: {}", sse_url);
-
-        // Monitor interval for checking process health
-        let mut monitor_interval = tokio::time::interval(Duration::from_millis(500));
-
-        loop {
-            let request_builder = client.get(&sse_url);
-
-            let mut es = match EventSource::new(request_builder) {
-                Ok(es) => es,
-                Err(e) => {
-                    tracing::error!("[discovery] Failed to create EventSource: {}", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
-
-            let mut sse_closed = false;
-
-            loop {
-                tokio::select! {
-                    // Periodic health check for process restarts
-                    _ = monitor_interval.tick() => {
-                        self.check_and_restart().await;
-                    }
-
-                    // SSE event processing
-                    event = es.next() => {
-                        match event {
-                            Some(Ok(SseEvent::Open)) => {
-                                tracing::info!("[discovery] SSE connection opened for {}", document_path);
-                            }
-                            Some(Ok(SseEvent::Message(msg))) => {
-                                tracing::debug!("[discovery] SSE event: {} - {}", msg.event, msg.data);
-
-                                match msg.event.as_str() {
-                                    "connected" => {
-                                        tracing::info!("[discovery] SSE connected to {}", document_path);
-                                    }
-                                    "edit" => {
-                                        // Document changed - fetch new content and reconcile
-                                        tracing::info!(
-                                            "[discovery] Document {} changed, reconciling processes",
-                                            document_path
-                                        );
-
-                                        if let Err(e) = self
-                                            .fetch_and_reconcile(client, &head_url, &base_path)
-                                            .await
-                                        {
-                                            tracing::error!(
-                                                "[discovery] Failed to reconcile after edit: {}",
-                                                e
-                                            );
-                                        }
-
-                                        // Also check and restart any failed processes
-                                        self.check_and_restart().await;
-                                    }
-                                    "closed" => {
-                                        tracing::warn!("[discovery] SSE: Document {} was deleted", document_path);
-                                        // Stop all processes since the config is gone
-                                        self.shutdown().await;
-                                        sse_closed = true;
-                                        break;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            Some(Err(e)) => {
-                                tracing::error!("[discovery] SSE error: {}", e);
-                                break;
-                            }
-                            None => {
-                                // Stream ended
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if sse_closed {
-                // Document was deleted, stop watching
-                break;
-            }
-
-            tracing::warn!("[discovery] SSE connection closed, reconnecting in 5s...");
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
-
-        Ok(())
-    }
-
     /// Fetch document content from HEAD and reconcile processes.
     async fn fetch_and_reconcile(
         &mut self,
@@ -837,20 +700,6 @@ impl DiscoveredProcessManager {
         self.reconcile_config(&config, base_path).await
     }
 
-    /// Run the manager loop with document watching.
-    ///
-    /// This is an alternative to `run()` that watches a __processes.json document
-    /// for changes and dynamically updates processes.
-    pub async fn run_with_document_watch(
-        &mut self,
-        client: &Client,
-        document_path: &str,
-        use_paths: bool,
-    ) -> Result<(), String> {
-        // Start watching - this will do initial fetch, start processes, and watch for changes
-        self.watch_document(client, document_path, use_paths).await
-    }
-
     /// Run with recursive discovery of all __processes.json files.
     ///
     /// This discovers all __processes.json files in the filesystem tree starting from
@@ -858,13 +707,23 @@ impl DiscoveredProcessManager {
     /// controls processes that sync at its containing directory.
     ///
     /// Watches ALL schema documents (directory node_ids) for changes, not just fs-root.
+    ///
+    /// Requires MQTT client to be configured via `with_mqtt_client()` or `set_mqtt_client()`.
     pub async fn run_with_recursive_watch(
         &mut self,
         client: &Client,
         fs_root_id: &str,
     ) -> Result<(), String> {
+        // Require MQTT client to be configured
+        let mqtt_client = self.mqtt_client.clone().ok_or_else(|| {
+            "MQTT client not configured. Call with_mqtt_client() or set_mqtt_client() before run_with_recursive_watch()".to_string()
+        })?;
+        let workspace = self.mqtt_workspace.clone().ok_or_else(|| {
+            "MQTT workspace not configured. Call with_mqtt_client() or set_mqtt_client() before run_with_recursive_watch()".to_string()
+        })?;
+
         tracing::info!(
-            "[discovery] Starting recursive discovery from fs-root: {}",
+            "[discovery] Starting recursive discovery from fs-root: {} (using MQTT)",
             fs_root_id
         );
 
@@ -877,7 +736,6 @@ impl DiscoveredProcessManager {
 
         if discovery.processes_json_files.is_empty() {
             tracing::warn!("[discovery] No __processes.json files found in filesystem tree");
-            // Still watch the root for changes
         } else {
             tracing::info!(
                 "[discovery] Found {} __processes.json file(s): {:?}",
@@ -896,7 +754,6 @@ impl DiscoveredProcessManager {
         );
 
         // Track watched documents: node_id -> base_path
-        // Only successfully loaded __processes.json files are added to this map
         let mut watched: HashMap<String, String> = HashMap::new();
 
         // Fetch and reconcile each __processes.json
@@ -908,7 +765,6 @@ impl DiscoveredProcessManager {
                         "[discovery] Loaded processes from {}/__processes.json",
                         base_path
                     );
-                    // Only add to watched if successfully loaded
                     watched.insert(pj_node_id.clone(), base_path.clone());
                 }
                 Err(e) => tracing::warn!(
@@ -924,8 +780,41 @@ impl DiscoveredProcessManager {
             discovery.schema_node_ids.iter().cloned().collect();
 
         // Resolve and track script files for evaluate processes
-        // script_uuid -> process_name
         let mut script_watches: ScriptWatchMap = self.resolve_script_watches(fs_root_id).await;
+
+        // Create MQTT document watcher
+        let watcher = MqttDocumentWatcher::new(mqtt_client.clone(), workspace.clone());
+
+        // Build initial watch set: schemas + __processes.json files + scripts
+        let initial_watch_ids: HashSet<String> = {
+            let mut ids = current_schema_ids.clone();
+            for node_id in watched.keys() {
+                ids.insert(node_id.clone());
+            }
+            for script_uuid in script_watches.keys() {
+                ids.insert(script_uuid.clone());
+            }
+            ids
+        };
+
+        // Set up initial subscriptions
+        if let Err(e) = watcher.update_watches(initial_watch_ids).await {
+            tracing::error!("[discovery] Failed to set up initial MQTT watches: {}", e);
+        }
+
+        // Get event receiver
+        let mut event_rx = watcher.events();
+
+        // Spawn the watcher's event loop as a background task
+        let watcher = Arc::new(watcher);
+        let watcher_handle = {
+            let watcher = watcher.clone();
+            tokio::spawn(async move {
+                if let Err(e) = watcher.run().await {
+                    tracing::error!("[discovery] MQTT watcher error: {}", e);
+                }
+            })
+        };
 
         // Monitor interval for checking process health
         let mut monitor_interval = tokio::time::interval(Duration::from_millis(500));
@@ -934,205 +823,177 @@ impl DiscoveredProcessManager {
         let mut discovery_interval = tokio::time::interval(Duration::from_secs(30));
 
         loop {
-            // Build SSE URL from current watched state (schemas + __processes.json files + scripts)
-            // Rebuilt on every reconnect to ensure we don't miss newly discovered docs
-            let mut all_ids: Vec<String> = current_schema_ids.iter().cloned().collect();
-            for node_id in watched.keys() {
-                all_ids.push(node_id.clone());
-            }
-            // Add script UUIDs to watch list
-            for script_uuid in script_watches.keys() {
-                all_ids.push(script_uuid.clone());
-            }
-            let all_ids_param = all_ids.join(",");
-            let sse_url = format!(
-                "{}/documents/stream?doc_ids={}",
-                self.server_url, all_ids_param
-            );
-
-            let request_builder = client.get(&sse_url);
-
-            let mut es = match EventSource::new(request_builder) {
-                Ok(es) => es,
-                Err(e) => {
-                    tracing::error!(
-                        "[discovery] Failed to create EventSource for schemas: {}",
-                        e
-                    );
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
+            tokio::select! {
+                // Periodic health check for process restarts
+                _ = monitor_interval.tick() => {
+                    self.check_and_restart().await;
                 }
-            };
 
-            let mut sse_closed = false;
+                // Periodic re-discovery of __processes.json files
+                _ = discovery_interval.tick() => {
+                    match self.discovery_service.discover_all(fs_root_id).await {
+                        Ok(new_discovery) => {
+                            let mut watches_changed = false;
 
-            loop {
-                tokio::select! {
-                    // Periodic health check for process restarts
-                    _ = monitor_interval.tick() => {
-                        self.check_and_restart().await;
-                    }
-
-                    // Periodic re-discovery of __processes.json files
-                    _ = discovery_interval.tick() => {
-                        match self.discovery_service.discover_all(fs_root_id).await {
-                            Ok(new_discovery) => {
-                                // Check for new or previously-failed __processes.json files
-                                let mut added_new_pj = false;
-                                for (base_path, node_id) in &new_discovery.processes_json_files {
-                                    if !watched.contains_key(node_id) {
-                                        tracing::info!("[discovery] Trying __processes.json at {}", base_path);
-                                        let url = format!("{}/docs/{}/head", self.server_url, node_id);
-                                        match self.fetch_and_reconcile(client, &url, base_path).await {
-                                            Ok(_) => {
-                                                tracing::info!("[discovery] Loaded processes from {}/__processes.json", base_path);
-                                                // Only add to watched if successfully loaded
-                                                watched.insert(node_id.clone(), base_path.clone());
-                                                added_new_pj = true;
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!("[discovery] Failed to load {}: {} (will retry)", base_path, e);
-                                            }
+                            // Check for new or previously-failed __processes.json files
+                            for (base_path, node_id) in &new_discovery.processes_json_files {
+                                if !watched.contains_key(node_id) {
+                                    tracing::info!("[discovery] Trying __processes.json at {}", base_path);
+                                    let url = format!("{}/docs/{}/head", self.server_url, node_id);
+                                    match self.fetch_and_reconcile(client, &url, base_path).await {
+                                        Ok(_) => {
+                                            tracing::info!("[discovery] Loaded processes from {}/__processes.json", base_path);
+                                            watched.insert(node_id.clone(), base_path.clone());
+                                            watches_changed = true;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("[discovery] Failed to load {}: {} (will retry)", base_path, e);
                                         }
                                     }
                                 }
+                            }
 
-                                // Check for removed __processes.json files
-                                let new_ids: HashSet<_> = new_discovery.processes_json_files.iter().map(|(_, id)| id.clone()).collect();
-                                let removed_pj: Vec<_> = watched.keys()
-                                    .filter(|id| !new_ids.contains(*id))
-                                    .cloned()
-                                    .collect();
-                                let _had_removed_pj = !removed_pj.is_empty();
-                                for node_id in removed_pj {
-                                    if let Some(base_path) = watched.remove(&node_id) {
-                                        tracing::info!("[discovery] __processes.json removed at {}", base_path);
-                                        // Remove processes that were from this base_path
-                                        let to_remove: Vec<_> = self.processes.iter()
-                                            .filter(|(_, p)| p.document_path.starts_with(&base_path))
-                                            .map(|(n, _)| n.clone())
-                                            .collect();
-                                        for name in to_remove {
-                                            self.remove_process(&name).await;
-                                        }
+                            // Check for removed __processes.json files
+                            let new_ids: HashSet<_> = new_discovery.processes_json_files.iter().map(|(_, id)| id.clone()).collect();
+                            let removed_pj: Vec<_> = watched.keys()
+                                .filter(|id| !new_ids.contains(*id))
+                                .cloned()
+                                .collect();
+                            for node_id in removed_pj {
+                                if let Some(base_path) = watched.remove(&node_id) {
+                                    tracing::info!("[discovery] __processes.json removed at {}", base_path);
+                                    let to_remove: Vec<_> = self.processes.iter()
+                                        .filter(|(_, p)| p.document_path.starts_with(&base_path))
+                                        .map(|(n, _)| n.clone())
+                                        .collect();
+                                    for name in to_remove {
+                                        self.remove_process(&name).await;
                                     }
-                                }
-
-                                // Check for new schema node_ids (new directories added)
-                                let new_schema_ids: HashSet<String> = new_discovery.schema_node_ids.iter().cloned().collect();
-                                let schema_changed = new_schema_ids != current_schema_ids;
-                                if schema_changed {
-                                    let added: Vec<_> = new_schema_ids.difference(&current_schema_ids).collect();
-                                    let removed: Vec<_> = current_schema_ids.difference(&new_schema_ids).collect();
-                                    tracing::info!(
-                                        "[discovery] Schema set changed: +{} -{} directories",
-                                        added.len(),
-                                        removed.len()
-                                    );
-                                    current_schema_ids = new_schema_ids;
-                                }
-
-                                // Update script watches - always rebuild to catch any changes
-                                // (not just when files are added/removed, but also when existing
-                                // __processes.json files are edited to add/change evaluate entries)
-                                let new_script_watches = self.resolve_script_watches(fs_root_id).await;
-                                let scripts_changed = new_script_watches != script_watches;
-                                script_watches = new_script_watches;
-
-                                // Reconnect SSE if schemas changed, new __processes.json added, or scripts changed
-                                // (URL is rebuilt on each loop iteration with current watch set)
-                                if schema_changed || added_new_pj || scripts_changed {
-                                    sse_closed = true;
+                                    watches_changed = true;
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!("[discovery] Re-discovery failed: {}", e);
-                            }
-                        }
-                    }
 
-                    // SSE event from any schema document (structural changes)
-                    event = es.next() => {
-                        match event {
-                            Some(Ok(SseEvent::Open)) => {
+                            // Check for new schema node_ids (new directories added)
+                            let new_schema_ids: HashSet<String> = new_discovery.schema_node_ids.iter().cloned().collect();
+                            if new_schema_ids != current_schema_ids {
+                                let added: Vec<_> = new_schema_ids.difference(&current_schema_ids).collect();
+                                let removed: Vec<_> = current_schema_ids.difference(&new_schema_ids).collect();
                                 tracing::info!(
-                                    "[discovery] SSE connection opened for {} schema(s)",
-                                    current_schema_ids.len()
+                                    "[discovery] Schema set changed: +{} -{} directories",
+                                    added.len(),
+                                    removed.len()
                                 );
+                                current_schema_ids = new_schema_ids;
+                                watches_changed = true;
                             }
-                            Some(Ok(SseEvent::Message(msg))) => {
-                                // /documents/stream sends "commit" events with doc_id in payload
-                                if msg.event == "commit" {
-                                    // Parse the commit event to get doc_id
-                                    if let Ok(commit) = serde_json::from_str::<serde_json::Value>(&msg.data) {
-                                        if let Some(doc_id) = commit.get("doc_id").and_then(|v| v.as_str()) {
-                                            // Check if this is a __processes.json file we're watching
-                                            if let Some(base_path) = watched.get(doc_id) {
-                                                tracing::info!(
-                                                    "[discovery] __processes.json changed at {}, reconciling...",
-                                                    base_path
-                                                );
-                                                // Fetch and reconcile this specific __processes.json
-                                                let url = format!("{}/docs/{}/head", self.server_url, doc_id);
-                                                let base_path = base_path.clone();
-                                                if let Err(e) = self.fetch_and_reconcile(client, &url, &base_path).await {
-                                                    tracing::error!(
-                                                        "[discovery] Failed to reconcile {}/__processes.json: {}",
-                                                        base_path, e
-                                                    );
-                                                }
-                                                // After reconciling, update script watches
-                                                // (processes may have been added/removed/changed)
-                                                script_watches = self.resolve_script_watches(fs_root_id).await;
-                                            } else if let Some(process_names) = script_watches.get(doc_id) {
-                                                // This is a script file change - restart all associated processes
-                                                for process_name in process_names.clone() {
-                                                    tracing::info!(
-                                                        "[discovery] Script {} changed, restarting process '{}'",
-                                                        doc_id,
-                                                        process_name
-                                                    );
-                                                    if let Err(e) = self.restart_process(&process_name).await {
-                                                        tracing::error!(
-                                                            "[discovery] Failed to restart '{}' after script change: {}",
-                                                            process_name, e
-                                                        );
-                                                    }
-                                                }
-                                            } else {
-                                                // It's a schema change - trigger re-discovery
-                                                tracing::info!(
-                                                    "[discovery] Schema {} changed, re-discovering...",
-                                                    doc_id
-                                                );
-                                                discovery_interval.reset();
-                                            }
-                                        }
-                                    }
+
+                            // Update script watches
+                            let new_script_watches = self.resolve_script_watches(fs_root_id).await;
+                            if new_script_watches != script_watches {
+                                script_watches = new_script_watches;
+                                watches_changed = true;
+                            }
+
+                            // Update MQTT subscriptions if watch set changed
+                            if watches_changed {
+                                let mut new_watch_ids: HashSet<String> = current_schema_ids.clone();
+                                for node_id in watched.keys() {
+                                    new_watch_ids.insert(node_id.clone());
+                                }
+                                for script_uuid in script_watches.keys() {
+                                    new_watch_ids.insert(script_uuid.clone());
+                                }
+                                if let Err(e) = watcher.update_watches(new_watch_ids).await {
+                                    tracing::error!("[discovery] Failed to update MQTT watches: {}", e);
                                 }
                             }
-                            Some(Err(e)) => {
-                                tracing::warn!("[discovery] SSE error: {}", e);
-                                sse_closed = true;
-                            }
-                            None => {
-                                tracing::info!("[discovery] SSE stream ended");
-                                sse_closed = true;
+                        }
+                        Err(e) => {
+                            tracing::warn!("[discovery] Re-discovery failed: {}", e);
+                        }
+                    }
+                }
+
+                // MQTT document change event
+                event = event_rx.recv() => {
+                    match event {
+                        Ok(WatchEvent::DocumentChanged(doc_id)) => {
+                            // Check if this is a __processes.json file we're watching
+                            if let Some(base_path) = watched.get(&doc_id) {
+                                tracing::info!(
+                                    "[discovery] __processes.json changed at {}, reconciling...",
+                                    base_path
+                                );
+                                let url = format!("{}/docs/{}/head", self.server_url, doc_id);
+                                let base_path = base_path.clone();
+                                if let Err(e) = self.fetch_and_reconcile(client, &url, &base_path).await {
+                                    tracing::error!(
+                                        "[discovery] Failed to reconcile {}/__processes.json: {}",
+                                        base_path, e
+                                    );
+                                }
+                                // Update script watches after reconciling
+                                let new_script_watches = self.resolve_script_watches(fs_root_id).await;
+                                if new_script_watches != script_watches {
+                                    script_watches = new_script_watches;
+                                    // Update MQTT subscriptions with new script watches
+                                    let mut new_watch_ids: HashSet<String> = current_schema_ids.clone();
+                                    for node_id in watched.keys() {
+                                        new_watch_ids.insert(node_id.clone());
+                                    }
+                                    for script_uuid in script_watches.keys() {
+                                        new_watch_ids.insert(script_uuid.clone());
+                                    }
+                                    if let Err(e) = watcher.update_watches(new_watch_ids).await {
+                                        tracing::error!("[discovery] Failed to update MQTT watches: {}", e);
+                                    }
+                                }
+                            } else if let Some(process_names) = script_watches.get(&doc_id) {
+                                // Script file change - restart associated processes
+                                for process_name in process_names.clone() {
+                                    tracing::info!(
+                                        "[discovery] Script {} changed, restarting process '{}'",
+                                        doc_id,
+                                        process_name
+                                    );
+                                    if let Err(e) = self.restart_process(&process_name).await {
+                                        tracing::error!(
+                                            "[discovery] Failed to restart '{}' after script change: {}",
+                                            process_name, e
+                                        );
+                                    }
+                                }
+                            } else {
+                                // Schema change - trigger re-discovery
+                                tracing::info!(
+                                    "[discovery] Schema {} changed, re-discovering...",
+                                    doc_id
+                                );
+                                discovery_interval.reset();
                             }
                         }
-
-                        if sse_closed {
+                        Ok(WatchEvent::Disconnected) => {
+                            tracing::warn!("[discovery] MQTT connection lost");
+                        }
+                        Ok(WatchEvent::Reconnected) => {
+                            tracing::info!("[discovery] MQTT connection restored");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("[discovery] MQTT events lagged by {} messages, triggering re-discovery", n);
+                            discovery_interval.reset();
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            tracing::error!("[discovery] MQTT event channel closed");
                             break;
                         }
                     }
                 }
             }
-
-            if sse_closed {
-                tracing::info!("[discovery] Reconnecting to schema stream SSE...");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
         }
+
+        // Clean up
+        watcher_handle.abort();
+        Ok(())
     }
 
     /// Gracefully shutdown all managed processes.
