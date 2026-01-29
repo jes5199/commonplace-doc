@@ -88,6 +88,242 @@ pub fn prepare_content_for_upload(raw_content: &[u8], file_path: &Path) -> Prepa
     }
 }
 
+/// Result of echo detection from pending write barrier.
+///
+/// This struct captures the outcome of checking whether a file change notification
+/// is an echo of our own write (which should be ignored) or a user edit (which
+/// should be uploaded).
+#[derive(Debug, Clone)]
+pub struct EchoDetectionResult {
+    /// Whether an echo was detected (content matches pending write or last written)
+    pub echo_detected: bool,
+    /// Whether we need to refresh from HEAD (server edits were skipped while barrier was up)
+    pub should_refresh: bool,
+    /// Updated content after retry loop (may differ from input if file was still being written)
+    pub updated_content: Option<String>,
+}
+
+impl EchoDetectionResult {
+    /// Create a result indicating an echo was detected.
+    pub fn echo(should_refresh: bool) -> Self {
+        Self {
+            echo_detected: true,
+            should_refresh,
+            updated_content: None,
+        }
+    }
+
+    /// Create a result indicating no echo (user edit detected).
+    pub fn no_echo(should_refresh: bool, updated_content: Option<String>) -> Self {
+        Self {
+            echo_detected: false,
+            should_refresh,
+            updated_content,
+        }
+    }
+}
+
+/// Detect if a file change is an echo of our own write or a user edit.
+///
+/// This function checks the SyncState's pending write barrier and determines:
+/// 1. If there's a pending write that matches - it's our echo, skip upload
+/// 2. If the pending write timed out - handle based on content match
+/// 3. If content doesn't match but is still changing - retry to wait for write completion
+/// 4. If no barrier - compare against last written content (trimmed)
+///
+/// # Arguments
+/// * `state` - The shared sync state (write lock will be acquired)
+/// * `content` - The current file content (may be updated by retry loop)
+/// * `is_binary` - Whether the content is binary (affects how we re-read file)
+/// * `file_path` - Path to the file (for re-reading during retry)
+///
+/// # Returns
+/// An `EchoDetectionResult` containing:
+/// - `echo_detected`: true if this is our echo and should skip upload
+/// - `should_refresh`: true if we need to refresh from HEAD after
+/// - `updated_content`: Some(content) if the retry loop updated the content
+///
+/// # Note
+/// This function is async because the retry loop may need to re-read the file
+/// and sleep between retries. The state lock is released during the retry loop.
+pub async fn detect_echo_from_pending_write(
+    state: &Arc<RwLock<SyncState>>,
+    content: &str,
+    is_binary: bool,
+    file_path: &Path,
+) -> EchoDetectionResult {
+    let mut s = state.write().await;
+
+    debug!(
+        "detect_echo: last_written_content={:?}, last_written_cid={:?}, has_barrier={}",
+        &s.last_written_content.chars().take(50).collect::<String>(),
+        s.last_written_cid.as_ref().map(|c| &c[..8.min(c.len())]),
+        s.pending_write.is_some()
+    );
+
+    // Check for pending write (barrier is up)
+    if let Some(pending) = s.pending_write.take() {
+        // Check for timeout
+        if pending.started_at.elapsed() > PENDING_WRITE_TIMEOUT {
+            warn!(
+                "Pending write timed out (id={}), clearing barrier",
+                pending.write_id
+            );
+            // The pending write timed out - we don't know if the file contains
+            // the server content (write succeeded but watcher was slow) or
+            // stale content (write failed or was interrupted).
+            //
+            // If content matches the pending write, treat as delayed echo.
+            // Otherwise, upload with old parent_cid for CRDT merge.
+            if content == pending.content {
+                debug!("Timed-out pending matches current content, treating as delayed echo");
+                s.last_written_cid = pending.cid;
+                s.last_written_content = pending.content;
+                let should_refresh = s.needs_head_refresh;
+                s.needs_head_refresh = false;
+                return EchoDetectionResult::echo(should_refresh);
+            } else {
+                // Content differs - this is a user edit that slipped through,
+                // or the write failed. Upload with old parent for merge.
+                debug!("Timed-out pending differs from current content, uploading as user edit");
+                let should_refresh = s.needs_head_refresh;
+                s.needs_head_refresh = false;
+                // DON'T update last_written_* - use old parent for CRDT merge
+                return EchoDetectionResult::no_echo(should_refresh, None);
+            }
+        } else if content == pending.content {
+            // Content matches what we wrote - this is our echo
+            debug!(
+                "Echo detected: content matches pending write (id={})",
+                pending.write_id
+            );
+            s.last_written_cid = pending.cid;
+            s.last_written_content = pending.content;
+            // Barrier cleared (we took it with .take())
+            let should_refresh = s.needs_head_refresh;
+            s.needs_head_refresh = false;
+            return EchoDetectionResult::echo(should_refresh);
+        } else {
+            debug!(
+                "Barrier present but content mismatch (id={}) - file: {:?} (len={}), pending: {:?} (len={})",
+                pending.write_id,
+                &content.chars().take(50).collect::<String>(),
+                content.len(),
+                &pending.content.chars().take(50).collect::<String>(),
+                pending.content.len()
+            );
+            // Content differs from pending - could be:
+            // a) Partial write (we're mid-write or just finished)
+            // b) User edit during our write
+            //
+            // Retry a few times to handle partial writes
+            let pending_content = pending.content.clone();
+            let pending_cid = pending.cid.clone();
+            let pending_write_id = pending.write_id;
+
+            // Put the pending back while we retry
+            s.pending_write = Some(pending);
+            drop(s); // Release lock during retries
+
+            let mut current_content = content.to_string();
+            let mut is_echo = false;
+            for i in 0..BARRIER_RETRY_COUNT {
+                sleep(BARRIER_RETRY_DELAY).await;
+
+                // Re-read file
+                let raw = match tokio::fs::read(file_path).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Failed to re-read file during retry: {}", e);
+                        break;
+                    }
+                };
+
+                let reread = if is_binary {
+                    use base64::{engine::general_purpose::STANDARD, Engine};
+                    STANDARD.encode(&raw)
+                } else {
+                    String::from_utf8_lossy(&raw).to_string()
+                };
+
+                if reread == pending_content {
+                    // Content now matches - was partial write, now complete
+                    debug!(
+                        "Retry {}: content now matches pending write (id={})",
+                        i + 1,
+                        pending_write_id
+                    );
+                    current_content = reread;
+                    is_echo = true;
+                    break;
+                }
+
+                if reread != current_content {
+                    // Content still changing, update and keep retrying
+                    debug!("Retry {}: content still changing", i + 1);
+                    current_content = reread;
+                }
+                // If reread == current_content and != pending, content is stable but different (user edit)
+            }
+
+            // Re-acquire lock and finalize
+            let mut s = state.write().await;
+
+            if is_echo {
+                // Our write completed after retries
+                debug!("Echo confirmed after retries (id={})", pending_write_id);
+                s.last_written_cid = pending_cid;
+                s.last_written_content = current_content.clone();
+                s.pending_write = None;
+                let should_refresh = s.needs_head_refresh;
+                s.needs_head_refresh = false;
+                return EchoDetectionResult::echo(should_refresh);
+            } else {
+                // User edited during our write
+                info!(
+                    "User edit detected during server write (id={})",
+                    pending_write_id
+                );
+                s.pending_write = None; // Clear barrier
+                                        // DON'T update last_written_* - use old parent for CRDT merge
+                                        // Fall through to upload with old parent_cid
+
+                // IMPORTANT: Also check needs_head_refresh here!
+                // If server edits were skipped while barrier was up, we need to
+                // refresh after uploading to get the merged state.
+                let should_refresh = s.needs_head_refresh;
+                s.needs_head_refresh = false;
+                return EchoDetectionResult::no_echo(should_refresh, Some(current_content));
+            }
+        }
+    }
+
+    // No barrier - normal echo detection
+    // Also check needs_head_refresh in case server edit was skipped
+    // due to local changes being pending
+    let should_refresh = s.needs_head_refresh;
+    s.needs_head_refresh = false;
+
+    // Use trimmed comparison to avoid whitespace differences
+    let content_trimmed = content.trim();
+    let last_written_trimmed = s.last_written_content.trim();
+
+    if content_trimmed == last_written_trimmed {
+        debug!("Ignoring echo: content matches last written (trimmed)");
+        return EchoDetectionResult::echo(should_refresh);
+    }
+
+    debug!(
+        "No barrier, content mismatch - file: {:?} (len={}), last_written: {:?} (len={})",
+        &content.chars().take(50).collect::<String>(),
+        content.len(),
+        &s.last_written_content.chars().take(50).collect::<String>(),
+        s.last_written_content.len()
+    );
+
+    EchoDetectionResult::no_echo(should_refresh, None)
+}
+
 /// Interval between periodic divergence checks (seconds).
 /// This ensures sync clients detect when they've diverged from the server
 /// even if MQTT messages are missed.
@@ -166,177 +402,14 @@ pub async fn upload_task(
         );
 
         // Check for pending write barrier and handle echo detection
-        // Track whether we detected an echo and need to refresh from HEAD
-        let mut echo_detected = false;
-        let mut should_refresh = false;
+        let echo_result =
+            detect_echo_from_pending_write(&state, &content, is_binary, &file_path).await;
+        let echo_detected = echo_result.echo_detected;
+        let should_refresh = echo_result.should_refresh;
 
-        {
-            let mut s = state.write().await;
-            debug!(
-                "upload_task state: last_written_content={:?}, last_written_cid={:?}, has_barrier={}",
-                &s.last_written_content.chars().take(50).collect::<String>(),
-                s.last_written_cid.as_ref().map(|c| &c[..8.min(c.len())]),
-                s.pending_write.is_some()
-            );
-
-            // Check for pending write (barrier is up)
-            if let Some(pending) = s.pending_write.take() {
-                // Check for timeout
-                if pending.started_at.elapsed() > PENDING_WRITE_TIMEOUT {
-                    warn!(
-                        "Pending write timed out (id={}), clearing barrier",
-                        pending.write_id
-                    );
-                    // The pending write timed out - we don't know if the file contains
-                    // the server content (write succeeded but watcher was slow) or
-                    // stale content (write failed or was interrupted).
-                    //
-                    // If content matches the pending write, treat as delayed echo.
-                    // Otherwise, upload with old parent_cid for CRDT merge.
-                    if content == pending.content {
-                        debug!(
-                            "Timed-out pending matches current content, treating as delayed echo"
-                        );
-                        s.last_written_cid = pending.cid;
-                        s.last_written_content = pending.content;
-                        should_refresh = s.needs_head_refresh;
-                        s.needs_head_refresh = false;
-                        echo_detected = true;
-                    } else {
-                        // Content differs - this is a user edit that slipped through,
-                        // or the write failed. Upload with old parent for merge.
-                        debug!(
-                            "Timed-out pending differs from current content, uploading as user edit"
-                        );
-                        // DON'T update last_written_* - use old parent for CRDT merge
-                    }
-                } else if content == pending.content {
-                    // Content matches what we wrote - this is our echo
-                    debug!(
-                        "Echo detected: content matches pending write (id={})",
-                        pending.write_id
-                    );
-                    s.last_written_cid = pending.cid;
-                    s.last_written_content = pending.content;
-                    // Barrier cleared (we took it with .take())
-                    should_refresh = s.needs_head_refresh;
-                    s.needs_head_refresh = false;
-                    echo_detected = true;
-                } else {
-                    debug!(
-                        "Barrier present but content mismatch (id={}) - file: {:?} (len={}), pending: {:?} (len={})",
-                        pending.write_id,
-                        &content.chars().take(50).collect::<String>(),
-                        content.len(),
-                        &pending.content.chars().take(50).collect::<String>(),
-                        pending.content.len()
-                    );
-                    // Content differs from pending - could be:
-                    // a) Partial write (we're mid-write or just finished)
-                    // b) User edit during our write
-                    //
-                    // Retry a few times to handle partial writes
-                    let pending_content = pending.content.clone();
-                    let pending_cid = pending.cid.clone();
-                    let pending_write_id = pending.write_id;
-
-                    // Put the pending back while we retry
-                    s.pending_write = Some(pending);
-                    drop(s); // Release lock during retries
-
-                    let mut is_echo = false;
-                    for i in 0..BARRIER_RETRY_COUNT {
-                        sleep(BARRIER_RETRY_DELAY).await;
-
-                        // Re-read file
-                        let raw = match tokio::fs::read(&file_path).await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                error!("Failed to re-read file during retry: {}", e);
-                                break;
-                            }
-                        };
-
-                        let reread = if is_binary {
-                            use base64::{engine::general_purpose::STANDARD, Engine};
-                            STANDARD.encode(&raw)
-                        } else {
-                            String::from_utf8_lossy(&raw).to_string()
-                        };
-
-                        if reread == pending_content {
-                            // Content now matches - was partial write, now complete
-                            debug!(
-                                "Retry {}: content now matches pending write (id={})",
-                                i + 1,
-                                pending_write_id
-                            );
-                            content = reread;
-                            is_echo = true;
-                            break;
-                        }
-
-                        if reread != content {
-                            // Content still changing, update and keep retrying
-                            debug!("Retry {}: content still changing", i + 1);
-                            content = reread;
-                        }
-                        // If reread == content and != pending, content is stable but different (user edit)
-                    }
-
-                    // Re-acquire lock and finalize
-                    let mut s = state.write().await;
-
-                    if is_echo {
-                        // Our write completed after retries
-                        debug!("Echo confirmed after retries (id={})", pending_write_id);
-                        s.last_written_cid = pending_cid;
-                        s.last_written_content = content.clone();
-                        s.pending_write = None;
-                        should_refresh = s.needs_head_refresh;
-                        s.needs_head_refresh = false;
-                        echo_detected = true;
-                    } else {
-                        // User edited during our write
-                        info!(
-                            "User edit detected during server write (id={})",
-                            pending_write_id
-                        );
-                        s.pending_write = None; // Clear barrier
-                                                // DON'T update last_written_* - use old parent for CRDT merge
-                                                // Fall through to upload with old parent_cid
-
-                        // IMPORTANT: Also check needs_head_refresh here!
-                        // If server edits were skipped while barrier was up, we need to
-                        // refresh after uploading to get the merged state.
-                        should_refresh = s.needs_head_refresh;
-                        s.needs_head_refresh = false;
-                    }
-                }
-            } else {
-                // No barrier - normal echo detection
-                // Also check needs_head_refresh in case server edit was skipped
-                // due to local changes being pending
-                should_refresh = s.needs_head_refresh;
-                s.needs_head_refresh = false;
-
-                // Use trimmed comparison to avoid whitespace differences
-                let content_trimmed = content.trim();
-                let last_written_trimmed = s.last_written_content.trim();
-
-                if content_trimmed == last_written_trimmed {
-                    debug!("Ignoring echo: content matches last written (trimmed)");
-                    echo_detected = true;
-                } else {
-                    debug!(
-                        "No barrier, content mismatch - file: {:?} (len={}), last_written: {:?} (len={})",
-                        &content.chars().take(50).collect::<String>(),
-                        content.len(),
-                        &s.last_written_content.chars().take(50).collect::<String>(),
-                        s.last_written_content.len()
-                    );
-                }
-            }
+        // Update content if the retry loop produced a new value
+        if let Some(updated) = echo_result.updated_content {
+            content = updated;
         }
 
         // If echo detected, optionally refresh from HEAD then skip upload
@@ -861,119 +934,14 @@ pub async fn upload_task_with_flock(
         let is_jsonl = prepared.is_jsonl;
 
         // Check for pending write barrier and handle echo detection
-        let mut echo_detected = false;
-        let mut should_refresh = false;
+        let echo_result =
+            detect_echo_from_pending_write(&state, &content, is_binary, &file_path).await;
+        let echo_detected = echo_result.echo_detected;
+        let should_refresh = echo_result.should_refresh;
 
-        {
-            let mut s = state.write().await;
-
-            if let Some(pending) = s.pending_write.take() {
-                if pending.started_at.elapsed() > PENDING_WRITE_TIMEOUT {
-                    warn!(
-                        "Pending write timed out (id={}), clearing barrier",
-                        pending.write_id
-                    );
-                    if content == pending.content {
-                        debug!(
-                            "Timed-out pending matches current content, treating as delayed echo"
-                        );
-                        s.last_written_cid = pending.cid;
-                        s.last_written_content = pending.content;
-                        should_refresh = s.needs_head_refresh;
-                        s.needs_head_refresh = false;
-                        echo_detected = true;
-                    } else {
-                        debug!(
-                            "Timed-out pending differs from current content, uploading as user edit"
-                        );
-                    }
-                } else if content == pending.content {
-                    debug!(
-                        "Echo detected: content matches pending write (id={})",
-                        pending.write_id
-                    );
-                    s.last_written_cid = pending.cid;
-                    s.last_written_content = pending.content;
-                    should_refresh = s.needs_head_refresh;
-                    s.needs_head_refresh = false;
-                    echo_detected = true;
-                } else {
-                    let pending_content = pending.content.clone();
-                    let pending_cid = pending.cid.clone();
-                    let pending_write_id = pending.write_id;
-
-                    s.pending_write = Some(pending);
-                    drop(s);
-
-                    let mut is_echo = false;
-                    for i in 0..BARRIER_RETRY_COUNT {
-                        sleep(BARRIER_RETRY_DELAY).await;
-
-                        let raw = match tokio::fs::read(&file_path).await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                error!("Failed to re-read file during retry: {}", e);
-                                break;
-                            }
-                        };
-
-                        let reread = if is_binary {
-                            use base64::{engine::general_purpose::STANDARD, Engine};
-                            STANDARD.encode(&raw)
-                        } else {
-                            String::from_utf8_lossy(&raw).to_string()
-                        };
-
-                        if reread == pending_content {
-                            debug!(
-                                "Retry {}: content now matches pending write (id={})",
-                                i + 1,
-                                pending_write_id
-                            );
-                            content = reread;
-                            is_echo = true;
-                            break;
-                        }
-
-                        if reread != content {
-                            debug!("Retry {}: content still changing", i + 1);
-                            content = reread;
-                        }
-                    }
-
-                    let mut s = state.write().await;
-
-                    if is_echo {
-                        debug!("Echo confirmed after retries (id={})", pending_write_id);
-                        s.last_written_cid = pending_cid;
-                        s.last_written_content = content.clone();
-                        s.pending_write = None;
-                        should_refresh = s.needs_head_refresh;
-                        s.needs_head_refresh = false;
-                        echo_detected = true;
-                    } else {
-                        info!(
-                            "User edit detected during server write (id={})",
-                            pending_write_id
-                        );
-                        s.pending_write = None;
-                        should_refresh = s.needs_head_refresh;
-                        s.needs_head_refresh = false;
-                    }
-                }
-            } else {
-                should_refresh = s.needs_head_refresh;
-                s.needs_head_refresh = false;
-
-                // Use trimmed comparison to avoid whitespace differences
-                let content_trimmed = content.trim();
-                let last_written_trimmed = s.last_written_content.trim();
-
-                if content_trimmed == last_written_trimmed {
-                    debug!("Ignoring echo: content matches last written (trimmed)");
-                    echo_detected = true;
-                }
-            }
+        // Update content if the retry loop produced a new value
+        if let Some(updated) = echo_result.updated_content {
+            content = updated;
         }
 
         if echo_detected {
@@ -1859,6 +1827,143 @@ pub async fn sync_single_file(
     Ok((identifier, content_hash))
 }
 
+/// Upload strategy for HTTP-based sync.
+///
+/// Determines which upload task variant to spawn. This enum allows consolidating
+/// the common spawn logic while supporting different upload behaviors.
+enum HttpUploadStrategy {
+    /// Standard upload via HTTP /replace or /edit endpoints.
+    Standard { force_push: bool, author: String },
+    /// Flock-aware upload that tracks pending outbound commits.
+    WithFlock {
+        force_push: bool,
+        flock_state: FlockSyncState,
+        author: String,
+    },
+}
+
+/// SSE subscription strategy for HTTP-based sync.
+///
+/// Determines which SSE task variant to spawn for receiving server updates.
+enum SseStrategy {
+    /// Standard SSE subscription with optional inode tracker for atomic writes.
+    Standard {
+        #[cfg(unix)]
+        inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    },
+    /// Flock-aware SSE subscription with ancestry checking.
+    WithFlock {
+        flock_state: FlockSyncState,
+        doc_id: Option<uuid::Uuid>,
+    },
+}
+
+/// Internal helper to spawn HTTP-based file sync tasks.
+///
+/// This consolidates the common logic between `spawn_file_sync_tasks` and
+/// `spawn_file_sync_tasks_with_flock`. Both functions delegate to this helper
+/// with their specific upload and SSE strategies.
+#[allow(clippy::too_many_arguments)]
+fn spawn_http_sync_tasks_inner(
+    client: Client,
+    server: String,
+    identifier: String,
+    file_path: PathBuf,
+    state: Arc<RwLock<SyncState>>,
+    use_paths: bool,
+    push_only: bool,
+    pull_only: bool,
+    upload_strategy: HttpUploadStrategy,
+    sse_strategy: SseStrategy,
+) -> Vec<JoinHandle<()>> {
+    let mut handles = Vec::new();
+
+    // File watcher and upload tasks (skip if pull-only)
+    if !pull_only {
+        let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
+
+        // Spawn file watcher
+        handles.push(tokio::spawn(file_watcher_task(file_path.clone(), file_tx)));
+
+        // Spawn appropriate upload task based on strategy
+        match upload_strategy {
+            HttpUploadStrategy::Standard { force_push, author } => {
+                handles.push(tokio::spawn(upload_task(
+                    client.clone(),
+                    server.clone(),
+                    identifier.clone(),
+                    file_path.clone(),
+                    state.clone(),
+                    file_rx,
+                    use_paths,
+                    force_push,
+                    author,
+                )));
+            }
+            HttpUploadStrategy::WithFlock {
+                force_push,
+                flock_state,
+                author,
+            } => {
+                handles.push(tokio::spawn(upload_task_with_flock(
+                    client.clone(),
+                    server.clone(),
+                    identifier.clone(),
+                    file_path.clone(),
+                    state.clone(),
+                    file_rx,
+                    use_paths,
+                    force_push,
+                    flock_state,
+                    author,
+                )));
+            }
+        }
+    }
+
+    // SSE task (skip if push-only)
+    if !push_only {
+        match sse_strategy {
+            SseStrategy::Standard {
+                #[cfg(unix)]
+                inode_tracker,
+            } => {
+                #[cfg(unix)]
+                if let Some(tracker) = inode_tracker {
+                    handles.push(tokio::spawn(crate::sync::sse_task_with_tracker(
+                        client, server, identifier, file_path, state, use_paths, tracker,
+                    )));
+                } else {
+                    handles.push(tokio::spawn(sse_task(
+                        client, server, identifier, file_path, state, use_paths,
+                    )));
+                }
+                #[cfg(not(unix))]
+                handles.push(tokio::spawn(sse_task(
+                    client, server, identifier, file_path, state, use_paths,
+                )));
+            }
+            SseStrategy::WithFlock {
+                flock_state,
+                doc_id,
+            } => {
+                handles.push(tokio::spawn(crate::sync::sse_task_with_flock(
+                    client,
+                    server,
+                    identifier,
+                    file_path,
+                    state,
+                    use_paths,
+                    flock_state,
+                    doc_id,
+                )));
+            }
+        }
+    }
+
+    handles
+}
+
 /// Spawn sync tasks (watcher, upload, SSE) for a single file.
 /// Returns the task handles so they can be aborted on file deletion.
 ///
@@ -1879,45 +1984,21 @@ pub fn spawn_file_sync_tasks(
     author: String,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
 ) -> Vec<JoinHandle<()>> {
-    let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
-    let mut handles = Vec::new();
-
-    // File watcher and upload tasks (skip if pull-only)
-    if !pull_only {
-        handles.push(tokio::spawn(file_watcher_task(file_path.clone(), file_tx)));
-        handles.push(tokio::spawn(upload_task(
-            client.clone(),
-            server.clone(),
-            identifier.clone(),
-            file_path.clone(),
-            state.clone(),
-            file_rx,
-            use_paths,
-            force_push,
-            author,
-        )));
-    }
-
-    // SSE task (skip if push-only)
-    // Use tracker variant for atomic writes when inode tracker is available
-    if !push_only {
-        #[cfg(unix)]
-        if let Some(tracker) = inode_tracker {
-            handles.push(tokio::spawn(crate::sync::sse_task_with_tracker(
-                client, server, identifier, file_path, state, use_paths, tracker,
-            )));
-        } else {
-            handles.push(tokio::spawn(sse_task(
-                client, server, identifier, file_path, state, use_paths,
-            )));
-        }
-        #[cfg(not(unix))]
-        handles.push(tokio::spawn(sse_task(
-            client, server, identifier, file_path, state, use_paths,
-        )));
-    }
-
-    handles
+    spawn_http_sync_tasks_inner(
+        client,
+        server,
+        identifier,
+        file_path,
+        state,
+        use_paths,
+        push_only,
+        pull_only,
+        HttpUploadStrategy::Standard { force_push, author },
+        SseStrategy::Standard {
+            #[cfg(unix)]
+            inode_tracker,
+        },
+    )
 }
 
 /// Spawn sync tasks (watcher, upload, SSE) for a single file with flock-aware tracking.
@@ -1948,47 +2029,30 @@ pub fn spawn_file_sync_tasks_with_flock(
     author: String,
     #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
 ) -> Vec<JoinHandle<()>> {
-    let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
-    let mut handles = Vec::new();
+    // Note: inode_tracker is unused for flock-aware sync since sse_task_with_flock
+    // handles atomic writes differently (via ancestry checking rather than inode tracking)
+    #[cfg(unix)]
+    let _ = inode_tracker;
 
-    // File watcher and flock-aware upload tasks (skip if pull-only)
-    if !pull_only {
-        handles.push(tokio::spawn(file_watcher_task(file_path.clone(), file_tx)));
-        handles.push(tokio::spawn(upload_task_with_flock(
-            client.clone(),
-            server.clone(),
-            identifier.clone(),
-            file_path.clone(),
-            state.clone(),
-            file_rx,
-            use_paths,
+    spawn_http_sync_tasks_inner(
+        client,
+        server,
+        identifier,
+        file_path,
+        state,
+        use_paths,
+        push_only,
+        pull_only,
+        HttpUploadStrategy::WithFlock {
             force_push,
-            flock_state.clone(),
+            flock_state: flock_state.clone(),
             author,
-        )));
-    }
-
-    // SSE task (skip if push-only)
-    // Use flock-aware SSE task for ancestry checking
-    if !push_only {
-        // Note: inode_tracker is only used on unix for atomic writes with shadow hardlinks
-        // For flock-aware sync, we use sse_task_with_flock which handles ancestry checking
-        #[cfg(unix)]
-        let _ = inode_tracker; // Acknowledge unused parameter on unix
-
-        handles.push(tokio::spawn(crate::sync::sse_task_with_flock(
-            client,
-            server,
-            identifier,
-            file_path,
-            state,
-            use_paths,
+        },
+        SseStrategy::WithFlock {
             flock_state,
             doc_id,
-        )));
-    }
-
-    handles
+        },
+    )
 }
 
 /// CRDT-aware upload task that publishes local changes via MQTT.
@@ -3568,5 +3632,283 @@ mod tests {
         assert!(!prepared.is_json);
         assert!(!prepared.is_jsonl);
         assert_eq!(prepared.content, "# Heading\n\nParagraph text.");
+    }
+
+    // Tests for EchoDetectionResult
+    #[test]
+    fn test_echo_detection_result_echo() {
+        let result = EchoDetectionResult::echo(true);
+        assert!(result.echo_detected);
+        assert!(result.should_refresh);
+        assert!(result.updated_content.is_none());
+
+        let result = EchoDetectionResult::echo(false);
+        assert!(result.echo_detected);
+        assert!(!result.should_refresh);
+        assert!(result.updated_content.is_none());
+    }
+
+    #[test]
+    fn test_echo_detection_result_no_echo() {
+        let result = EchoDetectionResult::no_echo(true, None);
+        assert!(!result.echo_detected);
+        assert!(result.should_refresh);
+        assert!(result.updated_content.is_none());
+
+        let result = EchoDetectionResult::no_echo(false, Some("updated".to_string()));
+        assert!(!result.echo_detected);
+        assert!(!result.should_refresh);
+        assert_eq!(result.updated_content, Some("updated".to_string()));
+    }
+
+    // Async tests for detect_echo_from_pending_write
+    mod echo_detection {
+        use super::*;
+        use crate::sync::state::PendingWrite;
+        use std::time::Instant;
+        use tokio::sync::RwLock;
+
+        fn create_test_state() -> Arc<RwLock<SyncState>> {
+            Arc::new(RwLock::new(SyncState::new()))
+        }
+
+        #[tokio::test]
+        async fn test_no_barrier_content_matches_trimmed() {
+            let state = create_test_state();
+            {
+                let mut s = state.write().await;
+                s.last_written_content = "hello world\n".to_string();
+            }
+
+            let result = detect_echo_from_pending_write(
+                &state,
+                "hello world",
+                false,
+                Path::new("/tmp/test.txt"),
+            )
+            .await;
+
+            assert!(result.echo_detected);
+            assert!(!result.should_refresh);
+            assert!(result.updated_content.is_none());
+        }
+
+        #[tokio::test]
+        async fn test_no_barrier_content_differs() {
+            let state = create_test_state();
+            {
+                let mut s = state.write().await;
+                s.last_written_content = "hello world".to_string();
+            }
+
+            let result = detect_echo_from_pending_write(
+                &state,
+                "different content",
+                false,
+                Path::new("/tmp/test.txt"),
+            )
+            .await;
+
+            assert!(!result.echo_detected);
+            assert!(!result.should_refresh);
+            assert!(result.updated_content.is_none());
+        }
+
+        #[tokio::test]
+        async fn test_no_barrier_needs_refresh_flag_cleared() {
+            let state = create_test_state();
+            {
+                let mut s = state.write().await;
+                s.last_written_content = "different".to_string();
+                s.needs_head_refresh = true;
+            }
+
+            let result = detect_echo_from_pending_write(
+                &state,
+                "content",
+                false,
+                Path::new("/tmp/test.txt"),
+            )
+            .await;
+
+            // should_refresh should be true (was needs_head_refresh)
+            assert!(!result.echo_detected);
+            assert!(result.should_refresh);
+
+            // Flag should be cleared in state
+            let s = state.read().await;
+            assert!(!s.needs_head_refresh);
+        }
+
+        #[tokio::test]
+        async fn test_pending_write_matches_content() {
+            let state = create_test_state();
+            {
+                let mut s = state.write().await;
+                s.pending_write = Some(PendingWrite {
+                    write_id: 1,
+                    content: "server content".to_string(),
+                    cid: Some("cid123".to_string()),
+                    started_at: Instant::now(),
+                });
+            }
+
+            let result = detect_echo_from_pending_write(
+                &state,
+                "server content",
+                false,
+                Path::new("/tmp/test.txt"),
+            )
+            .await;
+
+            assert!(result.echo_detected);
+            assert!(!result.should_refresh);
+            assert!(result.updated_content.is_none());
+
+            // Verify state was updated
+            let s = state.read().await;
+            assert!(s.pending_write.is_none()); // Barrier cleared
+            assert_eq!(s.last_written_cid, Some("cid123".to_string()));
+            assert_eq!(s.last_written_content, "server content");
+        }
+
+        #[tokio::test]
+        async fn test_pending_write_with_needs_refresh() {
+            let state = create_test_state();
+            {
+                let mut s = state.write().await;
+                s.needs_head_refresh = true;
+                s.pending_write = Some(PendingWrite {
+                    write_id: 2,
+                    content: "server content".to_string(),
+                    cid: Some("cid456".to_string()),
+                    started_at: Instant::now(),
+                });
+            }
+
+            let result = detect_echo_from_pending_write(
+                &state,
+                "server content",
+                false,
+                Path::new("/tmp/test.txt"),
+            )
+            .await;
+
+            assert!(result.echo_detected);
+            assert!(result.should_refresh); // Should be true
+            assert!(result.updated_content.is_none());
+
+            // Flag should be cleared
+            let s = state.read().await;
+            assert!(!s.needs_head_refresh);
+        }
+
+        #[tokio::test]
+        async fn test_pending_write_timed_out_matches() {
+            use crate::sync::PENDING_WRITE_TIMEOUT;
+            use std::time::Duration;
+
+            let state = create_test_state();
+            {
+                let mut s = state.write().await;
+                // Set started_at to beyond the timeout
+                s.pending_write = Some(PendingWrite {
+                    write_id: 3,
+                    content: "timed out content".to_string(),
+                    cid: Some("timeout_cid".to_string()),
+                    started_at: Instant::now() - PENDING_WRITE_TIMEOUT - Duration::from_secs(1),
+                });
+            }
+
+            let result = detect_echo_from_pending_write(
+                &state,
+                "timed out content",
+                false,
+                Path::new("/tmp/test.txt"),
+            )
+            .await;
+
+            // Timed out but content matches - treat as delayed echo
+            assert!(result.echo_detected);
+            assert!(!result.should_refresh);
+
+            // Verify state was updated
+            let s = state.read().await;
+            assert!(s.pending_write.is_none());
+            assert_eq!(s.last_written_cid, Some("timeout_cid".to_string()));
+            assert_eq!(s.last_written_content, "timed out content");
+        }
+
+        #[tokio::test]
+        async fn test_pending_write_timed_out_differs() {
+            use crate::sync::PENDING_WRITE_TIMEOUT;
+            use std::time::Duration;
+
+            let state = create_test_state();
+            {
+                let mut s = state.write().await;
+                s.pending_write = Some(PendingWrite {
+                    write_id: 4,
+                    content: "pending content".to_string(),
+                    cid: Some("stale_cid".to_string()),
+                    started_at: Instant::now() - PENDING_WRITE_TIMEOUT - Duration::from_secs(1),
+                });
+            }
+
+            let result = detect_echo_from_pending_write(
+                &state,
+                "user edit content",
+                false,
+                Path::new("/tmp/test.txt"),
+            )
+            .await;
+
+            // Timed out and content differs - treat as user edit
+            assert!(!result.echo_detected);
+            assert!(!result.should_refresh);
+            assert!(result.updated_content.is_none());
+
+            // State should NOT update last_written_* (old parent for CRDT merge)
+            let s = state.read().await;
+            assert!(s.pending_write.is_none());
+        }
+
+        #[tokio::test]
+        async fn test_empty_content_trimmed_comparison() {
+            let state = create_test_state();
+            {
+                let mut s = state.write().await;
+                s.last_written_content = "   \n\t".to_string(); // Whitespace only
+            }
+
+            let result =
+                detect_echo_from_pending_write(&state, "\n  ", false, Path::new("/tmp/test.txt"))
+                    .await;
+
+            // Both trim to empty, so should match
+            assert!(result.echo_detected);
+        }
+
+        #[tokio::test]
+        async fn test_binary_content_no_barrier() {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+
+            let state = create_test_state();
+            let binary_b64 = STANDARD.encode(b"\x00\x01\x02");
+            {
+                let mut s = state.write().await;
+                s.last_written_content = binary_b64.clone();
+            }
+
+            let result = detect_echo_from_pending_write(
+                &state,
+                &binary_b64,
+                true, // is_binary
+                Path::new("/tmp/test.bin"),
+            )
+            .await;
+
+            assert!(result.echo_detected);
+        }
     }
 }

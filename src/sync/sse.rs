@@ -287,6 +287,296 @@ pub async fn write_inbound_with_checks_atomic(
     Ok(InboundWriteResult::Written)
 }
 
+// ============================================================================
+// Helper functions for handle_server_edit variants
+// ============================================================================
+
+/// Result of checking HEAD and determining sync direction
+#[derive(Debug)]
+pub enum HeadCheckResult {
+    /// Should proceed with writing the content
+    Proceed {
+        head: crate::sync::HeadResponse,
+        direction: SyncDirection,
+    },
+    /// Should skip this edit (server has default content, local has data, etc.)
+    Skip { reason: &'static str },
+    /// HEAD fetch failed
+    Error { message: String },
+}
+
+/// Fetch HEAD from server and determine if we should proceed with the edit.
+///
+/// This implements the common logic for:
+/// 1. Fetching HEAD from server
+/// 2. CP-v5f7 guard: skip if server has default content but local has data
+/// 3. Determining sync direction via ancestry
+/// 4. Skip if local is ahead or in sync
+///
+/// Returns a `HeadCheckResult` indicating whether to proceed, skip, or error.
+pub async fn check_head_and_sync_direction(
+    client: &Client,
+    server: &str,
+    identifier: &str,
+    file_path: &Path,
+    local_cid: Option<&str>,
+    use_paths: bool,
+    content_info: &crate::sync::ContentTypeInfo,
+) -> HeadCheckResult {
+    // Fetch HEAD from server
+    let head = match fetch_head(client, server, identifier, use_paths).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            return HeadCheckResult::Error {
+                message: "HEAD not found (404)".to_string(),
+            };
+        }
+        Err(e) => {
+            return HeadCheckResult::Error {
+                message: format!("Failed to fetch HEAD: {:?}", e),
+            };
+        }
+    };
+
+    // CP-v5f7: Guard against restart data loss.
+    // When local_cid is None (fresh start, no persisted state) but local file has
+    // substantive content and server has only "default" content (empty or {}),
+    // skip pulling to prevent wiping local data with empty server content.
+    if local_cid.is_none() {
+        let server_is_default = is_default_content(&head.content, content_info);
+        if server_is_default {
+            // Check if local file has content
+            if let Ok(local_content) = std::fs::read(file_path) {
+                let local_is_default = if content_info.is_binary {
+                    local_content.is_empty()
+                } else {
+                    let local_str = String::from_utf8_lossy(&local_content);
+                    is_default_content(local_str.trim(), content_info)
+                };
+                if !local_is_default {
+                    return HeadCheckResult::Skip {
+                        reason: "server has default content but local has data",
+                    };
+                }
+            }
+        }
+    }
+
+    // Determine sync direction via ancestry
+    let server_cid = head.cid.as_deref();
+    let direction =
+        match determine_sync_direction(client, server, identifier, local_cid, server_cid).await {
+            Ok(dir) => dir,
+            Err(e) => {
+                return HeadCheckResult::Error {
+                    message: format!("Ancestry check failed: {}", e),
+                };
+            }
+        };
+
+    // Check if we should pull
+    if !direction.should_pull() {
+        return HeadCheckResult::Skip {
+            reason: "ancestry check indicates local is ahead or diverged",
+        };
+    }
+
+    // Skip if already in sync
+    if matches!(direction, SyncDirection::InSync) {
+        return HeadCheckResult::Skip {
+            reason: "already in sync, skipping redundant write",
+        };
+    }
+
+    HeadCheckResult::Proceed { head, direction }
+}
+
+/// Result of setting up the pending write barrier
+#[derive(Debug)]
+pub enum BarrierSetupResult {
+    /// Barrier set up successfully, proceed with write
+    Proceed { write_id: u64 },
+    /// Should skip this edit (local changes pending, concurrent write, etc.)
+    Skip { reason: &'static str },
+    /// Error reading local file
+    Error { message: String },
+}
+
+/// Set up the pending write barrier before writing.
+///
+/// This implements the common logic for:
+/// 1. Check if there's already a pending write (concurrent SSE events)
+/// 2. Read local file content
+/// 3. Check for pending local changes
+/// 4. Set up the pending write barrier
+/// 5. Update last_written_* state
+///
+/// Returns a `BarrierSetupResult` indicating whether to proceed, skip, or error.
+/// If `Proceed` is returned, the state lock has been released but the barrier is set.
+///
+/// The `allow_missing_file` parameter controls behavior when the file doesn't exist:
+/// - `false`: Return error if file read fails (used by handle_server_edit)
+/// - `true`: Treat as empty content (used by handle_server_edit_with_tracker)
+pub async fn setup_pending_write_barrier(
+    state: &Arc<RwLock<SyncState>>,
+    file_path: &Path,
+    head: &crate::sync::HeadResponse,
+    content_info: &crate::sync::ContentTypeInfo,
+    allow_missing_file: bool,
+) -> BarrierSetupResult {
+    let mut s = state.write().await;
+
+    // Check if there's already a pending write (concurrent SSE events)
+    if let Some(pending) = &s.pending_write {
+        if pending.started_at.elapsed() < PENDING_WRITE_TIMEOUT {
+            // Another write in progress
+            s.needs_head_refresh = true;
+            return BarrierSetupResult::Skip {
+                reason: "another write in progress",
+            };
+        }
+        // Timeout - clear stale pending and continue
+        warn!("Clearing timed-out pending write (id={})", pending.write_id);
+    }
+
+    // Read local file content to check for pending local changes
+    let raw_content = match std::fs::read(file_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && allow_missing_file => {
+            // File doesn't exist yet - that's OK, we'll create it
+            Vec::new()
+        }
+        Err(e) => {
+            return BarrierSetupResult::Error {
+                message: format!("Failed to read local file: {}", e),
+            };
+        }
+    };
+
+    // Only check for pending changes if file has content
+    if !raw_content.is_empty() {
+        let is_binary = content_info.is_binary || is_binary_content(&raw_content);
+        let local_content = if is_binary {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            STANDARD.encode(&raw_content)
+        } else {
+            String::from_utf8_lossy(&raw_content).to_string()
+        };
+
+        // Check if local content differs from what we last wrote
+        if local_content != s.last_written_content {
+            s.needs_head_refresh = true;
+            return BarrierSetupResult::Skip {
+                reason: "local changes pending",
+            };
+        }
+    }
+
+    // Set barrier with new token BEFORE writing
+    s.current_write_id += 1;
+    let write_id = s.current_write_id;
+    s.pending_write = Some(PendingWrite {
+        write_id,
+        content: head.content.clone(),
+        cid: head.cid.clone(),
+        started_at: std::time::Instant::now(),
+    });
+
+    // CRITICAL: Update last_written_* BEFORE releasing lock and writing.
+    s.last_written_content = head.content.clone();
+    s.last_written_cid = head.cid.clone();
+
+    BarrierSetupResult::Proceed { write_id }
+}
+
+/// Clear the pending write barrier on failure.
+pub async fn clear_pending_write_on_failure(state: &Arc<RwLock<SyncState>>, write_id: u64) {
+    let mut s = state.write().await;
+    if s.pending_write.as_ref().map(|p| p.write_id) == Some(write_id) {
+        s.pending_write = None;
+    }
+}
+
+/// Prepare content bytes for writing from HEAD response.
+///
+/// Handles binary detection and base64 decoding:
+/// - If extension indicates binary, decode base64
+/// - If content looks like base64-encoded binary, decode it
+/// - Otherwise, use content as-is (text)
+///
+/// Returns `Ok(bytes)` on success, `Err(message)` if base64 decode fails for binary.
+pub fn prepare_content_bytes(
+    head_content: &str,
+    content_info: &crate::sync::ContentTypeInfo,
+) -> Result<Vec<u8>, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    if content_info.is_binary {
+        // Extension says binary - decode base64
+        STANDARD
+            .decode(head_content)
+            .map_err(|e| format!("Failed to decode base64 content: {}", e))
+    } else if looks_like_base64_binary(head_content) {
+        // Extension says text, but content looks like base64-encoded binary
+        match STANDARD.decode(head_content) {
+            Ok(decoded) if is_binary_content(&decoded) => Ok(decoded),
+            _ => Ok(head_content.as_bytes().to_vec()),
+        }
+    } else {
+        // Text content
+        Ok(head_content.as_bytes().to_vec())
+    }
+}
+
+/// Prepare content bytes for writing, with fallback on decode failure.
+///
+/// Like `prepare_content_bytes`, but falls back to text encoding if base64 decode fails.
+/// This is useful for queuing writes where we want to always succeed.
+pub fn prepare_content_bytes_with_fallback(
+    head_content: &str,
+    content_info: &crate::sync::ContentTypeInfo,
+) -> Vec<u8> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    if content_info.is_binary {
+        // Extension says binary - try to decode base64, fall back to text
+        match STANDARD.decode(head_content) {
+            Ok(decoded) => decoded,
+            Err(_) => head_content.as_bytes().to_vec(),
+        }
+    } else if looks_like_base64_binary(head_content) {
+        // Extension says text, but content looks like base64-encoded binary
+        match STANDARD.decode(head_content) {
+            Ok(decoded) if is_binary_content(&decoded) => decoded,
+            _ => head_content.as_bytes().to_vec(),
+        }
+    } else {
+        // Text content
+        head_content.as_bytes().to_vec()
+    }
+}
+
+/// Log the result of a server content write.
+pub fn log_server_write(cid: &Option<String>, content_len: usize, write_id: u64, suffix: &str) {
+    match cid {
+        Some(cid) => info!(
+            "Wrote server content{}: {} bytes at {} (write_id={})",
+            suffix,
+            content_len,
+            &cid[..8.min(cid.len())],
+            write_id
+        ),
+        None => info!(
+            "Wrote server content{}: empty document (write_id={})",
+            suffix, write_id
+        ),
+    }
+}
+
+// ============================================================================
+// SSE connection and event loop
+// ============================================================================
+
 /// Shared SSE connection and event loop.
 ///
 /// This function implements the core SSE connect/reconnect/event-dispatch logic
@@ -608,20 +898,9 @@ pub async fn handle_server_edit_with_flock(
                 }
                 Ok(false) => {
                     // Not all ancestors - queue the write
-                    use base64::{engine::general_purpose::STANDARD, Engine};
-                    let content_bytes = if content_info.is_binary {
-                        match STANDARD.decode(&head.content) {
-                            Ok(decoded) => decoded,
-                            Err(_) => head.content.as_bytes().to_vec(),
-                        }
-                    } else if looks_like_base64_binary(&head.content) {
-                        match STANDARD.decode(&head.content) {
-                            Ok(decoded) if is_binary_content(&decoded) => decoded,
-                            _ => head.content.as_bytes().to_vec(),
-                        }
-                    } else {
-                        head.content.as_bytes().to_vec()
-                    };
+                    // Use prepare_content_bytes_with_fallback for queuing (never fails)
+                    let content_bytes =
+                        prepare_content_bytes_with_fallback(&head.content, &content_info);
 
                     flock_state
                         .queue_inbound(file_path, Bytes::from(content_bytes), commit_id.clone())
@@ -640,15 +919,9 @@ pub async fn handle_server_edit_with_flock(
                         ?file_path,
                         commit_id, "ancestry check failed, queuing write: {}", e
                     );
-                    use base64::{engine::general_purpose::STANDARD, Engine};
-                    let content_bytes = if content_info.is_binary {
-                        match STANDARD.decode(&head.content) {
-                            Ok(decoded) => decoded,
-                            Err(_) => head.content.as_bytes().to_vec(),
-                        }
-                    } else {
-                        head.content.as_bytes().to_vec()
-                    };
+                    // Use prepare_content_bytes_with_fallback for queuing (never fails)
+                    let content_bytes =
+                        prepare_content_bytes_with_fallback(&head.content, &content_info);
 
                     flock_state
                         .queue_inbound(file_path, Bytes::from(content_bytes), commit_id)
@@ -662,15 +935,8 @@ pub async fn handle_server_edit_with_flock(
                 ?file_path,
                 "no doc_id for ancestry check, queuing inbound write"
             );
-            use base64::{engine::general_purpose::STANDARD, Engine};
-            let content_bytes = if content_info.is_binary {
-                match STANDARD.decode(&head.content) {
-                    Ok(decoded) => decoded,
-                    Err(_) => head.content.as_bytes().to_vec(),
-                }
-            } else {
-                head.content.as_bytes().to_vec()
-            };
+            // Use prepare_content_bytes_with_fallback for queuing (never fails)
+            let content_bytes = prepare_content_bytes_with_fallback(&head.content, &content_info);
 
             flock_state
                 .queue_inbound(file_path, Bytes::from(content_bytes), commit_id)
@@ -859,221 +1125,72 @@ pub async fn handle_server_edit(
     // Detect if this file is binary (use both extension and content-based detection)
     let content_info = detect_from_path(file_path);
 
-    // Fetch new content from server first
-    let head = match fetch_head(client, server, identifier, use_paths).await {
-        Ok(Some(h)) => h,
-        Ok(None) => {
-            error!("HEAD not found (404)");
-            return;
-        }
-        Err(e) => {
-            error!("Failed to fetch HEAD: {:?}", e);
-            return;
-        }
-    };
-
     // Get our last known CID (snapshot from state) to check ancestry
     let local_cid = state.read().await.last_written_cid.clone();
 
-    // CP-v5f7: Guard against restart data loss.
-    // When local_cid is None (fresh start, no persisted state) but local file has
-    // substantive content and server has only "default" content (empty or {}),
-    // skip pulling to prevent wiping local data with empty server content.
-    if local_cid.is_none() {
-        let server_is_default = is_default_content(&head.content, &content_info);
-        if server_is_default {
-            // Check if local file has content
-            if let Ok(local_content) = std::fs::read(file_path) {
-                let local_is_default = if content_info.is_binary {
-                    local_content.is_empty()
-                } else {
-                    let local_str = String::from_utf8_lossy(&local_content);
-                    is_default_content(local_str.trim(), &content_info)
-                };
-                if !local_is_default {
-                    info!(
-                        "Skipping server edit: server has default content but local has data ({})",
-                        file_path.display()
-                    );
-                    state.write().await.needs_head_refresh = true;
-                    return;
-                }
-            }
-        }
-    }
-
-    // Use CRDT ancestry to determine if we should apply server content.
-    // Only pull if server is ahead of us (our CID is ancestor of server's CID).
-    let server_cid = head.cid.as_deref();
-    let direction = match determine_sync_direction(
+    // Check HEAD and determine sync direction using shared helper
+    let head = match check_head_and_sync_direction(
         client,
         server,
         identifier,
+        file_path,
         local_cid.as_deref(),
-        server_cid,
+        use_paths,
+        &content_info,
     )
     .await
     {
-        Ok(dir) => dir,
-        Err(e) => {
-            // Ancestry check failed - be conservative and skip
-            warn!("Ancestry check failed, skipping server edit: {}", e);
+        HeadCheckResult::Proceed { head, direction: _ } => head,
+        HeadCheckResult::Skip { reason } => {
+            debug!("Skipping server edit: {}", reason);
+            state.write().await.needs_head_refresh = true;
+            return;
+        }
+        HeadCheckResult::Error { message } => {
+            error!("{}", message);
             state.write().await.needs_head_refresh = true;
             return;
         }
     };
 
-    if !direction.should_pull() {
-        debug!("Ancestry check: {:?}, skipping server edit", direction);
-        state.write().await.needs_head_refresh = true;
-        return;
-    }
-
-    // Skip if already in sync - no need to write identical content.
-    // This prevents feedback loops where clients re-write the same content
-    // they just uploaded, triggering unnecessary file watcher events.
-    if matches!(direction, SyncDirection::InSync) {
-        debug!("Already in sync, skipping redundant write");
-        return;
-    }
-
-    // Acquire write lock and set up barrier atomically
-    let write_id = {
-        let mut s = state.write().await;
-
-        // Check if there's already a pending write (concurrent SSE events)
-        if let Some(pending) = &s.pending_write {
-            if pending.started_at.elapsed() < PENDING_WRITE_TIMEOUT {
-                // Another write in progress, we can't process this SSE event now.
-                // Set a flag so upload_task knows to refresh HEAD after clearing barrier.
-                // This prevents data loss when multiple server edits arrive quickly.
-                debug!(
-                    "Skipping server edit - another write in progress (id={}), \
-                     setting needs_head_refresh flag",
-                    pending.write_id
-                );
-                s.needs_head_refresh = true;
+    // Set up the pending write barrier using shared helper
+    // Note: allow_missing_file=false because this variant requires the file to exist
+    let write_id =
+        match setup_pending_write_barrier(state, file_path, &head, &content_info, false).await {
+            BarrierSetupResult::Proceed { write_id } => write_id,
+            BarrierSetupResult::Skip { reason } => {
+                debug!("Skipping server edit: {}", reason);
                 return;
             }
-            // Timeout - clear stale pending and continue
-            warn!("Clearing timed-out pending write (id={})", pending.write_id);
-        }
-
-        // Read local file content to check for pending local changes
-        let raw_content = match std::fs::read(file_path) {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Failed to read local file: {}", e);
+            BarrierSetupResult::Error { message } => {
+                error!("{}", message);
                 return;
             }
         };
 
-        let is_binary = content_info.is_binary || is_binary_content(&raw_content);
-        let local_content = if is_binary {
-            use base64::{engine::general_purpose::STANDARD, Engine};
-            STANDARD.encode(&raw_content)
-        } else {
-            String::from_utf8_lossy(&raw_content).to_string()
-        };
-
-        // Check if local content differs from what we last wrote
-        if local_content != s.last_written_content {
-            // Local changes pending - don't overwrite, let upload_task handle
-            // Set needs_head_refresh so upload_task will fetch HEAD after uploading
-            debug!("Skipping server update - local changes pending, setting needs_head_refresh");
-            s.needs_head_refresh = true;
+    // Prepare content bytes for writing using shared helper
+    let content_bytes = match prepare_content_bytes(&head.content, &content_info) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("{}", e);
+            clear_pending_write_on_failure(state, write_id).await;
             return;
         }
-
-        // Set barrier with new token BEFORE writing
-        s.current_write_id += 1;
-        let write_id = s.current_write_id;
-        s.pending_write = Some(PendingWrite {
-            write_id,
-            content: head.content.clone(),
-            cid: head.cid.clone(),
-            started_at: std::time::Instant::now(),
-        });
-
-        // CRITICAL: Update last_written_* BEFORE releasing lock and writing.
-        // The file watcher may process the inotify event immediately after we write,
-        // before we can update state in a subsequent lock acquisition. By updating
-        // here, we ensure the backup echo detection check always has the correct values.
-        s.last_written_content = head.content.clone();
-        s.last_written_cid = head.cid.clone();
-
-        write_id
     };
-    // Lock released before I/O
 
     // Write directly to local file (not atomic)
     // We avoid temp+rename because it changes the inode, which breaks
     // inotify file watchers on Linux. Since the server is authoritative,
     // partial writes on crash are recoverable via re-sync.
-    //
-    // For binary detection, use both extension-based AND content-based detection:
-    // - If extension suggests binary, decode base64
-    // - If extension says text, still try decoding as base64 in case
-    //   the file was detected as binary by content sniffing on upload
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let write_result = if content_info.is_binary {
-        // Extension says binary - decode base64
-        match STANDARD.decode(&head.content) {
-            Ok(decoded) => tokio::fs::write(file_path, &decoded).await,
-            Err(e) => {
-                error!("Failed to decode base64 content: {}", e);
-                // Clear barrier on failure
-                let mut s = state.write().await;
-                if s.pending_write.as_ref().map(|p| p.write_id) == Some(write_id) {
-                    s.pending_write = None;
-                }
-                return;
-            }
-        }
-    } else if looks_like_base64_binary(&head.content) {
-        // Extension says text, but content looks like base64-encoded binary
-        // This handles files that were detected as binary on upload
-        match STANDARD.decode(&head.content) {
-            Ok(decoded) if is_binary_content(&decoded) => {
-                // Successfully decoded and content is binary - write decoded bytes
-                tokio::fs::write(file_path, &decoded).await
-            }
-            _ => {
-                // Decode failed or not binary - write as text
-                tokio::fs::write(file_path, &head.content).await
-            }
-        }
-    } else {
-        // Extension says text, content doesn't look like base64 binary
-        tokio::fs::write(file_path, &head.content).await
-    };
+    let write_result = tokio::fs::write(file_path, &content_bytes).await;
 
     if let Err(e) = write_result {
         error!("Failed to write file: {}", e);
-        // Clear barrier on failure
-        let mut s = state.write().await;
-        if s.pending_write.as_ref().map(|p| p.write_id) == Some(write_id) {
-            s.pending_write = None;
-        }
+        clear_pending_write_on_failure(state, write_id).await;
         return;
     }
 
-    // Note: last_written_content and last_written_cid are now updated BEFORE the write
-    // (in the same lock block as pending_write setup) to prevent race conditions where
-    // the file watcher processes the inotify event before we can update state.
-
-    match &head.cid {
-        Some(cid) => info!(
-            "Wrote server content: {} bytes at {} (write_id={})",
-            head.content.len(),
-            &cid[..8.min(cid.len())],
-            write_id
-        ),
-        None => info!(
-            "Wrote server content: empty document (write_id={})",
-            write_id
-        ),
-    }
+    log_server_write(&head.cid, head.content.len(), write_id, "");
 }
 
 /// SSE task with inode tracking for shadow hardlinks.
@@ -1122,176 +1239,57 @@ pub async fn handle_server_edit_with_tracker(
     // Detect if this file is binary (use both extension and content-based detection)
     let content_info = detect_from_path(file_path);
 
-    // Fetch new content from server first
-    let head = match fetch_head(client, server, identifier, use_paths).await {
-        Ok(Some(h)) => h,
-        Ok(None) => {
-            error!("HEAD not found (404)");
-            return;
-        }
-        Err(e) => {
-            error!("Failed to fetch HEAD: {:?}", e);
-            return;
-        }
-    };
-
     // Get our last known CID (snapshot from state) to check ancestry
     let local_cid = state.read().await.last_written_cid.clone();
 
-    // CP-v5f7: Guard against restart data loss.
-    // When local_cid is None (fresh start, no persisted state) but local file has
-    // substantive content and server has only "default" content (empty or {}),
-    // skip pulling to prevent wiping local data with empty server content.
-    if local_cid.is_none() {
-        let server_is_default = is_default_content(&head.content, &content_info);
-        if server_is_default {
-            // Check if local file has content
-            if let Ok(local_content) = std::fs::read(file_path) {
-                let local_is_default = if content_info.is_binary {
-                    local_content.is_empty()
-                } else {
-                    let local_str = String::from_utf8_lossy(&local_content);
-                    is_default_content(local_str.trim(), &content_info)
-                };
-                if !local_is_default {
-                    info!(
-                        "Skipping server edit (tracker): server has default content but local has data ({})",
-                        file_path.display()
-                    );
-                    state.write().await.needs_head_refresh = true;
-                    return;
-                }
-            }
-        }
-    }
-
-    // Use CRDT ancestry to determine if we should apply server content.
-    // Only pull if server is ahead of us (our CID is ancestor of server's CID).
-    let server_cid = head.cid.as_deref();
-    let direction = match determine_sync_direction(
+    // Check HEAD and determine sync direction using shared helper
+    let head = match check_head_and_sync_direction(
         client,
         server,
         identifier,
+        file_path,
         local_cid.as_deref(),
-        server_cid,
+        use_paths,
+        &content_info,
     )
     .await
     {
-        Ok(dir) => dir,
-        Err(e) => {
-            // Ancestry check failed - be conservative and skip
-            warn!("Ancestry check failed, skipping server edit: {}", e);
+        HeadCheckResult::Proceed { head, direction: _ } => head,
+        HeadCheckResult::Skip { reason } => {
+            debug!("Skipping server edit (tracker): {}", reason);
+            state.write().await.needs_head_refresh = true;
+            return;
+        }
+        HeadCheckResult::Error { message } => {
+            error!("{}", message);
             state.write().await.needs_head_refresh = true;
             return;
         }
     };
 
-    if !direction.should_pull() {
-        debug!("Ancestry check: {:?}, skipping server edit", direction);
-        state.write().await.needs_head_refresh = true;
-        return;
-    }
-
-    // Skip if already in sync - no need to write identical content.
-    // This prevents feedback loops where clients re-write the same content
-    // they just uploaded, triggering unnecessary file watcher events.
-    if matches!(direction, SyncDirection::InSync) {
-        debug!("Already in sync, skipping redundant write");
-        return;
-    }
-
-    // Acquire write lock and set up barrier atomically
-    let write_id = {
-        let mut s = state.write().await;
-
-        // Check if there's already a pending write (concurrent SSE events)
-        if let Some(pending) = &s.pending_write {
-            if pending.started_at.elapsed() < PENDING_WRITE_TIMEOUT {
-                debug!(
-                    "Skipping server edit - another write in progress (id={}), \
-                     setting needs_head_refresh flag",
-                    pending.write_id
-                );
-                s.needs_head_refresh = true;
+    // Set up the pending write barrier using shared helper
+    // Note: allow_missing_file=true because this variant can create new files
+    let write_id =
+        match setup_pending_write_barrier(state, file_path, &head, &content_info, true).await {
+            BarrierSetupResult::Proceed { write_id } => write_id,
+            BarrierSetupResult::Skip { reason } => {
+                debug!("Skipping server edit (tracker): {}", reason);
                 return;
             }
-            warn!("Clearing timed-out pending write (id={})", pending.write_id);
-        }
-
-        // Read local file content to check for pending local changes
-        let raw_content = match std::fs::read(file_path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // File doesn't exist yet - that's OK, we'll create it
-                Vec::new()
-            }
-            Err(e) => {
-                error!("Failed to read local file: {}", e);
+            BarrierSetupResult::Error { message } => {
+                error!("{}", message);
                 return;
             }
         };
 
-        if !raw_content.is_empty() {
-            let is_binary = content_info.is_binary || is_binary_content(&raw_content);
-            let local_content = if is_binary {
-                use base64::{engine::general_purpose::STANDARD, Engine};
-                STANDARD.encode(&raw_content)
-            } else {
-                String::from_utf8_lossy(&raw_content).to_string()
-            };
-
-            // Check if local content differs from what we last wrote
-            if local_content != s.last_written_content {
-                debug!(
-                    "Skipping server update - local changes pending, setting needs_head_refresh"
-                );
-                s.needs_head_refresh = true;
-                return;
-            }
+    // Prepare content bytes for writing using shared helper
+    let content_bytes = match prepare_content_bytes(&head.content, &content_info) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("{}", e);
+            clear_pending_write_on_failure(state, write_id).await;
+            return;
         }
-
-        // Set barrier with new token BEFORE writing
-        s.current_write_id += 1;
-        let write_id = s.current_write_id;
-        s.pending_write = Some(PendingWrite {
-            write_id,
-            content: head.content.clone(),
-            cid: head.cid.clone(),
-            started_at: std::time::Instant::now(),
-        });
-
-        // CRITICAL: Update last_written_* BEFORE releasing lock and writing.
-        // The file watcher may process the inotify event immediately after we write,
-        // before we can update state in a subsequent lock acquisition. By updating
-        // here, we ensure the backup echo detection check always has the correct values.
-        s.last_written_content = head.content.clone();
-        s.last_written_cid = head.cid.clone();
-
-        write_id
-    };
-    // Lock released before I/O
-
-    // Prepare content bytes for writing
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let content_bytes: Vec<u8> = if content_info.is_binary {
-        match STANDARD.decode(&head.content) {
-            Ok(decoded) => decoded,
-            Err(e) => {
-                error!("Failed to decode base64 content: {}", e);
-                let mut s = state.write().await;
-                if s.pending_write.as_ref().map(|p| p.write_id) == Some(write_id) {
-                    s.pending_write = None;
-                }
-                return;
-            }
-        }
-    } else if looks_like_base64_binary(&head.content) {
-        match STANDARD.decode(&head.content) {
-            Ok(decoded) if is_binary_content(&decoded) => decoded,
-            _ => head.content.as_bytes().to_vec(),
-        }
-    } else {
-        head.content.as_bytes().to_vec()
     };
 
     // Use atomic write with shadow hardlinking
@@ -1300,28 +1298,11 @@ pub async fn handle_server_edit_with_tracker(
 
     if let Err(e) = write_result {
         error!("Failed to write file: {}", e);
-        let mut s = state.write().await;
-        if s.pending_write.as_ref().map(|p| p.write_id) == Some(write_id) {
-            s.pending_write = None;
-        }
+        clear_pending_write_on_failure(state, write_id).await;
         return;
     }
 
-    // Note: last_written_content and last_written_cid are now updated BEFORE the write
-    // (in the same lock block as pending_write setup) to prevent race conditions.
-
-    match &head.cid {
-        Some(cid) => info!(
-            "Wrote server content (atomic): {} bytes at {} (write_id={})",
-            head.content.len(),
-            &cid[..8.min(cid.len())],
-            write_id
-        ),
-        None => info!(
-            "Wrote server content (atomic): empty document (write_id={})",
-            write_id
-        ),
-    }
+    log_server_write(&head.cid, head.content.len(), write_id, " (atomic)");
 }
 
 /// Handle a write event from a shadowed inode.
@@ -1677,5 +1658,134 @@ mod tests {
         assert!(matches!(written, InboundWriteResult::Written));
         assert!(matches!(queued, InboundWriteResult::Queued));
         assert!(matches!(skipped, InboundWriteResult::Skipped));
+    }
+
+    // Tests for prepare_content_bytes helper
+    mod prepare_content_bytes_tests {
+        use super::*;
+        use crate::sync::content_type::ContentTypeInfo;
+
+        #[test]
+        fn test_prepare_text_content() {
+            let content_info = ContentTypeInfo::text("text/plain");
+            let result = prepare_content_bytes("hello world", &content_info);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), b"hello world");
+        }
+
+        #[test]
+        fn test_prepare_binary_content_valid_base64() {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            let binary_data = vec![0x89, 0x50, 0x4E, 0x47]; // PNG magic bytes
+            let encoded = STANDARD.encode(&binary_data);
+
+            let content_info = ContentTypeInfo::binary("image/png");
+            let result = prepare_content_bytes(&encoded, &content_info);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), binary_data);
+        }
+
+        #[test]
+        fn test_prepare_binary_content_invalid_base64() {
+            let content_info = ContentTypeInfo::binary("image/png");
+            // Invalid base64 should error
+            let result = prepare_content_bytes("not valid base64!!!", &content_info);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("Failed to decode"));
+        }
+
+        #[test]
+        fn test_prepare_text_with_base64_like_binary() {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            // Create binary content with at least 12 bytes (needed for looks_like_base64_binary)
+            // PNG header + IHDR chunk start = binary content that will be detected
+            let binary_data = vec![
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
+                0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
+            ];
+            let encoded = STANDARD.encode(&binary_data);
+
+            let content_info = ContentTypeInfo::text("text/plain"); // extension says text
+                                                                    // Should decode and detect binary content
+            let result = prepare_content_bytes(&encoded, &content_info);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), binary_data);
+        }
+    }
+
+    // Tests for prepare_content_bytes_with_fallback helper
+    mod prepare_content_bytes_with_fallback_tests {
+        use super::*;
+        use crate::sync::content_type::ContentTypeInfo;
+
+        #[test]
+        fn test_fallback_text_content() {
+            let content_info = ContentTypeInfo::text("text/plain");
+            let result = prepare_content_bytes_with_fallback("hello world", &content_info);
+            assert_eq!(result, b"hello world");
+        }
+
+        #[test]
+        fn test_fallback_binary_content_valid_base64() {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            let binary_data = vec![0x89, 0x50, 0x4E, 0x47];
+            let encoded = STANDARD.encode(&binary_data);
+
+            let content_info = ContentTypeInfo::binary("image/png");
+            let result = prepare_content_bytes_with_fallback(&encoded, &content_info);
+            assert_eq!(result, binary_data);
+        }
+
+        #[test]
+        fn test_fallback_binary_content_invalid_base64_returns_text() {
+            let content_info = ContentTypeInfo::binary("image/png");
+            // Invalid base64 should NOT error - falls back to text
+            let result = prepare_content_bytes_with_fallback("not valid base64!!!", &content_info);
+            assert_eq!(result, b"not valid base64!!!");
+        }
+    }
+
+    // Tests for HeadCheckResult and BarrierSetupResult enums
+    #[test]
+    fn test_head_check_result_variants() {
+        use crate::sync::ancestry::SyncDirection;
+        use crate::sync::HeadResponse;
+
+        let proceed = HeadCheckResult::Proceed {
+            head: HeadResponse {
+                content: "test".to_string(),
+                cid: Some("cid123".to_string()),
+                state: None,
+            },
+            direction: SyncDirection::Pull,
+        };
+        let skip = HeadCheckResult::Skip {
+            reason: "test reason",
+        };
+        let error = HeadCheckResult::Error {
+            message: "test error".to_string(),
+        };
+
+        assert!(matches!(proceed, HeadCheckResult::Proceed { .. }));
+        assert!(matches!(skip, HeadCheckResult::Skip { .. }));
+        assert!(matches!(error, HeadCheckResult::Error { .. }));
+    }
+
+    #[test]
+    fn test_barrier_setup_result_variants() {
+        let proceed = BarrierSetupResult::Proceed { write_id: 42 };
+        let skip = BarrierSetupResult::Skip {
+            reason: "test reason",
+        };
+        let error = BarrierSetupResult::Error {
+            message: "test error".to_string(),
+        };
+
+        assert!(matches!(
+            proceed,
+            BarrierSetupResult::Proceed { write_id: 42 }
+        ));
+        assert!(matches!(skip, BarrierSetupResult::Skip { .. }));
+        assert!(matches!(error, BarrierSetupResult::Error { .. }));
     }
 }
