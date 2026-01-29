@@ -649,13 +649,8 @@ fn wait_for_process_removed(
 /// - H6: Verify process stopped and removed from commonplace-ps within 10 seconds
 ///
 /// Requires MQTT broker on localhost:1883 (skipped if not available).
-///
-/// IGNORED: This test is blocked by a sync CRDT schema bug where MQTT broadcasts
-/// empty schemas (0 entries) that override valid schemas, causing the sync to
-/// stop watching files. This prevents file changes from being detected and pushed
-/// to the server. The underlying sync bug needs to be fixed first.
 #[test]
-#[ignore = "Blocked by sync CRDT schema bug - empty MQTT schemas override valid schemas"]
+#[ignore = "Blocked by discovery manager not detecting __processes.json content changes via MQTT"]
 fn test_processes_json_add_remove_starts_stops_processes() {
     if !mqtt_available() {
         eprintln!("Skipping test: MQTT broker not available on localhost:1883");
@@ -833,11 +828,8 @@ fn test_processes_json_add_remove_starts_stops_processes() {
 /// - H1: Edit __processes.json to change a process command
 /// - H2: Verify process restarted with new PID within 10 seconds
 ///
-/// IGNORED: This test is blocked by a sync CRDT schema bug where MQTT broadcasts
-/// empty schemas (0 entries) that override valid schemas, causing the sync to
-/// stop watching files. The underlying sync bug needs to be fixed first.
 #[test]
-#[ignore = "Blocked by sync CRDT schema bug - empty MQTT schemas override valid schemas"]
+#[ignore = "Blocked by discovery manager not detecting __processes.json content changes via MQTT"]
 fn test_process_config_change_triggers_restart() {
     if !mqtt_available() {
         eprintln!("Skipping test: MQTT broker not available on localhost:1883");

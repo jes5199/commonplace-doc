@@ -966,6 +966,18 @@ impl DiscoveredProcessManager {
                                 }
                             }
 
+                            // Re-read already-watched __processes.json files to detect content changes.
+                            // MQTT should handle this in real-time via DocumentChanged events, but
+                            // as a fallback, we re-read on each periodic discovery cycle.
+                            for (base_path, node_id) in &new_discovery.processes_json_files {
+                                if watched.contains_key(node_id) {
+                                    let url = format!("{}/docs/{}/head", self.server_url, node_id);
+                                    if let Err(e) = self.fetch_and_reconcile(client, &url, base_path).await {
+                                        tracing::debug!("[discovery] Failed to re-read {}/__processes.json: {}", base_path, e);
+                                    }
+                                }
+                            }
+
                             // Check for removed __processes.json files
                             let new_ids: HashSet<_> = new_discovery.processes_json_files.iter().map(|(_, id)| id.clone()).collect();
                             let removed_pj: Vec<_> = watched.keys()

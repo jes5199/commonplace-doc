@@ -871,27 +871,83 @@ pub async fn directory_mqtt_task(
                         entry_count, entry_names
                     );
 
-                    // Compute hash for deduplication
-                    let current_hash =
-                        crate::sync::state_file::compute_content_hash(schema_json.as_bytes());
-                    let is_duplicate = last_schema_hash.as_ref() == Some(&current_hash);
-
-                    if !is_duplicate {
-                        // Write the schema to disk
-                        if let Err(e) = crate::sync::write_schema_file(
+                    // Guard: If the decoded schema has 0 entries, don't process it.
+                    // An empty schema can result from applying updates to state that
+                    // was initialized empty (e.g., after resync where server had no
+                    // Yjs state). Processing an empty schema would write an empty
+                    // .commonplace.json and trigger cleanup that deletes real files.
+                    // Instead, trigger a resync from server. See CP-bfav.
+                    if entry_count == 0 {
+                        info!(
+                            "[CRDT-GUARD] Root schema decoded with 0 entries after MQTT update. \
+                             Skipping processing and triggering resync to avoid data loss."
+                        );
+                        // Trigger resync from server to get authoritative state
+                        resync_schema_from_server(
+                            &http_client,
+                            &server,
+                            &fs_root_id,
+                            ctx,
                             &directory,
-                            schema_json,
                             written_schemas.as_ref(),
                         )
-                        .await
-                        {
-                            warn!("MQTT: Failed to write schema file: {}", e);
-                        }
+                        .await;
+                    } else {
+                        // Compute hash for deduplication
+                        let current_hash =
+                            crate::sync::state_file::compute_content_hash(schema_json.as_bytes());
+                        let is_duplicate = last_schema_hash.as_ref() == Some(&current_hash);
 
-                        // Handle new files using MQTT schema
-                        let schema_tuple = (schema.clone(), schema_json.clone());
-                        if !push_only {
-                            if let Err(e) = handle_subdir_new_files(
+                        if !is_duplicate {
+                            // Write the schema to disk
+                            if let Err(e) = crate::sync::write_schema_file(
+                                &directory,
+                                schema_json,
+                                written_schemas.as_ref(),
+                            )
+                            .await
+                            {
+                                warn!("MQTT: Failed to write schema file: {}", e);
+                            }
+
+                            // Handle new files using MQTT schema
+                            let schema_tuple = (schema.clone(), schema_json.clone());
+                            if !push_only {
+                                if let Err(e) = handle_subdir_new_files(
+                                    &http_client,
+                                    &server,
+                                    &fs_root_id,
+                                    "", // root directory = empty subdir_path
+                                    &directory,
+                                    &directory,
+                                    &file_states,
+                                    use_paths,
+                                    push_only,
+                                    pull_only,
+                                    shared_state_file.as_ref(),
+                                    &author,
+                                    #[cfg(unix)]
+                                    inode_tracker.clone(),
+                                    crdt_context.as_ref(),
+                                    Some(schema_tuple.clone()),
+                                )
+                                .await
+                                {
+                                    warn!("MQTT: Failed to sync new files: {}", e);
+                                }
+
+                                // Reconcile UUIDs after schema update to fix any drift
+                                let mut state = ctx.crdt_state.write().await;
+                                if let Err(e) = state.reconcile_with_schema(&directory).await {
+                                    warn!(
+                                        "MQTT: Failed to reconcile UUIDs after schema update: {}",
+                                        e
+                                    );
+                                }
+                            }
+
+                            // Handle deletions using MQTT schema
+                            if let Err(e) = handle_subdir_schema_cleanup(
                                 &http_client,
                                 &server,
                                 &fs_root_id,
@@ -899,68 +955,38 @@ pub async fn directory_mqtt_task(
                                 &directory,
                                 &directory,
                                 &file_states,
-                                use_paths,
-                                push_only,
-                                pull_only,
-                                shared_state_file.as_ref(),
-                                &author,
-                                #[cfg(unix)]
-                                inode_tracker.clone(),
-                                crdt_context.as_ref(),
-                                Some(schema_tuple.clone()),
+                                Some(schema_tuple),
                             )
                             .await
                             {
-                                warn!("MQTT: Failed to sync new files: {}", e);
+                                warn!("MQTT: Failed to cleanup deleted files: {}", e);
                             }
 
-                            // Reconcile UUIDs after schema update to fix any drift
-                            let mut state = ctx.crdt_state.write().await;
-                            if let Err(e) = state.reconcile_with_schema(&directory).await {
-                                warn!("MQTT: Failed to reconcile UUIDs after schema update: {}", e);
+                            // Ensure CRDT tasks exist for all files
+                            if let Err(e) = ensure_crdt_tasks_for_files(
+                                &http_client,
+                                &server,
+                                &directory,
+                                &file_states,
+                                pull_only,
+                                &author,
+                                ctx,
+                            )
+                            .await
+                            {
+                                warn!("MQTT: Failed to ensure CRDT tasks: {}", e);
                             }
-                        }
 
-                        // Handle deletions using MQTT schema
-                        if let Err(e) = handle_subdir_schema_cleanup(
-                            &http_client,
-                            &server,
-                            &fs_root_id,
-                            "", // root directory = empty subdir_path
-                            &directory,
-                            &directory,
-                            &file_states,
-                            Some(schema_tuple),
-                        )
-                        .await
-                        {
-                            warn!("MQTT: Failed to cleanup deleted files: {}", e);
+                            // Update dedup state (hash and CID for ancestry tracking)
+                            last_schema_hash = Some(current_hash);
+                            // Sync last_schema_cid from CRDT state to maintain ancestry checks
+                            if updated_cid.is_some() {
+                                last_schema_cid = updated_cid.clone();
+                            }
+                        } else {
+                            debug!("MQTT: Schema unchanged (same hash), skipped processing");
                         }
-
-                        // Ensure CRDT tasks exist for all files
-                        if let Err(e) = ensure_crdt_tasks_for_files(
-                            &http_client,
-                            &server,
-                            &directory,
-                            &file_states,
-                            pull_only,
-                            &author,
-                            ctx,
-                        )
-                        .await
-                        {
-                            warn!("MQTT: Failed to ensure CRDT tasks: {}", e);
-                        }
-
-                        // Update dedup state (hash and CID for ancestry tracking)
-                        last_schema_hash = Some(current_hash);
-                        // Sync last_schema_cid from CRDT state to maintain ancestry checks
-                        if updated_cid.is_some() {
-                            last_schema_cid = updated_cid.clone();
-                        }
-                    } else {
-                        debug!("MQTT: Schema unchanged (same hash), skipped processing");
-                    }
+                    } // end of entry_count > 0 guard
                 } else {
                     trace_log(
                         "MQTT: Failed to decode schema from CRDT state, falling back to HTTP",

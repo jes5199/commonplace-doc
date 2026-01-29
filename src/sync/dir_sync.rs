@@ -145,10 +145,14 @@ pub fn apply_schema_update_to_state(
         }
     };
 
+    // Track whether CRDT state was uninitialized before this update.
+    // The first MQTT retained message carries the full state and correctly
+    // initializes an empty doc. But delta-only updates (e.g., DELETE operations)
+    // applied to an empty doc produce 0 entries, which would trigger destructive
+    // cleanup. See CP-bfav.
+    let was_uninitialized = state.needs_server_init();
+
     // Load existing Y.Doc from state, or create fresh if none exists.
-    // Since we no longer initialize from local file (see CP-1ual), the first MQTT
-    // message will initialize the state with the server's correct item IDs.
-    // This ensures DELETE operations work correctly.
     let doc = match state.to_doc() {
         Ok(d) => {
             // Log existing entries for debugging
@@ -162,8 +166,8 @@ pub fn apply_schema_update_to_state(
                 })
                 .unwrap_or(0);
             info!(
-                "[CRDT-DEBUG] Loaded existing Y.Doc with {} entries",
-                before_count
+                "[CRDT-DEBUG] Loaded existing Y.Doc with {} entries (was_uninitialized={})",
+                before_count, was_uninitialized
             );
             d
         }
@@ -198,9 +202,23 @@ pub fn apply_schema_update_to_state(
         })
         .unwrap_or(0);
     info!(
-        "[CRDT-DEBUG] After applying update: {} entries",
-        after_count
+        "[CRDT-DEBUG] After applying update: {} entries (was_uninitialized={})",
+        after_count, was_uninitialized
     );
+
+    // Guard: If the update produced 0 entries and the state was uninitialized,
+    // this is likely a delta-only update (e.g., DELETE) applied to an empty doc.
+    // Don't persist this - return None so the caller falls back to HTTP/resync.
+    // However, if the update produced entries, it's a valid full-state initialization
+    // (e.g., retained MQTT message) and should be accepted. See CP-bfav.
+    if after_count == 0 && was_uninitialized {
+        info!(
+            "[CRDT-GUARD] Schema update produced 0 entries from uninitialized state. \
+             This is likely a delta applied to an empty doc. Skipping to avoid data loss. \
+             Caller should resync from server."
+        );
+        return None;
+    }
 
     // Save the updated doc back to state
     state.update_from_doc(&doc);
@@ -309,6 +327,32 @@ async fn path_in_written_schemas(
 /// removes any orphaned directories (directories that exist locally but
 /// have no corresponding entry in the schema).
 async fn cleanup_orphaned_directories(directory: &Path, schema: &FsSchema) {
+    // Guard: If schema is empty (root=None or 0 entries), treat it as "unknown"
+    // rather than "everything deleted". An empty schema can result from applying
+    // a delta to uninitialized CRDT state, and deleting all directories would
+    // cause data loss. See CP-bfav.
+    let entry_count = schema
+        .root
+        .as_ref()
+        .and_then(|e| match e {
+            Entry::Dir(dir) => dir.entries.as_ref().map(|e| e.len()),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if schema.root.is_none() || entry_count == 0 {
+        info!(
+            "[CRDT-GUARD] Skipping orphaned directory cleanup: schema is empty \
+             (root={}, entries={}). Empty schema treated as unknown, not as all-deleted.",
+            if schema.root.is_some() {
+                "Some"
+            } else {
+                "None"
+            },
+            entry_count
+        );
+        return;
+    }
+
     // Collect all directory names from the schema
     let schema_dirs: std::collections::HashSet<String> = collect_schema_directories(schema);
 
@@ -406,6 +450,32 @@ pub async fn handle_subdir_schema_cleanup(
         };
         (fetched.schema, fetched.content)
     };
+
+    // Guard: If schema is empty (root=None or 0 entries), skip ALL cleanup.
+    // An empty schema can result from applying a delta to uninitialized CRDT state,
+    // and deleting all files/directories would cause data loss. See CP-bfav.
+    let schema_entry_count = schema
+        .root
+        .as_ref()
+        .and_then(|e| match e {
+            Entry::Dir(dir) => dir.entries.as_ref().map(|e| e.len()),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if schema.root.is_none() || schema_entry_count == 0 {
+        info!(
+            "[CRDT-GUARD] Skipping subdir schema cleanup for '{}': schema is empty \
+             (root={}, entries={}). Empty schema treated as unknown, not as all-deleted.",
+            subdir_path,
+            if schema.root.is_some() {
+                "Some"
+            } else {
+                "None"
+            },
+            schema_entry_count
+        );
+        return Ok(());
+    }
 
     // Write valid schema to local .commonplace.json file
     if let Err(e) = write_schema_file(subdir_directory, &schema_json, None).await {
