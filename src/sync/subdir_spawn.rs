@@ -3,12 +3,12 @@
 //! This module centralizes the logic for:
 //! 1. Discovering node-backed subdirectories via get_all_node_backed_dir_ids
 //! 2. Filtering for newly discovered subdirs (not already watched)
-//! 3. Spawning appropriate SSE or MQTT tasks for each new subdir
+//! 3. Spawning MQTT tasks for each new subdir
 //!
 //! Used by both `subscriptions.rs` and `bin/sync.rs` to avoid duplication.
 
 use crate::mqtt::MqttClient;
-use crate::sync::subscriptions::{subdir_mqtt_task, subdir_sse_task, CrdtFileSyncContext};
+use crate::sync::subscriptions::{subdir_mqtt_task, CrdtFileSyncContext};
 use crate::sync::uuid_map::get_all_node_backed_dir_ids;
 use crate::sync::FileSyncState;
 use reqwest::Client;
@@ -21,8 +21,6 @@ use tracing::info;
 /// Transport mode for subdir sync tasks.
 #[derive(Clone)]
 pub enum SubdirTransport {
-    /// Use SSE (Server-Sent Events) for subscriptions.
-    Sse,
     /// Use MQTT for subscriptions.
     Mqtt {
         client: Arc<MqttClient>,
@@ -56,7 +54,7 @@ pub struct SubdirSpawnParams {
 /// This function:
 /// 1. Fetches all node-backed subdirs from the server
 /// 2. Filters for subdirs not already in watched_subdirs
-/// 3. Spawns SSE or MQTT tasks based on the transport mode
+/// 3. Spawns MQTT tasks for each new subdir
 /// 4. Updates watched_subdirs with newly spawned subdirs
 ///
 /// Returns the number of new subdirs spawned.
@@ -79,29 +77,6 @@ pub async fn spawn_subdir_watchers(
         spawned_count += 1;
 
         match &transport {
-            SubdirTransport::Sse => {
-                info!(
-                    "Spawning SSE task for node-backed subdir: {} ({})",
-                    subdir_path, subdir_node_id
-                );
-                tokio::spawn(subdir_sse_task(
-                    params.client.clone(),
-                    params.server.clone(),
-                    params.fs_root_id.clone(),
-                    subdir_path,
-                    subdir_node_id,
-                    params.directory.clone(),
-                    params.file_states.clone(),
-                    params.use_paths,
-                    params.push_only,
-                    params.pull_only,
-                    params.shared_state_file.clone(),
-                    params.author.clone(),
-                    #[cfg(unix)]
-                    params.inode_tracker.clone(),
-                    params.watched_subdirs.clone(),
-                ));
-            }
             SubdirTransport::Mqtt { client, workspace } => {
                 info!(
                     "Spawning MQTT task for node-backed subdir: {} ({})",

@@ -717,7 +717,7 @@ pub async fn handle_subdir_schema_cleanup(
 
 /// Handle syncing NEW files that appear in a subdirectory schema.
 ///
-/// This is called from `subdir_sse_task` when a subdirectory schema changes.
+/// This is called from `subdir_mqtt_task` when a subdirectory schema changes.
 /// It finds files in the server schema that don't exist locally and syncs them.
 ///
 /// When `crdt_context` is provided, CRDT sync tasks are spawned instead of HTTP sync tasks.

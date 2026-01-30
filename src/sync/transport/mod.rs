@@ -61,8 +61,8 @@ pub use sse::{
 
 // From subscriptions
 pub use subscriptions::{
-    directory_mqtt_task, directory_sse_task, spawn_subdir_mqtt_task, spawn_subdir_sse_task,
-    subdir_mqtt_task, subdir_sse_task, trace_timeline, CrdtFileSyncContext, TimelineMilestone,
+    directory_mqtt_task, spawn_subdir_mqtt_task, subdir_mqtt_task, trace_timeline,
+    CrdtFileSyncContext, TimelineMilestone,
 };
 
 // From urls
