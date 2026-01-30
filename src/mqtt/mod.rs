@@ -12,6 +12,7 @@ pub mod commands;
 pub mod edits;
 pub mod events;
 pub mod messages;
+pub mod request;
 pub mod sync;
 pub mod topics;
 
@@ -29,6 +30,7 @@ pub use messages::{
     DeleteDocumentResponse, EditMessage, EventMessage, GetContentRequest, GetContentResponse,
     GetInfoRequest, GetInfoResponse, SyncMessage,
 };
+pub use request::MqttRequestClient;
 pub use topics::{Port, Topic};
 
 /// Errors that can occur in MQTT operations.
