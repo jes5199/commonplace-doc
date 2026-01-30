@@ -32,9 +32,7 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::RwLock;
-use tokio::time::sleep;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use yrs::updates::decoder::Decode;
@@ -2545,32 +2543,6 @@ pub async fn sync_schema(
                     write_nested_schemas(client, server, directory, &server_schema, None).await
                 {
                     warn!("Failed to write nested schemas from server: {}", e);
-                }
-            }
-        }
-
-        // Retry fetching nested schemas to handle async directory creation by other clients
-        for attempt in 2..=3 {
-            // Wait between retries to give other sync clients time to push schemas
-            info!(
-                "Waiting 3s before retry #{} of write_nested_schemas...",
-                attempt
-            );
-            sleep(Duration::from_secs(3)).await;
-
-            if let Ok(Some(head)) = fetch_head(client, server, fs_root_id, false).await {
-                // Update final_cid with the latest CID from retry
-                final_cid = head.cid.clone();
-                if let Ok(server_schema) = serde_json::from_str::<FsSchema>(&head.content) {
-                    info!(
-                        "Writing nested schemas from server (attempt {})...",
-                        attempt
-                    );
-                    if let Err(e) =
-                        write_nested_schemas(client, server, directory, &server_schema, None).await
-                    {
-                        warn!("Failed to write nested schemas from server: {}", e);
-                    }
                 }
             }
         }
