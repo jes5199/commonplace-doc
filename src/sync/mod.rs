@@ -117,6 +117,7 @@ pub use transport::client;
 pub use transport::commands;
 pub use transport::missing_parent;
 pub use transport::peer_fallback;
+pub use transport::shadow;
 pub use transport::sse;
 pub use transport::subscriptions;
 pub use transport::urls;
@@ -203,7 +204,7 @@ pub use transport::ancestry::{determine_sync_direction, is_ancestor, SyncDirecti
 pub use transport::client::{
     delete_schema_entry, discover_fs_root, fetch_head, fork_node, push_content_by_type,
     push_file_content, push_json_content, push_jsonl_content, push_schema_to_server,
-    resolve_path_to_uuid_http, DiscoverFsRootError, FetchHeadError,
+    refresh_from_head, resolve_path_to_uuid_http, DiscoverFsRootError, FetchHeadError,
 };
 pub use transport::commands::{spawn_command_listener, CommandEntry};
 pub use transport::missing_parent::{
@@ -216,15 +217,16 @@ pub use transport::peer_fallback::{
     PeerFallbackHandler, PeerFallbackStats, PendingRequest, SharedPeerFallbackHandler,
 };
 #[cfg(unix)]
-pub use transport::sse::{
-    atomic_write_with_shadow, handle_server_edit_with_tracker, handle_shadow_write,
-    shadow_write_handler_task, sse_task_with_tracker, write_inbound_with_checks,
-    write_inbound_with_checks_atomic, InboundWriteError, InboundWriteResult,
+pub use transport::shadow::{
+    atomic_write_with_shadow, handle_shadow_write, shadow_write_handler_task,
+    write_inbound_with_checks, write_inbound_with_checks_atomic, InboundWriteError,
+    InboundWriteResult,
 };
 pub use transport::sse::{
-    handle_server_edit, handle_server_edit_with_flock, refresh_from_head, sse_task,
-    sse_task_with_flock, PENDING_WRITE_TIMEOUT,
+    handle_server_edit, handle_server_edit_with_flock, sse_task, sse_task_with_flock,
 };
+#[cfg(unix)]
+pub use transport::sse::{handle_server_edit_with_tracker, sse_task_with_tracker};
 pub use transport::subscriptions::{
     directory_mqtt_task, spawn_subdir_mqtt_task, subdir_mqtt_task, trace_timeline,
     CrdtFileSyncContext, TimelineMilestone,
@@ -246,6 +248,7 @@ pub use file_sync::{
     initial_sync, initialize_crdt_state_from_server,
     initialize_crdt_state_from_server_with_pending, prepare_content_for_upload,
     spawn_file_sync_tasks_crdt, sync_single_file, upload_task, upload_task_crdt, PreparedContent,
+    PENDING_WRITE_TIMEOUT,
 };
 pub use types::{
     build_uuid_to_paths_map, remove_file_state_and_abort, CommitData, DirEvent, EditEventData,

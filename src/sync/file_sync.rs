@@ -18,7 +18,7 @@ use crate::sync::{
     ensure_trailing_newline, error::SyncResult, file_watcher_task, is_binary_content,
     is_default_content_for_mime, looks_like_base64_binary, push_json_content, push_jsonl_content,
     push_schema_to_server, refresh_from_head, trace_timeline, EditRequest, EditResponse, FileEvent,
-    ReplaceResponse, SharedLastContent, SyncState, TimelineMilestone, PENDING_WRITE_TIMEOUT,
+    ReplaceResponse, SharedLastContent, SyncState, TimelineMilestone,
 };
 use reqwest::Client;
 use rumqttc::QoS;
@@ -32,6 +32,8 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use yrs::{GetString, ReadTxn, Transact};
 
+/// Timeout for pending write barrier (30 seconds)
+pub const PENDING_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Number of retries when content differs during a pending write (handles partial writes)
 pub const BARRIER_RETRY_COUNT: u32 = 5;
 /// Delay between retries when checking for stable content

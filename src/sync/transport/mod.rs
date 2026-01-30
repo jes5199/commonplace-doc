@@ -15,6 +15,7 @@ pub mod client;
 pub mod commands;
 pub mod missing_parent;
 pub mod peer_fallback;
+pub mod shadow;
 pub mod sse;
 pub mod subscriptions;
 pub mod urls;
@@ -28,7 +29,7 @@ pub use ancestry::{all_are_ancestors, determine_sync_direction, is_ancestor, Syn
 pub use client::{
     delete_schema_entry, discover_fs_root, fetch_head, fork_node, push_content_by_type,
     push_file_content, push_json_content, push_jsonl_content, push_schema_to_server,
-    resolve_path_to_uuid_http, DiscoverFsRootError, FetchHeadError,
+    refresh_from_head, resolve_path_to_uuid_http, DiscoverFsRootError, FetchHeadError,
 };
 
 // From commands
@@ -47,17 +48,18 @@ pub use peer_fallback::{
     PeerFallbackHandler, PeerFallbackStats, PendingRequest, SharedPeerFallbackHandler,
 };
 
-// From sse
+// From shadow
 #[cfg(unix)]
-pub use sse::{
-    atomic_write_with_shadow, handle_server_edit_with_tracker, handle_shadow_write,
-    shadow_write_handler_task, sse_task_with_tracker, write_inbound_with_checks,
-    write_inbound_with_checks_atomic, InboundWriteError, InboundWriteResult,
+pub use shadow::{
+    atomic_write_with_shadow, handle_shadow_write, shadow_write_handler_task,
+    write_inbound_with_checks, write_inbound_with_checks_atomic, InboundWriteError,
+    InboundWriteResult,
 };
-pub use sse::{
-    handle_server_edit, handle_server_edit_with_flock, refresh_from_head, sse_task,
-    sse_task_with_flock, PENDING_WRITE_TIMEOUT,
-};
+
+// From sse
+pub use sse::{handle_server_edit, handle_server_edit_with_flock, sse_task, sse_task_with_flock};
+#[cfg(unix)]
+pub use sse::{handle_server_edit_with_tracker, sse_task_with_tracker};
 
 // From subscriptions
 pub use subscriptions::{

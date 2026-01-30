@@ -891,7 +891,7 @@ pub fn spawn_shadow_tasks(
     tokio::task::JoinHandle<()>,
 ) {
     use super::watcher::ShadowWriteEvent;
-    use crate::sync::sse::shadow_write_handler_task;
+    use crate::sync::shadow::shadow_write_handler_task;
 
     // Create channel for shadow write events
     let (shadow_tx, shadow_rx) = mpsc::channel::<ShadowWriteEvent>(100);

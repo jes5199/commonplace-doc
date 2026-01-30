@@ -3,18 +3,21 @@
 //! This module contains functions for interacting with the Commonplace server
 //! via HTTP: forking nodes, pushing content, and syncing schemas.
 
+use super::ancestry::determine_sync_direction;
 use super::urls::{build_edit_url, build_fork_url, build_head_url, build_replace_url};
 use crate::sync::{
     create_yjs_json_delete_key, create_yjs_json_merge, create_yjs_json_update,
-    create_yjs_jsonl_update, create_yjs_text_update, EditRequest, EditResponse, ForkResponse,
-    HeadResponse, ReplaceResponse, SyncState,
+    create_yjs_jsonl_update, create_yjs_text_update, detect_from_path, is_binary_content,
+    looks_like_base64_binary, EditRequest, EditResponse, ForkResponse, HeadResponse,
+    ReplaceResponse, SyncState,
 };
 use reqwest::Client;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Error from fetching HEAD
 #[derive(Debug)]
@@ -669,4 +672,160 @@ pub async fn discover_fs_root(
 
     let response: FsRootResponse = resp.json().await.map_err(DiscoverFsRootError::Parse)?;
     Ok(response.id)
+}
+
+/// Refresh local file from server HEAD if needed.
+///
+/// Called by upload_task after clearing barrier when needs_head_refresh was set.
+/// Returns true on success, false on failure (caller should re-set needs_head_refresh).
+pub async fn refresh_from_head(
+    client: &Client,
+    server: &str,
+    identifier: &str,
+    file_path: &PathBuf,
+    state: &Arc<RwLock<SyncState>>,
+    use_paths: bool,
+) -> bool {
+    debug!("Refreshing from HEAD due to skipped server edit");
+
+    // Fetch HEAD
+    let head = match fetch_head(client, server, identifier, use_paths).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            error!("HEAD not found for refresh (404)");
+            return false;
+        }
+        Err(e) => {
+            error!("Failed to fetch HEAD for refresh: {:?}", e);
+            return false;
+        }
+    };
+
+    // Get our last known CID (snapshot from state) to check ancestry
+    let local_cid = state.read().await.last_written_cid.clone();
+
+    // Use CRDT ancestry to determine if we should apply server content.
+    // Only pull if server is ahead of us (our CID is ancestor of server's CID).
+    let server_cid = head.cid.as_deref();
+    let direction = match determine_sync_direction(
+        client,
+        server,
+        identifier,
+        local_cid.as_deref(),
+        server_cid,
+    )
+    .await
+    {
+        Ok(dir) => dir,
+        Err(e) => {
+            // Ancestry check failed - be conservative and skip
+            warn!("Ancestry check failed in refresh: {}", e);
+            return false;
+        }
+    };
+
+    if !direction.should_pull() {
+        debug!("Ancestry check for refresh: {:?}, skipping", direction);
+        return false;
+    }
+
+    // Read current local file to check for pending changes
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let content_info = detect_from_path(file_path);
+    let local_content = match std::fs::read(file_path) {
+        Ok(bytes) => {
+            if content_info.is_binary || is_binary_content(&bytes) {
+                Some(STANDARD.encode(&bytes))
+            } else {
+                Some(String::from_utf8_lossy(&bytes).to_string())
+            }
+        }
+        Err(e) => {
+            // File missing or unreadable - treat as no pending changes so we can
+            // recreate it from server HEAD
+            debug!(
+                "Local file not readable for refresh check ({}), will recreate from HEAD",
+                e
+            );
+            None
+        }
+    };
+
+    // Check for pending local changes and if HEAD differs from our state
+    {
+        let mut s = state.write().await;
+
+        // If local file exists and differs from what we last wrote, there are pending changes.
+        // Don't overwrite them - let the next upload cycle handle merging.
+        // If local file is missing (None), proceed with refresh to recreate it.
+        if let Some(ref local) = local_content {
+            if local != &s.last_written_content {
+                debug!(
+                    "Skipping refresh - local file has pending changes (local {} bytes != last_written {} bytes)",
+                    local.len(),
+                    s.last_written_content.len()
+                );
+                return false; // Caller will re-set needs_head_refresh
+            }
+        }
+
+        // Only skip write if local file exists AND matches what we expect.
+        // If local file is missing, we must write to recreate it.
+        if local_content.is_some() && head.content == s.last_written_content {
+            // Content matches, but still update CID in case server advanced to new commit
+            // with identical content (e.g., concurrent edits that merge to same text)
+            debug!("HEAD matches last_written_content, updating CID only");
+            s.last_written_cid = head.cid.clone();
+            return true; // Success - content already matches
+        }
+
+        // No pending local changes and HEAD differs - safe to write
+        // Update state BEFORE writing file - this way if watcher fires after write,
+        // echo detection will see matching content and skip upload
+        s.last_written_cid = head.cid.clone();
+        s.last_written_content = head.content.clone();
+    }
+
+    // Content differs - we need to write the new content
+    // Use similar logic to handle_server_edit for binary detection
+    // (content_info and STANDARD already available from above)
+    let write_result = if content_info.is_binary {
+        match STANDARD.decode(&head.content) {
+            Ok(decoded) => tokio::fs::write(file_path, &decoded).await,
+            Err(e) => {
+                // Decode failed - fall back to writing as text (like initial sync does)
+                warn!(
+                    "Failed to decode base64 content for refresh, writing as text: {}",
+                    e
+                );
+                tokio::fs::write(file_path, &head.content).await
+            }
+        }
+    } else if looks_like_base64_binary(&head.content) {
+        // Content looks like base64-encoded binary
+        match STANDARD.decode(&head.content) {
+            Ok(decoded) if is_binary_content(&decoded) => {
+                tokio::fs::write(file_path, &decoded).await
+            }
+            _ => tokio::fs::write(file_path, &head.content).await,
+        }
+    } else {
+        // Extension says text, content doesn't look like base64 binary
+        tokio::fs::write(file_path, &head.content).await
+    };
+
+    if let Err(e) = write_result {
+        error!("Failed to write file for refresh: {}", e);
+        // Revert state on failure
+        let mut s = state.write().await;
+        s.last_written_cid = None;
+        s.last_written_content = String::new();
+        return false;
+    }
+
+    info!(
+        "Refreshed local file from HEAD: {} bytes",
+        head.content.len()
+    );
+    true
 }
