@@ -667,39 +667,23 @@ pub async fn handle_subdir_schema_cleanup(
             .chain(disk_deleted_paths.into_iter())
             .collect();
 
-        // Mass-deletion guard: if the schema would delete more than half of the
-        // known files AND the schema has very few entries, this is likely a partial
-        // or corrupt schema rather than a legitimate bulk delete. A legitimate bulk
-        // delete would remove files one at a time through individual MQTT edits, not
-        // appear as a schema with most entries missing. See CP-l8d2.
-        let total_known_files = {
-            let states = file_states.read().await;
-            let file_state_count = states
-                .keys()
-                .filter(|p| {
-                    if subdir_path.is_empty() {
-                        true
-                    } else {
-                        p.starts_with(&format!("{}/", subdir_path))
-                    }
-                })
-                .count();
-            // Use the larger of file_states count and disk file count for safety
-            file_state_count
-        };
-        if !all_deleted_paths.is_empty()
-            && total_known_files > 2
-            && all_deleted_paths.len() > total_known_files / 2
-            && schema_entry_count < 3
-        {
+        // Mass-deletion guard: if the schema has very few entries but would delete
+        // many files, this is likely a partial or corrupt schema rather than a
+        // legitimate bulk delete. A legitimate bulk delete would remove files one
+        // at a time through individual MQTT edits, not appear as a schema with
+        // most entries missing. See CP-l8d2.
+        //
+        // Use the deletion count itself rather than file_states count, because
+        // file_states may be empty at startup (files exist on disk but aren't
+        // tracked yet). The disk scan in disk_deleted_paths catches those files.
+        if !all_deleted_paths.is_empty() && all_deleted_paths.len() > 2 && schema_entry_count < 3 {
             info!(
                 "[CRDT-GUARD] Mass deletion guard for '{}': schema has {} entries but would \
-                 delete {}/{} tracked files. This likely indicates a partial or corrupt schema. \
+                 delete {} files. This likely indicates a partial or corrupt schema. \
                  Skipping deletions to prevent data loss. See CP-l8d2.",
                 subdir_path,
                 schema_entry_count,
-                all_deleted_paths.len(),
-                total_known_files
+                all_deleted_paths.len()
             );
         } else {
             // Delete files that were removed from server
