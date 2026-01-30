@@ -165,6 +165,7 @@ pub async fn handle_subdir_edit(
     log_prefix: &str,
     crdt_context: Option<&CrdtFileSyncContext>,
     mqtt_schema: Option<(FsSchema, String)>,
+    crdt_skip_deletions: bool,
 ) {
     // Clone mqtt_schema to pass to new files sync
     let mqtt_schema_for_new_files = mqtt_schema.clone();
@@ -179,6 +180,7 @@ pub async fn handle_subdir_edit(
         directory,
         file_states,
         mqtt_schema,
+        crdt_skip_deletions,
     )
     .await
     {
@@ -485,9 +487,16 @@ pub async fn directory_mqtt_task(
             if let Some(ref ctx) = crdt_context {
                 // Apply MQTT delta to persistent CRDT state
                 let mut state = ctx.crdt_state.write().await;
-                let mqtt_schema = apply_schema_update_to_state(&mut state.schema, &msg.payload);
+                let mqtt_schema_result =
+                    apply_schema_update_to_state(&mut state.schema, &msg.payload);
                 // Extract the updated CID before releasing the lock (for ancestry tracking)
                 let updated_cid = state.schema.head_cid.clone();
+
+                // Split 3-tuple: extract skip_deletions flag (CP-l8d2)
+                let (mqtt_schema, root_skip_deletions) = match mqtt_schema_result {
+                    Some((s, j, skip)) => (Some((s, j)), skip),
+                    None => (None, false),
+                };
 
                 // Persist the updated CRDT state to disk so it survives restarts
                 if mqtt_schema.is_some() {
@@ -610,6 +619,7 @@ pub async fn directory_mqtt_task(
                                 &directory,
                                 &file_states,
                                 Some(schema_tuple),
+                                root_skip_deletions, // Skip deletions when CRDT state was uninitialized (CP-l8d2)
                             )
                             .await
                             {
@@ -1838,7 +1848,8 @@ pub async fn subdir_mqtt_task(
                     inode_tracker.clone(),
                     "MQTT-resync",
                     crdt_context.as_ref(),
-                    None, // No MQTT schema during resync, fetch from HTTP
+                    None,  // No MQTT schema during resync, fetch from HTTP
+                    false, // HTTP resync has full schema, no skip needed
                 )
                 .await;
 
@@ -1947,7 +1958,7 @@ pub async fn subdir_mqtt_task(
                             let mut state = subdir_state.write().await;
                             let result =
                                 apply_schema_update_to_state(&mut state.schema, &msg.payload);
-                            if let Some((ref schema, _)) = result {
+                            if let Some((ref schema, _, _)) = result {
                                 let entry_count =
                                     if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
                                         root.entries.as_ref().map(|e| e.len()).unwrap_or(0)
@@ -2005,7 +2016,7 @@ pub async fn subdir_mqtt_task(
                             // Use the correct pattern: load state first, then apply update
                             let schema_result =
                                 apply_schema_update_to_state(&mut state.schema, &msg.payload);
-                            if let Some((ref schema, _)) = schema_result {
+                            if let Some((ref schema, _, _)) = schema_result {
                                 let entry_count =
                                     if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
                                         root.entries.as_ref().map(|e| e.len()).unwrap_or(0)
@@ -2036,7 +2047,10 @@ pub async fn subdir_mqtt_task(
                             // WARNING: decode_schema_from_mqtt_payload cannot handle DELETE
                             // operations correctly because it uses a fresh Y.Doc. Deletions
                             // will be ignored and must be handled via HTTP fallback.
+                            // skip_deletions=false: stateless decode always starts fresh,
+                            // so was_uninitialized doesn't apply here.
                             decode_schema_from_mqtt_payload(&msg.payload)
+                                .map(|(s, j)| (s, j, false))
                         }
                     }
                 } else {
@@ -2047,7 +2061,7 @@ pub async fn subdir_mqtt_task(
                     // WARNING: decode_schema_from_mqtt_payload cannot handle DELETE
                     // operations correctly because it uses a fresh Y.Doc. Deletions
                     // will be ignored and must be handled via HTTP fallback.
-                    decode_schema_from_mqtt_payload(&msg.payload)
+                    decode_schema_from_mqtt_payload(&msg.payload).map(|(s, j)| (s, j, false))
                 };
 
                 if result.is_none() {
@@ -2057,6 +2071,13 @@ pub async fn subdir_mqtt_task(
                     );
                 }
                 result
+            };
+
+            // Split the 3-tuple: extract skip_deletions flag (true when CRDT
+            // state was uninitialized, meaning schema may be partial). See CP-l8d2.
+            let (mqtt_schema, crdt_skip_deletions) = match mqtt_schema {
+                Some((s, j, skip)) => (Some((s, j)), skip),
+                None => (None, false),
             };
 
             // Use shared helper for edit handling
@@ -2077,7 +2098,8 @@ pub async fn subdir_mqtt_task(
                 inode_tracker.clone(),
                 "MQTT",
                 crdt_context.as_ref(),
-                mqtt_schema, // Use MQTT-decoded schema to avoid HTTP race
+                mqtt_schema,         // Use MQTT-decoded schema to avoid HTTP race
+                crdt_skip_deletions, // Skip deletions when CRDT state was uninitialized (CP-l8d2)
             )
             .await;
 

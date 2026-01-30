@@ -124,7 +124,7 @@ pub fn decode_schema_from_mqtt_payload(payload: &[u8]) -> Option<(FsSchema, Stri
 pub fn apply_schema_update_to_state(
     state: &mut crate::sync::CrdtPeerState,
     payload: &[u8],
-) -> Option<(FsSchema, String)> {
+) -> Option<(FsSchema, String, bool)> {
     // Parse the EditMessage JSON
     let edit_msg = match parse_edit_message(payload) {
         Ok(m) => m,
@@ -258,7 +258,7 @@ pub fn apply_schema_update_to_state(
         }
     };
 
-    Some((schema, schema_json))
+    Some((schema, schema_json, was_uninitialized))
 }
 
 /// Check if a file path exists in any recently written schema.
@@ -324,7 +324,18 @@ async fn path_in_written_schemas(
 /// After deleting files that were removed from the schema, this function
 /// removes any orphaned directories (directories that exist locally but
 /// have no corresponding entry in the schema).
-async fn cleanup_orphaned_directories(directory: &Path, schema: &FsSchema) {
+async fn cleanup_orphaned_directories(directory: &Path, schema: &FsSchema, skip_deletions: bool) {
+    // Guard: If schema was decoded from uninitialized CRDT state, it may be
+    // partial and missing entries. Deleting directories not found in a partial
+    // schema would cause data loss. See CP-l8d2.
+    if skip_deletions {
+        info!(
+            "[CRDT-GUARD] Skipping orphaned directory cleanup: schema was decoded from \
+             uninitialized CRDT state. Deletions deferred until state is fully initialized."
+        );
+        return;
+    }
+
     // Guard: If schema is empty (root=None or 0 entries), treat it as "unknown"
     // rather than "everything deleted". An empty schema can result from applying
     // a delta to uninitialized CRDT state, and deleting all directories would
@@ -427,6 +438,7 @@ pub async fn handle_subdir_schema_cleanup(
     root_directory: &Path,
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
     mqtt_schema: Option<(FsSchema, String)>,
+    crdt_skip_deletions: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Track whether we're using MQTT schema (authoritative) vs HTTP (may be stale)
     let using_mqtt_schema = mqtt_schema.is_some();
@@ -478,6 +490,20 @@ pub async fn handle_subdir_schema_cleanup(
     // Write valid schema to local .commonplace.json file
     if let Err(e) = write_schema_file(subdir_directory, &schema_json, None).await {
         warn!("Failed to write subdir schema file: {}", e);
+    }
+
+    // Guard: If schema was decoded from uninitialized CRDT state, it may be
+    // partial (only containing entries from a single delta, not the full state).
+    // The schema is still written to disk above (good for new file discovery),
+    // but we must NOT use it for deletions — a partial schema would delete every
+    // file not mentioned in the delta. See CP-l8d2.
+    if crdt_skip_deletions {
+        info!(
+            "[CRDT-GUARD] Skipping file deletion for '{}': schema was decoded from \
+             uninitialized CRDT state. Deletions deferred until state is fully initialized.",
+            subdir_path
+        );
+        return Ok(());
     }
 
     // Extract filenames from the MQTT/local schema for deletion checks.
@@ -710,7 +736,7 @@ pub async fn handle_subdir_schema_cleanup(
     }
 
     // Clean up directories that exist locally but not in the schema
-    cleanup_orphaned_directories(subdir_directory, &schema).await;
+    cleanup_orphaned_directories(subdir_directory, &schema, crdt_skip_deletions).await;
 
     Ok(())
 }
@@ -2123,7 +2149,7 @@ pub async fn handle_schema_change(
 
     // Check for directories that should be removed (empty after file deletions,
     // or directories that exist on disk but have no corresponding entries in schema)
-    cleanup_orphaned_directories(directory, &schema).await;
+    cleanup_orphaned_directories(directory, &schema, false).await;
 
     // Unmark locally deleted directories from sync state so they don't keep being flagged
     for dir_name in &locally_deleted_dirs {
