@@ -7,7 +7,7 @@ use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Incoming MQTT message.
 #[derive(Debug, Clone)]
@@ -24,6 +24,8 @@ pub struct MqttClient {
     client_id: String,
     event_loop: Arc<Mutex<EventLoop>>,
     message_tx: broadcast::Sender<IncomingMessage>,
+    /// Notifies subscribers when a ConnAck is received (i.e., reconnection).
+    connack_tx: broadcast::Sender<()>,
 }
 
 impl MqttClient {
@@ -44,6 +46,9 @@ impl MqttClient {
         // Create broadcast channel for incoming messages
         let (message_tx, _) = broadcast::channel(1024);
 
+        // Create broadcast channel for ConnAck notifications (reconnection detection)
+        let (connack_tx, _) = broadcast::channel(16);
+
         info!(
             "MQTT client created for {}:{} as {}",
             config.broker_url, port, config.client_id
@@ -54,6 +59,7 @@ impl MqttClient {
             client_id: config.client_id,
             event_loop: Arc::new(Mutex::new(event_loop)),
             message_tx,
+            connack_tx,
         })
     }
 
@@ -84,29 +90,6 @@ impl MqttClient {
 
     /// Publish a message to a topic.
     pub async fn publish(&self, topic: &str, payload: &[u8], qos: QoS) -> Result<(), MqttError> {
-        // Trace log for debugging
-        {
-            use std::io::Write;
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/sandbox-trace.log")
-            {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                let pid = std::process::id();
-                let _ = writeln!(
-                    file,
-                    "[{} pid={}] MQTT publish (non-retained): topic={}, payload_len={}",
-                    timestamp,
-                    pid,
-                    topic,
-                    payload.len()
-                );
-            }
-        }
         self.client
             .publish(topic, qos, false, payload)
             .await
@@ -125,29 +108,6 @@ impl MqttClient {
         payload: &[u8],
         qos: QoS,
     ) -> Result<(), MqttError> {
-        // Trace log for debugging
-        {
-            use std::io::Write;
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/sandbox-trace.log")
-            {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                let pid = std::process::id();
-                let _ = writeln!(
-                    file,
-                    "[{} pid={}] MQTT publish_retained: topic={}, payload_len={}",
-                    timestamp,
-                    pid,
-                    topic,
-                    payload.len()
-                );
-            }
-        }
         self.client
             .publish(topic, qos, true, payload)
             .await
@@ -165,15 +125,41 @@ impl MqttClient {
         self.message_tx.subscribe()
     }
 
+    /// Get a receiver for ConnAck notifications.
+    ///
+    /// A ConnAck is received on initial connection and on every reconnection.
+    /// With `clean_session: true`, reconnection means all subscriptions are lost,
+    /// so subscribers should use this to re-subscribe.
+    pub fn subscribe_connack(&self) -> broadcast::Receiver<()> {
+        self.connack_tx.subscribe()
+    }
+
     /// Run the MQTT event loop.
     ///
     /// This should be spawned as a background task. It processes incoming
     /// messages and broadcasts them to subscribers.
+    ///
+    /// Uses a timeout on `poll()` to prevent indefinite hangs. When poll()
+    /// stalls (e.g., due to network issues), the timeout ensures the loop
+    /// continues and can detect/recover from connection problems.
     pub async fn run_event_loop(&self) -> Result<(), MqttError> {
+        let mut connack_count: u64 = 0;
         loop {
+            // Timeout prevents poll() from hanging indefinitely.
+            // rumqttc's poll() can stall when the network connection degrades,
+            // which blocks keep-alive pings and causes broker disconnection.
             let notification = {
                 let mut event_loop = self.event_loop.lock().await;
-                event_loop.poll().await
+                match tokio::time::timeout(Duration::from_secs(10), event_loop.poll()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        warn!(
+                            "MQTT poll() timed out after 10s, client_id={}",
+                            self.client_id
+                        );
+                        continue;
+                    }
+                }
             };
 
             match notification {
@@ -182,7 +168,6 @@ impl MqttClient {
                         topic: publish.topic.clone(),
                         payload: publish.payload.to_vec(),
                     };
-
                     // Broadcast to all receivers (ignore if no receivers)
                     let _ = self.message_tx.send(msg);
                 }
@@ -193,13 +178,20 @@ impl MqttClient {
                     debug!("Unsubscription acknowledged");
                 }
                 Ok(Event::Incoming(Packet::ConnAck(ack))) => {
-                    info!("Connected to MQTT broker: {:?}", ack.code);
+                    connack_count += 1;
+                    if connack_count == 1 {
+                        info!("Connected to MQTT broker: {:?}", ack.code);
+                    } else {
+                        warn!(
+                            "Reconnected to MQTT broker (connack #{}): {:?}",
+                            connack_count, ack.code
+                        );
+                    }
+                    // Notify subscribers of (re)connection so they can re-subscribe
+                    let _ = self.connack_tx.send(());
                 }
                 Ok(Event::Incoming(Packet::PingResp)) => {
-                    // Ping response, ignore
-                }
-                Ok(Event::Outgoing(_)) => {
-                    // Outgoing packet, ignore
+                    debug!("MQTT ping response received");
                 }
                 Ok(event) => {
                     debug!("MQTT event: {:?}", event);

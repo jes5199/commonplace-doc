@@ -548,7 +548,6 @@ fn test_sandbox_process_runs_in_sandbox_cwd() {
             &server_url,
         ])
         .current_dir(temp_dir.path())
-        // Use Stdio::null() to prevent blocking on stdout/stderr output
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -650,7 +649,6 @@ fn wait_for_process_removed(
 ///
 /// Requires MQTT broker on localhost:1883 (skipped if not available).
 #[test]
-#[ignore = "Blocked by discovery manager not detecting __processes.json content changes via MQTT"]
 fn test_processes_json_add_remove_starts_stops_processes() {
     if !mqtt_available() {
         eprintln!("Skipping test: MQTT broker not available on localhost:1883");
@@ -750,7 +748,7 @@ fn test_processes_json_add_remove_starts_stops_processes() {
     )
     .unwrap();
 
-    // H4: Verify new process appears within 10 seconds (using 30 to be safe in CI)
+    // H4: Verify new process appears within 30 seconds
     wait_for_discovered_process(&config_path, "added-proc", Duration::from_secs(30))
         .expect("Added process 'added-proc' should appear after updating __processes.json");
 
@@ -829,7 +827,6 @@ fn test_processes_json_add_remove_starts_stops_processes() {
 /// - H2: Verify process restarted with new PID within 10 seconds
 ///
 #[test]
-#[ignore = "Blocked by discovery manager not detecting __processes.json content changes via MQTT"]
 fn test_process_config_change_triggers_restart() {
     if !mqtt_available() {
         eprintln!("Skipping test: MQTT broker not available on localhost:1883");

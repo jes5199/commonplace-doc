@@ -31,6 +31,16 @@ pub enum DiscoveredProcessState {
     Failed,
 }
 
+/// Action to take after checking a process in check_and_restart.
+enum RestartAction {
+    /// No action needed
+    None,
+    /// Process just failed, update status file
+    UpdateStatus,
+    /// Backoff elapsed, restart the process
+    Restart,
+}
+
 /// A running discovered process with its metadata.
 #[derive(Debug)]
 pub struct ManagedDiscoveredProcess {
@@ -51,6 +61,8 @@ pub struct ManagedDiscoveredProcess {
     pub consecutive_failures: u32,
     /// When the process was last started
     pub last_start: Option<Instant>,
+    /// Earliest time to attempt restart (non-blocking backoff)
+    pub restart_after: Option<Instant>,
     /// Path to the log file for this process
     pub log_file: Option<String>,
 }
@@ -187,6 +199,7 @@ impl DiscoveredProcessManager {
             state: DiscoveredProcessState::Stopped,
             consecutive_failures: 0,
             last_start: None,
+            restart_after: None,
             log_file: None,
         };
         self.processes.insert(name, process);
@@ -429,11 +442,17 @@ impl DiscoveredProcessManager {
     }
 
     /// Check all processes and restart any that have exited.
+    ///
+    /// Uses non-blocking backoff: when a process needs restart, a `restart_after`
+    /// timestamp is set. The process is only restarted once the current time
+    /// exceeds that timestamp. This avoids sleeping in the event loop, which
+    /// would block discovery interval and MQTT event processing.
     pub async fn check_and_restart(&mut self) {
         let names: Vec<String> = self.processes.keys().cloned().collect();
+        let now = Instant::now();
 
         for name in names {
-            let should_restart = {
+            let action = {
                 let process = match self.processes.get_mut(&name) {
                     Some(p) => p,
                     None => continue,
@@ -449,7 +468,21 @@ impl DiscoveredProcessManager {
                             );
                             process.handle = None;
                             process.state = DiscoveredProcessState::Failed;
-                            true // Always restart discovered processes
+                            // Schedule restart with backoff
+                            process.consecutive_failures += 1;
+                            let backoff = std::cmp::min(
+                                self.initial_backoff_ms
+                                    * 2u64.pow(process.consecutive_failures.saturating_sub(1)),
+                                self.max_backoff_ms,
+                            );
+                            process.restart_after = Some(now + Duration::from_millis(backoff));
+                            tracing::info!(
+                                "[discovery] Scheduling '{}' restart in {}ms (attempt {})",
+                                name,
+                                backoff,
+                                process.consecutive_failures
+                            );
+                            RestartAction::UpdateStatus
                         }
                         Ok(None) => {
                             // Still running - reset failure count if running long enough
@@ -464,48 +497,38 @@ impl DiscoveredProcessManager {
                                     );
                                 }
                             }
-                            false
+                            RestartAction::None
                         }
                         Err(e) => {
                             tracing::error!("[discovery] Error checking process '{}': {}", name, e);
-                            false
+                            RestartAction::None
                         }
                     }
+                } else if process.state == DiscoveredProcessState::Failed {
+                    // No handle, failed state - check if backoff has elapsed
+                    match process.restart_after {
+                        Some(restart_at) if now >= restart_at => {
+                            process.restart_after = None;
+                            RestartAction::Restart
+                        }
+                        Some(_) => RestartAction::None, // Still waiting for backoff
+                        None => RestartAction::Restart, // No backoff set, restart immediately
+                    }
                 } else {
-                    // No handle - retry if in Failed state (handles spawn failures)
-                    process.state == DiscoveredProcessState::Failed
+                    RestartAction::None
                 }
             };
 
-            if should_restart {
-                let backoff = {
-                    let process = self.processes.get_mut(&name).unwrap();
-                    process.consecutive_failures += 1;
-                    process.state = DiscoveredProcessState::Failed;
-
-                    std::cmp::min(
-                        self.initial_backoff_ms
-                            * 2u64.pow(process.consecutive_failures.saturating_sub(1)),
-                        self.max_backoff_ms,
-                    )
-                };
-
-                // Update status to reflect the failed state
-                self.write_status();
-
-                let failures = self.processes.get(&name).unwrap().consecutive_failures;
-                tracing::info!(
-                    "[discovery] Restarting '{}' in {}ms (attempt {})",
-                    name,
-                    backoff,
-                    failures
-                );
-
-                tokio::time::sleep(Duration::from_millis(backoff)).await;
-
-                if let Err(e) = self.spawn_process(&name).await {
-                    tracing::error!("[discovery] Failed to restart '{}': {}", name, e);
+            match action {
+                RestartAction::UpdateStatus => {
+                    self.write_status();
                 }
+                RestartAction::Restart => {
+                    if let Err(e) = self.spawn_process(&name).await {
+                        tracing::error!("[discovery] Failed to restart '{}': {}", name, e);
+                    }
+                }
+                RestartAction::None => {}
             }
         }
     }
@@ -658,6 +681,7 @@ impl DiscoveredProcessManager {
 
             // Reset failure count since this is an intentional restart
             process.consecutive_failures = 0;
+            process.restart_after = None;
             process.state = DiscoveredProcessState::Stopped;
         }
 
@@ -819,8 +843,10 @@ impl DiscoveredProcessManager {
         // Monitor interval for checking process health
         let mut monitor_interval = tokio::time::interval(Duration::from_millis(500));
 
-        // Re-discovery interval (check for new/removed __processes.json files)
-        let mut discovery_interval = tokio::time::interval(Duration::from_secs(30));
+        // Re-discovery interval (check for new/removed __processes.json files).
+        // Also serves as a fallback for detecting content changes when MQTT
+        // misses events due to connection issues.
+        let mut discovery_interval = tokio::time::interval(Duration::from_secs(10));
 
         // Flag to trigger immediate discovery (set when schema changes)
         let mut need_immediate_discovery = false;

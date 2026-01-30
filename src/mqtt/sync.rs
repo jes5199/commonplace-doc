@@ -111,6 +111,12 @@ impl SyncHandler {
         Ok(())
     }
 
+    /// Get all subscribed paths.
+    pub async fn subscribed_paths(&self) -> Vec<String> {
+        let paths = self.subscribed_paths.read().await;
+        paths.iter().cloned().collect()
+    }
+
     /// Handle an incoming sync request.
     pub async fn handle_sync_request(
         &self,

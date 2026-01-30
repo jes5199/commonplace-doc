@@ -238,11 +238,65 @@ impl MqttService {
         Ok(())
     }
 
+    /// Re-subscribe to all topics after a reconnection.
+    ///
+    /// With `clean_session: true`, all subscriptions are lost when the MQTT
+    /// connection drops. This method restores store commands, the edits wildcard,
+    /// and any per-path subscriptions that were active before disconnection.
+    async fn resubscribe_all(&self) {
+        // Re-subscribe store commands
+        if let Err(e) = self.subscribe_store_commands().await {
+            tracing::warn!("Failed to re-subscribe store commands on reconnect: {}", e);
+        }
+
+        // Re-subscribe all edits wildcard
+        if let Err(e) = self.subscribe_all_edits().await {
+            tracing::warn!("Failed to re-subscribe all edits on reconnect: {}", e);
+        }
+
+        // Re-subscribe per-path edits subscriptions
+        let edits_paths: Vec<String> = {
+            let paths = self.edits_handler.subscribed_paths().await;
+            paths.into_iter().collect()
+        };
+        for path in &edits_paths {
+            let topic = topics::Topic::edits(&self.workspace, path).to_topic_string();
+            if let Err(e) = self.client.subscribe(&topic, QoS::AtLeastOnce).await {
+                tracing::warn!(
+                    "Failed to re-subscribe edits path {} on reconnect: {}",
+                    path,
+                    e
+                );
+            }
+        }
+
+        // Re-subscribe per-path sync subscriptions
+        let sync_paths: Vec<String> = {
+            let paths = self.sync_handler.subscribed_paths().await;
+            paths.into_iter().collect()
+        };
+        for path in &sync_paths {
+            let topic = topics::Topic::sync_wildcard(&self.workspace, path);
+            if let Err(e) = self.client.subscribe(&topic, QoS::AtMostOnce).await {
+                tracing::warn!(
+                    "Failed to re-subscribe sync path {} on reconnect: {}",
+                    path,
+                    e
+                );
+            }
+        }
+
+        let total = 2 + edits_paths.len() + sync_paths.len();
+        tracing::info!("Re-subscribed {} MQTT topics after reconnection", total);
+    }
+
     /// Run the MQTT service event loop.
     /// This processes incoming messages and dispatches them to handlers.
     pub async fn run(&self) -> Result<(), MqttError> {
         // Subscribe to the message broadcast channel
         let mut message_rx = self.client.subscribe_messages();
+        // Subscribe to ConnAck notifications for reconnection handling
+        let mut connack_rx = self.client.subscribe_connack();
 
         // Spawn the client event loop in a separate task
         let client = self.client.clone();
@@ -252,27 +306,52 @@ impl MqttService {
             }
         });
 
-        // Process incoming messages and dispatch to handlers
+        // Process incoming messages and ConnAck reconnection events
         tracing::info!("MQTT event loop starting message processing");
         let mut msg_count = 0u64;
-        while let Some(msg) =
-            recv_broadcast(&mut message_rx, "MQTT message receiver", None::<fn(u64)>).await
-        {
-            msg_count += 1;
-            tracing::info!(
-                "MQTT received message #{} on topic: {} ({} bytes)",
-                msg_count,
-                msg.topic,
-                msg.payload.len()
-            );
-            if let Err(e) = self.dispatch_message(&msg.topic, &msg.payload).await {
-                tracing::warn!("Error dispatching MQTT message to {}: {}", msg.topic, e);
-            } else {
-                tracing::info!("MQTT dispatched message #{} successfully", msg_count);
+        loop {
+            tokio::select! {
+                msg = recv_broadcast(&mut message_rx, "MQTT message receiver", None::<fn(u64)>) => {
+                    match msg {
+                        Some(msg) => {
+                            msg_count += 1;
+                            tracing::info!(
+                                "MQTT received message #{} on topic: {} ({} bytes)",
+                                msg_count,
+                                msg.topic,
+                                msg.payload.len()
+                            );
+                            if let Err(e) = self.dispatch_message(&msg.topic, &msg.payload).await {
+                                tracing::warn!("Error dispatching MQTT message to {}: {}", msg.topic, e);
+                            } else {
+                                tracing::info!("MQTT dispatched message #{} successfully", msg_count);
+                            }
+                        }
+                        None => {
+                            tracing::info!("MQTT message channel closed");
+                            break;
+                        }
+                    }
+                }
+                connack = connack_rx.recv() => {
+                    match connack {
+                        Ok(()) => {
+                            tracing::info!("MQTT ConnAck received in server, re-subscribing all topics");
+                            self.resubscribe_all().await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("MQTT ConnAck receiver lagged by {} messages", n);
+                            // Still re-subscribe on lag since we may have missed a reconnection
+                            self.resubscribe_all().await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            tracing::info!("MQTT ConnAck channel closed");
+                            break;
+                        }
+                    }
+                }
             }
         }
-
-        tracing::info!("MQTT message channel closed");
 
         Ok(())
     }

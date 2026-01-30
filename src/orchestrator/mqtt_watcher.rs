@@ -167,100 +167,30 @@ impl MqttDocumentWatcher {
     /// incoming MQTT messages, checks if they're for watched documents,
     /// and emits appropriate events.
     ///
+    /// On reconnection (ConnAck), all watched documents are re-subscribed
+    /// because `clean_session: true` causes the broker to discard subscriptions.
+    ///
     /// The loop continues until the MQTT message channel is closed.
     pub async fn run(&self) -> Result<(), MqttError> {
         // Subscribe to MQTT messages BEFORE we're ready to process them.
         // This ensures we don't miss any messages sent after subscription.
         let mut message_rx = self.client.subscribe_messages();
+        let mut connack_rx = self.client.subscribe_connack();
 
         info!(
             "MQTT document watcher starting event loop for workspace: {}",
             self.workspace
         );
-
-        // Process incoming MQTT messages
-        while let Some(msg) =
-            recv_broadcast(&mut message_rx, "MQTT document watcher", None::<fn(u64)>).await
-        {
-            // Parse the topic to extract the document ID
-            let parsed = match Topic::parse(&msg.topic, &self.workspace) {
-                Ok(t) => t,
-                Err(_) => {
-                    // Not a topic we care about, ignore
-                    continue;
-                }
-            };
-
-            // Only process edits
-            if parsed.port != crate::mqtt::topics::Port::Edits {
-                continue;
-            }
-
-            let doc_id = &parsed.path;
-
-            // Check if this is a document we're watching
-            let is_watched = {
-                let watched = self.watched_docs.read().await;
-                watched.contains(doc_id)
-            };
-
-            if is_watched {
-                debug!(
-                    "Document changed: {} ({} bytes payload)",
-                    doc_id,
-                    msg.payload.len()
-                );
-
-                // Emit the change event
-                let event = WatchEvent::DocumentChanged(doc_id.clone());
-                if self.event_tx.send(event).is_err() {
-                    // No receivers, but that's okay
-                    debug!("No receivers for watch event");
-                }
-            }
-        }
-
-        info!("MQTT document watcher event loop ended");
-        Ok(())
-    }
-
-    /// Run the event loop with a callback for connection state changes.
-    ///
-    /// This variant of `run` accepts a callback that is invoked when
-    /// connection state changes are detected (disconnected/reconnected).
-    ///
-    /// # Arguments
-    /// * `on_connection_change` - Callback invoked with `true` for reconnected, `false` for disconnected
-    pub async fn run_with_connection_callback<F>(
-        &self,
-        mut on_connection_change: F,
-    ) -> Result<(), MqttError>
-    where
-        F: FnMut(bool) + Send,
-    {
-        let mut message_rx = self.client.subscribe_messages();
-
-        info!(
-            "MQTT document watcher starting event loop for workspace: {}",
-            self.workspace
-        );
-
-        // Track connection state for detecting reconnects
-        let mut was_connected = true;
 
         loop {
-            // Use recv_broadcast_with_lag for more detailed lag handling
-            match tokio::time::timeout(std::time::Duration::from_secs(30), message_rx.recv()).await
-            {
-                Ok(Ok(msg)) => {
-                    // We received a message, so we're connected
-                    if !was_connected {
-                        was_connected = true;
-                        on_connection_change(true);
-                        let _ = self.event_tx.send(WatchEvent::Reconnected);
-                    }
+            tokio::select! {
+                msg = recv_broadcast(&mut message_rx, "MQTT document watcher", None::<fn(u64)>) => {
+                    let msg = match msg {
+                        Some(m) => m,
+                        None => break, // Channel closed
+                    };
 
-                    // Parse the topic
+                    // Parse the topic to extract the document ID
                     let parsed = match Topic::parse(&msg.topic, &self.workspace) {
                         Ok(t) => t,
                         Err(_) => continue,
@@ -273,7 +203,7 @@ impl MqttDocumentWatcher {
 
                     let doc_id = &parsed.path;
 
-                    // Check if watched
+                    // Check if this is a document we're watching
                     let is_watched = {
                         let watched = self.watched_docs.read().await;
                         watched.contains(doc_id)
@@ -281,29 +211,48 @@ impl MqttDocumentWatcher {
 
                     if is_watched {
                         debug!("Document changed: {}", doc_id);
-                        let _ = self
-                            .event_tx
-                            .send(WatchEvent::DocumentChanged(doc_id.clone()));
+                        let event = WatchEvent::DocumentChanged(doc_id.clone());
+                        let _ = self.event_tx.send(event);
                     }
                 }
-                Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
-                    warn!("MQTT document watcher lagged by {} messages", n);
-                    // Continue processing - we may have missed some changes
-                    // Callers should handle this by re-reading document content
-                }
-                Ok(Err(broadcast::error::RecvError::Closed)) => {
-                    info!("MQTT message channel closed");
-                    break;
-                }
-                Err(_) => {
-                    // Timeout - check if we're still connected
-                    // In a real scenario, we might want to ping the broker
-                    // For now, just continue waiting
-                    debug!("MQTT watcher timeout, continuing...");
+
+                connack = connack_rx.recv() => {
+                    match connack {
+                        Ok(()) => {
+                            // Re-subscribe all watched documents after reconnection.
+                            // With clean_session=true, the broker drops all subscriptions
+                            // on disconnect, so we must re-subscribe on every ConnAck.
+                            let docs = {
+                                let watched = self.watched_docs.read().await;
+                                watched.clone()
+                            };
+                            if !docs.is_empty() {
+                                info!(
+                                    "MQTT reconnected, re-subscribing {} watched documents",
+                                    docs.len()
+                                );
+                                for doc_id in &docs {
+                                    let topic = Topic::edits(&self.workspace, doc_id).to_topic_string();
+                                    if let Err(e) = self.client.subscribe(&topic, QoS::AtLeastOnce).await {
+                                        warn!("Failed to re-subscribe to {}: {}", doc_id, e);
+                                    }
+                                }
+                            }
+                            let _ = self.event_tx.send(WatchEvent::Reconnected);
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("ConnAck receiver lagged by {} events", n);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            info!("ConnAck channel closed");
+                            break;
+                        }
+                    }
                 }
             }
         }
 
+        info!("MQTT document watcher event loop ended");
         Ok(())
     }
 }

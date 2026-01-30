@@ -6,7 +6,7 @@
 use crate::mqtt::{IncomingMessage, MqttClient, Topic};
 use crate::sync::client::fetch_head;
 use crate::sync::crdt_merge::{parse_edit_message, process_received_edit};
-use crate::sync::crdt_publish::publish_text_change;
+use crate::sync::crdt_publish::{publish_text_change, publish_yjs_update};
 use crate::sync::crdt_state::DirectorySyncState;
 use crate::sync::directory::{scan_directory_to_json, ScanOptions};
 use crate::sync::file_events::find_owning_document;
@@ -2200,18 +2200,73 @@ pub async fn upload_task_crdt(
         let mut state_guard = crdt_state.write().await;
         let file_state = state_guard.get_or_create_file(&filename, node_id);
 
-        // Publish the change via MQTT
-        match publish_text_change(
-            &mqtt_client,
-            &workspace,
-            &node_id.to_string(),
-            file_state,
-            &old_content,
-            &new_content,
-            &author,
-        )
-        .await
-        {
+        // Publish the change via MQTT.
+        // For JSON files, create a YMap update to match the server's document type.
+        // For text files, use character-level YText diffs (more efficient).
+        let publish_result = if prepared.is_json || prepared.is_jsonl {
+            // JSON/JSONL files: create structured update (YMap/YArray)
+            let content_type = if prepared.is_jsonl {
+                crate::content_type::ContentType::Jsonl
+            } else {
+                crate::content_type::ContentType::Json
+            };
+            let base_state = file_state.yjs_state.as_deref();
+            match crate::sync::crdt::yjs::create_yjs_structured_update(
+                content_type,
+                &new_content,
+                base_state,
+            ) {
+                Ok(update_b64) => match crate::sync::crdt::yjs::base64_decode(&update_b64) {
+                    Ok(update_bytes) => {
+                        publish_yjs_update(
+                            &mqtt_client,
+                            &workspace,
+                            &node_id.to_string(),
+                            file_state,
+                            update_bytes,
+                            &author,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(crate::sync::error::SyncError::other(format!(
+                        "Failed to decode structured update: {}",
+                        e
+                    ))),
+                },
+                Err(e) => {
+                    // Fall back to text change if structured update fails
+                    // (e.g., content isn't valid JSON)
+                    warn!(
+                        "Structured update failed for {}, falling back to text: {}",
+                        file_path.display(),
+                        e
+                    );
+                    publish_text_change(
+                        &mqtt_client,
+                        &workspace,
+                        &node_id.to_string(),
+                        file_state,
+                        &old_content,
+                        &new_content,
+                        &author,
+                    )
+                    .await
+                }
+            }
+        } else {
+            // Text files: use efficient character-level diffs
+            publish_text_change(
+                &mqtt_client,
+                &workspace,
+                &node_id.to_string(),
+                file_state,
+                &old_content,
+                &new_content,
+                &author,
+            )
+            .await
+        };
+        match publish_result {
             Ok(result) => {
                 info!(
                     "[SANDBOX-TRACE] upload_task_crdt PUBLISHED file={} uuid={} cid={} update_bytes={}",
