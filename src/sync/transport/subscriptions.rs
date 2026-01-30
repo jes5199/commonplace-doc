@@ -1531,7 +1531,7 @@ async fn resync_subdir_schema_from_server(
     directory: &Path,
 ) {
     warn!(
-        "Resyncing subdirectory schema CRDT state from server after broadcast lag for {} ({})",
+        "Resyncing subdirectory schema CRDT state via cyan sync for {} ({})",
         subdir_path, subdir_node_id
     );
 
@@ -1549,7 +1549,7 @@ async fn resync_subdir_schema_from_server(
 
     let subdir_full_path = directory.join(subdir_path);
 
-    // Step 1: Get or load the subdirectory's cached state and mark as needing resync
+    // Step 1: Mark as needing resync
     {
         match crdt_context
             .subdir_cache
@@ -1559,10 +1559,7 @@ async fn resync_subdir_schema_from_server(
             Ok(subdir_state) => {
                 let mut state = subdir_state.write().await;
                 state.schema.mark_needs_resync();
-                debug!(
-                    "Marked subdir schema {} as needing resync - cleared CRDT state",
-                    subdir_node_id
-                );
+                debug!("Marked subdir schema {} as needing resync", subdir_node_id);
             }
             Err(e) => {
                 warn!(
@@ -1574,12 +1571,54 @@ async fn resync_subdir_schema_from_server(
         }
     }
 
-    // Step 2: Fetch authoritative schema HEAD from server
+    // Step 2: Initialize via cyan sync (CP-uals)
+    let sync_client_id = Uuid::new_v4().to_string();
+    let initialized = {
+        match crdt_context
+            .subdir_cache
+            .get_or_load(&subdir_full_path, subdir_uuid)
+            .await
+        {
+            Ok(subdir_state) => {
+                let mut state = subdir_state.write().await;
+                sync_schema_via_cyan(
+                    &crdt_context.mqtt_client,
+                    &crdt_context.workspace,
+                    subdir_node_id,
+                    &sync_client_id,
+                    &mut state.schema,
+                )
+                .await
+            }
+            Err(e) => {
+                warn!(
+                    "Subdir schema resync: Failed to reload state for {}: {}",
+                    subdir_path, e
+                );
+                false
+            }
+        }
+    };
+
+    if initialized {
+        info!(
+            "Subdir schema resync via cyan completed for {} ({})",
+            subdir_path, subdir_node_id
+        );
+        return;
+    }
+
+    // Step 3: Fall back to HTTP
+    warn!(
+        "Subdir schema resync: Cyan sync failed for {} — falling back to HTTP",
+        subdir_path
+    );
+
     let head = match fetch_head(http_client, server, &encode_node_id(subdir_node_id), false).await {
         Ok(Some(h)) => h,
         Ok(None) => {
             warn!(
-                "Subdir schema resync: Document {} not found on server, skipping",
+                "Subdir schema resync: Document {} not found on server",
                 subdir_node_id
             );
             return;
@@ -1593,52 +1632,43 @@ async fn resync_subdir_schema_from_server(
         }
     };
 
-    // Step 3: Re-initialize CRDT state with server's Yjs state
+    match crdt_context
+        .subdir_cache
+        .get_or_load(&subdir_full_path, subdir_uuid)
+        .await
     {
-        match crdt_context
-            .subdir_cache
-            .get_or_load(&subdir_full_path, subdir_uuid)
-            .await
-        {
-            Ok(subdir_state) => {
-                let mut state = subdir_state.write().await;
-                if let Some(ref server_state) = head.state {
-                    let cid = head.cid.as_deref().unwrap_or("unknown");
-                    state.schema.initialize_from_server(server_state, cid);
-                    info!(
-                        "Subdir schema resync: Re-initialized CRDT state from server for {} at cid={}",
-                        subdir_path, cid
-                    );
-                } else {
-                    state.schema.initialize_empty();
-                    info!(
-                        "Subdir schema resync: Initialized empty CRDT state for {} (server has no state)",
-                        subdir_path
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Subdir schema resync: Failed to reload cached state for {}: {}",
-                    subdir_path, e
+        Ok(subdir_state) => {
+            let mut state = subdir_state.write().await;
+            if let Some(ref server_state) = head.state {
+                let cid = head.cid.as_deref().unwrap_or("unknown");
+                state.schema.initialize_from_server(server_state, cid);
+                info!(
+                    "Subdir schema resync: HTTP fallback initialized for {} at cid={}",
+                    subdir_path, cid
                 );
-                return;
+            } else {
+                state.schema.initialize_empty();
+                info!(
+                    "Subdir schema resync: Initialized empty for {} (no server state)",
+                    subdir_path
+                );
             }
+        }
+        Err(e) => {
+            warn!(
+                "Subdir schema resync: Failed to update state for {}: {}",
+                subdir_path, e
+            );
+            return;
         }
     }
 
-    // Step 4: Write the schema content to disk
     if !head.content.is_empty() {
         if let Err(e) = crate::sync::write_schema_file(&subdir_full_path, &head.content, None).await
         {
             warn!(
                 "Subdir schema resync: Failed to write schema file for {}: {}",
                 subdir_path, e
-            );
-        } else {
-            debug!(
-                "Subdir schema resync: Wrote schema file to {}",
-                subdir_full_path.display()
             );
         }
     }
