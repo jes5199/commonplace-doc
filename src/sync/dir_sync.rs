@@ -1733,7 +1733,7 @@ pub async fn handle_schema_change(
     // Collect all paths from schema (with explicit node_id if present)
     // Use async version that follows node-backed directories to get complete path->UUID map
     // AND writes nested schema files to local directory (required for find_owning_document fallback)
-    let (uuid_map, _all_succeeded) =
+    let (uuid_map, all_uuids_succeeded) =
         build_uuid_map_and_write_schemas(client, server, fs_root_id, directory, written_schemas)
             .await;
     let mut schema_paths: Vec<(String, Option<String>)> = uuid_map
@@ -2157,15 +2157,27 @@ pub async fn handle_schema_change(
         .chain(disk_deleted_paths.into_iter())
         .collect();
 
-    // Mass-deletion guard: if we would delete more than half of known files and
-    // the schema has very few entries, this likely indicates a partial/corrupt schema
-    // rather than a legitimate bulk delete. See CP-l8d2.
+    // Deletion guards: skip file deletions when schema data may be incomplete.
+    // Two cases: (1) UUID map build had failures/timeouts, so schema_path_set is
+    // missing paths that legitimately exist; (2) mass deletion where a partial
+    // schema would delete most known files. See CP-l8d2.
     let total_tracked = known_paths.len();
+    let uuid_map_incomplete = !all_uuids_succeeded && !all_deleted_paths.is_empty();
     let mass_deletion_blocked = !all_deleted_paths.is_empty()
         && total_tracked > 2
         && all_deleted_paths.len() > total_tracked / 2
         && schema_filenames.len() < 3;
+    let skip_all_deletions = uuid_map_incomplete || mass_deletion_blocked;
 
+    if uuid_map_incomplete {
+        info!(
+            "[CRDT-GUARD] UUID map incomplete (HTTP path): skipping {}/{} file deletions \
+             because UUID map build had failures/timeouts. Files may not actually be deleted \
+             on server. See CP-l8d2.",
+            all_deleted_paths.len(),
+            total_tracked
+        );
+    }
     if mass_deletion_blocked {
         info!(
             "[CRDT-GUARD] Mass deletion guard (HTTP path): schema has {} filenames but would \
@@ -2174,7 +2186,8 @@ pub async fn handle_schema_change(
             all_deleted_paths.len(),
             total_tracked
         );
-    } else {
+    }
+    if !skip_all_deletions {
         for path in &all_deleted_paths {
             // Check if we recently wrote a schema containing this file
             // This prevents race conditions where we create a file, push schema,
@@ -2202,9 +2215,9 @@ pub async fn handle_schema_change(
         }
     }
 
-    // Clean up orphaned directories — but skip if mass deletion was blocked
+    // Clean up orphaned directories — but skip if deletions were blocked
     // (partial schema would also incorrectly identify directories as orphaned)
-    cleanup_orphaned_directories(directory, &schema, mass_deletion_blocked).await;
+    cleanup_orphaned_directories(directory, &schema, skip_all_deletions).await;
 
     // Unmark locally deleted directories from sync state so they don't keep being flagged
     for dir_name in &locally_deleted_dirs {
