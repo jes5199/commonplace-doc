@@ -347,16 +347,41 @@ pub async fn directory_mqtt_task(
         debug!("Wrote MQTT readiness marker to {}", ready_marker.display());
     }
 
-    // Bootstrap schema from HTTP before entering MQTT loop.
-    // This ensures we have initial state even if no retained MQTT messages exist
-    // for the directory schema. Without this, files that exist on the server but
-    // not locally would never get CRDT tasks spawned.
+    // Bootstrap schema CRDT state via cyan sync channel before entering MQTT loop.
+    // This replaces HTTP bootstrap — see CP-uals, design: cyan-schema-sync-design.md
     if let Some(ref ctx) = crdt_context {
         if !push_only {
-            info!(
-                "Bootstrapping schema from HTTP for {} before MQTT loop",
-                fs_root_id
-            );
+            let needs_init = {
+                let state = ctx.crdt_state.read().await;
+                state.schema.needs_server_init()
+            };
+
+            if needs_init {
+                let sync_client_id = Uuid::new_v4().to_string();
+
+                let initialized = {
+                    let mut state = ctx.crdt_state.write().await;
+                    sync_schema_via_cyan(
+                        &mqtt_client,
+                        &workspace,
+                        &fs_root_id,
+                        &sync_client_id,
+                        &mut state.schema,
+                    )
+                    .await
+                };
+
+                if initialized {
+                    info!("Schema CRDT initialized via cyan sync for {}", fs_root_id);
+                } else {
+                    warn!(
+                        "Cyan sync failed for {} — falling back to HTTP bootstrap",
+                        fs_root_id
+                    );
+                }
+            }
+
+            // Bootstrap files from the schema (whether initialized via cyan or already present)
             if let Err(e) = handle_subdir_new_files(
                 &http_client,
                 &server,
@@ -373,11 +398,11 @@ pub async fn directory_mqtt_task(
                 #[cfg(unix)]
                 inode_tracker.clone(),
                 Some(ctx),
-                None, // No MQTT schema yet - fetch from HTTP
+                None, // Schema already initialized — HTTP fetch will populate files
             )
             .await
             {
-                warn!("Failed to bootstrap schema from HTTP: {}", e);
+                warn!("Failed to bootstrap files after schema init: {}", e);
             }
         }
     }
