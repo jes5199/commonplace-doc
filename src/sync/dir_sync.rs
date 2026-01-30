@@ -375,6 +375,7 @@ async fn cleanup_orphaned_directories(directory: &Path, schema: &FsSchema, skip_
     };
 
     let mut dirs_to_remove = Vec::new();
+    let mut local_dir_count: usize = 0;
 
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
@@ -392,23 +393,43 @@ async fn cleanup_orphaned_directories(directory: &Path, schema: &FsSchema, skip_
             continue;
         }
 
+        local_dir_count += 1;
+
         // If this directory isn't in the schema, mark it for removal
         if !schema_dirs.contains(&name) {
             dirs_to_remove.push((path, name));
         }
     }
 
+    // Guard: If we would delete more directories than the schema contains,
+    // the schema is likely incomplete (e.g., server hasn't fully populated yet,
+    // or CRDT state is partial). Deleting many directories based on an incomplete
+    // schema would cause data loss. See CP-l8d2.
+    if !dirs_to_remove.is_empty()
+        && dirs_to_remove.len() >= local_dir_count.saturating_sub(1)
+        && local_dir_count > 1
+    {
+        info!(
+            "[CRDT-GUARD] Skipping orphaned directory cleanup: would delete {}/{} local \
+             directories (schema has {} dir entries). Schema likely incomplete. See CP-l8d2.",
+            dirs_to_remove.len(),
+            local_dir_count,
+            schema_dirs.len()
+        );
+        return;
+    }
+
     // Remove orphaned directories and unmark them from sync state
-    for (dir_path, name) in dirs_to_remove {
+    for (dir_path, name) in &dirs_to_remove {
         info!(
             "Removing orphaned directory (not in schema): {}",
             dir_path.display()
         );
-        if let Err(e) = tokio::fs::remove_dir_all(&dir_path).await {
+        if let Err(e) = tokio::fs::remove_dir_all(dir_path).await {
             warn!("Failed to remove directory {}: {}", dir_path.display(), e);
         }
         // Unmark this directory from synced state
-        if let Err(e) = unmark_directory_synced(directory, &name).await {
+        if let Err(e) = unmark_directory_synced(directory, name).await {
             debug!("Failed to unmark directory synced: {}", e);
         }
     }
