@@ -203,6 +203,21 @@ pub fn list_entries(doc: &Doc) -> HashMap<String, SchemaEntry> {
     result
 }
 
+/// List all entry names in the schema (lightweight version of list_entries).
+/// Used for before/after comparison to detect explicit deletions.
+pub fn list_entry_names(doc: &Doc) -> std::collections::HashSet<String> {
+    let txn = doc.transact();
+    let mut names = std::collections::HashSet::new();
+
+    if let Some(entries) = get_entries(&txn) {
+        for (key, _value) in entries.iter(&txn) {
+            names.insert(key.to_string());
+        }
+    }
+
+    names
+}
+
 /// Check if the doc uses the new YMap format (has YMap at "content" with "root" submap).
 pub fn is_ymap_format(doc: &Doc) -> bool {
     let txn = doc.transact();

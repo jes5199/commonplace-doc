@@ -103,7 +103,7 @@ use crate::events::{recv_broadcast_with_lag, BroadcastRecvResult};
 use crate::fs::FsSchema;
 use crate::mqtt::{MqttClient, Topic};
 use crate::sync::dir_sync::{
-    apply_schema_update_to_state, create_subdir_nested_directories,
+    apply_explicit_deletions, apply_schema_update_to_state, create_subdir_nested_directories,
     decode_schema_from_mqtt_payload, handle_schema_change_with_dedup, handle_subdir_new_files,
     handle_subdir_schema_cleanup,
 };
@@ -165,36 +165,46 @@ pub async fn handle_subdir_edit(
     log_prefix: &str,
     crdt_context: Option<&CrdtFileSyncContext>,
     mqtt_schema: Option<(FsSchema, String)>,
-    crdt_skip_deletions: bool,
+    deleted_entries: std::collections::HashSet<String>,
 ) {
     // Clone mqtt_schema to pass to new files sync
     let mqtt_schema_for_new_files = mqtt_schema.clone();
 
-    // First, cleanup deleted files and orphaned directories
-    match handle_subdir_schema_cleanup(
-        client,
-        server,
-        subdir_node_id,
-        subdir_path,
-        subdir_full_path,
-        directory,
-        file_states,
-        mqtt_schema,
-        crdt_skip_deletions,
-    )
-    .await
-    {
-        Ok(()) => {
-            debug!(
-                "{}: Subdir {} schema cleanup completed",
-                log_prefix, subdir_path
-            );
-        }
-        Err(e) => {
-            warn!(
-                "{}: Failed to handle subdir {} schema cleanup: {}",
-                log_prefix, subdir_path, e
-            );
+    // First, cleanup deleted files and orphaned directories.
+    // Use explicit CRDT deletions when available (CP-seha).
+    if !deleted_entries.is_empty() {
+        apply_explicit_deletions(subdir_path, subdir_full_path, file_states, &deleted_entries)
+            .await;
+        debug!(
+            "{}: Subdir {} explicit CRDT deletions applied",
+            log_prefix, subdir_path
+        );
+    } else {
+        // Fall back to schema-diff cleanup (no CRDT deletions detected)
+        match handle_subdir_schema_cleanup(
+            client,
+            server,
+            subdir_node_id,
+            subdir_path,
+            subdir_full_path,
+            directory,
+            file_states,
+            mqtt_schema,
+        )
+        .await
+        {
+            Ok(()) => {
+                debug!(
+                    "{}: Subdir {} schema cleanup completed",
+                    log_prefix, subdir_path
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "{}: Failed to handle subdir {} schema cleanup: {}",
+                    log_prefix, subdir_path, e
+                );
+            }
         }
     }
 
@@ -492,10 +502,10 @@ pub async fn directory_mqtt_task(
                 // Extract the updated CID before releasing the lock (for ancestry tracking)
                 let updated_cid = state.schema.head_cid.clone();
 
-                // Split 3-tuple: extract skip_deletions flag (CP-l8d2)
-                let (mqtt_schema, root_skip_deletions) = match mqtt_schema_result {
-                    Some((s, j, skip)) => (Some((s, j)), skip),
-                    None => (None, false),
+                // Extract fields from SchemaUpdateResult (CP-seha)
+                let (mqtt_schema, root_deleted_entries) = match mqtt_schema_result {
+                    Some(r) => (Some((r.schema, r.schema_json)), r.deleted_entries),
+                    None => (None, std::collections::HashSet::new()),
                 };
 
                 // Persist the updated CRDT state to disk so it survives restarts
@@ -534,28 +544,7 @@ pub async fn directory_mqtt_task(
                         entry_count, entry_names
                     );
 
-                    // Guard: If the decoded schema has 0 entries, don't process it.
-                    // An empty schema can result from applying updates to state that
-                    // was initialized empty (e.g., after resync where server had no
-                    // Yjs state). Processing an empty schema would write an empty
-                    // .commonplace.json and trigger cleanup that deletes real files.
-                    // Instead, trigger a resync from server. See CP-bfav.
-                    if entry_count == 0 {
-                        info!(
-                            "[CRDT-GUARD] Root schema decoded with 0 entries after MQTT update. \
-                             Skipping processing and triggering resync to avoid data loss."
-                        );
-                        // Trigger resync from server to get authoritative state
-                        resync_schema_from_server(
-                            &http_client,
-                            &server,
-                            &fs_root_id,
-                            ctx,
-                            &directory,
-                            written_schemas.as_ref(),
-                        )
-                        .await;
-                    } else {
+                    {
                         // Compute hash for deduplication
                         let current_hash =
                             crate::sync::state_file::compute_content_hash(schema_json.as_bytes());
@@ -609,21 +598,32 @@ pub async fn directory_mqtt_task(
                                 }
                             }
 
-                            // Handle deletions using MQTT schema
-                            if let Err(e) = handle_subdir_schema_cleanup(
-                                &http_client,
-                                &server,
-                                &fs_root_id,
-                                "", // root directory = empty subdir_path
-                                &directory,
-                                &directory,
-                                &file_states,
-                                Some(schema_tuple),
-                                root_skip_deletions, // Skip deletions when CRDT state was uninitialized (CP-l8d2)
-                            )
-                            .await
-                            {
-                                warn!("MQTT: Failed to cleanup deleted files: {}", e);
+                            // Handle deletions: use explicit CRDT deletions when available (CP-seha),
+                            // fall back to schema-diff cleanup for non-CRDT paths.
+                            if !root_deleted_entries.is_empty() {
+                                apply_explicit_deletions(
+                                    "", // root directory = empty subdir_path
+                                    &directory,
+                                    &file_states,
+                                    &root_deleted_entries,
+                                )
+                                .await;
+                            } else {
+                                // No explicit deletions detected - call schema cleanup as fallback
+                                if let Err(e) = handle_subdir_schema_cleanup(
+                                    &http_client,
+                                    &server,
+                                    &fs_root_id,
+                                    "", // root directory = empty subdir_path
+                                    &directory,
+                                    &directory,
+                                    &file_states,
+                                    Some(schema_tuple),
+                                )
+                                .await
+                                {
+                                    warn!("MQTT: Failed to cleanup deleted files: {}", e);
+                                }
                             }
 
                             // Ensure CRDT tasks exist for all files
@@ -650,7 +650,7 @@ pub async fn directory_mqtt_task(
                         } else {
                             debug!("MQTT: Schema unchanged (same hash), skipped processing");
                         }
-                    } // end of entry_count > 0 guard
+                    }
                 } else {
                     trace_log(
                         "MQTT: Failed to decode schema from CRDT state, falling back to HTTP",
@@ -1848,8 +1848,8 @@ pub async fn subdir_mqtt_task(
                     inode_tracker.clone(),
                     "MQTT-resync",
                     crdt_context.as_ref(),
-                    None,  // No MQTT schema during resync, fetch from HTTP
-                    false, // HTTP resync has full schema, no skip needed
+                    None, // No MQTT schema during resync, fetch from HTTP
+                    std::collections::HashSet::new(), // No CRDT deletions during HTTP resync
                 )
                 .await;
 
@@ -1958,9 +1958,9 @@ pub async fn subdir_mqtt_task(
                             let mut state = subdir_state.write().await;
                             let result =
                                 apply_schema_update_to_state(&mut state.schema, &msg.payload);
-                            if let Some((ref schema, _, _)) = result {
+                            if let Some(ref r) = result {
                                 let entry_count =
-                                    if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
+                                    if let Some(crate::fs::Entry::Dir(ref root)) = r.schema.root {
                                         root.entries.as_ref().map(|e| e.len()).unwrap_or(0)
                                     } else {
                                         0
@@ -1988,7 +1988,7 @@ pub async fn subdir_mqtt_task(
                                     subdir_path
                                 );
                             }
-                            result
+                            result.map(|r| (r.schema, r.schema_json, r.deleted_entries))
                         }
                         Err(e) => {
                             warn!(
@@ -2016,9 +2016,9 @@ pub async fn subdir_mqtt_task(
                             // Use the correct pattern: load state first, then apply update
                             let schema_result =
                                 apply_schema_update_to_state(&mut state.schema, &msg.payload);
-                            if let Some((ref schema, _, _)) = schema_result {
+                            if let Some(ref r) = schema_result {
                                 let entry_count =
-                                    if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
+                                    if let Some(crate::fs::Entry::Dir(ref root)) = r.schema.root {
                                         root.entries.as_ref().map(|e| e.len()).unwrap_or(0)
                                     } else {
                                         0
@@ -2036,7 +2036,7 @@ pub async fn subdir_mqtt_task(
                                     );
                                 }
                             }
-                            schema_result
+                            schema_result.map(|r| (r.schema, r.schema_json, r.deleted_entries))
                         }
                         Err(e) => {
                             warn!(
@@ -2047,10 +2047,8 @@ pub async fn subdir_mqtt_task(
                             // WARNING: decode_schema_from_mqtt_payload cannot handle DELETE
                             // operations correctly because it uses a fresh Y.Doc. Deletions
                             // will be ignored and must be handled via HTTP fallback.
-                            // skip_deletions=false: stateless decode always starts fresh,
-                            // so was_uninitialized doesn't apply here.
                             decode_schema_from_mqtt_payload(&msg.payload)
-                                .map(|(s, j)| (s, j, false))
+                                .map(|(s, j)| (s, j, std::collections::HashSet::new()))
                         }
                     }
                 } else {
@@ -2061,7 +2059,8 @@ pub async fn subdir_mqtt_task(
                     // WARNING: decode_schema_from_mqtt_payload cannot handle DELETE
                     // operations correctly because it uses a fresh Y.Doc. Deletions
                     // will be ignored and must be handled via HTTP fallback.
-                    decode_schema_from_mqtt_payload(&msg.payload).map(|(s, j)| (s, j, false))
+                    decode_schema_from_mqtt_payload(&msg.payload)
+                        .map(|(s, j)| (s, j, std::collections::HashSet::new()))
                 };
 
                 if result.is_none() {
@@ -2073,11 +2072,10 @@ pub async fn subdir_mqtt_task(
                 result
             };
 
-            // Split the 3-tuple: extract skip_deletions flag (true when CRDT
-            // state was uninitialized, meaning schema may be partial). See CP-l8d2.
-            let (mqtt_schema, crdt_skip_deletions) = match mqtt_schema {
-                Some((s, j, skip)) => (Some((s, j)), skip),
-                None => (None, false),
+            // Extract deleted_entries from schema result (CP-seha)
+            let (mqtt_schema, crdt_deleted_entries) = match mqtt_schema {
+                Some((s, j, deleted)) => (Some((s, j)), deleted),
+                None => (None, std::collections::HashSet::new()),
             };
 
             // Use shared helper for edit handling
@@ -2098,8 +2096,8 @@ pub async fn subdir_mqtt_task(
                 inode_tracker.clone(),
                 "MQTT",
                 crdt_context.as_ref(),
-                mqtt_schema,         // Use MQTT-decoded schema to avoid HTTP race
-                crdt_skip_deletions, // Skip deletions when CRDT state was uninitialized (CP-l8d2)
+                mqtt_schema,          // Use MQTT-decoded schema to avoid HTTP race
+                crdt_deleted_entries, // Explicit CRDT deletions (CP-seha)
             )
             .await;
 

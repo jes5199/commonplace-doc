@@ -106,6 +106,17 @@ pub fn decode_schema_from_mqtt_payload(payload: &[u8]) -> Option<(FsSchema, Stri
     Some((schema, schema_json))
 }
 
+/// Result of applying a schema CRDT update, including explicit deletion tracking.
+/// See CP-seha: deletions are detected by before/after YMap comparison rather than
+/// schema-diff against disk.
+pub struct SchemaUpdateResult {
+    pub schema: FsSchema,
+    pub schema_json: String,
+    /// Entry names that were explicitly removed by this CRDT update.
+    /// Empty when state was uninitialized (fresh Y.Doc has no "before" entries).
+    pub deleted_entries: std::collections::HashSet<String>,
+}
+
 /// Apply an MQTT schema update to persistent CRDT state.
 ///
 /// Unlike `decode_schema_from_mqtt_payload` which creates a fresh Y.Doc,
@@ -119,12 +130,12 @@ pub fn decode_schema_from_mqtt_payload(payload: &[u8]) -> Option<(FsSchema, Stri
 /// * `payload` - The raw MQTT payload containing the EditMessage
 ///
 /// # Returns
-/// * `Some((FsSchema, String))` - The decoded schema and its JSON representation
+/// * `Some(SchemaUpdateResult)` - The decoded schema, JSON, and deletion tracking
 /// * `None` - If decoding fails (caller should fall back to HTTP fetch)
 pub fn apply_schema_update_to_state(
     state: &mut crate::sync::CrdtPeerState,
     payload: &[u8],
-) -> Option<(FsSchema, String, bool)> {
+) -> Option<SchemaUpdateResult> {
     // Parse the EditMessage JSON
     let edit_msg = match parse_edit_message(payload) {
         Ok(m) => m,
@@ -143,29 +154,13 @@ pub fn apply_schema_update_to_state(
         }
     };
 
-    // Track whether CRDT state was uninitialized before this update.
-    // The first MQTT retained message carries the full state and correctly
-    // initializes an empty doc. But delta-only updates (e.g., DELETE operations)
-    // applied to an empty doc produce 0 entries, which would trigger destructive
-    // cleanup. See CP-bfav.
-    let was_uninitialized = state.needs_server_init();
-
     // Load existing Y.Doc from state, or create fresh if none exists.
     let doc = match state.to_doc() {
         Ok(d) => {
-            // Log existing entries for debugging
-            let before_schema = ymap_schema::to_fs_schema(&d);
-            let before_count = before_schema
-                .root
-                .as_ref()
-                .and_then(|e| match e {
-                    crate::fs::Entry::Dir(dir) => dir.entries.as_ref().map(|e| e.len()),
-                    _ => None,
-                })
-                .unwrap_or(0);
-            info!(
-                "[CRDT-DEBUG] Loaded existing Y.Doc with {} entries (was_uninitialized={})",
-                before_count, was_uninitialized
+            let before_count = ymap_schema::list_entry_names(&d).len();
+            debug!(
+                "[CRDT-DEBUG] Loaded existing Y.Doc with {} entries",
+                before_count
             );
             d
         }
@@ -174,6 +169,9 @@ pub fn apply_schema_update_to_state(
             Doc::new()
         }
     };
+
+    // Capture entry names BEFORE applying update for deletion detection (CP-seha)
+    let before_entries = ymap_schema::list_entry_names(&doc);
 
     // Apply the incoming update
     {
@@ -189,34 +187,26 @@ pub fn apply_schema_update_to_state(
         }
     }
 
-    // Log entries after update for debugging
-    let after_schema = ymap_schema::to_fs_schema(&doc);
-    let after_count = after_schema
-        .root
-        .as_ref()
-        .and_then(|e| match e {
-            crate::fs::Entry::Dir(dir) => dir.entries.as_ref().map(|e| e.len()),
-            _ => None,
-        })
-        .unwrap_or(0);
-    info!(
-        "[CRDT-DEBUG] After applying update: {} entries (was_uninitialized={})",
-        after_count, was_uninitialized
-    );
+    // Detect explicit deletions: entries present before but absent after (CP-seha)
+    let after_entry_names = ymap_schema::list_entry_names(&doc);
+    let deleted_entries: std::collections::HashSet<String> = before_entries
+        .difference(&after_entry_names)
+        .cloned()
+        .collect();
 
-    // Guard: If the update produced 0 entries and the state was uninitialized,
-    // this is likely a delta-only update (e.g., DELETE) applied to an empty doc.
-    // Don't persist this - return None so the caller falls back to HTTP/resync.
-    // However, if the update produced entries, it's a valid full-state initialization
-    // (e.g., retained MQTT message) and should be accepted. See CP-bfav.
-    if after_count == 0 && was_uninitialized {
+    if !deleted_entries.is_empty() {
         info!(
-            "[CRDT-GUARD] Schema update produced 0 entries from uninitialized state. \
-             This is likely a delta applied to an empty doc. Skipping to avoid data loss. \
-             Caller should resync from server."
+            "[CRDT-DELETE] Detected {} explicit deletions: {:?}",
+            deleted_entries.len(),
+            deleted_entries
         );
-        return None;
     }
+
+    let after_count = after_entry_names.len();
+    debug!(
+        "[CRDT-DEBUG] After applying update: {} entries",
+        after_count
+    );
 
     // Save the updated doc back to state
     state.update_from_doc(&doc);
@@ -258,7 +248,11 @@ pub fn apply_schema_update_to_state(
         }
     };
 
-    Some((schema, schema_json, was_uninitialized))
+    Some(SchemaUpdateResult {
+        schema,
+        schema_json,
+        deleted_entries,
+    })
 }
 
 /// Check if a file path exists in any recently written schema.
@@ -324,44 +318,7 @@ async fn path_in_written_schemas(
 /// After deleting files that were removed from the schema, this function
 /// removes any orphaned directories (directories that exist locally but
 /// have no corresponding entry in the schema).
-async fn cleanup_orphaned_directories(directory: &Path, schema: &FsSchema, skip_deletions: bool) {
-    // Guard: If schema was decoded from uninitialized CRDT state, it may be
-    // partial and missing entries. Deleting directories not found in a partial
-    // schema would cause data loss. See CP-l8d2.
-    if skip_deletions {
-        info!(
-            "[CRDT-GUARD] Skipping orphaned directory cleanup: schema was decoded from \
-             uninitialized CRDT state. Deletions deferred until state is fully initialized."
-        );
-        return;
-    }
-
-    // Guard: If schema is empty (root=None or 0 entries), treat it as "unknown"
-    // rather than "everything deleted". An empty schema can result from applying
-    // a delta to uninitialized CRDT state, and deleting all directories would
-    // cause data loss. See CP-bfav.
-    let entry_count = schema
-        .root
-        .as_ref()
-        .and_then(|e| match e {
-            Entry::Dir(dir) => dir.entries.as_ref().map(|e| e.len()),
-            _ => None,
-        })
-        .unwrap_or(0);
-    if schema.root.is_none() || entry_count == 0 {
-        info!(
-            "[CRDT-GUARD] Skipping orphaned directory cleanup: schema is empty \
-             (root={}, entries={}). Empty schema treated as unknown, not as all-deleted.",
-            if schema.root.is_some() {
-                "Some"
-            } else {
-                "None"
-            },
-            entry_count
-        );
-        return;
-    }
-
+async fn cleanup_orphaned_directories(directory: &Path, schema: &FsSchema) {
     // Collect all directory names from the schema
     let schema_dirs: std::collections::HashSet<String> = collect_schema_directories(schema);
 
@@ -375,7 +332,6 @@ async fn cleanup_orphaned_directories(directory: &Path, schema: &FsSchema, skip_
     };
 
     let mut dirs_to_remove = Vec::new();
-    let mut local_dir_count: usize = 0;
 
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
@@ -393,30 +349,10 @@ async fn cleanup_orphaned_directories(directory: &Path, schema: &FsSchema, skip_
             continue;
         }
 
-        local_dir_count += 1;
-
         // If this directory isn't in the schema, mark it for removal
         if !schema_dirs.contains(&name) {
             dirs_to_remove.push((path, name));
         }
-    }
-
-    // Guard: If we would delete more directories than the schema contains,
-    // the schema is likely incomplete (e.g., server hasn't fully populated yet,
-    // or CRDT state is partial). Deleting many directories based on an incomplete
-    // schema would cause data loss. See CP-l8d2.
-    if !dirs_to_remove.is_empty()
-        && dirs_to_remove.len() >= local_dir_count.saturating_sub(1)
-        && local_dir_count > 1
-    {
-        info!(
-            "[CRDT-GUARD] Skipping orphaned directory cleanup: would delete {}/{} local \
-             directories (schema has {} dir entries). Schema likely incomplete. See CP-l8d2.",
-            dirs_to_remove.len(),
-            local_dir_count,
-            schema_dirs.len()
-        );
-        return;
     }
 
     // Remove orphaned directories and unmark them from sync state
@@ -459,7 +395,6 @@ pub async fn handle_subdir_schema_cleanup(
     root_directory: &Path,
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
     mqtt_schema: Option<(FsSchema, String)>,
-    crdt_skip_deletions: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Track whether we're using MQTT schema (authoritative) vs HTTP (may be stale)
     let using_mqtt_schema = mqtt_schema.is_some();
@@ -482,49 +417,9 @@ pub async fn handle_subdir_schema_cleanup(
         (fetched.schema, fetched.content)
     };
 
-    // Guard: If schema is empty (root=None or 0 entries), skip ALL cleanup.
-    // An empty schema can result from applying a delta to uninitialized CRDT state,
-    // and deleting all files/directories would cause data loss. See CP-bfav.
-    let schema_entry_count = schema
-        .root
-        .as_ref()
-        .and_then(|e| match e {
-            Entry::Dir(dir) => dir.entries.as_ref().map(|e| e.len()),
-            _ => None,
-        })
-        .unwrap_or(0);
-    if schema.root.is_none() || schema_entry_count == 0 {
-        info!(
-            "[CRDT-GUARD] Skipping subdir schema cleanup for '{}': schema is empty \
-             (root={}, entries={}). Empty schema treated as unknown, not as all-deleted.",
-            subdir_path,
-            if schema.root.is_some() {
-                "Some"
-            } else {
-                "None"
-            },
-            schema_entry_count
-        );
-        return Ok(());
-    }
-
     // Write valid schema to local .commonplace.json file
     if let Err(e) = write_schema_file(subdir_directory, &schema_json, None).await {
         warn!("Failed to write subdir schema file: {}", e);
-    }
-
-    // Guard: If schema was decoded from uninitialized CRDT state, it may be
-    // partial (only containing entries from a single delta, not the full state).
-    // The schema is still written to disk above (good for new file discovery),
-    // but we must NOT use it for deletions — a partial schema would delete every
-    // file not mentioned in the delta. See CP-l8d2.
-    if crdt_skip_deletions {
-        info!(
-            "[CRDT-GUARD] Skipping file deletion for '{}': schema was decoded from \
-             uninitialized CRDT state. Deletions deferred until state is fully initialized.",
-            subdir_path
-        );
-        return Ok(());
     }
 
     // Extract filenames from the MQTT/local schema for deletion checks.
@@ -558,11 +453,7 @@ pub async fn handle_subdir_schema_cleanup(
     let (subdir_uuid_map, all_fetches_succeeded) =
         build_uuid_map_recursive_with_status(client, server, subdir_node_id).await;
 
-    // Safety checks for deletion:
-    // 1. If ANY fetch failed → map may be incomplete, skip deletions
-    // 2. If schema has entries but BOTH UUID map AND schema_entry_names are empty → something is wrong
-    //    (Note: schema_entry_names includes all entries, UUID map only those with node_id.
-    //    Files without node_id are valid and should not cause deletion skip.)
+    // Safety check: if ANY fetch failed → map may be incomplete, skip deletions
     let skip_deletions = if !all_fetches_succeeded {
         debug!(
             "Subdir {} had fetch failures during UUID map building - skipping file deletion to avoid data loss",
@@ -623,8 +514,6 @@ pub async fn handle_subdir_schema_cleanup(
         }
 
         // Find files in file_states that are under this subdir but no longer in schema.
-        // Skip __processes.json — it's a system file that drives process discovery;
-        // deleting it cascades into process stops and sandbox wipes. See CP-l8d2.
         let deleted_paths: Vec<String> = {
             let states = file_states.read().await;
             states
@@ -636,9 +525,7 @@ pub async fn handle_subdir_schema_cleanup(
                     } else {
                         p.starts_with(&format!("{}/", subdir_path))
                     };
-                    // Never delete __processes.json via schema cleanup
-                    let is_system_file = p.ends_with("__processes.json");
-                    is_in_subdir && !is_system_file && !schema_paths.contains(*p)
+                    is_in_subdir && !schema_paths.contains(*p)
                 })
                 .cloned()
                 .collect()
@@ -664,10 +551,8 @@ pub async fn handle_subdir_schema_cleanup(
                         Ok(n) => n,
                         Err(_) => continue,
                     };
-                    // Skip hidden files, schema files, and system config files.
-                    // __processes.json is a system file that drives process discovery;
-                    // deleting it cascades into process stops and sandbox wipes. See CP-l8d2.
-                    if filename.starts_with('.') || filename == "__processes.json" {
+                    // Skip hidden files and schema files
+                    if filename.starts_with('.') {
                         continue;
                     }
                     // If this file is not in the MQTT schema, mark for deletion
@@ -694,98 +579,128 @@ pub async fn handle_subdir_schema_cleanup(
             .chain(disk_deleted_paths.into_iter())
             .collect();
 
-        // Mass-deletion guard: if the schema has very few entries but would delete
-        // many files, this is likely a partial or corrupt schema rather than a
-        // legitimate bulk delete. A legitimate bulk delete would remove files one
-        // at a time through individual MQTT edits, not appear as a schema with
-        // most entries missing. See CP-l8d2.
-        //
-        // Use the deletion count itself rather than file_states count, because
-        // file_states may be empty at startup (files exist on disk but aren't
-        // tracked yet). The disk scan in disk_deleted_paths catches those files.
-        if !all_deleted_paths.is_empty() && all_deleted_paths.len() > 2 && schema_entry_count < 3 {
-            info!(
-                "[CRDT-GUARD] Mass deletion guard for '{}': schema has {} entries but would \
-                 delete {} files. This likely indicates a partial or corrupt schema. \
-                 Skipping deletions to prevent data loss. See CP-l8d2.",
-                subdir_path,
-                schema_entry_count,
-                all_deleted_paths.len()
-            );
-        } else {
-            // Delete files that were removed from server
-            for path in &all_deleted_paths {
-                let file_path = root_directory.join(path);
+        // Delete files that were removed from server
+        for path in &all_deleted_paths {
+            let file_path = root_directory.join(path);
 
-                // Safety check: don't delete files that were modified very recently (within 10 seconds)
-                // ONLY when using HTTP-fetched schema. When using MQTT schema, the delete is
-                // authoritative and should proceed regardless of local modification time.
-                //
-                // This protects against race conditions where we just created a file via CRDT but
-                // the server schema hasn't been updated yet. Without this check, the cleanup would
-                // see the file isn't in the server schema and delete it prematurely.
-                //
-                // When using_mqtt_schema is true, we trust the MQTT-delivered schema as authoritative
-                // because MQTT messages are delivered in causal order within a topic.
-                if !using_mqtt_schema && file_path.exists() && file_path.is_file() {
-                    if let Ok(metadata) = file_path.metadata() {
-                        if let Ok(modified) = metadata.modified() {
-                            if let Ok(elapsed) = modified.elapsed() {
-                                if elapsed.as_secs() < 10 {
-                                    debug!(
+            // Safety check: don't delete files that were modified very recently (within 10 seconds)
+            // ONLY when using HTTP-fetched schema. When using MQTT schema, the delete is
+            // authoritative and should proceed regardless of local modification time.
+            //
+            // This protects against race conditions where we just created a file via CRDT but
+            // the server schema hasn't been updated yet. Without this check, the cleanup would
+            // see the file isn't in the server schema and delete it prematurely.
+            //
+            // When using_mqtt_schema is true, we trust the MQTT-delivered schema as authoritative
+            // because MQTT messages are delivered in causal order within a topic.
+            if !using_mqtt_schema && file_path.exists() && file_path.is_file() {
+                if let Ok(metadata) = file_path.metadata() {
+                    if let Ok(modified) = metadata.modified() {
+                        if let Ok(elapsed) = modified.elapsed() {
+                            if elapsed.as_secs() < 10 {
+                                debug!(
                                     "Subdir {} skipping deletion of recently modified file: {} (modified {}s ago)",
                                     subdir_path, path, elapsed.as_secs()
                                 );
-                                    continue;
-                                }
+                                continue;
                             }
                         }
                     }
                 }
+            }
 
-                // Trace log for debugging
-                {
-                    use std::io::Write;
-                    if let Ok(mut file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/sandbox-trace.log")
-                    {
-                        let timestamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis())
-                            .unwrap_or(0);
-                        let pid = std::process::id();
-                        let _ = writeln!(
-                            file,
-                            "[{} pid={}] DELETE file: subdir={}, path={}",
-                            timestamp, pid, subdir_path, path
-                        );
-                    }
-                }
+            info!(
+                "Subdir {} removed file: {} - deleting local copy",
+                subdir_path, path
+            );
 
-                info!(
-                    "Subdir {} removed file: {} - deleting local copy",
-                    subdir_path, path
-                );
+            // Stop sync tasks and remove from file_states
+            remove_file_state_and_abort(file_states, path).await;
 
-                // Stop sync tasks and remove from file_states
-                remove_file_state_and_abort(file_states, path).await;
-
-                // Delete the file from disk
-                if file_path.exists() && file_path.is_file() {
-                    if let Err(e) = tokio::fs::remove_file(&file_path).await {
-                        warn!("Failed to delete file {}: {}", file_path.display(), e);
-                    }
+            // Delete the file from disk
+            if file_path.exists() && file_path.is_file() {
+                if let Err(e) = tokio::fs::remove_file(&file_path).await {
+                    warn!("Failed to delete file {}: {}", file_path.display(), e);
                 }
             }
-        } // end mass-deletion guard else
+        }
     }
 
     // Clean up directories that exist locally but not in the schema
-    cleanup_orphaned_directories(subdir_directory, &schema, crdt_skip_deletions).await;
+    cleanup_orphaned_directories(subdir_directory, &schema).await;
 
     Ok(())
+}
+
+/// Apply explicit file deletions detected from CRDT before/after comparison.
+///
+/// Unlike handle_subdir_schema_cleanup which infers deletions by comparing schema
+/// against disk (fragile when schema is incomplete), this function only deletes
+/// files that were explicitly removed from the CRDT YMap. See CP-seha.
+///
+/// Handles both file entries (deletes the file) and directory entries (deletes
+/// the directory tree and unmarks from sync state).
+pub async fn apply_explicit_deletions(
+    subdir_path: &str,
+    subdir_directory: &Path,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    deleted_entries: &std::collections::HashSet<String>,
+) {
+    if deleted_entries.is_empty() {
+        return;
+    }
+
+    info!(
+        "[CRDT-DELETE] Applying {} explicit deletions for '{}': {:?}",
+        deleted_entries.len(),
+        subdir_path,
+        deleted_entries
+    );
+
+    for entry_name in deleted_entries {
+        let entry_path = subdir_directory.join(entry_name);
+
+        // Build the relative path key used in file_states
+        let relative_key = if subdir_path.is_empty() {
+            entry_name.clone()
+        } else {
+            format!("{}/{}", subdir_path, entry_name)
+        };
+
+        if entry_path.is_dir() {
+            // Directory entry was removed - delete the directory tree
+            info!(
+                "[CRDT-DELETE] Removing directory '{}' (explicitly deleted from schema)",
+                entry_path.display()
+            );
+            if let Err(e) = tokio::fs::remove_dir_all(&entry_path).await {
+                warn!("Failed to remove directory {}: {}", entry_path.display(), e);
+            }
+            // Unmark from synced directories state
+            if let Err(e) = unmark_directory_synced(subdir_directory, entry_name).await {
+                debug!("Failed to unmark directory synced: {}", e);
+            }
+        } else if entry_path.is_file() {
+            // File entry was removed - delete the file
+            info!(
+                "[CRDT-DELETE] Removing file '{}' (explicitly deleted from schema)",
+                entry_path.display()
+            );
+
+            // Remove from file_states and abort sync tasks
+            remove_file_state_and_abort(file_states, &relative_key).await;
+
+            if let Err(e) = tokio::fs::remove_file(&entry_path).await {
+                warn!("Failed to delete file {}: {}", entry_path.display(), e);
+            }
+        } else {
+            // Entry doesn't exist on disk - nothing to delete
+            debug!(
+                "[CRDT-DELETE] Entry '{}' not found on disk, skipping",
+                entry_path.display()
+            );
+        }
+    }
 }
 
 /// Handle syncing NEW files that appear in a subdirectory schema.
@@ -1744,7 +1659,7 @@ pub async fn handle_schema_change(
     // Collect all paths from schema (with explicit node_id if present)
     // Use async version that follows node-backed directories to get complete path->UUID map
     // AND writes nested schema files to local directory (required for find_owning_document fallback)
-    let (uuid_map, all_uuids_succeeded) =
+    let (uuid_map, _all_uuids_succeeded) =
         build_uuid_map_and_write_schemas(client, server, fs_root_id, directory, written_schemas)
             .await;
     let mut schema_paths: Vec<(String, Option<String>)> = uuid_map
@@ -2141,10 +2056,8 @@ pub async fn handle_schema_change(
                     Ok(n) => n,
                     Err(_) => continue,
                 };
-                // Skip hidden files, schema files, and system config files.
-                // __processes.json drives process discovery; deleting it cascades
-                // into process stops and sandbox wipes. See CP-l8d2.
-                if filename.starts_with('.') || filename == "__processes.json" {
+                // Skip hidden files and schema files
+                if filename.starts_with('.') {
                     continue;
                 }
                 // If this file is not in the schema, mark for deletion
@@ -2170,67 +2083,34 @@ pub async fn handle_schema_change(
         .chain(disk_deleted_paths.into_iter())
         .collect();
 
-    // Deletion guards: skip file deletions when schema data may be incomplete.
-    // Two cases: (1) UUID map build had failures/timeouts, so schema_path_set is
-    // missing paths that legitimately exist; (2) mass deletion where a partial
-    // schema would delete most known files. See CP-l8d2.
-    let total_tracked = known_paths.len();
-    let uuid_map_incomplete = !all_uuids_succeeded && !all_deleted_paths.is_empty();
-    let mass_deletion_blocked = !all_deleted_paths.is_empty()
-        && total_tracked > 2
-        && all_deleted_paths.len() > total_tracked / 2
-        && schema_filenames.len() < 3;
-    let skip_all_deletions = uuid_map_incomplete || mass_deletion_blocked;
+    for path in &all_deleted_paths {
+        // Check if we recently wrote a schema containing this file
+        // This prevents race conditions where we create a file, push schema,
+        // but receive a stale SSE update before the server processes our push
+        if path_in_written_schemas(path, directory, written_schemas).await {
+            debug!(
+                "Skipping deletion of {} - found in recently written schema (echo detection)",
+                path
+            );
+            continue;
+        }
 
-    if uuid_map_incomplete {
-        info!(
-            "[CRDT-GUARD] UUID map incomplete (HTTP path): skipping {}/{} file deletions \
-             because UUID map build had failures/timeouts. Files may not actually be deleted \
-             on server. See CP-l8d2.",
-            all_deleted_paths.len(),
-            total_tracked
-        );
-    }
-    if mass_deletion_blocked {
-        info!(
-            "[CRDT-GUARD] Mass deletion guard (HTTP path): schema has {} filenames but would \
-             delete {}/{} tracked files. Skipping deletions to prevent data loss. See CP-l8d2.",
-            schema_filenames.len(),
-            all_deleted_paths.len(),
-            total_tracked
-        );
-    }
-    if !skip_all_deletions {
-        for path in &all_deleted_paths {
-            // Check if we recently wrote a schema containing this file
-            // This prevents race conditions where we create a file, push schema,
-            // but receive a stale SSE update before the server processes our push
-            if path_in_written_schemas(path, directory, written_schemas).await {
-                debug!(
-                    "Skipping deletion of {} - found in recently written schema (echo detection)",
-                    path
-                );
-                continue;
-            }
+        info!("Server removed file: {} - deleting local copy", path);
+        let file_path = directory.join(path);
 
-            info!("Server removed file: {} - deleting local copy", path);
-            let file_path = directory.join(path);
+        // Stop sync tasks and remove from file_states
+        remove_file_state_and_abort(file_states, path).await;
 
-            // Stop sync tasks and remove from file_states
-            remove_file_state_and_abort(file_states, path).await;
-
-            // Delete the file from disk
-            if file_path.exists() && file_path.is_file() {
-                if let Err(e) = tokio::fs::remove_file(&file_path).await {
-                    warn!("Failed to delete file {}: {}", file_path.display(), e);
-                }
+        // Delete the file from disk
+        if file_path.exists() && file_path.is_file() {
+            if let Err(e) = tokio::fs::remove_file(&file_path).await {
+                warn!("Failed to delete file {}: {}", file_path.display(), e);
             }
         }
     }
 
-    // Clean up orphaned directories — but skip if deletions were blocked
-    // (partial schema would also incorrectly identify directories as orphaned)
-    cleanup_orphaned_directories(directory, &schema, skip_all_deletions).await;
+    // Clean up directories that exist locally but not in the schema
+    cleanup_orphaned_directories(directory, &schema).await;
 
     // Unmark locally deleted directories from sync state so they don't keep being flagged
     for dir_name in &locally_deleted_dirs {
@@ -2925,5 +2805,151 @@ mod tests {
         let (schema, _) = result.unwrap();
         // Empty schema should not have any paths
         assert!(!schema.has_path("anything"));
+    }
+
+    // =========================================================================
+    // Tests for explicit CRDT deletion detection (CP-seha)
+    // =========================================================================
+
+    /// Helper: create a valid EditMessage payload from a Y.Doc's full state.
+    fn make_edit_payload(doc: &Doc) -> Vec<u8> {
+        let txn = doc.transact();
+        let update = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+        drop(txn);
+
+        let edit_msg = serde_json::json!({
+            "update": STANDARD.encode(&update),
+            "parents": [],
+            "author": "test",
+            "message": "test",
+            "timestamp": 0_u64
+        });
+        serde_json::to_vec(&edit_msg).unwrap()
+    }
+
+    #[test]
+    fn test_uninitialized_state_produces_no_deletions() {
+        // Fresh state (no yjs_state) + full schema update = no deletions.
+        // This is the CP-l8d2 scenario: fresh Y.Doc receives full state.
+        // Before-entries is empty, so deleted_entries must be empty.
+        let mut state = crate::sync::CrdtPeerState::new(uuid::Uuid::new_v4());
+        assert!(state.needs_server_init());
+
+        // Create a "full state" MQTT payload with 3 files
+        let doc = Doc::new();
+        ymap_schema::add_file(&doc, "file1.txt", &uuid::Uuid::new_v4().to_string());
+        ymap_schema::add_file(&doc, "file2.txt", &uuid::Uuid::new_v4().to_string());
+        ymap_schema::add_file(&doc, "file3.txt", &uuid::Uuid::new_v4().to_string());
+
+        let payload = make_edit_payload(&doc);
+
+        let result = apply_schema_update_to_state(&mut state, &payload);
+        let r = result.expect("should produce a result");
+        assert!(
+            r.deleted_entries.is_empty(),
+            "Fresh state must produce no deletions"
+        );
+        assert_eq!(
+            r.schema
+                .root
+                .as_ref()
+                .and_then(|e| match e {
+                    crate::fs::Entry::Dir(d) => d.entries.as_ref().map(|e| e.len()),
+                    _ => None,
+                })
+                .unwrap_or(0),
+            3,
+            "Schema should have 3 entries"
+        );
+    }
+
+    #[test]
+    fn test_explicit_deletion_detected() {
+        // State has 3 files. Update removes 1 file. deleted_entries should contain it.
+        let node1 = uuid::Uuid::new_v4().to_string();
+        let node2 = uuid::Uuid::new_v4().to_string();
+        let node3 = uuid::Uuid::new_v4().to_string();
+
+        // Create initial state with 3 files
+        let doc = Doc::new();
+        ymap_schema::add_file(&doc, "file1.txt", &node1);
+        ymap_schema::add_file(&doc, "file2.txt", &node2);
+        ymap_schema::add_file(&doc, "file3.txt", &node3);
+
+        let mut state = crate::sync::CrdtPeerState::new(uuid::Uuid::new_v4());
+        state.update_from_doc(&doc);
+        assert!(!state.needs_server_init());
+
+        // Now remove file2.txt from the doc
+        ymap_schema::remove_entry(&doc, "file2.txt");
+
+        // Encode the full state (which now has file2.txt tombstoned)
+        let payload = make_edit_payload(&doc);
+
+        let result = apply_schema_update_to_state(&mut state, &payload);
+        let r = result.expect("should produce a result");
+        assert!(
+            r.deleted_entries.contains("file2.txt"),
+            "file2.txt should be in deleted_entries"
+        );
+        assert_eq!(r.deleted_entries.len(), 1, "Only 1 deletion expected");
+    }
+
+    #[test]
+    fn test_idempotent_deletion_on_replay() {
+        // After applying deletion once and persisting state, re-applying the same
+        // update should produce no new deletions (before and after are identical).
+        let node1 = uuid::Uuid::new_v4().to_string();
+        let node2 = uuid::Uuid::new_v4().to_string();
+
+        // Create initial state with 2 files
+        let doc = Doc::new();
+        ymap_schema::add_file(&doc, "file1.txt", &node1);
+        ymap_schema::add_file(&doc, "file2.txt", &node2);
+
+        let mut state = crate::sync::CrdtPeerState::new(uuid::Uuid::new_v4());
+        state.update_from_doc(&doc);
+
+        // Remove file2.txt
+        ymap_schema::remove_entry(&doc, "file2.txt");
+        let payload = make_edit_payload(&doc);
+
+        // First application: should detect deletion
+        let r1 =
+            apply_schema_update_to_state(&mut state, &payload).expect("first apply should succeed");
+        assert!(r1.deleted_entries.contains("file2.txt"));
+
+        // Second application (simulates MQTT retained message replay):
+        // State already has file2.txt removed, so before and after are the same.
+        let r2 = apply_schema_update_to_state(&mut state, &payload)
+            .expect("second apply should succeed");
+        assert!(
+            r2.deleted_entries.is_empty(),
+            "Replay must produce no deletions"
+        );
+    }
+
+    #[test]
+    fn test_addition_produces_no_deletions() {
+        // Adding a new file to existing state should not produce any deletions.
+        let node1 = uuid::Uuid::new_v4().to_string();
+
+        let doc = Doc::new();
+        ymap_schema::add_file(&doc, "file1.txt", &node1);
+
+        let mut state = crate::sync::CrdtPeerState::new(uuid::Uuid::new_v4());
+        state.update_from_doc(&doc);
+
+        // Add a second file
+        let node2 = uuid::Uuid::new_v4().to_string();
+        ymap_schema::add_file(&doc, "file2.txt", &node2);
+
+        let payload = make_edit_payload(&doc);
+
+        let r = apply_schema_update_to_state(&mut state, &payload).expect("should succeed");
+        assert!(
+            r.deleted_entries.is_empty(),
+            "Adding file should not produce deletions"
+        );
     }
 }
