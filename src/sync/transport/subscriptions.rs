@@ -1418,13 +1418,8 @@ async fn resync_schema_from_server(
     directory: &Path,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
 ) {
-    // Log deprecation warning if MQTT-only mode is enabled
-    crdt_context
-        .mqtt_only_config
-        .log_http_deprecation("resync_schema_from_server");
-
     warn!(
-        "Resyncing schema CRDT state from server after broadcast lag for {}",
+        "Resyncing schema CRDT state via cyan sync for {}",
         fs_root_id
     );
 
@@ -1438,7 +1433,34 @@ async fn resync_schema_from_server(
         );
     }
 
-    // Step 2: Fetch authoritative schema HEAD from server
+    // Step 2: Initialize via cyan sync (CP-uals)
+    let sync_client_id = Uuid::new_v4().to_string();
+    let initialized = {
+        let mut state_guard = crdt_context.crdt_state.write().await;
+        sync_schema_via_cyan(
+            &crdt_context.mqtt_client,
+            &crdt_context.workspace,
+            fs_root_id,
+            &sync_client_id,
+            &mut state_guard.schema,
+        )
+        .await
+    };
+
+    if initialized {
+        info!("Schema resync via cyan completed for {}", fs_root_id);
+        return;
+    }
+
+    // Step 3: Fall back to HTTP if cyan sync failed
+    warn!(
+        "Schema resync: Cyan sync failed for {} — falling back to HTTP",
+        fs_root_id
+    );
+    crdt_context
+        .mqtt_only_config
+        .log_http_deprecation("resync_schema_from_server");
+
     let head = match fetch_head(http_client, server, &encode_node_id(fs_root_id), false).await {
         Ok(Some(h)) => h,
         Ok(None) => {
@@ -1457,30 +1479,23 @@ async fn resync_schema_from_server(
         }
     };
 
-    // Step 3: Re-initialize CRDT state with server's Yjs state
     if let Some(ref server_state) = head.state {
         let cid = head.cid.as_deref().unwrap_or("unknown");
-        {
-            let mut state_guard = crdt_context.crdt_state.write().await;
-            state_guard.schema.initialize_from_server(server_state, cid);
-            info!(
-                "Schema resync: Re-initialized CRDT state from server for {} at cid={}",
-                fs_root_id, cid
-            );
-        }
+        let mut state_guard = crdt_context.crdt_state.write().await;
+        state_guard.schema.initialize_from_server(server_state, cid);
+        info!(
+            "Schema resync: HTTP fallback initialized for {} at cid={}",
+            fs_root_id, cid
+        );
     } else {
-        // Server has no Yjs state - initialize as empty
-        {
-            let mut state_guard = crdt_context.crdt_state.write().await;
-            state_guard.schema.initialize_empty();
-            info!(
-                "Schema resync: Initialized empty CRDT state for {} (server has no state)",
-                fs_root_id
-            );
-        }
+        let mut state_guard = crdt_context.crdt_state.write().await;
+        state_guard.schema.initialize_empty();
+        info!(
+            "Schema resync: Initialized empty CRDT state for {} (server has no state)",
+            fs_root_id
+        );
     }
 
-    // Step 4: Also write the schema content to disk to ensure consistency
     if !head.content.is_empty() {
         if let Err(e) =
             crate::sync::write_schema_file(directory, &head.content, written_schemas).await
@@ -1488,11 +1503,6 @@ async fn resync_schema_from_server(
             warn!(
                 "Schema resync: Failed to write schema file for {}: {}",
                 fs_root_id, e
-            );
-        } else {
-            debug!(
-                "Schema resync: Wrote schema file to {}",
-                directory.display()
             );
         }
     }
