@@ -601,7 +601,9 @@ pub async fn handle_subdir_schema_cleanup(
             }
         }
 
-        // Find files in file_states that are under this subdir but no longer in schema
+        // Find files in file_states that are under this subdir but no longer in schema.
+        // Skip __processes.json — it's a system file that drives process discovery;
+        // deleting it cascades into process stops and sandbox wipes. See CP-l8d2.
         let deleted_paths: Vec<String> = {
             let states = file_states.read().await;
             states
@@ -613,7 +615,9 @@ pub async fn handle_subdir_schema_cleanup(
                     } else {
                         p.starts_with(&format!("{}/", subdir_path))
                     };
-                    is_in_subdir && !schema_paths.contains(*p)
+                    // Never delete __processes.json via schema cleanup
+                    let is_system_file = p.ends_with("__processes.json");
+                    is_in_subdir && !is_system_file && !schema_paths.contains(*p)
                 })
                 .cloned()
                 .collect()
@@ -639,8 +643,10 @@ pub async fn handle_subdir_schema_cleanup(
                         Ok(n) => n,
                         Err(_) => continue,
                     };
-                    // Skip hidden files and schema files
-                    if filename.starts_with('.') {
+                    // Skip hidden files, schema files, and system config files.
+                    // __processes.json is a system file that drives process discovery;
+                    // deleting it cascades into process stops and sandbox wipes. See CP-l8d2.
+                    if filename.starts_with('.') || filename == "__processes.json" {
                         continue;
                     }
                     // If this file is not in the MQTT schema, mark for deletion
@@ -2114,8 +2120,10 @@ pub async fn handle_schema_change(
                     Ok(n) => n,
                     Err(_) => continue,
                 };
-                // Skip hidden files and schema files
-                if filename.starts_with('.') {
+                // Skip hidden files, schema files, and system config files.
+                // __processes.json drives process discovery; deleting it cascades
+                // into process stops and sandbox wipes. See CP-l8d2.
+                if filename.starts_with('.') || filename == "__processes.json" {
                     continue;
                 }
                 // If this file is not in the schema, mark for deletion
