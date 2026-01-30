@@ -667,72 +667,108 @@ pub async fn handle_subdir_schema_cleanup(
             .chain(disk_deleted_paths.into_iter())
             .collect();
 
-        // Delete files that were removed from server
-        for path in &all_deleted_paths {
-            let file_path = root_directory.join(path);
+        // Mass-deletion guard: if the schema would delete more than half of the
+        // known files AND the schema has very few entries, this is likely a partial
+        // or corrupt schema rather than a legitimate bulk delete. A legitimate bulk
+        // delete would remove files one at a time through individual MQTT edits, not
+        // appear as a schema with most entries missing. See CP-l8d2.
+        let total_known_files = {
+            let states = file_states.read().await;
+            let file_state_count = states
+                .keys()
+                .filter(|p| {
+                    if subdir_path.is_empty() {
+                        true
+                    } else {
+                        p.starts_with(&format!("{}/", subdir_path))
+                    }
+                })
+                .count();
+            // Use the larger of file_states count and disk file count for safety
+            file_state_count
+        };
+        if !all_deleted_paths.is_empty()
+            && total_known_files > 2
+            && all_deleted_paths.len() > total_known_files / 2
+            && schema_entry_count < 3
+        {
+            info!(
+                "[CRDT-GUARD] Mass deletion guard for '{}': schema has {} entries but would \
+                 delete {}/{} tracked files. This likely indicates a partial or corrupt schema. \
+                 Skipping deletions to prevent data loss. See CP-l8d2.",
+                subdir_path,
+                schema_entry_count,
+                all_deleted_paths.len(),
+                total_known_files
+            );
+        } else {
+            // Delete files that were removed from server
+            for path in &all_deleted_paths {
+                let file_path = root_directory.join(path);
 
-            // Safety check: don't delete files that were modified very recently (within 10 seconds)
-            // ONLY when using HTTP-fetched schema. When using MQTT schema, the delete is
-            // authoritative and should proceed regardless of local modification time.
-            //
-            // This protects against race conditions where we just created a file via CRDT but
-            // the server schema hasn't been updated yet. Without this check, the cleanup would
-            // see the file isn't in the server schema and delete it prematurely.
-            //
-            // When using_mqtt_schema is true, we trust the MQTT-delivered schema as authoritative
-            // because MQTT messages are delivered in causal order within a topic.
-            if !using_mqtt_schema && file_path.exists() && file_path.is_file() {
-                if let Ok(metadata) = file_path.metadata() {
-                    if let Ok(modified) = metadata.modified() {
-                        if let Ok(elapsed) = modified.elapsed() {
-                            if elapsed.as_secs() < 10 {
-                                debug!(
+                // Safety check: don't delete files that were modified very recently (within 10 seconds)
+                // ONLY when using HTTP-fetched schema. When using MQTT schema, the delete is
+                // authoritative and should proceed regardless of local modification time.
+                //
+                // This protects against race conditions where we just created a file via CRDT but
+                // the server schema hasn't been updated yet. Without this check, the cleanup would
+                // see the file isn't in the server schema and delete it prematurely.
+                //
+                // When using_mqtt_schema is true, we trust the MQTT-delivered schema as authoritative
+                // because MQTT messages are delivered in causal order within a topic.
+                if !using_mqtt_schema && file_path.exists() && file_path.is_file() {
+                    if let Ok(metadata) = file_path.metadata() {
+                        if let Ok(modified) = metadata.modified() {
+                            if let Ok(elapsed) = modified.elapsed() {
+                                if elapsed.as_secs() < 10 {
+                                    debug!(
                                     "Subdir {} skipping deletion of recently modified file: {} (modified {}s ago)",
                                     subdir_path, path, elapsed.as_secs()
                                 );
-                                continue;
+                                    continue;
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            // Trace log for debugging
-            {
-                use std::io::Write;
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/sandbox-trace.log")
+                // Trace log for debugging
                 {
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0);
-                    let pid = std::process::id();
-                    let _ = writeln!(
-                        file,
-                        "[{} pid={}] DELETE file: subdir={}, path={}",
-                        timestamp, pid, subdir_path, path
-                    );
+                    use std::io::Write;
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/sandbox-trace.log")
+                    {
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0);
+                        let pid = std::process::id();
+                        let _ = writeln!(
+                            file,
+                            "[{} pid={}] DELETE file: subdir={}, path={}",
+                            timestamp, pid, subdir_path, path
+                        );
+                    }
+                }
+
+                info!(
+                    "Subdir {} removed file: {} - deleting local copy",
+                    subdir_path, path
+                );
+
+                // Stop sync tasks and remove from file_states
+                remove_file_state_and_abort(file_states, path).await;
+
+                // Delete the file from disk
+                if file_path.exists() && file_path.is_file() {
+                    if let Err(e) = tokio::fs::remove_file(&file_path).await {
+                        warn!("Failed to delete file {}: {}", file_path.display(), e);
+                    }
                 }
             }
-
-            info!(
-                "Subdir {} removed file: {} - deleting local copy",
-                subdir_path, path
-            );
-
-            // Stop sync tasks and remove from file_states
-            remove_file_state_and_abort(file_states, path).await;
-
-            // Delete the file from disk
-            if file_path.exists() && file_path.is_file() {
-                if let Err(e) = tokio::fs::remove_file(&file_path).await {
-                    warn!("Failed to delete file {}: {}", file_path.display(), e);
-                }
-            }
-        }
+        } // end mass-deletion guard else
     }
 
     // Clean up directories that exist locally but not in the schema
@@ -2121,35 +2157,54 @@ pub async fn handle_schema_change(
         .chain(disk_deleted_paths.into_iter())
         .collect();
 
-    for path in &all_deleted_paths {
-        // Check if we recently wrote a schema containing this file
-        // This prevents race conditions where we create a file, push schema,
-        // but receive a stale SSE update before the server processes our push
-        if path_in_written_schemas(path, directory, written_schemas).await {
-            debug!(
-                "Skipping deletion of {} - found in recently written schema (echo detection)",
-                path
-            );
-            continue;
-        }
+    // Mass-deletion guard: if we would delete more than half of known files and
+    // the schema has very few entries, this likely indicates a partial/corrupt schema
+    // rather than a legitimate bulk delete. See CP-l8d2.
+    let total_tracked = known_paths.len();
+    let mass_deletion_blocked = !all_deleted_paths.is_empty()
+        && total_tracked > 2
+        && all_deleted_paths.len() > total_tracked / 2
+        && schema_filenames.len() < 3;
 
-        info!("Server removed file: {} - deleting local copy", path);
-        let file_path = directory.join(path);
+    if mass_deletion_blocked {
+        info!(
+            "[CRDT-GUARD] Mass deletion guard (HTTP path): schema has {} filenames but would \
+             delete {}/{} tracked files. Skipping deletions to prevent data loss. See CP-l8d2.",
+            schema_filenames.len(),
+            all_deleted_paths.len(),
+            total_tracked
+        );
+    } else {
+        for path in &all_deleted_paths {
+            // Check if we recently wrote a schema containing this file
+            // This prevents race conditions where we create a file, push schema,
+            // but receive a stale SSE update before the server processes our push
+            if path_in_written_schemas(path, directory, written_schemas).await {
+                debug!(
+                    "Skipping deletion of {} - found in recently written schema (echo detection)",
+                    path
+                );
+                continue;
+            }
 
-        // Stop sync tasks and remove from file_states
-        remove_file_state_and_abort(file_states, path).await;
+            info!("Server removed file: {} - deleting local copy", path);
+            let file_path = directory.join(path);
 
-        // Delete the file from disk
-        if file_path.exists() && file_path.is_file() {
-            if let Err(e) = tokio::fs::remove_file(&file_path).await {
-                warn!("Failed to delete file {}: {}", file_path.display(), e);
+            // Stop sync tasks and remove from file_states
+            remove_file_state_and_abort(file_states, path).await;
+
+            // Delete the file from disk
+            if file_path.exists() && file_path.is_file() {
+                if let Err(e) = tokio::fs::remove_file(&file_path).await {
+                    warn!("Failed to delete file {}: {}", file_path.display(), e);
+                }
             }
         }
     }
 
-    // Check for directories that should be removed (empty after file deletions,
-    // or directories that exist on disk but have no corresponding entries in schema)
-    cleanup_orphaned_directories(directory, &schema, false).await;
+    // Clean up orphaned directories — but skip if mass deletion was blocked
+    // (partial schema would also incorrectly identify directories as orphaned)
+    cleanup_orphaned_directories(directory, &schema, mass_deletion_blocked).await;
 
     // Unmark locally deleted directories from sync state so they don't keep being flagged
     for dir_name in &locally_deleted_dirs {
