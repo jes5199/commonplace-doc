@@ -66,6 +66,11 @@ impl SyncHandler {
     }
 
     /// Resolve a path to a document ID.
+    ///
+    /// Accepts either:
+    /// - The fs-root path (e.g., "workspace") → returns as-is
+    /// - A UUID string (e.g., "0e1967af-362b-4cb5-93a8-ab465c57d69f") → returns as-is
+    /// - A filesystem path (e.g., "bartleby/test.txt") → resolved via schema
     async fn resolve_document_id(&self, path: &str) -> Option<String> {
         let fs_root_path = self.fs_root_path.read().await;
         let is_fs_root = fs_root_path.as_ref() == Some(&path.to_string());
@@ -74,11 +79,29 @@ impl SyncHandler {
 
         if is_fs_root {
             Some(path.to_string())
+        } else if uuid::Uuid::parse_str(path).is_ok() {
+            // Path is already a UUID — use it directly as a document ID.
+            // This supports sync clients that address documents by UUID
+            // rather than by filesystem path.
+            Some(path.to_string())
         } else {
             let fs_root = self.fs_root_content.read().await;
             let fs_root_id = fs_root_id.as_deref().unwrap_or("");
             resolve_path_to_uuid(&fs_root, path, fs_root_id)
         }
+    }
+
+    /// Subscribe to ALL sync requests in the workspace.
+    /// Uses wildcard: `{workspace}/sync/#`
+    pub async fn subscribe_all_sync(&self) -> Result<(), MqttError> {
+        let topic_pattern = format!("{}/sync/#", self.workspace);
+
+        self.client
+            .subscribe(&topic_pattern, QoS::AtMostOnce)
+            .await?;
+
+        debug!("Subscribed to all sync requests: {}", topic_pattern);
+        Ok(())
     }
 
     /// Subscribe to sync requests for a path.

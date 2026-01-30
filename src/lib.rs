@@ -171,6 +171,14 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
                     tracing::info!("MQTT subscribed to all edits (wildcard)");
                 }
 
+                // Subscribe to ALL sync requests to handle cyan sync protocol
+                // (Ancestors, Get, Pull, etc.) from sync clients
+                if let Err(e) = mqtt_service.subscribe_all_sync().await {
+                    tracing::warn!("Failed to subscribe to all sync: {}", e);
+                } else {
+                    tracing::info!("MQTT subscribed to all sync (wildcard)");
+                }
+
                 // Subscribe to configured document paths
                 for path in &config.mqtt_subscribe {
                     if let Err(e) = mqtt_service.subscribe_path(path).await {

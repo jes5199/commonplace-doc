@@ -231,6 +231,14 @@ impl MqttService {
         self.edits_handler.subscribe_all_edits().await
     }
 
+    /// Subscribe to ALL sync requests in the workspace.
+    ///
+    /// This uses the wildcard pattern `{workspace}/sync/#` to receive all
+    /// sync protocol requests (Ancestors, Get, Pull, etc.) from sync clients.
+    pub async fn subscribe_all_sync(&self) -> Result<(), MqttError> {
+        self.sync_handler.subscribe_all_sync().await
+    }
+
     /// Unsubscribe from a path.
     pub async fn unsubscribe_path(&self, path: &str) -> Result<(), MqttError> {
         self.edits_handler.unsubscribe_path(path).await?;
@@ -252,6 +260,11 @@ impl MqttService {
         // Re-subscribe all edits wildcard
         if let Err(e) = self.subscribe_all_edits().await {
             tracing::warn!("Failed to re-subscribe all edits on reconnect: {}", e);
+        }
+
+        // Re-subscribe all sync wildcard
+        if let Err(e) = self.subscribe_all_sync().await {
+            tracing::warn!("Failed to re-subscribe all sync on reconnect: {}", e);
         }
 
         // Re-subscribe per-path edits subscriptions
@@ -392,8 +405,20 @@ impl MqttService {
                 let sync_msg: messages::SyncMessage = serde_json::from_slice(payload)?;
                 // Only handle requests, not responses
                 if sync_msg.is_request() {
+                    // Extract client_id qualifier from the path.
+                    // Sync topics are {workspace}/sync/{doc_path}/{client_id},
+                    // but the generic parser puts "{doc_path}/{client_id}" into path.
+                    // Split the last segment as the qualifier.
+                    let mut sync_topic = topic;
+                    if sync_topic.qualifier.is_none() {
+                        if let Some(slash_pos) = sync_topic.path.rfind('/') {
+                            let qualifier = sync_topic.path[slash_pos + 1..].to_string();
+                            sync_topic.path = sync_topic.path[..slash_pos].to_string();
+                            sync_topic.qualifier = Some(qualifier);
+                        }
+                    }
                     self.sync_handler
-                        .handle_sync_request(&topic, sync_msg)
+                        .handle_sync_request(&sync_topic, sync_msg)
                         .await?;
                 }
             }
