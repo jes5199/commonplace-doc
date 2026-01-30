@@ -5,13 +5,14 @@
 
 use super::schema_visitor::{SchemaVisitor, VisitorError};
 use crate::fs::Entry;
-use reqwest::Client;
+use crate::mqtt::MqttRequestClient;
 use std::fmt;
+use std::sync::Arc;
 
 /// Error type for process discovery operations.
 #[derive(Debug)]
 pub enum DiscoveryError {
-    /// Schema visitor error (HTTP, parsing, etc.)
+    /// Schema visitor error (request, parsing, etc.)
     VisitorError(VisitorError),
 }
 
@@ -61,11 +62,10 @@ impl ProcessDiscoveryService {
     /// Create a new ProcessDiscoveryService.
     ///
     /// # Arguments
-    /// * `client` - HTTP client for making requests
-    /// * `server_url` - Base URL of the commonplace server
-    pub fn new(client: Client, server_url: String) -> Self {
+    /// * `request_client` - MQTT request client for fetching documents
+    pub fn new(request_client: Arc<MqttRequestClient>) -> Self {
         Self {
-            visitor: SchemaVisitor::new(client, server_url),
+            visitor: SchemaVisitor::new(request_client),
         }
     }
 
@@ -121,10 +121,10 @@ mod tests {
 
     #[test]
     fn test_discovery_error_display() {
-        let visitor_err = VisitorError::HttpError("connection refused".to_string());
+        let visitor_err = VisitorError::RequestError("connection refused".to_string());
         let discovery_err = DiscoveryError::from(visitor_err);
         assert!(discovery_err.to_string().contains("Discovery error"));
-        assert!(discovery_err.to_string().contains("HTTP error"));
+        assert!(discovery_err.to_string().contains("Request error"));
     }
 
     #[test]
@@ -138,10 +138,6 @@ mod tests {
         assert_eq!(cloned.schema_node_ids.len(), 1);
     }
 
-    // =========================================================================
-    // Additional edge case tests
-    // =========================================================================
-
     #[test]
     fn test_discovery_result_empty() {
         let result = DiscoveryResult {
@@ -152,7 +148,6 @@ mod tests {
         assert!(result.processes_json_files.is_empty());
         assert!(result.schema_node_ids.is_empty());
 
-        // Clone should also be empty
         let cloned = result.clone();
         assert!(cloned.processes_json_files.is_empty());
         assert!(cloned.schema_node_ids.is_empty());
@@ -176,7 +171,6 @@ mod tests {
         assert_eq!(result.processes_json_files.len(), 3);
         assert_eq!(result.schema_node_ids.len(), 3);
 
-        // Check individual entries
         assert!(result
             .processes_json_files
             .iter()
@@ -193,12 +187,11 @@ mod tests {
 
     #[test]
     fn test_discovery_error_from_visitor_error() {
-        // Test From<VisitorError> for DiscoveryError
-        let http_err = VisitorError::HttpError("timeout".to_string());
-        let discovery_err: DiscoveryError = http_err.into();
+        let req_err = VisitorError::RequestError("timeout".to_string());
+        let discovery_err: DiscoveryError = req_err.into();
 
         assert!(discovery_err.to_string().contains("timeout"));
-        assert!(discovery_err.to_string().contains("HTTP error"));
+        assert!(discovery_err.to_string().contains("Request error"));
     }
 
     #[test]
@@ -219,11 +212,9 @@ mod tests {
 
     #[test]
     fn test_discovery_error_source() {
-        // DiscoveryError should expose its source error
-        let visitor_err = VisitorError::HttpError("source error".to_string());
+        let visitor_err = VisitorError::RequestError("source error".to_string());
         let discovery_err = DiscoveryError::VisitorError(visitor_err);
 
-        // The source should be available
         let source = std::error::Error::source(&discovery_err);
         assert!(source.is_some());
         assert!(source.unwrap().to_string().contains("source error"));
@@ -236,7 +227,6 @@ mod tests {
             schema_node_ids: vec!["schema-456".to_string()],
         };
 
-        // Should be able to format for debug output
         let debug_str = format!("{:?}", result);
         assert!(debug_str.contains("DiscoveryResult"));
         assert!(debug_str.contains("uuid-123"));
@@ -245,20 +235,10 @@ mod tests {
 
     #[test]
     fn test_discovery_error_debug() {
-        let err = DiscoveryError::VisitorError(VisitorError::HttpError("test".to_string()));
+        let err = DiscoveryError::VisitorError(VisitorError::RequestError("test".to_string()));
 
-        // Should be able to format for debug output
         let debug_str = format!("{:?}", err);
         assert!(debug_str.contains("VisitorError"));
-        assert!(debug_str.contains("HttpError"));
-    }
-
-    #[test]
-    fn test_process_discovery_service_new() {
-        let client = Client::new();
-        let service = ProcessDiscoveryService::new(client, "http://localhost:5199".to_string());
-
-        // Service should provide access to its visitor
-        let _visitor = service.visitor();
+        assert!(debug_str.contains("RequestError"));
     }
 }

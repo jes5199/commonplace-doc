@@ -20,7 +20,7 @@ pub use discovery::{CommandSpec, DiscoveredProcess, ProcessesConfig};
 pub use manager::{ManagedProcess, ProcessManager, ProcessState};
 pub use mqtt_watcher::{MqttDocumentWatcher, WatchEvent};
 pub use process_discovery::{DiscoveryError, DiscoveryResult, ProcessDiscoveryService};
-pub use schema_visitor::{SchemaVisitor, VisitorError};
+pub use schema_visitor::{visit_entries, SchemaVisitor, VisitorError};
 pub use script_resolver::{ResolverError, ScriptResolver, ScriptWatchMap};
 pub use spawn::{spawn_managed_process, spawn_managed_process_with_logging, SpawnResult};
 pub use status::{get_process_cwd, OrchestratorStatus, ProcessStatus, LEGACY_STATUS_FILE_PATH};

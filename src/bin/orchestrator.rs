@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use commonplace_doc::cli::OrchestratorArgs;
-use commonplace_doc::mqtt::{MqttClient, MqttConfig};
+use commonplace_doc::mqtt::{MqttClient, MqttConfig, MqttRequestClient};
 use commonplace_doc::orchestrator::{DiscoveredProcessManager, OrchestratorConfig, ProcessManager};
 use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
@@ -615,14 +615,28 @@ async fn main() {
         }
     }
 
+    // Create MQTT request client for document fetching (used by discovery)
+    let request_client: Arc<MqttRequestClient> = if let Some(ref mqtt) = mqtt_client {
+        Arc::new(
+            MqttRequestClient::new(mqtt.clone(), DEFAULT_WORKSPACE.to_string())
+                .await
+                .expect("Failed to create MQTT request client"),
+        )
+    } else {
+        tracing::error!("[orchestrator] MQTT client required for process discovery");
+        base_manager.shutdown().await;
+        std::process::exit(1);
+    };
+
     // Now we can start recursive discovery
     let mut discovered_manager = DiscoveredProcessManager::new(
         broker_raw.to_string(),
         args.server.clone(),
+        request_client.clone(),
         base_manager.status_file_path().to_path_buf(),
     );
 
-    // Set up MQTT client for discovered process manager if available
+    // Set up MQTT client for discovered process manager
     if let Some(ref mqtt) = mqtt_client {
         discovered_manager.set_mqtt_client(mqtt.clone(), DEFAULT_WORKSPACE.to_string());
     }
@@ -647,7 +661,7 @@ async fn main() {
     // And handle config file changes
     let mut monitor_interval = tokio::time::interval(Duration::from_millis(500));
     tokio::select! {
-        result = discovered_manager.run_with_recursive_watch(&client, &fs_root_id) => {
+        result = discovered_manager.run_with_recursive_watch(&fs_root_id) => {
             if let Err(e) = result {
                 tracing::error!("[orchestrator] Recursive watch failed: {}", e);
             }

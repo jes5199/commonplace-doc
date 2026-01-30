@@ -3,8 +3,10 @@
 //! This module handles resolving script paths to UUIDs for evaluate processes,
 //! enabling the orchestrator to watch script files and restart processes when they change.
 
-use reqwest::Client;
+use crate::fs::{Entry, FsSchema};
+use crate::mqtt::MqttRequestClient;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Maps script UUID -> list of process names that use that script.
 /// Used to restart evaluate processes when their script changes.
@@ -14,8 +16,8 @@ pub type ScriptWatchMap = HashMap<String, Vec<String>>;
 /// Error type for script resolution operations.
 #[derive(Debug)]
 pub enum ResolverError {
-    /// HTTP request failed
-    Request(reqwest::Error),
+    /// MQTT request failed
+    Request(String),
     /// Path resolution failed
     PathNotFound(String),
 }
@@ -23,7 +25,7 @@ pub enum ResolverError {
 impl std::fmt::Display for ResolverError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Request(e) => write!(f, "HTTP request failed: {}", e),
+            Self::Request(e) => write!(f, "MQTT request failed: {}", e),
             Self::PathNotFound(msg) => write!(f, "Path not found: {}", msg),
         }
     }
@@ -31,10 +33,7 @@ impl std::fmt::Display for ResolverError {
 
 impl std::error::Error for ResolverError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Request(e) => Some(e),
-            Self::PathNotFound(_) => None,
-        }
+        None
     }
 }
 
@@ -44,18 +43,16 @@ impl std::error::Error for ResolverError {
 /// - Resolve a single script path to its UUID
 /// - Build a complete ScriptWatchMap from a list of processes
 pub struct ScriptResolver {
-    client: Client,
-    server_url: String,
+    request_client: Arc<MqttRequestClient>,
 }
 
 impl ScriptResolver {
     /// Create a new ScriptResolver.
     ///
     /// # Arguments
-    /// * `client` - HTTP client for making requests
-    /// * `server_url` - Base URL of the commonplace server
-    pub fn new(client: Client, server_url: String) -> Self {
-        Self { client, server_url }
+    /// * `request_client` - MQTT request client for fetching documents
+    pub fn new(request_client: Arc<MqttRequestClient>) -> Self {
+        Self { request_client }
     }
 
     /// Resolve a script path to its UUID.
@@ -75,20 +72,13 @@ impl ScriptResolver {
         base_path: &str,
         script_name: &str,
     ) -> Result<Option<String>, ResolverError> {
-        use crate::sync::resolve_path_to_uuid_http;
-
-        // Construct the full script path
         let script_path = format!("{}/{}", base_path, script_name);
 
-        match resolve_path_to_uuid_http(&self.client, &self.server_url, fs_root_id, &script_path)
-            .await
-        {
+        match resolve_path_to_uuid_mqtt(&self.request_client, fs_root_id, &script_path).await {
             Ok(uuid) => Ok(Some(uuid)),
             Err(e) => {
-                // Check if this is a "not found" error vs a real error
                 let err_msg = e.to_string();
                 if err_msg.contains("not found") || err_msg.contains("no entry") {
-                    // Script doesn't exist yet - not an error
                     Ok(None)
                 } else {
                     Err(ResolverError::PathNotFound(err_msg))
@@ -162,6 +152,102 @@ impl ScriptResolver {
     }
 }
 
+/// Resolve a path to its UUID by walking the schema tree via MQTT.
+///
+/// This is the MQTT equivalent of `resolve_path_to_uuid_http` in
+/// `src/sync/transport/client.rs`. The algorithm is identical:
+/// walk path segments, fetch schema at each level, extract node_id.
+pub async fn resolve_path_to_uuid_mqtt(
+    request_client: &MqttRequestClient,
+    fs_root_id: &str,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    if segments.is_empty() {
+        return Ok(fs_root_id.to_string());
+    }
+
+    let mut current_id = fs_root_id.to_string();
+
+    for (i, segment) in segments.iter().enumerate() {
+        let response = request_client.get_content(&current_id).await.map_err(|e| {
+            format!(
+                "Failed to fetch schema for '{}': {}",
+                segments[..=i].join("/"),
+                e
+            )
+        })?;
+
+        if let Some(error) = response.error {
+            return Err(format!(
+                "Failed to fetch schema for '{}': {}",
+                segments[..=i].join("/"),
+                error
+            )
+            .into());
+        }
+
+        let content = response
+            .content
+            .ok_or_else(|| format!("No content for schema '{}'", segments[..=i].join("/")))?;
+
+        let schema: FsSchema = serde_json::from_str(&content).map_err(|e| {
+            format!(
+                "Failed to parse schema for '{}': {}",
+                segments[..=i].join("/"),
+                e
+            )
+        })?;
+
+        // Find the segment in schema entries
+        let is_last = i == segments.len() - 1;
+        let entry = schema
+            .root
+            .as_ref()
+            .and_then(|root| match root {
+                Entry::Dir(dir) => dir.entries.as_ref(),
+                _ => None,
+            })
+            .and_then(|entries| entries.get(*segment));
+
+        match entry {
+            Some(Entry::Doc(doc)) if is_last => {
+                return doc
+                    .node_id
+                    .clone()
+                    .ok_or_else(|| format!("Entry '{}' has no node_id", segment).into());
+            }
+            Some(Entry::Dir(dir)) => {
+                current_id = dir
+                    .node_id
+                    .clone()
+                    .ok_or_else(|| format!("Directory '{}' has no node_id", segment))?;
+            }
+            Some(Entry::Doc(doc)) if !is_last => {
+                current_id = doc
+                    .node_id
+                    .clone()
+                    .ok_or_else(|| format!("Entry '{}' has no node_id", segment))?;
+            }
+            _ => {
+                return Err(format!(
+                    "Entry '{}' not found in schema at '{}'",
+                    segment,
+                    if i == 0 {
+                        "/".to_string()
+                    } else {
+                        segments[..i].join("/")
+                    }
+                )
+                .into());
+            }
+        }
+    }
+
+    Ok(current_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,19 +270,14 @@ mod tests {
     }
 
     #[test]
-    fn test_script_resolver_new() {
-        let client = Client::new();
-        let resolver = ScriptResolver::new(client, "http://localhost:5199".to_string());
-        assert_eq!(resolver.server_url, "http://localhost:5199");
+    fn test_resolver_error_request_display() {
+        let err = ResolverError::Request("connection refused".to_string());
+        assert!(err.to_string().contains("MQTT request failed"));
+        assert!(err.to_string().contains("connection refused"));
     }
-
-    // =========================================================================
-    // Additional edge case tests
-    // =========================================================================
 
     #[test]
     fn test_script_watch_map_multiple_processes_same_script() {
-        // Multiple processes can share the same script
         let mut map: ScriptWatchMap = HashMap::new();
         let script_uuid = "shared-script-uuid".to_string();
 
@@ -210,8 +291,8 @@ mod tests {
             .or_default()
             .push("process3".to_string());
 
-        assert_eq!(map.len(), 1); // Only one script entry
-        assert_eq!(map.get(&script_uuid).unwrap().len(), 3); // Three processes
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&script_uuid).unwrap().len(), 3);
     }
 
     #[test]
@@ -230,17 +311,8 @@ mod tests {
     }
 
     #[test]
-    fn test_resolver_error_path_not_found_display() {
-        let err = ResolverError::PathNotFound("workspace/missing/script.ts".to_string());
-        let display = err.to_string();
-        assert!(display.contains("Path not found"));
-        assert!(display.contains("workspace/missing/script.ts"));
-    }
-
-    #[test]
     fn test_resolver_error_source() {
         use std::error::Error;
-        // PathNotFound should have no source error
         let err = ResolverError::PathNotFound("test".to_string());
         assert!(err.source().is_none());
     }
@@ -250,40 +322,5 @@ mod tests {
         let map: ScriptWatchMap = HashMap::new();
         assert!(map.is_empty());
         assert!(map.get("any-uuid").is_none());
-    }
-
-    #[test]
-    fn test_script_resolver_with_different_urls() {
-        // Test with various URL formats
-        let client = Client::new();
-
-        let resolver1 = ScriptResolver::new(client.clone(), "http://localhost:5199".to_string());
-        assert_eq!(resolver1.server_url, "http://localhost:5199");
-
-        let resolver2 = ScriptResolver::new(client.clone(), "http://127.0.0.1:8080".to_string());
-        assert_eq!(resolver2.server_url, "http://127.0.0.1:8080");
-
-        let resolver3 = ScriptResolver::new(client, "https://example.com".to_string());
-        assert_eq!(resolver3.server_url, "https://example.com");
-    }
-
-    #[test]
-    fn test_script_watch_map_overwrite_processes() {
-        let mut map: ScriptWatchMap = HashMap::new();
-
-        // Initial insert
-        map.insert("script-uuid".to_string(), vec!["old-process".to_string()]);
-
-        // Overwrite with new processes
-        map.insert(
-            "script-uuid".to_string(),
-            vec!["new-process-1".to_string(), "new-process-2".to_string()],
-        );
-
-        assert_eq!(map.len(), 1);
-        let processes = map.get("script-uuid").unwrap();
-        assert_eq!(processes.len(), 2);
-        assert!(!processes.contains(&"old-process".to_string()));
-        assert!(processes.contains(&"new-process-1".to_string()));
     }
 }

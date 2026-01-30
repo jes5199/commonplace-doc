@@ -4,15 +4,15 @@
 //! and traversing the directory structure to find entries of interest.
 
 use crate::fs::{DirEntry, Entry, FsSchema};
-use reqwest::Client;
-use serde::Deserialize;
+use crate::mqtt::MqttRequestClient;
 use std::fmt;
+use std::sync::Arc;
 
 /// Error type for schema visitor operations.
 #[derive(Debug)]
 pub enum VisitorError {
-    /// HTTP request failed
-    HttpError(String),
+    /// MQTT request failed
+    RequestError(String),
     /// Failed to parse response
     ParseError(String),
     /// Schema validation failed
@@ -22,7 +22,7 @@ pub enum VisitorError {
 impl fmt::Display for VisitorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            VisitorError::HttpError(msg) => write!(f, "HTTP error: {}", msg),
+            VisitorError::RequestError(msg) => write!(f, "Request error: {}", msg),
             VisitorError::ParseError(msg) => write!(f, "Parse error: {}", msg),
             VisitorError::SchemaError(msg) => write!(f, "Schema error: {}", msg),
         }
@@ -31,23 +31,40 @@ impl fmt::Display for VisitorError {
 
 impl std::error::Error for VisitorError {}
 
+/// Visit all entries in a schema's root directory.
+///
+/// Calls the visitor function for each entry in the schema's root.
+/// Does NOT recurse into subdirectories — use `SchemaVisitor::visit_tree` for that.
+///
+/// This is a free function since it doesn't require any client state.
+pub fn visit_entries<F>(schema: &FsSchema, mut visitor: F)
+where
+    F: FnMut(&str, &Entry),
+{
+    if let Some(Entry::Dir(ref root)) = schema.root {
+        if let Some(ref entries) = root.entries {
+            for (name, entry) in entries {
+                visitor(name, entry);
+            }
+        }
+    }
+}
+
 /// Visitor for traversing filesystem schemas.
 ///
 /// This struct provides methods for fetching schemas from the server
 /// and recursively visiting all entries in the schema tree.
 pub struct SchemaVisitor {
-    client: Client,
-    server_url: String,
+    request_client: Arc<MqttRequestClient>,
 }
 
 impl SchemaVisitor {
     /// Create a new SchemaVisitor.
     ///
     /// # Arguments
-    /// * `client` - HTTP client for making requests
-    /// * `server_url` - Base URL of the commonplace server
-    pub fn new(client: Client, server_url: String) -> Self {
-        Self { client, server_url }
+    /// * `request_client` - MQTT request client for fetching documents
+    pub fn new(request_client: Arc<MqttRequestClient>) -> Self {
+        Self { request_client }
     }
 
     /// Fetch and parse a schema from the server.
@@ -58,57 +75,29 @@ impl SchemaVisitor {
     /// # Returns
     /// The parsed FsSchema, or an error if the fetch or parse failed.
     pub async fn fetch_schema(&self, node_id: &str) -> Result<FsSchema, VisitorError> {
-        #[derive(Deserialize)]
-        struct HeadResponse {
-            content: String,
-        }
-
-        let url = format!("{}/docs/{}/head", self.server_url, node_id);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
+        let response = self
+            .request_client
+            .get_content(node_id)
             .await
-            .map_err(|e| VisitorError::HttpError(format!("Failed to fetch {}: {}", url, e)))?;
+            .map_err(|e| {
+                VisitorError::RequestError(format!("MQTT request failed for {}: {}", node_id, e))
+            })?;
 
-        if !resp.status().is_success() {
-            return Err(VisitorError::HttpError(format!(
-                "HTTP {} for {}",
-                resp.status(),
-                url
+        if let Some(error) = response.error {
+            return Err(VisitorError::RequestError(format!(
+                "get-content error for {}: {}",
+                node_id, error
             )));
         }
 
-        let head: HeadResponse = resp
-            .json()
-            .await
-            .map_err(|e| VisitorError::ParseError(format!("Failed to parse response: {}", e)))?;
+        let content = response.content.ok_or_else(|| {
+            VisitorError::RequestError(format!("No content in response for {}", node_id))
+        })?;
 
-        let schema: FsSchema = serde_json::from_str(&head.content)
+        let schema: FsSchema = serde_json::from_str(&content)
             .map_err(|e| VisitorError::ParseError(format!("Failed to parse schema: {}", e)))?;
 
         Ok(schema)
-    }
-
-    /// Visit all entries in a schema's root directory.
-    ///
-    /// Calls the visitor function for each entry in the schema's root.
-    /// Does NOT recurse into subdirectories - use `visit_tree` for that.
-    ///
-    /// # Arguments
-    /// * `schema` - The schema to visit
-    /// * `visitor` - Callback invoked with (entry_name, entry) for each entry
-    pub fn visit_entries<F>(&self, schema: &FsSchema, mut visitor: F)
-    where
-        F: FnMut(&str, &Entry),
-    {
-        if let Some(Entry::Dir(ref root)) = schema.root {
-            if let Some(ref entries) = root.entries {
-                for (name, entry) in entries {
-                    visitor(name, entry);
-                }
-            }
-        }
     }
 
     /// Recursively collect all schema node_ids in the tree.
@@ -260,14 +249,13 @@ mod tests {
 
     #[test]
     fn test_visit_entries_empty_schema() {
-        let visitor = SchemaVisitor::new(Client::new(), "http://localhost:5199".to_string());
         let schema = FsSchema {
             version: 1,
             root: None,
         };
 
         let mut visited = Vec::new();
-        visitor.visit_entries(&schema, |name, _entry| {
+        visit_entries(&schema, |name, _entry| {
             visited.push(name.to_string());
         });
 
@@ -276,8 +264,6 @@ mod tests {
 
     #[test]
     fn test_visit_entries_with_files() {
-        let visitor = SchemaVisitor::new(Client::new(), "http://localhost:5199".to_string());
-
         let json = r#"{
             "version": 1,
             "root": {
@@ -291,7 +277,7 @@ mod tests {
         let schema: FsSchema = serde_json::from_str(json).unwrap();
 
         let mut visited = Vec::new();
-        visitor.visit_entries(&schema, |name, entry| {
+        visit_entries(&schema, |name, entry| {
             if let Entry::Doc(doc) = entry {
                 visited.push((name.to_string(), doc.node_id.clone()));
             }
@@ -311,9 +297,9 @@ mod tests {
 
     #[test]
     fn test_visitor_error_display() {
-        let http_err = VisitorError::HttpError("connection refused".to_string());
-        assert!(http_err.to_string().contains("HTTP error"));
-        assert!(http_err.to_string().contains("connection refused"));
+        let req_err = VisitorError::RequestError("connection refused".to_string());
+        assert!(req_err.to_string().contains("Request error"));
+        assert!(req_err.to_string().contains("connection refused"));
 
         let parse_err = VisitorError::ParseError("invalid JSON".to_string());
         assert!(parse_err.to_string().contains("Parse error"));
@@ -322,15 +308,8 @@ mod tests {
         assert!(schema_err.to_string().contains("Schema error"));
     }
 
-    // =========================================================================
-    // Additional edge case tests
-    // =========================================================================
-
     #[test]
     fn test_visit_entries_with_nested_directories() {
-        let visitor = SchemaVisitor::new(Client::new(), "http://localhost:5199".to_string());
-
-        // Schema with both files and directories
         let json = r#"{
             "version": 1,
             "root": {
@@ -346,7 +325,7 @@ mod tests {
 
         let mut docs = Vec::new();
         let mut dirs = Vec::new();
-        visitor.visit_entries(&schema, |name, entry| match entry {
+        visit_entries(&schema, |name, entry| match entry {
             Entry::Doc(_) => docs.push(name.to_string()),
             Entry::Dir(_) => dirs.push(name.to_string()),
         });
@@ -359,9 +338,6 @@ mod tests {
 
     #[test]
     fn test_visit_entries_with_root_but_no_entries() {
-        let visitor = SchemaVisitor::new(Client::new(), "http://localhost:5199".to_string());
-
-        // Root directory exists but has no entries field
         let json = r#"{
             "version": 1,
             "root": {
@@ -371,7 +347,7 @@ mod tests {
         let schema: FsSchema = serde_json::from_str(json).unwrap();
 
         let mut count = 0;
-        visitor.visit_entries(&schema, |_name, _entry| {
+        visit_entries(&schema, |_name, _entry| {
             count += 1;
         });
 
@@ -380,8 +356,6 @@ mod tests {
 
     #[test]
     fn test_visit_entries_with_doc_as_root() {
-        let visitor = SchemaVisitor::new(Client::new(), "http://localhost:5199".to_string());
-
         // This is an invalid schema (root should be dir), but visit_entries handles it gracefully
         let json = r#"{
             "version": 1,
@@ -393,7 +367,7 @@ mod tests {
         let schema: FsSchema = serde_json::from_str(json).unwrap();
 
         let mut count = 0;
-        visitor.visit_entries(&schema, |_name, _entry| {
+        visit_entries(&schema, |_name, _entry| {
             count += 1;
         });
 
@@ -403,8 +377,6 @@ mod tests {
 
     #[test]
     fn test_visit_entries_extracts_node_ids_from_dirs() {
-        let visitor = SchemaVisitor::new(Client::new(), "http://localhost:5199".to_string());
-
         let json = r#"{
             "version": 1,
             "root": {
@@ -418,7 +390,7 @@ mod tests {
         let schema: FsSchema = serde_json::from_str(json).unwrap();
 
         let mut dir_node_ids: Vec<(String, Option<String>)> = Vec::new();
-        visitor.visit_entries(&schema, |name, entry| {
+        visit_entries(&schema, |name, entry| {
             if let Entry::Dir(dir) = entry {
                 dir_node_ids.push((name.to_string(), dir.node_id.clone()));
             }
@@ -438,8 +410,6 @@ mod tests {
 
     #[test]
     fn test_visit_entries_mixed_content_types() {
-        let visitor = SchemaVisitor::new(Client::new(), "http://localhost:5199".to_string());
-
         let json = r#"{
             "version": 1,
             "root": {
@@ -454,7 +424,7 @@ mod tests {
         let schema: FsSchema = serde_json::from_str(json).unwrap();
 
         let mut entries_found = Vec::new();
-        visitor.visit_entries(&schema, |name, _entry| {
+        visit_entries(&schema, |name, _entry| {
             entries_found.push(name.to_string());
         });
 
@@ -465,14 +435,12 @@ mod tests {
     #[test]
     fn test_visitor_error_is_std_error() {
         // Verify VisitorError implements std::error::Error
-        let err = VisitorError::HttpError("test".to_string());
+        let err = VisitorError::RequestError("test".to_string());
         let _: &dyn std::error::Error = &err;
     }
 
     #[test]
     fn test_visit_entries_with_special_characters_in_names() {
-        let visitor = SchemaVisitor::new(Client::new(), "http://localhost:5199".to_string());
-
         let json = r#"{
             "version": 1,
             "root": {
@@ -489,7 +457,7 @@ mod tests {
 
         let mut found_processes_json = false;
         let mut found_commonplace_json = false;
-        visitor.visit_entries(&schema, |name, _entry| {
+        visit_entries(&schema, |name, _entry| {
             if name == "__processes.json" {
                 found_processes_json = true;
             }
