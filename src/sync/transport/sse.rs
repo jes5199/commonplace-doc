@@ -7,7 +7,10 @@
 use super::ancestry::all_are_ancestors;
 use super::ancestry::{determine_sync_direction, SyncDirection};
 use super::client::fetch_head;
+#[cfg(unix)]
+use super::shadow::atomic_write_with_shadow;
 use super::urls::build_sse_url;
+use crate::sync::file_sync::PENDING_WRITE_TIMEOUT;
 #[cfg(unix)]
 use crate::sync::flock::{try_flock_exclusive, FlockResult};
 use crate::sync::{
@@ -28,9 +31,6 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-// Re-export from file_sync for backward compatibility
-pub use crate::sync::file_sync::PENDING_WRITE_TIMEOUT;
-
 /// Context for different SSE task variants.
 ///
 /// This enum allows the shared SSE loop to dispatch to different edit handlers
@@ -49,14 +49,6 @@ pub enum SseContext {
         inode_tracker: Arc<RwLock<crate::sync::InodeTracker>>,
     },
 }
-
-// Re-export shadow write types for backward compatibility
-#[cfg(unix)]
-pub use super::shadow::{
-    atomic_write_with_shadow, handle_shadow_write, shadow_write_handler_task,
-    write_inbound_with_checks, write_inbound_with_checks_atomic,
-};
-pub use super::shadow::{InboundWriteError, InboundWriteResult};
 
 // ============================================================================
 // Helper functions for handle_server_edit variants

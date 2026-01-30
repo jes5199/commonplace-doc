@@ -5,7 +5,7 @@
 //! - URL building utilities (urls.rs)
 //! - SSE (Server-Sent Events) handling (sse.rs)
 //! - Commit ancestry checking (ancestry.rs)
-//! - SSE/MQTT subscription tasks (subscriptions.rs)
+//! - MQTT subscription tasks (subscriptions.rs)
 //! - MQTT command handling (commands.rs)
 //! - Missing parent alerts (missing_parent.rs)
 //! - Peer fallback for sync requests (peer_fallback.rs)
