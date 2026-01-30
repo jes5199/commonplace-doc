@@ -319,6 +319,28 @@ async fn path_in_written_schemas(
 /// removes any orphaned directories (directories that exist locally but
 /// have no corresponding entry in the schema).
 async fn cleanup_orphaned_directories(directory: &Path, schema: &FsSchema) {
+    // Guard: If schema is empty (root=None or 0 entries), treat it as "unknown"
+    // rather than "everything deleted". An empty schema can result from applying
+    // a delta to uninitialized CRDT state, and deleting all directories would
+    // cause data loss. Explicit CRDT deletions (via apply_explicit_deletions)
+    // handle real deletions without relying on schema-diff.
+    let entry_count = schema
+        .root
+        .as_ref()
+        .and_then(|e| match e {
+            crate::fs::Entry::Dir(dir) => dir.entries.as_ref().map(|e| e.len()),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if entry_count == 0 {
+        info!(
+            "[CRDT-GUARD] Skipping orphaned directory cleanup: schema has 0 entries \
+             (likely uninitialized CRDT state). Directory: {}",
+            directory.display()
+        );
+        return;
+    }
+
     // Collect all directory names from the schema
     let schema_dirs: std::collections::HashSet<String> = collect_schema_directories(schema);
 
@@ -472,7 +494,16 @@ pub async fn handle_subdir_schema_cleanup(
         false
     };
 
-    if skip_deletions {
+    // Guard: If schema has 0 entries, treat it as unknown rather than empty.
+    // An empty schema can result from applying a delta to uninitialized CRDT state.
+    // Real deletions are handled by apply_explicit_deletions via before/after comparison.
+    if schema_entry_names.is_empty() {
+        info!(
+            "[CRDT-GUARD] Skipping schema-diff deletions for '{}': schema has 0 entries \
+             (likely uninitialized CRDT state). Real deletions handled by CRDT before/after comparison.",
+            subdir_path
+        );
+    } else if skip_deletions {
         // Don't proceed with deletions, just clean up orphaned directories
     } else {
         // Build the set of paths that legitimately exist in the schema.
@@ -1659,7 +1690,7 @@ pub async fn handle_schema_change(
     // Collect all paths from schema (with explicit node_id if present)
     // Use async version that follows node-backed directories to get complete path->UUID map
     // AND writes nested schema files to local directory (required for find_owning_document fallback)
-    let (uuid_map, _all_uuids_succeeded) =
+    let (uuid_map, all_uuids_succeeded) =
         build_uuid_map_and_write_schemas(client, server, fs_root_id, directory, written_schemas)
             .await;
     let mut schema_paths: Vec<(String, Option<String>)> = uuid_map
@@ -1996,6 +2027,20 @@ pub async fn handle_schema_change(
         }
     }
 
+    // Guard: If UUID map is incomplete (some subdirectory schemas failed to fetch),
+    // skip all deletions. The UUID map only contains files from successfully fetched
+    // subdirectories, so deleting files "not in the map" would delete files from
+    // subdirectories whose schemas are empty/unreachable on the server.
+    // Real deletions are handled by apply_explicit_deletions via CRDT before/after comparison.
+    let skip_deletions = !all_uuids_succeeded;
+    if skip_deletions {
+        info!(
+            "[CRDT-GUARD] Skipping schema-diff deletions in handle_schema_change: \
+             UUID map is incomplete (some subdirectory schemas failed to fetch). \
+             Real deletions handled by CRDT before/after comparison."
+        );
+    }
+
     // Delete local files/directories that have been removed from server schema
     let schema_path_set: std::collections::HashSet<&String> =
         schema_paths.iter().map(|(p, _)| p).collect();
@@ -2019,98 +2064,100 @@ pub async fn handle_schema_change(
             std::collections::HashSet::new()
         };
 
-    // Find files that exist in file_states but not in schema
-    // IMPORTANT: Check both schema_path_set (for files with node_id) AND schema_filenames
-    // (for root-level files without node_id). A file should only be deleted if it's not
-    // in the schema at all.
-    let deleted_paths: Vec<String> = known_paths
-        .iter()
-        .filter(|p| {
-            // Not in uuid_map (schema_path_set)
-            if schema_path_set.contains(p) {
-                return false;
-            }
-            // For root-level files, also check schema_filenames
-            // (which includes files without explicit node_id)
-            if !p.contains('/') && schema_filenames.contains(p.as_str()) {
-                return false;
-            }
-            true
-        })
-        .cloned()
-        .collect();
+    if !skip_deletions {
+        // Find files that exist in file_states but not in schema
+        // IMPORTANT: Check both schema_path_set (for files with node_id) AND schema_filenames
+        // (for root-level files without node_id). A file should only be deleted if it's not
+        // in the schema at all.
+        let deleted_paths: Vec<String> = known_paths
+            .iter()
+            .filter(|p| {
+                // Not in uuid_map (schema_path_set)
+                if schema_path_set.contains(p) {
+                    return false;
+                }
+                // For root-level files, also check schema_filenames
+                // (which includes files without explicit node_id)
+                if !p.contains('/') && schema_filenames.contains(p.as_str()) {
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect();
 
-    // ALSO scan the actual disk directory for files not in schema.
-    // This is critical for sandbox sync: files may exist on disk (written via MQTT)
-    // but not be tracked in file_states. Without this disk scan, such files would
-    // never be deleted when removed from the schema.
-    let disk_deleted_paths: Vec<String> = {
-        let mut paths = Vec::new();
-        if let Ok(mut entries) = tokio::fs::read_dir(directory).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let entry_path = entry.path();
-                if !entry_path.is_file() {
-                    continue;
-                }
-                let filename = match entry.file_name().into_string() {
-                    Ok(n) => n,
-                    Err(_) => continue,
-                };
-                // Skip hidden files and schema files
-                if filename.starts_with('.') {
-                    continue;
-                }
-                // If this file is not in the schema, mark for deletion
-                if !schema_filenames.contains(&filename) {
-                    // Only add if not already tracked in file_states (avoid double-processing)
-                    if !deleted_paths.contains(&filename) {
-                        paths.push(filename);
+        // ALSO scan the actual disk directory for files not in schema.
+        // This is critical for sandbox sync: files may exist on disk (written via MQTT)
+        // but not be tracked in file_states. Without this disk scan, such files would
+        // never be deleted when removed from the schema.
+        let disk_deleted_paths: Vec<String> = {
+            let mut paths = Vec::new();
+            if let Ok(mut entries) = tokio::fs::read_dir(directory).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let entry_path = entry.path();
+                    if !entry_path.is_file() {
+                        continue;
+                    }
+                    let filename = match entry.file_name().into_string() {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    };
+                    // Skip hidden files and schema files
+                    if filename.starts_with('.') {
+                        continue;
+                    }
+                    // If this file is not in the schema, mark for deletion
+                    if !schema_filenames.contains(&filename) {
+                        // Only add if not already tracked in file_states (avoid double-processing)
+                        if !deleted_paths.contains(&filename) {
+                            paths.push(filename);
+                        }
                     }
                 }
             }
-        }
-        paths
-    };
+            paths
+        };
 
-    debug!(
-        "delete check: schema_filenames={:?} disk_scan={:?} deleted_paths={:?}",
-        schema_filenames, disk_deleted_paths, deleted_paths
-    );
+        debug!(
+            "delete check: schema_filenames={:?} disk_scan={:?} deleted_paths={:?}",
+            schema_filenames, disk_deleted_paths, deleted_paths
+        );
 
-    // Combine paths from file_states and disk scan
-    let all_deleted_paths: Vec<String> = deleted_paths
-        .into_iter()
-        .chain(disk_deleted_paths.into_iter())
-        .collect();
+        // Combine paths from file_states and disk scan
+        let all_deleted_paths: Vec<String> = deleted_paths
+            .into_iter()
+            .chain(disk_deleted_paths.into_iter())
+            .collect();
 
-    for path in &all_deleted_paths {
-        // Check if we recently wrote a schema containing this file
-        // This prevents race conditions where we create a file, push schema,
-        // but receive a stale SSE update before the server processes our push
-        if path_in_written_schemas(path, directory, written_schemas).await {
-            debug!(
-                "Skipping deletion of {} - found in recently written schema (echo detection)",
-                path
-            );
-            continue;
-        }
+        for path in &all_deleted_paths {
+            // Check if we recently wrote a schema containing this file
+            // This prevents race conditions where we create a file, push schema,
+            // but receive a stale SSE update before the server processes our push
+            if path_in_written_schemas(path, directory, written_schemas).await {
+                debug!(
+                    "Skipping deletion of {} - found in recently written schema (echo detection)",
+                    path
+                );
+                continue;
+            }
 
-        info!("Server removed file: {} - deleting local copy", path);
-        let file_path = directory.join(path);
+            info!("Server removed file: {} - deleting local copy", path);
+            let file_path = directory.join(path);
 
-        // Stop sync tasks and remove from file_states
-        remove_file_state_and_abort(file_states, path).await;
+            // Stop sync tasks and remove from file_states
+            remove_file_state_and_abort(file_states, path).await;
 
-        // Delete the file from disk
-        if file_path.exists() && file_path.is_file() {
-            if let Err(e) = tokio::fs::remove_file(&file_path).await {
-                warn!("Failed to delete file {}: {}", file_path.display(), e);
+            // Delete the file from disk
+            if file_path.exists() && file_path.is_file() {
+                if let Err(e) = tokio::fs::remove_file(&file_path).await {
+                    warn!("Failed to delete file {}: {}", file_path.display(), e);
+                }
             }
         }
-    }
 
-    // Clean up directories that exist locally but not in the schema
-    cleanup_orphaned_directories(directory, &schema).await;
+        // Clean up directories that exist locally but not in the schema
+        cleanup_orphaned_directories(directory, &schema).await;
+    }
 
     // Unmark locally deleted directories from sync state so they don't keep being flagged
     for dir_name in &locally_deleted_dirs {

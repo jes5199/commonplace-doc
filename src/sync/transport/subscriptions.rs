@@ -105,7 +105,6 @@ use crate::mqtt::{MqttClient, Topic};
 use crate::sync::dir_sync::{
     apply_explicit_deletions, apply_schema_update_to_state, create_subdir_nested_directories,
     decode_schema_from_mqtt_payload, handle_schema_change_with_dedup, handle_subdir_new_files,
-    handle_subdir_schema_cleanup,
 };
 use crate::sync::error::SyncResult;
 use crate::sync::subdir_spawn::{spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport};
@@ -167,11 +166,10 @@ pub async fn handle_subdir_edit(
     mqtt_schema: Option<(FsSchema, String)>,
     deleted_entries: std::collections::HashSet<String>,
 ) {
-    // Clone mqtt_schema to pass to new files sync
-    let mqtt_schema_for_new_files = mqtt_schema.clone();
-
-    // First, cleanup deleted files and orphaned directories.
-    // Use explicit CRDT deletions when available (CP-seha).
+    // Cleanup deleted files using ONLY explicit CRDT deletions (CP-seha).
+    // When CRDT path is active, empty deleted_entries means "no deletions"
+    // — NOT "fall back to schema-diff". Schema-diff is unreliable when
+    // CRDT state is partial/uninitialized and would cause mass deletions.
     if !deleted_entries.is_empty() {
         apply_explicit_deletions(subdir_path, subdir_full_path, file_states, &deleted_entries)
             .await;
@@ -179,33 +177,6 @@ pub async fn handle_subdir_edit(
             "{}: Subdir {} explicit CRDT deletions applied",
             log_prefix, subdir_path
         );
-    } else {
-        // Fall back to schema-diff cleanup (no CRDT deletions detected)
-        match handle_subdir_schema_cleanup(
-            client,
-            server,
-            subdir_node_id,
-            subdir_path,
-            subdir_full_path,
-            directory,
-            file_states,
-            mqtt_schema,
-        )
-        .await
-        {
-            Ok(()) => {
-                debug!(
-                    "{}: Subdir {} schema cleanup completed",
-                    log_prefix, subdir_path
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "{}: Failed to handle subdir {} schema cleanup: {}",
-                    log_prefix, subdir_path, e
-                );
-            }
-        }
     }
 
     // Then, sync NEW files from server
@@ -225,7 +196,7 @@ pub async fn handle_subdir_edit(
         #[cfg(unix)]
         inode_tracker,
         crdt_context,
-        mqtt_schema_for_new_files,
+        mqtt_schema,
     )
     .await
     {
@@ -598,8 +569,10 @@ pub async fn directory_mqtt_task(
                                 }
                             }
 
-                            // Handle deletions: use explicit CRDT deletions when available (CP-seha),
-                            // fall back to schema-diff cleanup for non-CRDT paths.
+                            // Handle deletions: use ONLY explicit CRDT deletions (CP-seha).
+                            // When CRDT path is active, empty deleted_entries means "no deletions"
+                            // — NOT "fall back to schema-diff". Schema-diff is unreliable when
+                            // CRDT state is partial/uninitialized and would cause mass deletions.
                             if !root_deleted_entries.is_empty() {
                                 apply_explicit_deletions(
                                     "", // root directory = empty subdir_path
@@ -608,22 +581,6 @@ pub async fn directory_mqtt_task(
                                     &root_deleted_entries,
                                 )
                                 .await;
-                            } else {
-                                // No explicit deletions detected - call schema cleanup as fallback
-                                if let Err(e) = handle_subdir_schema_cleanup(
-                                    &http_client,
-                                    &server,
-                                    &fs_root_id,
-                                    "", // root directory = empty subdir_path
-                                    &directory,
-                                    &directory,
-                                    &file_states,
-                                    Some(schema_tuple),
-                                )
-                                .await
-                                {
-                                    warn!("MQTT: Failed to cleanup deleted files: {}", e);
-                                }
                             }
 
                             // Ensure CRDT tasks exist for all files

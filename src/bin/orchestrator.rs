@@ -509,9 +509,9 @@ async fn main() {
             }
             _ => {
                 attempts += 1;
-                if attempts > 30 {
+                if attempts > 120 {
                     tracing::error!(
-                        "[orchestrator] Server failed to become healthy after 30 attempts"
+                        "[orchestrator] Server failed to become healthy after 120 attempts (60s)"
                     );
                     base_manager.shutdown().await;
                     std::process::exit(1);
