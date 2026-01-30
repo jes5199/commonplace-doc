@@ -1984,6 +1984,56 @@ pub async fn subdir_mqtt_task(
         return;
     }
 
+    // Initialize subdirectory schema CRDT state via cyan sync (CP-uals)
+    if let Some(ref ctx) = crdt_context {
+        let subdir_full_path_init = directory.join(&subdir_path);
+        if let Ok(subdir_uuid) = Uuid::parse_str(&subdir_node_id) {
+            match ctx
+                .subdir_cache
+                .get_or_load(&subdir_full_path_init, subdir_uuid)
+                .await
+            {
+                Ok(subdir_state) => {
+                    let needs_init = {
+                        let state = subdir_state.read().await;
+                        state.schema.needs_server_init()
+                    };
+
+                    if needs_init {
+                        let sync_client_id = Uuid::new_v4().to_string();
+                        let mut state = subdir_state.write().await;
+                        let initialized = sync_schema_via_cyan(
+                            &mqtt_client,
+                            &workspace,
+                            &subdir_node_id,
+                            &sync_client_id,
+                            &mut state.schema,
+                        )
+                        .await;
+
+                        if initialized {
+                            info!(
+                                "[CYAN-SYNC] Subdir schema CRDT initialized for {} ({})",
+                                subdir_path, subdir_node_id
+                            );
+                        } else {
+                            warn!(
+                                "[CYAN-SYNC] Failed to init subdir schema for {} — will use MQTT retained messages",
+                                subdir_path
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "[CYAN-SYNC] Failed to load subdir state for {}: {}",
+                        subdir_path, e
+                    );
+                }
+            }
+        }
+    }
+
     // Build initial UUID map from the subdirectory's schema AND write schemas locally.
     // This ensures local .commonplace.json files exist with correct UUIDs from server.
     // The subdir_path is the prefix for paths within this subdirectory
