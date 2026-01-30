@@ -159,8 +159,8 @@ pub use crdt::ymap_schema;
 
 // --- From watcher/ ---
 pub use watcher::file_events::{
-    ensure_parent_directories_exist, find_owning_document, handle_file_created,
-    handle_file_deleted, handle_file_modified, OwningDocument,
+    ensure_parent_directories_exist, find_owning_document, handle_file_deleted,
+    handle_file_modified, OwningDocument,
 };
 #[cfg(unix)]
 pub use watcher::flock::{
@@ -245,8 +245,7 @@ pub use error::{SyncError, SyncResult};
 pub use file_sync::{
     initial_sync, initialize_crdt_state_from_server,
     initialize_crdt_state_from_server_with_pending, prepare_content_for_upload,
-    spawn_file_sync_tasks, spawn_file_sync_tasks_crdt, spawn_file_sync_tasks_with_flock,
-    sync_single_file, upload_task, upload_task_crdt, upload_task_with_flock, PreparedContent,
+    spawn_file_sync_tasks_crdt, sync_single_file, upload_task, upload_task_crdt, PreparedContent,
 };
 pub use types::{
     build_uuid_to_paths_map, remove_file_state_and_abort, CommitData, DirEvent, EditEventData,

@@ -24,8 +24,8 @@ use crate::sync::ymap_schema;
 use crate::sync::{
     ancestry::determine_sync_direction, build_info_url, detect_from_path, is_allowed_extension,
     is_binary_content, looks_like_base64_binary, push_schema_to_server,
-    remove_file_state_and_abort, spawn_file_sync_tasks, spawn_file_sync_tasks_crdt, FileSyncState,
-    SharedLastContent, SyncState,
+    remove_file_state_and_abort, spawn_file_sync_tasks_crdt, FileSyncState, SharedLastContent,
+    SyncState,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::Client;
@@ -736,7 +736,7 @@ pub async fn handle_subdir_new_files(
     pull_only: bool,
     shared_state_file: Option<&crate::sync::SharedStateFile>,
     author: &str,
-    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    #[cfg(unix)] _inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     crdt_context: Option<&CrdtFileSyncContext>,
     mqtt_schema: Option<(crate::fs::FsSchema, String)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1190,44 +1190,20 @@ pub async fn handle_subdir_new_files(
                     );
                     (handles, Some(shared_last_content))
                 } else {
-                    // Non-UUID identifier, fall back to HTTP sync
-                    debug!(
-                        "Subdir {} file {} has non-UUID identifier, using HTTP sync",
-                        subdir_path, root_relative_path
+                    // Non-UUID identifier - CRDT sync requires a valid UUID
+                    warn!(
+                        "Subdir {} file {} has non-UUID identifier '{}', skipping sync",
+                        subdir_path, root_relative_path, identifier
                     );
-                    let handles = spawn_file_sync_tasks(
-                        client.clone(),
-                        server.to_string(),
-                        identifier.clone(),
-                        file_path.clone(),
-                        state.clone(),
-                        use_paths,
-                        push_only,
-                        pull_only,
-                        false, // force_push: directory mode doesn't support force-push
-                        author.to_string(),
-                        #[cfg(unix)]
-                        inode_tracker.clone(),
-                    );
-                    (handles, None)
+                    continue;
                 }
             } else {
-                // No CRDT context, use HTTP sync
-                let handles = spawn_file_sync_tasks(
-                    client.clone(),
-                    server.to_string(),
-                    identifier.clone(),
-                    file_path.clone(),
-                    state.clone(),
-                    use_paths,
-                    push_only,
-                    pull_only,
-                    false, // force_push: directory mode doesn't support force-push
-                    author.to_string(),
-                    #[cfg(unix)]
-                    inode_tracker.clone(),
+                // No CRDT context available - CRDT is required for sync
+                warn!(
+                    "No CRDT context for subdir {} file {}, skipping sync",
+                    subdir_path, root_relative_path
                 );
-                (handles, None)
+                continue;
             };
 
             // Update the registered state with task handles and crdt_last_content
@@ -1659,10 +1635,10 @@ pub async fn handle_schema_change(
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
     spawn_tasks: bool,
     use_paths: bool,
-    push_only: bool,
+    _push_only: bool,
     pull_only: bool,
     author: &str,
-    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    #[cfg(unix)] _inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
     shared_state_file: Option<&crate::sync::SharedStateFile>,
     crdt_context: Option<&CrdtFileSyncContext>,
@@ -1981,41 +1957,17 @@ pub async fn handle_schema_change(
                             drop(states_snapshot);
                             (handles, Some(shared_last_content))
                         } else {
-                            // Non-UUID identifier, fall back to HTTP sync
-                            debug!("File {} has non-UUID identifier, using HTTP sync", path);
-                            let handles = spawn_file_sync_tasks(
-                                client.clone(),
-                                server.to_string(),
-                                identifier.clone(),
-                                file_path.clone(),
-                                state.clone(),
-                                use_paths,
-                                push_only,
-                                pull_only,
-                                false, // force_push: directory mode doesn't support force-push
-                                author.to_string(),
-                                #[cfg(unix)]
-                                inode_tracker.clone(),
+                            // Non-UUID identifier - CRDT sync requires a valid UUID
+                            warn!(
+                                "File {} has non-UUID identifier '{}', skipping sync",
+                                path, identifier
                             );
-                            (handles, None)
+                            continue;
                         }
                     } else {
-                        // No CRDT context, use HTTP sync
-                        let handles = spawn_file_sync_tasks(
-                            client.clone(),
-                            server.to_string(),
-                            identifier.clone(),
-                            file_path.clone(),
-                            state.clone(),
-                            use_paths,
-                            push_only,
-                            pull_only,
-                            false, // force_push: directory mode doesn't support force-push
-                            author.to_string(),
-                            #[cfg(unix)]
-                            inode_tracker.clone(),
-                        );
-                        (handles, None)
+                        // No CRDT context available - CRDT is required for sync
+                        warn!("No CRDT context for file {}, skipping sync", path);
+                        continue;
                     }
                 } else {
                     (Vec::new(), None)

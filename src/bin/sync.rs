@@ -19,14 +19,13 @@ use commonplace_doc::sync::{
     check_server_has_content, create_new_file, detect_from_path, directory_mqtt_task,
     directory_watcher_task, discover_fs_root, ensure_fs_root_exists,
     ensure_parent_directories_exist, file_watcher_task, find_owning_document, fork_node,
-    handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
-    handle_schema_modified, initial_sync, initialize_crdt_state_from_server_with_pending,
-    is_binary_content, push_schema_to_server, remove_file_from_schema,
-    scan_directory_with_contents, schema_to_json, spawn_command_listener,
-    spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file, trace_timeline,
-    upload_task, wait_for_file_stability, wait_for_uuid_map_ready, write_schema_file, ymap_schema,
-    CrdtFileSyncContext, DirEvent, FileEvent, FileSyncState, InodeKey, InodeTracker,
-    MqttOnlySyncConfig, ReplaceResponse, ScanOptions, SharedLastContent, SharedStateFile,
+    handle_file_deleted, handle_file_modified, handle_schema_change, handle_schema_modified,
+    initial_sync, initialize_crdt_state_from_server_with_pending, is_binary_content,
+    push_schema_to_server, remove_file_from_schema, scan_directory_with_contents, schema_to_json,
+    spawn_command_listener, spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file,
+    trace_timeline, upload_task, wait_for_file_stability, wait_for_uuid_map_ready,
+    write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent, FileEvent, FileSyncState,
+    InodeKey, InodeTracker, MqttOnlySyncConfig, ReplaceResponse, ScanOptions, SharedLastContent,
     SubdirStateCache, SyncState, TimelineMilestone, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
@@ -150,19 +149,14 @@ async fn handle_dir_event(
     directory: &std::path::Path,
     options: &ScanOptions,
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
-    use_paths: bool,
-    push_only: bool,
     pull_only: bool,
-    shared_state_file: Option<&SharedStateFile>,
     author: &str,
-    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<InodeTracker>>>,
     written_schemas: Option<&WrittenSchemas>,
     crdt_params: Option<&CrdtEventParams>,
     event: DirEvent,
 ) {
     match event {
         DirEvent::Created(path) => {
-            // Use CRDT path if available
             if let Some(crdt) = crdt_params {
                 handle_file_created_crdt(
                     client,
@@ -179,24 +173,10 @@ async fn handle_dir_event(
                 )
                 .await;
             } else {
-                handle_file_created(
-                    client,
-                    server,
-                    fs_root_id,
-                    directory,
-                    &path,
-                    options,
-                    file_states,
-                    use_paths,
-                    push_only,
-                    pull_only,
-                    shared_state_file,
-                    author,
-                    #[cfg(unix)]
-                    inode_tracker,
-                    written_schemas,
-                )
-                .await;
+                warn!(
+                    "No CRDT context for file creation event: {}, skipping",
+                    path.display()
+                );
             }
         }
         DirEvent::Modified(path) => {
@@ -2565,11 +2545,8 @@ async fn run_directory_mode(
         let directory = directory.clone();
         let options = options.clone();
         let file_states = file_states.clone();
-        let shared_state_file = shared_state_file.clone();
         let written_schemas = written_schemas.clone();
         let author = author.clone();
-        #[cfg(unix)]
-        let inode_tracker = inode_tracker.clone();
         // Create CRDT params for the event handler
         let crdt_params = CrdtEventParams {
             mqtt_client: mqtt_client.clone(),
@@ -2586,13 +2563,8 @@ async fn run_directory_mode(
                     &directory,
                     &options,
                     &file_states,
-                    use_paths,
-                    push_only,
                     pull_only,
-                    Some(&shared_state_file),
                     &author,
-                    #[cfg(unix)]
-                    inode_tracker.clone(),
                     Some(&written_schemas),
                     Some(&crdt_params),
                     event,
@@ -3193,11 +3165,8 @@ async fn run_exec_mode(
         let directory = directory.clone();
         let options = options.clone();
         let file_states = file_states.clone();
-        let shared_state_file = shared_state_file.clone();
         let written_schemas = written_schemas.clone();
         let author = author.clone();
-        #[cfg(unix)]
-        let inode_tracker = inode_tracker.clone();
         // Create CRDT params for the event handler
         let crdt_params = CrdtEventParams {
             mqtt_client: mqtt_client.clone(),
@@ -3215,13 +3184,8 @@ async fn run_exec_mode(
                     &directory,
                     &options,
                     &file_states,
-                    use_paths,
-                    push_only,
                     pull_only,
-                    Some(&shared_state_file),
                     &author,
-                    #[cfg(unix)]
-                    inode_tracker.clone(),
                     Some(&written_schemas),
                     Some(&crdt_params),
                     event,

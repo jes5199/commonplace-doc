@@ -16,8 +16,8 @@ pub mod watcher;
 
 // Re-export from file_events
 pub use file_events::{
-    ensure_parent_directories_exist, find_owning_document, handle_file_created,
-    handle_file_deleted, handle_file_modified, OwningDocument,
+    ensure_parent_directories_exist, find_owning_document, handle_file_deleted,
+    handle_file_modified, OwningDocument,
 };
 
 // Re-export from flock (Unix only)
