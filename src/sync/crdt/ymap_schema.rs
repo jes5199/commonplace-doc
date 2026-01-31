@@ -120,15 +120,34 @@ pub fn add_file(doc: &Doc, filename: &str, node_id: &str) {
 }
 
 /// Add a directory entry to the schema.
+///
+/// If the entry already exists and `node_id` is None, the existing node_id
+/// is preserved. This prevents scan_directory() from overwriting server-assigned
+/// node_ids when the local .commonplace.json doesn't have them yet. See CP-urp5.
 pub fn add_directory(doc: &Doc, dirname: &str, node_id: Option<&str>) {
     let mut txn = doc.transact_mut();
     let entries = get_or_create_entries(&mut txn);
 
+    // If node_id is None and entry already exists with a node_id, preserve it
+    let existing_node_id = if node_id.is_none() {
+        match entries.get(&txn, dirname) {
+            Some(yrs::Value::YMap(existing)) => match existing.get(&txn, "node_id") {
+                Some(yrs::Value::Any(Any::String(s))) => Some(s.to_string()),
+                _ => None,
+            },
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let effective_node_id = node_id.map(|s| s.to_string()).or(existing_node_id);
+
     // Create the entry map for this directory
     let entry_map = entries.insert(&mut txn, dirname, yrs::MapPrelim::<Any>::new());
     entry_map.insert(&mut txn, "type", "dir");
-    if let Some(id) = node_id {
-        entry_map.insert(&mut txn, "node_id", id);
+    if let Some(ref id) = effective_node_id {
+        entry_map.insert(&mut txn, "node_id", id.as_str());
     }
 }
 
@@ -614,6 +633,46 @@ mod tests {
         } else {
             panic!("Expected Dir root entry");
         }
+    }
+
+    #[test]
+    fn test_add_directory_none_preserves_existing_node_id() {
+        // CP-urp5: calling add_directory with node_id=None should NOT overwrite
+        // an existing entry that has a valid node_id.
+        let doc = Doc::new();
+
+        // Add directory with a node_id
+        add_directory(&doc, "subdir", Some("uuid-456"));
+        let entry = get_entry(&doc, "subdir").expect("Entry should exist");
+        assert_eq!(entry.node_id, Some("uuid-456".to_string()));
+
+        // Now add the same directory with node_id=None (simulates scan_directory
+        // returning None because .commonplace.json doesn't have the node_id yet)
+        add_directory(&doc, "subdir", None);
+
+        // The existing node_id should be PRESERVED, not overwritten
+        let entry = get_entry(&doc, "subdir").expect("Entry should still exist");
+        assert_eq!(
+            entry.node_id,
+            Some("uuid-456".to_string()),
+            "CP-urp5: add_directory with None must not overwrite existing node_id"
+        );
+    }
+
+    #[test]
+    fn test_add_directory_some_overwrites_existing_node_id() {
+        // When add_directory is called with a DIFFERENT Some(node_id),
+        // it should update the node_id (this is a legitimate update).
+        let doc = Doc::new();
+
+        add_directory(&doc, "subdir", Some("uuid-old"));
+        let entry = get_entry(&doc, "subdir").expect("Entry should exist");
+        assert_eq!(entry.node_id, Some("uuid-old".to_string()));
+
+        // Update with a new node_id
+        add_directory(&doc, "subdir", Some("uuid-new"));
+        let entry = get_entry(&doc, "subdir").expect("Entry should exist");
+        assert_eq!(entry.node_id, Some("uuid-new".to_string()));
     }
 }
 
