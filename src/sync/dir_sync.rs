@@ -2308,6 +2308,64 @@ pub async fn ensure_fs_root_exists(
     Ok(())
 }
 
+/// Merge existing node_ids from server schema into a local schema.
+///
+/// When the local .commonplace.json is corrupted or incomplete, scan_directory()
+/// returns entries with node_id=None even though the server already has UUIDs for
+/// those entries. This function copies server node_ids into the local schema,
+/// preventing create_documents_for_null_entries() from creating duplicate UUIDs.
+/// See CP-7hmh.
+fn merge_server_node_ids(local: &mut FsSchema, server: &FsSchema) -> usize {
+    let mut merged = 0;
+
+    let (local_entries, server_entries) = match (&mut local.root, &server.root) {
+        (Some(Entry::Dir(local_dir)), Some(Entry::Dir(server_dir))) => {
+            match (&mut local_dir.entries, &server_dir.entries) {
+                (Some(local_e), Some(server_e)) => (local_e, server_e),
+                _ => return 0,
+            }
+        }
+        _ => return 0,
+    };
+
+    for (name, local_entry) in local_entries.iter_mut() {
+        let server_entry = match server_entries.get(name) {
+            Some(e) => e,
+            None => continue,
+        };
+
+        match (local_entry, server_entry) {
+            (Entry::Dir(local_dir), Entry::Dir(server_dir)) => {
+                if local_dir.node_id.is_none() {
+                    if let Some(ref server_id) = server_dir.node_id {
+                        info!(
+                            "Using existing server UUID {} for directory '{}' (CP-7hmh)",
+                            server_id, name
+                        );
+                        local_dir.node_id = Some(server_id.clone());
+                        merged += 1;
+                    }
+                }
+            }
+            (Entry::Doc(local_doc), Entry::Doc(server_doc)) => {
+                if local_doc.node_id.is_none() {
+                    if let Some(ref server_id) = server_doc.node_id {
+                        debug!(
+                            "Using existing server UUID {} for file '{}' (CP-7hmh)",
+                            server_id, name
+                        );
+                        local_doc.node_id = Some(server_id.clone());
+                        merged += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    merged
+}
+
 /// Create documents on the server for all schema entries with null node_ids.
 ///
 /// Per RECURSIVE_SYNC_THEORY.md: schemas pushed to server must have valid UUIDs.
@@ -2482,6 +2540,23 @@ pub async fn sync_schema(
     };
 
     if should_push_schema {
+        // Before creating new documents, check if the server already has UUIDs for
+        // entries that appear as null locally (e.g., due to corrupted .commonplace.json).
+        // This prevents creating duplicate UUIDs for directories that already exist
+        // on the server. See CP-7hmh.
+        let mut schema = schema;
+        if let Ok(Some(head)) = fetch_head(client, server, fs_root_id, false).await {
+            if let Ok(server_schema) = serde_json::from_str::<FsSchema>(&head.content) {
+                let merged = merge_server_node_ids(&mut schema, &server_schema);
+                if merged > 0 {
+                    info!(
+                        "Merged {} existing node_ids from server schema (CP-7hmh)",
+                        merged
+                    );
+                }
+            }
+        }
+
         // Per RECURSIVE_SYNC_THEORY.md: Create documents for null entries BEFORE pushing schema.
         // This ensures we never push schemas with node_id: null to the server.
         info!("Creating documents for new entries...");
@@ -2998,5 +3073,132 @@ mod tests {
             r.deleted_entries.is_empty(),
             "Adding file should not produce deletions"
         );
+    }
+
+    #[test]
+    fn test_merge_server_node_ids_fills_missing() {
+        use crate::fs::{DirEntry, DocEntry};
+
+        let mut local = FsSchema {
+            version: 1,
+            root: Some(Entry::Dir(DirEntry {
+                entries: Some(HashMap::from([
+                    (
+                        "bartleby".to_string(),
+                        Entry::Dir(DirEntry {
+                            entries: None,
+                            node_id: None, // Local doesn't know the UUID
+                            content_type: Some("application/json".to_string()),
+                        }),
+                    ),
+                    (
+                        "file.txt".to_string(),
+                        Entry::Doc(DocEntry {
+                            node_id: None, // Local doesn't know the UUID
+                            content_type: Some("text/plain".to_string()),
+                        }),
+                    ),
+                ])),
+                node_id: None,
+                content_type: None,
+            })),
+        };
+
+        let server = FsSchema {
+            version: 1,
+            root: Some(Entry::Dir(DirEntry {
+                entries: Some(HashMap::from([
+                    (
+                        "bartleby".to_string(),
+                        Entry::Dir(DirEntry {
+                            entries: None,
+                            node_id: Some("server-dir-uuid".to_string()),
+                            content_type: Some("application/json".to_string()),
+                        }),
+                    ),
+                    (
+                        "file.txt".to_string(),
+                        Entry::Doc(DocEntry {
+                            node_id: Some("server-file-uuid".to_string()),
+                            content_type: Some("text/plain".to_string()),
+                        }),
+                    ),
+                ])),
+                node_id: None,
+                content_type: None,
+            })),
+        };
+
+        let merged = merge_server_node_ids(&mut local, &server);
+        assert_eq!(merged, 2, "Should merge 2 node_ids from server");
+
+        if let Some(Entry::Dir(ref root)) = local.root {
+            let entries = root.entries.as_ref().unwrap();
+            if let Entry::Dir(ref dir) = entries["bartleby"] {
+                assert_eq!(
+                    dir.node_id.as_deref(),
+                    Some("server-dir-uuid"),
+                    "Directory node_id should be filled from server"
+                );
+            }
+            if let Entry::Doc(ref doc) = entries["file.txt"] {
+                assert_eq!(
+                    doc.node_id.as_deref(),
+                    Some("server-file-uuid"),
+                    "File node_id should be filled from server"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_merge_server_node_ids_preserves_existing_local() {
+        use crate::fs::DirEntry;
+
+        let mut local = FsSchema {
+            version: 1,
+            root: Some(Entry::Dir(DirEntry {
+                entries: Some(HashMap::from([(
+                    "bartleby".to_string(),
+                    Entry::Dir(DirEntry {
+                        entries: None,
+                        node_id: Some("local-uuid".to_string()), // Already has UUID
+                        content_type: Some("application/json".to_string()),
+                    }),
+                )])),
+                node_id: None,
+                content_type: None,
+            })),
+        };
+
+        let server = FsSchema {
+            version: 1,
+            root: Some(Entry::Dir(DirEntry {
+                entries: Some(HashMap::from([(
+                    "bartleby".to_string(),
+                    Entry::Dir(DirEntry {
+                        entries: None,
+                        node_id: Some("server-uuid".to_string()),
+                        content_type: Some("application/json".to_string()),
+                    }),
+                )])),
+                node_id: None,
+                content_type: None,
+            })),
+        };
+
+        let merged = merge_server_node_ids(&mut local, &server);
+        assert_eq!(merged, 0, "Should not merge when local already has node_id");
+
+        if let Some(Entry::Dir(ref root)) = local.root {
+            let entries = root.entries.as_ref().unwrap();
+            if let Entry::Dir(ref dir) = entries["bartleby"] {
+                assert_eq!(
+                    dir.node_id.as_deref(),
+                    Some("local-uuid"),
+                    "Local node_id should be preserved when it already exists"
+                );
+            }
+        }
     }
 }

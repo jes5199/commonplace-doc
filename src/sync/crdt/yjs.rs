@@ -281,6 +281,11 @@ fn create_yjs_json_update_impl(
 /// Deep merge objects, preserving entries from the existing object when not in new.
 /// This specifically handles schema merges where `root.entries` should combine
 /// entries from multiple sync clients.
+///
+/// node_id fields receive special treatment: existing non-null node_ids are never
+/// overwritten. This prevents UUID divergence when multiple sync clients create
+/// different UUIDs for the same directory due to corrupted or stale local state.
+/// See CP-7hmh.
 fn deep_merge_objects(
     new_obj: &mut serde_json::Map<String, serde_json::Value>,
     existing_obj: &serde_json::Map<String, serde_json::Value>,
@@ -288,12 +293,17 @@ fn deep_merge_objects(
     for (key, existing_val) in existing_obj {
         match new_obj.get_mut(key) {
             Some(new_val) => {
-                // Both have this key - recursively merge if both are objects
-                if let (
+                // Preserve existing non-null node_ids (CP-7hmh).
+                // Once a UUID is assigned to a directory, it must not be overwritten
+                // by a different UUID from another sync client.
+                if key == "node_id" && !existing_val.is_null() {
+                    *new_val = existing_val.clone();
+                } else if let (
                     serde_json::Value::Object(new_inner),
                     serde_json::Value::Object(existing_inner),
                 ) = (new_val, existing_val)
                 {
+                    // Both have this key as objects - recursively merge
                     deep_merge_objects(new_inner, existing_inner);
                 }
                 // Otherwise keep the new value (it takes precedence)
@@ -928,6 +938,135 @@ mod tests {
                 "node_id should be preserved after Yjs roundtrip, got: {}",
                 node_id
             );
+        }
+    }
+
+    mod deep_merge {
+        use super::*;
+
+        #[test]
+        fn test_deep_merge_preserves_existing_node_id() {
+            // Server has bartleby with node_id "OLD-UUID"
+            // Local has bartleby with node_id "NEW-UUID"
+            // After merge, server's "OLD-UUID" should win
+            let mut new_obj: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(r#"{"node_id": "NEW-UUID", "type": "dir"}"#).unwrap();
+            let existing_obj: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(r#"{"node_id": "OLD-UUID", "type": "dir"}"#).unwrap();
+
+            deep_merge_objects(&mut new_obj, &existing_obj);
+
+            assert_eq!(
+                new_obj["node_id"], "OLD-UUID",
+                "Existing node_id must be preserved"
+            );
+        }
+
+        #[test]
+        fn test_deep_merge_allows_new_node_id_when_server_null() {
+            // Server has bartleby with node_id null (not yet assigned)
+            // Local has bartleby with node_id "NEW-UUID"
+            // Local value should win (first assignment)
+            let mut new_obj: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(r#"{"node_id": "NEW-UUID", "type": "dir"}"#).unwrap();
+            let existing_obj: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(r#"{"node_id": null, "type": "dir"}"#).unwrap();
+
+            deep_merge_objects(&mut new_obj, &existing_obj);
+
+            assert_eq!(
+                new_obj["node_id"], "NEW-UUID",
+                "New node_id should be kept when server has null"
+            );
+        }
+
+        #[test]
+        fn test_deep_merge_fills_null_from_server() {
+            // Local has bartleby with node_id null
+            // Server has bartleby with node_id "SERVER-UUID"
+            // Server value should fill in the null
+            let mut new_obj: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(r#"{"node_id": null, "type": "dir"}"#).unwrap();
+            let existing_obj: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(r#"{"node_id": "SERVER-UUID", "type": "dir"}"#).unwrap();
+
+            deep_merge_objects(&mut new_obj, &existing_obj);
+
+            assert_eq!(
+                new_obj["node_id"], "SERVER-UUID",
+                "Server node_id should fill null"
+            );
+        }
+
+        #[test]
+        fn test_deep_merge_preserves_node_id_in_nested_schema() {
+            // Full schema merge: new has different node_id for bartleby entry
+            let mut new_obj: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+                r#"{
+                    "version": 1,
+                    "root": {
+                        "type": "dir",
+                        "entries": {
+                            "bartleby": {
+                                "type": "dir",
+                                "node_id": "NEW-UUID"
+                            }
+                        }
+                    }
+                }"#,
+            )
+            .unwrap();
+
+            let existing_obj: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+                r#"{
+                    "version": 1,
+                    "root": {
+                        "type": "dir",
+                        "entries": {
+                            "bartleby": {
+                                "type": "dir",
+                                "node_id": "OLD-UUID"
+                            },
+                            "extra": {
+                                "type": "doc",
+                                "node_id": "EXTRA-UUID"
+                            }
+                        }
+                    }
+                }"#,
+            )
+            .unwrap();
+
+            deep_merge_objects(&mut new_obj, &existing_obj);
+
+            // bartleby's node_id should be preserved from server
+            assert_eq!(
+                new_obj["root"]["entries"]["bartleby"]["node_id"], "OLD-UUID",
+                "Nested node_id must be preserved from server"
+            );
+            // Extra entry from server should be preserved (additive)
+            assert_eq!(
+                new_obj["root"]["entries"]["extra"]["node_id"], "EXTRA-UUID",
+                "Server-only entries should be preserved"
+            );
+        }
+
+        #[test]
+        fn test_deep_merge_non_node_id_scalars_new_wins() {
+            // For non-node_id fields, new value should take precedence
+            let mut new_obj: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(r#"{"type": "doc", "content_type": "text/plain"}"#).unwrap();
+            let existing_obj: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(r#"{"type": "dir", "content_type": "application/json"}"#)
+                    .unwrap();
+
+            deep_merge_objects(&mut new_obj, &existing_obj);
+
+            assert_eq!(
+                new_obj["type"], "doc",
+                "Non-node_id scalars: new should win"
+            );
+            assert_eq!(new_obj["content_type"], "text/plain");
         }
     }
 }
