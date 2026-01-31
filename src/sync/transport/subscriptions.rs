@@ -372,7 +372,7 @@ pub async fn directory_mqtt_task(
                 };
 
                 if initialized {
-                    info!("Schema CRDT initialized via cyan sync for {}", fs_root_id);
+                    debug!("Schema CRDT initialized via cyan sync for {}", fs_root_id);
                 } else {
                     warn!(
                         "Cyan sync failed for {} — falling back to HTTP bootstrap",
@@ -422,7 +422,7 @@ pub async fn directory_mqtt_task(
                 next_message,
             } => {
                 // Resync all subscribed files to recover missed edits
-                info!(
+                debug!(
                     "MQTT directory receiver lagged by {} messages, triggering resync",
                     missed_count
                 );
@@ -1294,7 +1294,7 @@ async fn resync_subscribed_files(
             .log_http_deprecation("resync_subscribed_files");
     }
 
-    info!(
+    debug!(
         "Resyncing {} subscribed file UUIDs after broadcast lag",
         subscribed_uuids.len()
     );
@@ -1384,7 +1384,7 @@ async fn resync_subscribed_files(
         }
     }
 
-    info!("Resync completed for subscribed file UUIDs");
+    debug!("Resync completed for subscribed file UUIDs");
 }
 
 /// Resync schema CRDT state from server after broadcast lag.
@@ -1418,7 +1418,7 @@ async fn resync_schema_from_server(
     directory: &Path,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
 ) {
-    warn!(
+    debug!(
         "Resyncing schema CRDT state via cyan sync for {}",
         fs_root_id
     );
@@ -1448,7 +1448,7 @@ async fn resync_schema_from_server(
     };
 
     if initialized {
-        info!("Schema resync via cyan completed for {}", fs_root_id);
+        debug!("Schema resync via cyan completed for {}", fs_root_id);
         return;
     }
 
@@ -1483,14 +1483,14 @@ async fn resync_schema_from_server(
         let cid = head.cid.as_deref().unwrap_or("unknown");
         let mut state_guard = crdt_context.crdt_state.write().await;
         state_guard.schema.initialize_from_server(server_state, cid);
-        info!(
+        debug!(
             "Schema resync: HTTP fallback initialized for {} at cid={}",
             fs_root_id, cid
         );
     } else {
         let mut state_guard = crdt_context.crdt_state.write().await;
         state_guard.schema.initialize_empty();
-        info!(
+        debug!(
             "Schema resync: Initialized empty CRDT state for {} (server has no state)",
             fs_root_id
         );
@@ -1507,7 +1507,7 @@ async fn resync_schema_from_server(
         }
     }
 
-    info!("Schema resync completed for {}", fs_root_id);
+    debug!("Schema resync completed for {}", fs_root_id);
 }
 
 /// Resync subdirectory schema CRDT state from server after broadcast lag.
@@ -1530,7 +1530,7 @@ async fn resync_subdir_schema_from_server(
     crdt_context: &CrdtFileSyncContext,
     directory: &Path,
 ) {
-    warn!(
+    debug!(
         "Resyncing subdirectory schema CRDT state via cyan sync for {} ({})",
         subdir_path, subdir_node_id
     );
@@ -1601,7 +1601,7 @@ async fn resync_subdir_schema_from_server(
     };
 
     if initialized {
-        info!(
+        debug!(
             "Subdir schema resync via cyan completed for {} ({})",
             subdir_path, subdir_node_id
         );
@@ -1642,13 +1642,13 @@ async fn resync_subdir_schema_from_server(
             if let Some(ref server_state) = head.state {
                 let cid = head.cid.as_deref().unwrap_or("unknown");
                 state.schema.initialize_from_server(server_state, cid);
-                info!(
+                debug!(
                     "Subdir schema resync: HTTP fallback initialized for {} at cid={}",
                     subdir_path, cid
                 );
             } else {
                 state.schema.initialize_empty();
-                info!(
+                debug!(
                     "Subdir schema resync: Initialized empty for {} (no server state)",
                     subdir_path
                 );
@@ -1673,7 +1673,7 @@ async fn resync_subdir_schema_from_server(
         }
     }
 
-    info!("Subdir schema resync completed for {}", subdir_path);
+    debug!("Subdir schema resync completed for {}", subdir_path);
 }
 
 /// Initialize schema CRDT state via the cyan (sync) MQTT channel.
@@ -1703,7 +1703,7 @@ async fn sync_schema_via_cyan(
     let sync_topic = Topic::sync(workspace, doc_path, client_id);
     let sync_topic_str = sync_topic.to_topic_string();
 
-    info!(
+    debug!(
         "[CYAN-SYNC] Starting schema sync for doc={} on topic={}",
         doc_path, sync_topic_str
     );
@@ -1811,7 +1811,7 @@ async fn sync_schema_via_cyan(
                         commits: ref done_commits,
                         ..
                     } if req == &req_id => {
-                        info!(
+                        debug!(
                             "[CYAN-SYNC] Received Done for doc={}: {} commits",
                             doc_path,
                             done_commits.len()
@@ -1863,7 +1863,7 @@ async fn sync_schema_via_cyan(
 
     // Step 6: Handle empty history (new document)
     if commits.is_empty() {
-        info!(
+        debug!(
             "[CYAN-SYNC] Empty history for doc={} — initializing empty schema",
             doc_path
         );
@@ -1910,7 +1910,7 @@ async fn sync_schema_via_cyan(
 
     schema_state.initialize_from_server(&state_b64, cid);
 
-    info!(
+    debug!(
         "[CYAN-SYNC] Schema CRDT initialized for doc={}: {} commits applied, head={}",
         doc_path,
         commits.len(),
@@ -2052,7 +2052,7 @@ pub async fn subdir_mqtt_task(
                         .await;
 
                         if initialized {
-                            info!(
+                            debug!(
                                 "[CYAN-SYNC] Subdir schema CRDT initialized for {} ({})",
                                 subdir_path, subdir_node_id
                             );
@@ -2140,7 +2140,7 @@ pub async fn subdir_mqtt_task(
                 next_message,
             } => {
                 // For subdir watchers, resync by triggering a schema refresh and resyncing files
-                info!(
+                debug!(
                     "MQTT subdir {} receiver lagged by {} messages, triggering resync",
                     subdir_path, missed_count
                 );

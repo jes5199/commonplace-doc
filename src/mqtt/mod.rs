@@ -330,7 +330,7 @@ impl MqttService {
                     match msg {
                         Some(msg) => {
                             msg_count += 1;
-                            tracing::info!(
+                            tracing::trace!(
                                 "MQTT received message #{} on topic: {} ({} bytes)",
                                 msg_count,
                                 msg.topic,
@@ -339,7 +339,7 @@ impl MqttService {
                             if let Err(e) = self.dispatch_message(&msg.topic, &msg.payload).await {
                                 tracing::warn!("Error dispatching MQTT message to {}: {}", msg.topic, e);
                             } else {
-                                tracing::info!("MQTT dispatched message #{} successfully", msg_count);
+                                tracing::trace!("MQTT dispatched message #{} successfully", msg_count);
                             }
                         }
                         None => {

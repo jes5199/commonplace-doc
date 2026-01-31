@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Result of finding which document owns a given file path.
 ///
@@ -52,9 +52,10 @@ pub fn find_owning_document(
 ) -> OwningDocument {
     // Split path into components
     let components: Vec<&str> = relative_path.split('/').collect();
-    info!(
+    trace!(
         "find_owning_document: path={}, components={:?}",
-        relative_path, components
+        relative_path,
+        components
     );
 
     // Walk from root checking each directory for node-backed status
@@ -68,9 +69,10 @@ pub fn find_owning_document(
         .take(components.len().saturating_sub(1))
         .enumerate()
     {
-        info!(
+        trace!(
             "find_owning_document: checking component '{}' at index {}",
-            component, i
+            component,
+            i
         );
 
         // Check if parent has a .commonplace.json with this component as a node-backed entry
@@ -79,18 +81,18 @@ pub fn find_owning_document(
             if let Ok(schema) = serde_json::from_str::<FsSchema>(&content) {
                 if let Some(Entry::Dir(dir_entry)) = schema.root.as_ref() {
                     if let Some(ref entries) = dir_entry.entries {
-                        info!("find_owning_document: schema has {} entries", entries.len());
+                        trace!("find_owning_document: schema has {} entries", entries.len());
                         if let Some(entry) = entries.get(*component) {
-                            info!("find_owning_document: found entry for '{}'", component);
+                            trace!("find_owning_document: found entry for '{}'", component);
                             if let Entry::Dir(subdir) = entry {
-                                info!(
+                                trace!(
                                     "find_owning_document: entry is dir, node_id={:?}",
                                     subdir.node_id
                                 );
                                 if let Some(ref node_id) = subdir.node_id {
                                     // This is a node-backed directory!
                                     // The remaining path belongs to this document
-                                    info!(
+                                    trace!(
                                         "find_owning_document: FOUND node-backed dir '{}' with id {}",
                                         component, node_id
                                     );
@@ -102,13 +104,13 @@ pub fn find_owning_document(
                     }
                 }
             } else {
-                info!(
+                debug!(
                     "find_owning_document: failed to parse schema from {:?}",
                     schema_path
                 );
             }
         } else {
-            info!("find_owning_document: no schema at {:?}", schema_path);
+            trace!("find_owning_document: no schema at {:?}", schema_path);
         }
 
         // Move into this directory for next iteration

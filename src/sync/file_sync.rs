@@ -28,7 +28,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 use yrs::{GetString, ReadTxn, Transact};
 
@@ -1401,7 +1401,7 @@ pub async fn upload_task_crdt(
             shared.clone().unwrap_or_default()
         };
 
-        info!(
+        trace!(
             "[UPLOAD-TRACE] upload_task_crdt recv for {} - old_len={} old={:?} new_len={} new={:?}",
             file_path.display(),
             old_content.len(),
@@ -1412,7 +1412,7 @@ pub async fn upload_task_crdt(
 
         // Skip if content unchanged
         if old_content == new_content {
-            info!(
+            trace!(
                 "[UPLOAD-TRACE] upload_task_crdt SKIPPING unchanged content for {}",
                 file_path.display()
             );

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Default debounce duration for file watcher (100ms)
 pub const FILE_DEBOUNCE_MS: u64 = 100;
@@ -431,7 +431,7 @@ pub async fn file_watcher_task(file_path: PathBuf, tx: mpsc::Sender<FileEvent>) 
                     }
                 };
 
-                info!(
+                trace!(
                     "[WATCHER-TRACE] Sending FileEvent::Modified for {} ({} bytes, content={:?})",
                     file_path.display(),
                     content.len(),
