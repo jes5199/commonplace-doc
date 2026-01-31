@@ -2574,19 +2574,16 @@ pub async fn sync_schema(
             warn!("Failed to write local schema file: {}", e);
         }
 
-        // Push nested schemas from local subdirectories to their server documents.
-        // This restores node-backed directory contents after a server database clear.
-        if let Err(e) =
-            push_nested_schemas(client, server, directory, &schema_with_uuids, author).await
-        {
-            warn!("Failed to push nested schemas: {}", e);
-        }
-
         // No need to wait for reconciler - we already created documents directly
 
-        // Fetch the schema back from server (now with server-generated UUIDs)
+        // Fetch the schema back from server (now with server-assigned UUIDs)
         // and write to local .commonplace.json files.
         // This ensures all sync clients get the same server-assigned UUIDs.
+        //
+        // IMPORTANT: push_nested_schemas must use the SERVER schema (fetched below),
+        // not the local schema. When deep_merge preserves existing server node_ids
+        // (CP-7hmh), the server's UUIDs may differ from local. Pushing nested schemas
+        // to the server's UUIDs ensures content reaches the right documents.
         let mut final_schema_json = schema_json.clone();
         let mut final_cid: Option<String> = None;
         if let Ok(Some(head)) = fetch_head(client, server, fs_root_id, false).await {
@@ -2597,8 +2594,18 @@ pub async fn sync_schema(
                 warn!("Failed to write schema file: {}", e);
             }
 
-            // Write nested schemas from server
             if let Ok(server_schema) = serde_json::from_str::<FsSchema>(&head.content) {
+                // Push nested schemas using server UUIDs (CP-7hmh).
+                // This restores node-backed directory contents after a server database
+                // clear, and ensures content is pushed to the correct documents when
+                // local and server UUIDs differ.
+                if let Err(e) =
+                    push_nested_schemas(client, server, directory, &server_schema, author).await
+                {
+                    warn!("Failed to push nested schemas: {}", e);
+                }
+
+                // Write nested schemas (create directories) from server
                 info!("Writing nested schemas from server...");
                 if let Err(e) =
                     write_nested_schemas(client, server, directory, &server_schema, None).await

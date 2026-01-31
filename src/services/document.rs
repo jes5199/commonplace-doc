@@ -357,36 +357,49 @@ impl DocumentService {
         author: Option<String>,
         message: Option<String>,
     ) -> Result<EditResult, ServiceError> {
-        let commit_store = self
-            .commit_store
-            .as_ref()
-            .ok_or(ServiceError::NoPersistence)?;
-
         // Verify document exists
         self.get_document(id).await?;
 
         let update_bytes =
             b64::decode_with_context(update_b64, "update").map_err(ServiceError::InvalidInput)?;
 
-        // Get current head
-        let current_head = commit_store
-            .get_document_head(id)
-            .await
-            .map_err(|e| ServiceError::Internal(e.to_string()))?;
-
-        let parents = current_head.into_iter().collect();
-        let author = author.unwrap_or_else(|| "anonymous".to_string());
-
-        let commit = Commit::new(parents, update_b64.to_string(), author, message);
-
-        // Apply update to document
+        // Apply update to document (works with or without persistence)
         self.doc_store.apply_yjs_update(id, &update_bytes).await?;
 
-        // Store commit and update head
-        let (cid, timestamp) = commit_store
-            .store_commit_and_set_head(id, &commit)
-            .await
-            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let author = author.unwrap_or_else(|| "anonymous".to_string());
+
+        // Store commit if persistence is available; otherwise generate a
+        // content-hash CID so callers still get a valid EditResult.
+        let (cid, timestamp, parents) = if let Some(commit_store) = &self.commit_store {
+            let current_head = commit_store
+                .get_document_head(id)
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+            let parents: Vec<String> = current_head.into_iter().collect();
+            let commit = Commit::new(
+                parents.clone(),
+                update_b64.to_string(),
+                author.clone(),
+                message.clone(),
+            );
+
+            let (cid, timestamp) = commit_store
+                .store_commit_and_set_head(id, &commit)
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+            (cid, timestamp, parents)
+        } else {
+            // No persistence: derive a CID from update content and use current time
+            use sha2::{Digest, Sha256};
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let cid = format!("{:x}", Sha256::digest(update_b64.as_bytes()));
+            (cid, timestamp, vec![])
+        };
 
         self.broadcast_commit(id, &cid, timestamp);
 
@@ -394,9 +407,9 @@ impl DocumentService {
         self.publish_commit_to_mqtt(
             id,
             update_b64,
-            &commit.parents,
-            &commit.author,
-            commit.message.as_deref(),
+            &parents,
+            &author,
+            message.as_deref(),
             timestamp,
         )
         .await;
