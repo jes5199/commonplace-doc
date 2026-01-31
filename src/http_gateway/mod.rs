@@ -5,7 +5,7 @@
 //!
 //! ## Response Correlation
 //!
-//! Request-response correlation is handled via a dedicated dispatcher:
+//! Request-response correlation is handled by `MqttRequestClient`:
 //! - Each request registers with a unique ID and a oneshot channel
 //! - A background task routes responses to the correct waiting request
 //! - This ensures concurrent requests never receive each other's responses
@@ -15,25 +15,18 @@ mod sse;
 
 pub use api::router;
 
-use crate::mqtt::{client::MqttClient, MqttConfig, MqttError};
+use crate::mqtt::{client::MqttClient, MqttConfig, MqttError, MqttRequestClient};
 use rumqttc::QoS;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{oneshot, RwLock};
-
-/// A pending request waiting for a response
-pub(crate) type PendingResponse = oneshot::Sender<Vec<u8>>;
+use tokio::sync::RwLock;
 
 /// HTTP Gateway that translates HTTP to MQTT
 pub struct HttpGateway {
-    /// MQTT client for publishing and subscribing
-    pub(crate) client: Arc<MqttClient>,
-    /// Workspace name for topic namespacing
-    pub(crate) workspace: String,
+    /// Shared MQTT request/response client (handles correlation)
+    pub(crate) request_client: Arc<MqttRequestClient>,
     /// Reference counts for MQTT topic subscriptions (for SSE)
     pub(crate) subscription_counts: Arc<RwLock<HashMap<String, usize>>>,
-    /// Pending requests waiting for responses, keyed by request ID
-    pub(crate) pending_requests: Arc<RwLock<HashMap<String, PendingResponse>>>,
 }
 
 impl HttpGateway {
@@ -41,7 +34,7 @@ impl HttpGateway {
     ///
     /// This spawns the MQTT event loop in the background so that
     /// publish/subscribe operations can actually execute.
-    /// Also spawns a response dispatcher that routes responses to pending requests.
+    /// Also spawns a response dispatcher via MqttRequestClient.
     pub async fn new(config: MqttConfig) -> Result<Self, MqttError> {
         let workspace = config.workspace.clone();
         let client = Arc::new(MqttClient::connect(config).await?);
@@ -54,118 +47,22 @@ impl HttpGateway {
             }
         });
 
-        let pending_requests: Arc<RwLock<HashMap<String, PendingResponse>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let request_client = Arc::new(MqttRequestClient::new(client, workspace).await?);
 
-        let gateway = Self {
-            client,
-            workspace,
+        Ok(Self {
+            request_client,
             subscription_counts: Arc::new(RwLock::new(HashMap::new())),
-            pending_requests,
-        };
-
-        // Subscribe to responses topic and spawn dispatcher
-        gateway.start_response_dispatcher().await?;
-
-        Ok(gateway)
-    }
-
-    /// Start the response dispatcher that routes responses to pending requests.
-    ///
-    /// This subscribes to the responses topic once and dispatches each response
-    /// to the correct waiting request based on the `req` field.
-    async fn start_response_dispatcher(&self) -> Result<(), MqttError> {
-        let responses_topic = format!("{}/responses", self.workspace);
-
-        // Subscribe to the responses topic
-        self.client
-            .subscribe(&responses_topic, QoS::AtLeastOnce)
-            .await?;
-        tracing::debug!(
-            "HTTP gateway subscribed to responses topic: {}",
-            responses_topic
-        );
-
-        // Spawn the dispatcher task
-        let mut rx = self.client.subscribe_messages();
-        let pending = self.pending_requests.clone();
-        let topic = responses_topic.clone();
-
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(msg) => {
-                        if msg.topic != topic {
-                            continue;
-                        }
-
-                        // Try to extract the request ID from the response
-                        // All response types have a "req" field
-                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&msg.payload)
-                        {
-                            if let Some(req_id) = json.get("req").and_then(|v| v.as_str()) {
-                                // Look up and remove the pending request
-                                let sender = {
-                                    let mut pending_guard = pending.write().await;
-                                    pending_guard.remove(req_id)
-                                };
-
-                                // Send the response to the waiting request
-                                if let Some(tx) = sender {
-                                    // Ignore send error - receiver may have dropped (timeout)
-                                    let _ = tx.send(msg.payload);
-                                } else {
-                                    tracing::trace!(
-                                        "No pending request for response with req={}",
-                                        req_id
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(
-                            "Response dispatcher lagged {} messages - some requests may timeout",
-                            n
-                        );
-                        // Continue processing - affected requests will timeout
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        tracing::info!("Response dispatcher shutting down - channel closed");
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(())
-    }
-
-    /// Register a pending request and return a receiver for the response.
-    ///
-    /// The caller should await on the returned receiver with a timeout.
-    /// The request ID must match the `req` field in the response.
-    pub(crate) async fn register_pending_request_async(
-        &self,
-        req_id: String,
-    ) -> oneshot::Receiver<Vec<u8>> {
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut pending = self.pending_requests.write().await;
-            pending.insert(req_id, tx);
-        }
-        rx
-    }
-
-    /// Remove a pending request (used for cleanup on timeout/error).
-    pub(crate) async fn remove_pending_request(&self, req_id: &str) {
-        let mut pending = self.pending_requests.write().await;
-        pending.remove(req_id);
+        })
     }
 
     /// Get a reference to the MQTT client
     pub fn client(&self) -> &Arc<MqttClient> {
-        &self.client
+        self.request_client.client()
+    }
+
+    /// Get the workspace name
+    pub fn workspace(&self) -> &str {
+        self.request_client.workspace()
     }
 
     /// Increment the subscription count for a topic.
@@ -177,7 +74,7 @@ impl HttpGateway {
         if *count == 0 {
             // First subscriber - actually subscribe to MQTT
             // Subscribe before incrementing count so failures don't leave stale counts
-            self.client.subscribe(topic, QoS::AtLeastOnce).await?;
+            self.client().subscribe(topic, QoS::AtLeastOnce).await?;
             tracing::debug!("SSE subscribed to MQTT topic: {}", topic);
         }
 
@@ -196,7 +93,7 @@ impl HttpGateway {
             if *count == 0 {
                 counts.remove(topic);
                 // Last subscriber - unsubscribe from MQTT
-                if let Err(e) = self.client.unsubscribe(topic).await {
+                if let Err(e) = self.client().unsubscribe(topic).await {
                     tracing::warn!("Failed to unsubscribe from {}: {}", topic, e);
                 } else {
                     tracing::debug!("SSE unsubscribed from MQTT topic: {}", topic);
@@ -209,9 +106,11 @@ impl HttpGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mqtt::request::PendingRequests;
+    use tokio::sync::oneshot;
 
     /// Create a pending requests map for testing the correlation logic
-    fn create_pending_requests_only() -> Arc<RwLock<HashMap<String, PendingResponse>>> {
+    fn create_pending_requests_only() -> PendingRequests {
         Arc::new(RwLock::new(HashMap::new()))
     }
 

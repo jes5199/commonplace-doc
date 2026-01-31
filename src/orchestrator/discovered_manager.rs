@@ -1171,8 +1171,6 @@ impl DiscoveredProcessManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orchestrator::discovery::CommandSpec;
-
     // Note: Tests that construct DiscoveredProcessManager require an MQTT connection
     // and are covered by integration tests. Unit tests here focus on structural types.
 

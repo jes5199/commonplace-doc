@@ -41,7 +41,7 @@ async fn subscribe_to_doc(
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(100);
 
     // Subscribe to the MQTT edits topic
-    let edits_topic = crate::mqtt::topics::Topic::edits(&gateway.workspace, &id).to_topic_string();
+    let edits_topic = crate::mqtt::topics::Topic::edits(gateway.workspace(), &id).to_topic_string();
 
     let gateway_clone = gateway.clone();
     let edits_topic_clone = edits_topic.clone();
@@ -69,7 +69,7 @@ async fn subscribe_to_doc(
             .await;
 
         // Subscribe to the MQTT message broadcast and forward matching messages
-        let mut mqtt_rx = gateway_clone.client.subscribe_messages();
+        let mut mqtt_rx = gateway_clone.client().subscribe_messages();
 
         loop {
             tokio::select! {

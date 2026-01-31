@@ -20,13 +20,9 @@ use axum::{
 use rumqttc::QoS;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::HttpGateway;
-use crate::mqtt::{
-    messages::{EditMessage, GetContentRequest, GetContentResponse},
-    topics::Topic,
-};
+use crate::mqtt::{messages::EditMessage, topics::Topic};
 
 // ============================================================================
 // Error helpers
@@ -110,13 +106,13 @@ async fn send_edit(
     };
 
     // Build the topic
-    let topic = Topic::edits(&gateway.workspace, &id);
+    let topic = Topic::edits(gateway.workspace(), &id);
 
     // Serialize and publish
     let payload = serde_json::to_vec(&edit_msg).map_err(bad_request)?;
 
     gateway
-        .client
+        .client()
         .publish(&topic.to_topic_string(), &payload, QoS::AtLeastOnce)
         .await
         .map_err(internal_error)?;
@@ -133,13 +129,13 @@ async fn send_event(
     Json(req): Json<SendEventRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     // Build the topic
-    let topic = Topic::events(&gateway.workspace, &id, &req.event_type);
+    let topic = Topic::events(gateway.workspace(), &id, &req.event_type);
 
     // Serialize and publish
     let payload = serde_json::to_vec(&req.payload).map_err(bad_request)?;
 
     gateway
-        .client
+        .client()
         .publish(&topic.to_topic_string(), &payload, QoS::AtMostOnce)
         .await
         .map_err(internal_error)?;
@@ -150,70 +146,23 @@ async fn send_event(
 /// GET /docs/{id} - Get current document content via MQTT command/response
 ///
 /// Sends a get-content command to the server via MQTT and waits for the response.
-/// Uses per-request correlation to ensure concurrent requests receive correct responses.
+/// Uses MqttRequestClient for correlation to ensure concurrent requests receive correct responses.
 async fn get_doc_content(
     State(gateway): State<Arc<HttpGateway>>,
     Path(id): Path<String>,
 ) -> Result<Json<DocContentResponse>, (StatusCode, String)> {
-    // Generate a unique request ID for correlation
-    let req_id = format!("http-{}", uuid::Uuid::new_v4());
-
-    // Register this request with the response dispatcher
-    // The dispatcher will route the matching response to our channel
-    let response_rx = gateway.register_pending_request_async(req_id.clone()).await;
-
-    // Build and send the get-content request
-    let request = GetContentRequest {
-        req: req_id.clone(),
-        id: id.clone(),
-    };
-    let payload = serde_json::to_vec(&request).map_err(bad_request)?;
-
-    let command_topic = format!("{}/commands/__system/get-content", gateway.workspace);
-    if let Err(e) = gateway
-        .client
-        .publish(&command_topic, &payload, QoS::AtLeastOnce)
+    let response = gateway
+        .request_client
+        .get_content(&id)
         .await
-    {
-        // Clean up pending request on publish failure
-        gateway.remove_pending_request(&req_id).await;
-        return Err(internal_error(e));
-    }
+        .map_err(internal_error)?;
 
-    // Wait for response with timeout
-    let timeout = Duration::from_secs(5);
-    match tokio::time::timeout(timeout, response_rx).await {
-        Ok(Ok(payload)) => {
-            // Successfully received response - parse it
-            match serde_json::from_slice::<GetContentResponse>(&payload) {
-                Ok(response) => {
-                    if let Some(error) = response.error {
-                        Err((StatusCode::NOT_FOUND, error))
-                    } else {
-                        Ok(Json(DocContentResponse {
-                            cid: None, // get-content doesn't return cid currently
-                            content: response.content.unwrap_or_default(),
-                        }))
-                    }
-                }
-                Err(e) => Err(internal_error(format!("Failed to parse response: {}", e))),
-            }
-        }
-        Ok(Err(_)) => {
-            // Channel was dropped (dispatcher shut down)
-            gateway.remove_pending_request(&req_id).await;
-            Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Response dispatcher unavailable".to_string(),
-            ))
-        }
-        Err(_) => {
-            // Timeout - clean up pending request
-            gateway.remove_pending_request(&req_id).await;
-            Err((
-                StatusCode::GATEWAY_TIMEOUT,
-                "Timeout waiting for response from document store".to_string(),
-            ))
-        }
+    if let Some(error) = response.error {
+        Err((StatusCode::NOT_FOUND, error))
+    } else {
+        Ok(Json(DocContentResponse {
+            cid: None, // get-content doesn't return cid currently
+            content: response.content.unwrap_or_default(),
+        }))
     }
 }
