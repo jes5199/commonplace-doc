@@ -212,6 +212,24 @@ pub async fn ensure_parent_directories_exist(
         }
 
         if needs_creation {
+            // Before creating a new document, check the server's schema to see if
+            // this directory already exists there. The local schema file may be stale
+            // (e.g., overwritten by an MQTT schema edit with incomplete Y.Doc state),
+            // so we verify with the server to prevent creating duplicate documents
+            // that cause UUID divergence.
+            if let Some(server_node_id) =
+                fetch_subdir_node_id(client, server, &current_parent_id, dir_name).await
+            {
+                info!(
+                    "Directory '{}' already exists on server with node_id {} (local schema was stale)",
+                    dir_name, server_node_id
+                );
+                needs_creation = false;
+                existing_node_id = Some(server_node_id);
+            }
+        }
+
+        if needs_creation {
             info!(
                 "Creating node-backed directory '{}' (parent: {})",
                 dir_name, current_parent_id
