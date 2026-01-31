@@ -290,7 +290,7 @@ pub async fn process_received_edit(
         } => {
             // Intermediate commits are missing - cannot fast-forward.
             // Don't update state - the caller should trigger a resync.
-            info!(
+            debug!(
                 "Missing intermediate commits between head {} and received {}. Resync needed.",
                 current_head, cid
             );

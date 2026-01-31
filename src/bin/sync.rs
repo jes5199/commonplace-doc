@@ -3176,7 +3176,7 @@ async fn run_exec_mode(
         };
         async move {
             while let Some(event) = dir_rx.recv().await {
-                info!("RECEIVED DIR EVENT (exec mode): {:?}", event);
+                debug!("RECEIVED DIR EVENT (exec mode): {:?}", event);
                 handle_dir_event(
                     &client,
                     &server,

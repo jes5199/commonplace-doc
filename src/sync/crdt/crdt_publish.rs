@@ -16,7 +16,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use rumqttc::QoS;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, info};
+use tracing::debug;
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, GetString, ReadTxn, Transact, Update};
 
@@ -140,7 +140,7 @@ pub async fn publish_text_change(
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish edit: {}", e)))?;
 
-    info!(
+    debug!(
         "Published commit {} for {} ({} bytes, retained)",
         cid,
         node_id,
@@ -222,7 +222,7 @@ pub async fn publish_yjs_update(
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish edit: {}", e)))?;
 
-    info!(
+    debug!(
         "Published commit {} for {} ({} bytes, retained)",
         cid,
         node_id,

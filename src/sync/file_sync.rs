@@ -1445,7 +1445,7 @@ pub async fn upload_task_crdt(
             new_content.hash(&mut h);
             h.finish()
         };
-        info!(
+        debug!(
             "[SANDBOX-TRACE] upload_task_crdt CHANGE_DETECTED file={} uuid={} old_len={} old_hash={:016x} new_len={} new_hash={:016x}",
             file_path.display(),
             node_id,
@@ -1455,7 +1455,7 @@ pub async fn upload_task_crdt(
             new_hash
         );
         // DEBUG: Log the diff being computed
-        info!(
+        debug!(
             "CRDT upload_task: computing diff for {} - old_len={}, new_len={}, old_preview={:?}, new_preview={:?}",
             file_path.display(),
             old_content.len(),
@@ -1467,6 +1467,20 @@ pub async fn upload_task_crdt(
         // Get or create the CRDT state for this file
         let mut state_guard = crdt_state.write().await;
         let file_state = state_guard.get_or_create_file(&filename, node_id);
+
+        // Skip publishing if CRDT state hasn't been initialized from server yet.
+        // Publishing from an empty Y.Doc creates Yjs insert operations with a new
+        // client ID. When the server merges these with its existing state, the same
+        // text gets inserted twice (once per client ID), causing content duplication
+        // like "{}" becoming "{}{}".
+        if file_state.needs_server_init() {
+            debug!(
+                "CRDT upload_task: skipping publish for {} - CRDT state not yet initialized from server",
+                file_path.display()
+            );
+            drop(state_guard);
+            continue;
+        }
 
         // Publish the change via MQTT.
         // For JSON files, create a YMap update to match the server's document type.
@@ -1536,14 +1550,14 @@ pub async fn upload_task_crdt(
         };
         match publish_result {
             Ok(result) => {
-                info!(
+                debug!(
                     "[SANDBOX-TRACE] upload_task_crdt PUBLISHED file={} uuid={} cid={} update_bytes={}",
                     file_path.display(),
                     node_id,
                     result.cid,
                     result.update_bytes.len()
                 );
-                info!(
+                debug!(
                     "CRDT upload: published commit {} for {} ({} bytes)",
                     result.cid,
                     file_path.display(),
@@ -1775,7 +1789,7 @@ pub async fn initialize_crdt_state_from_server_with_pending(
                     }
                 }
 
-                info!(
+                debug!(
                     "Initialized CRDT state for {} from server HEAD {}",
                     filename, cid
                 );
@@ -2099,7 +2113,7 @@ pub async fn receive_task_crdt(
     // Subscribe to edits for this file's UUID
     let topic = Topic::edits(&workspace, &node_id_str).to_topic_string();
 
-    info!(
+    debug!(
         "CRDT receive_task: subscribing to edits for {} at topic: {}",
         file_path.display(),
         topic
@@ -2110,7 +2124,7 @@ pub async fn receive_task_crdt(
         return;
     }
 
-    info!(
+    debug!(
         "[SANDBOX-TRACE] receive_task_crdt SUBSCRIBED file={} uuid={} topic={}",
         file_path.display(),
         node_id,
@@ -2285,7 +2299,7 @@ pub async fn receive_task_crdt(
 
     let context = format!("CRDT receive {}", file_path.display());
 
-    info!(
+    debug!(
         "[SANDBOX-TRACE] receive_task_crdt ENTERING_LOOP file={} uuid={}",
         file_path.display(),
         node_id
@@ -2394,7 +2408,7 @@ pub async fn receive_task_crdt(
             continue;
         }
 
-        info!(
+        debug!(
             "[SANDBOX-TRACE] receive_task_crdt RECV file={} uuid={} payload_len={}",
             file_path.display(),
             node_id,
@@ -2427,7 +2441,7 @@ pub async fn receive_task_crdt(
         // Queue the edit for later processing instead of trying to merge it now.
         if let Some(reason) = file_state.should_queue_edits() {
             file_state.queue_pending_edit(msg.payload.clone());
-            info!(
+            debug!(
                 "[SANDBOX-TRACE] receive_task_crdt QUEUED file={} uuid={} queue_size={} reason={:?}",
                 file_path.display(),
                 node_id,
@@ -2457,7 +2471,7 @@ pub async fn receive_task_crdt(
         .await
         {
             Ok((result, maybe_content)) => {
-                info!(
+                debug!(
                     "[SANDBOX-TRACE] receive_task_crdt CRDT_MERGE file={} uuid={} result={:?} has_content={}",
                     file_path.display(),
                     node_id,
@@ -2474,7 +2488,7 @@ pub async fn receive_task_crdt(
                         );
                     }
                     MergeResult::FastForward { new_head } => {
-                        info!(
+                        debug!(
                             "CRDT receive_task: fast-forward to {} for {}",
                             new_head,
                             file_path.display()
@@ -2484,7 +2498,7 @@ pub async fn receive_task_crdt(
                         merge_cid,
                         remote_cid,
                     } => {
-                        info!(
+                        debug!(
                             "CRDT receive_task: merged {} into {} for {}",
                             remote_cid,
                             merge_cid,
@@ -2507,7 +2521,7 @@ pub async fn receive_task_crdt(
                         current_head,
                     } => {
                         // Intermediate commits are missing - trigger a resync from server
-                        warn!(
+                        debug!(
                             "CRDT receive_task: missing history for {} (head: {}, received: {}). Triggering resync.",
                             file_path.display(),
                             current_head,
@@ -2547,7 +2561,7 @@ pub async fn receive_task_crdt(
                                 e
                             );
                         } else {
-                            info!(
+                            debug!(
                                 "CRDT receive_task: successfully resynced {} from server after missing history",
                                 file_path.display()
                             );
@@ -2566,7 +2580,7 @@ pub async fn receive_task_crdt(
                         .await
                         .unwrap_or_default();
 
-                    info!(
+                    debug!(
                         "CRDT receive_task: merge produced content for {} - existing={} bytes ({:?}), new={} bytes ({:?})",
                         file_path.display(),
                         existing_content.len(),
@@ -2611,7 +2625,7 @@ pub async fn receive_task_crdt(
                         let previous_content = {
                             let mut shared = shared_last_content.write().await;
                             let prev = shared.clone();
-                            info!(
+                            debug!(
                                 "[RECEIVE-TRACE] receive_task_crdt updating shared_last_content for {} from {:?} to {:?}",
                                 file_path.display(),
                                 prev.as_ref().map(|s| s.chars().take(30).collect::<String>()),
@@ -2631,13 +2645,13 @@ pub async fn receive_task_crdt(
                                     &file_path.display().to_string(),
                                     Some(&node_id_str),
                                 );
-                                info!(
+                                debug!(
                                     "[SANDBOX-TRACE] receive_task_crdt DISK_WRITE file={} uuid={} content_len={}",
                                     file_path.display(),
                                     node_id,
                                     content.len()
                                 );
-                                info!(
+                                debug!(
                                     "CRDT receive_task: wrote {} bytes to {}",
                                     content.len(),
                                     file_path.display()
