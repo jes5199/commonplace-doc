@@ -117,7 +117,18 @@ impl SchemaVisitor {
         while let Some(node_id) = to_visit.pop() {
             schema_ids.push(node_id.clone());
 
-            let schema = self.fetch_schema(&node_id).await?;
+            let schema = match self.fetch_schema(&node_id).await {
+                Ok(s) => s,
+                Err(VisitorError::ParseError(msg)) => {
+                    tracing::warn!(
+                        "Skipping unparseable schema node {}: {} (CP-urp5)",
+                        node_id,
+                        msg
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             if let Some(Entry::Dir(ref root)) = schema.root {
                 if let Some(ref entries) = root.entries {
@@ -156,7 +167,19 @@ impl SchemaVisitor {
         let mut to_visit: Vec<(String, String)> = vec![("/".to_string(), root_id.to_string())];
 
         while let Some((path, node_id)) = to_visit.pop() {
-            let schema = self.fetch_schema(&node_id).await?;
+            let schema = match self.fetch_schema(&node_id).await {
+                Ok(s) => s,
+                Err(VisitorError::ParseError(msg)) => {
+                    tracing::warn!(
+                        "Skipping unparseable schema at path '{}' node {}: {} (CP-urp5)",
+                        path,
+                        node_id,
+                        msg
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             if let Some(Entry::Dir(ref root)) = schema.root {
                 if let Some(ref entries) = root.entries {
@@ -208,7 +231,19 @@ impl SchemaVisitor {
         let mut to_visit: Vec<(String, String)> = vec![("/".to_string(), root_id.to_string())];
 
         while let Some((path, schema_node_id)) = to_visit.pop() {
-            let schema = self.fetch_schema(&schema_node_id).await?;
+            let schema = match self.fetch_schema(&schema_node_id).await {
+                Ok(s) => s,
+                Err(VisitorError::ParseError(msg)) => {
+                    tracing::warn!(
+                        "Skipping unparseable schema at path '{}' node {}: {} (CP-urp5)",
+                        path,
+                        schema_node_id,
+                        msg
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             if let Some(Entry::Dir(ref root)) = schema.root {
                 if let Some(ref entries) = root.entries {
