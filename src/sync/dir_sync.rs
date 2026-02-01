@@ -764,10 +764,8 @@ pub async fn handle_subdir_new_files(
         return Ok(());
     }
 
-    #[cfg(unix)]
-    let inode_tracker = inode_tracker;
     #[cfg(not(unix))]
-    let inode_tracker = None;
+    let inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>> = None;
 
     if crdt_context
         .as_ref()
@@ -1689,10 +1687,8 @@ pub async fn handle_schema_change(
     shared_state_file: Option<&crate::sync::SharedStateFile>,
     crdt_context: Option<&CrdtFileSyncContext>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    #[cfg(unix)]
-    let inode_tracker = inode_tracker;
     #[cfg(not(unix))]
-    let inode_tracker = None;
+    let inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>> = None;
     // Fetch, parse, and validate schema from server
     let fetched = match fetch_and_validate_schema(client, server, fs_root_id, true).await {
         Some(f) => f,
