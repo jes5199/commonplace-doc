@@ -5,6 +5,8 @@
 // Note: recv_broadcast_with_lag was replaced with direct tokio::select! in receive_task_crdt
 use crate::commit::Commit;
 use crate::mqtt::{IncomingMessage, MqttClient, Topic};
+#[cfg(unix)]
+use crate::sync::atomic_write_with_shadow;
 use crate::sync::client::fetch_head;
 use crate::sync::crdt_merge::{parse_edit_message, process_received_edit};
 use crate::sync::crdt_publish::{publish_text_change, publish_yjs_update};
@@ -27,6 +29,7 @@ use reqwest::Client;
 use rumqttc::QoS;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -336,6 +339,8 @@ pub async fn detect_echo_from_pending_write(
 pub const DIVERGENCE_CHECK_INTERVAL_SECS: u64 = 30;
 /// Interval for retrying deferred CRDT edits while waiting on flock (seconds).
 pub const PENDING_EDIT_FLUSH_INTERVAL_SECS: u64 = 5;
+
+static WARNED_NO_INODE_TRACKER: AtomicBool = AtomicBool::new(false);
 
 /// Handle refresh logic after an upload attempt.
 ///
@@ -1665,6 +1670,7 @@ pub async fn initialize_crdt_state_from_server(
         None,
         None,
         None,
+        None,
         mqtt_only_config,
     )
     .await
@@ -1702,6 +1708,7 @@ pub async fn initialize_crdt_state_from_server_with_pending(
     workspace: Option<&str>,
     author: Option<&str>,
     shared_last_content: Option<&SharedLastContent>,
+    inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
     mqtt_only_config: crate::sync::MqttOnlySyncConfig,
 ) -> SyncResult<()> {
     // Check if we need initialization
@@ -1743,12 +1750,16 @@ pub async fn initialize_crdt_state_from_server_with_pending(
 
                     // Only write if local differs from server
                     if local_content != head.content {
-                        // Update shared_last_content BEFORE writing to prevent echo detection
-                        if let Some(slc) = shared_last_content {
-                            let mut shared = slc.write().await;
-                            *shared = Some(head.content.clone());
-                        }
-                        if let Err(e) = tokio::fs::write(file_path, &head.content).await {
+                        if let Err(e) = write_content_with_tracker(
+                            file_path,
+                            &head.content,
+                            shared_last_content,
+                            inode_tracker,
+                            Some(cid.clone()),
+                            "CRDT init",
+                        )
+                        .await
+                        {
                             warn!(
                                 "Failed to write server content to {}: {}",
                                 file_path.display(),
@@ -1808,12 +1819,16 @@ pub async fn initialize_crdt_state_from_server_with_pending(
 
                         // Only write if local differs from extracted content
                         if local_content != content {
-                            // Update shared_last_content BEFORE writing to prevent echo
-                            if let Some(slc) = shared_last_content {
-                                let mut shared = slc.write().await;
-                                *shared = Some(content.clone());
-                            }
-                            if let Err(e) = tokio::fs::write(file_path, &content).await {
+                            if let Err(e) = write_content_with_tracker(
+                                file_path,
+                                &content,
+                                shared_last_content,
+                                inode_tracker,
+                                Some(cid.clone()),
+                                "CRDT init",
+                            )
+                            .await
+                            {
                                 warn!(
                                     "Failed to write CRDT-extracted content to {}: {}",
                                     file_path.display(),
@@ -1845,6 +1860,7 @@ pub async fn initialize_crdt_state_from_server_with_pending(
                     crdt_state,
                     author.unwrap_or(""),
                     shared_last_content,
+                    inode_tracker,
                 )
                 .await;
 
@@ -1870,6 +1886,7 @@ pub async fn initialize_crdt_state_from_server_with_pending(
                     crdt_state,
                     author.unwrap_or(""),
                     shared_last_content,
+                    inode_tracker,
                 )
                 .await;
 
@@ -1929,6 +1946,7 @@ async fn resync_crdt_state_via_cyan_with_pending(
     file_path: &Path,
     author: &str,
     shared_last_content: Option<&SharedLastContent>,
+    inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
 ) -> bool {
     use crate::mqtt::messages::SyncMessage;
     use base64::engine::general_purpose::STANDARD;
@@ -2101,6 +2119,7 @@ async fn resync_crdt_state_via_cyan_with_pending(
             crdt_state,
             author,
             shared_last_content,
+            inode_tracker,
         )
         .await;
 
@@ -2146,6 +2165,11 @@ async fn resync_crdt_state_via_cyan_with_pending(
     };
     let state_b64 = STANDARD.encode(&state_bytes);
     let head_cid = head_cid.unwrap_or_else(|| "unknown".to_string());
+    let commit_id = if head_cid == "unknown" {
+        None
+    } else {
+        Some(head_cid.clone())
+    };
 
     {
         let mut state = crdt_state.write().await;
@@ -2160,11 +2184,16 @@ async fn resync_crdt_state_via_cyan_with_pending(
         .await
         .unwrap_or_default();
     if local_content != content {
-        if let Some(slc) = shared_last_content {
-            let mut shared = slc.write().await;
-            *shared = Some(content.clone());
-        }
-        if let Err(e) = tokio::fs::write(file_path, &content).await {
+        if let Err(e) = write_content_with_tracker(
+            file_path,
+            &content,
+            shared_last_content,
+            inode_tracker,
+            commit_id,
+            "CYAN-SYNC",
+        )
+        .await
+        {
             warn!(
                 "[CYAN-SYNC] Failed to write synced content to {}: {}",
                 file_path.display(),
@@ -2189,6 +2218,7 @@ async fn resync_crdt_state_via_cyan_with_pending(
         crdt_state,
         author,
         shared_last_content,
+        inode_tracker,
     )
     .await;
 
@@ -2209,10 +2239,89 @@ enum WriteDecision {
     Failed,
 }
 
+fn commit_id_for_write(
+    result: &crate::sync::crdt_merge::MergeResult,
+    received_cid: &str,
+) -> Option<String> {
+    match result {
+        crate::sync::crdt_merge::MergeResult::FastForward { new_head } => Some(new_head.clone()),
+        crate::sync::crdt_merge::MergeResult::Merged { merge_cid, .. } => Some(merge_cid.clone()),
+        crate::sync::crdt_merge::MergeResult::LocalAhead => Some(received_cid.to_string()),
+        _ => None,
+    }
+}
+
+async fn write_content_with_tracker(
+    file_path: &Path,
+    content: &str,
+    shared_last_content: Option<&SharedLastContent>,
+    inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
+    commit_id: Option<String>,
+    context: &str,
+) -> io::Result<()> {
+    let mut previous_content = None;
+    if let Some(slc) = shared_last_content {
+        let mut shared = slc.write().await;
+        previous_content = shared.clone();
+        *shared = Some(content.to_string());
+    }
+
+    #[cfg(unix)]
+    if let Some(tracker) = inode_tracker {
+        let path_buf = file_path.to_path_buf();
+        match atomic_write_with_shadow(&path_buf, content.as_bytes(), commit_id, tracker).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                if let Some(slc) = shared_last_content {
+                    let mut shared = slc.write().await;
+                    *shared = previous_content;
+                }
+                error!(
+                    "{}: failed to atomic write to {}: {}",
+                    context,
+                    file_path.display(),
+                    e
+                );
+                return Err(e);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    if inode_tracker.is_none()
+        && WARNED_NO_INODE_TRACKER
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        warn!(
+            "Inode tracking disabled; inbound CRDT writes will not use atomic shadow writes. Set --shadow-dir or COMMONPLACE_SHADOW_DIR to enable."
+        );
+    }
+
+    match tokio::fs::write(file_path, content).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if let Some(slc) = shared_last_content {
+                let mut shared = slc.write().await;
+                *shared = previous_content;
+            }
+            error!(
+                "{}: failed to write to {}: {}",
+                context,
+                file_path.display(),
+                e
+            );
+            Err(e)
+        }
+    }
+}
+
 async fn write_content_with_rollback_guard(
     file_path: &Path,
     content: &str,
     shared_last_content: Option<&SharedLastContent>,
+    inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
+    commit_id: Option<String>,
 ) -> WriteDecision {
     let existing_content = tokio::fs::read_to_string(file_path)
         .await
@@ -2248,27 +2357,18 @@ async fn write_content_with_rollback_guard(
         return WriteDecision::SkippedRollback;
     }
 
-    let mut previous_content = None;
-    if let Some(slc) = shared_last_content {
-        let mut shared = slc.write().await;
-        previous_content = shared.clone();
-        *shared = Some(content.to_string());
-    }
-
-    match tokio::fs::write(file_path, content).await {
+    match write_content_with_tracker(
+        file_path,
+        content,
+        shared_last_content,
+        inode_tracker,
+        commit_id,
+        "CRDT receive_task",
+    )
+    .await
+    {
         Ok(()) => WriteDecision::Written,
-        Err(e) => {
-            if let Some(slc) = shared_last_content {
-                let mut shared = slc.write().await;
-                *shared = previous_content;
-            }
-            error!(
-                "CRDT receive_task: failed to write to {}: {}",
-                file_path.display(),
-                e
-            );
-            WriteDecision::Failed
-        }
+        Err(_) => WriteDecision::Failed,
     }
 }
 
@@ -2282,6 +2382,7 @@ async fn process_pending_edits_with_flock(
     crdt_state: &Arc<RwLock<DirectorySyncState>>,
     author: &str,
     shared_last_content: Option<&SharedLastContent>,
+    inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
 ) -> Vec<crate::sync::PendingEdit> {
     let node_id_str = node_id.to_string();
     let mut remaining = pending_edits;
@@ -2368,10 +2469,13 @@ async fn process_pending_edits_with_flock(
             Ok((merge_result, maybe_content)) => {
                 processed_any = true;
                 if let Some(content) = maybe_content {
+                    let commit_id = commit_id_for_write(&merge_result, &received_cid);
                     match write_content_with_rollback_guard(
                         file_path,
                         &content,
                         shared_last_content,
+                        inode_tracker,
+                        commit_id,
                     )
                     .await
                     {
@@ -2420,6 +2524,7 @@ async fn handle_pending_edits_with_flock(
     crdt_state: &Arc<RwLock<DirectorySyncState>>,
     author: &str,
     shared_last_content: Option<&SharedLastContent>,
+    inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
 ) {
     let pending_edits = {
         let mut state_guard = crdt_state.write().await;
@@ -2451,6 +2556,7 @@ async fn handle_pending_edits_with_flock(
         crdt_state,
         author,
         shared_last_content,
+        inode_tracker,
     )
     .await;
 
@@ -2494,6 +2600,7 @@ pub fn spawn_file_sync_tasks_crdt(
     pull_only: bool,
     author: String,
     mqtt_only_config: crate::sync::MqttOnlySyncConfig,
+    inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     file_states: Option<&std::collections::HashMap<String, crate::sync::FileSyncState>>,
     relative_path: Option<&str>,
 ) -> Vec<JoinHandle<()>> {
@@ -2564,6 +2671,7 @@ pub fn spawn_file_sync_tasks_crdt(
         shared_last_content,
         author,
         mqtt_only_config,
+        inode_tracker,
         message_rx,
     )));
 
@@ -2590,6 +2698,7 @@ pub async fn receive_task_crdt(
     shared_last_content: SharedLastContent,
     author: String,
     mqtt_only_config: crate::sync::MqttOnlySyncConfig,
+    inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     message_rx: broadcast::Receiver<IncomingMessage>,
 ) {
     let node_id_str = node_id.to_string();
@@ -2639,6 +2748,7 @@ pub async fn receive_task_crdt(
             &crdt_state,
             &author,
             Some(&shared_last_content),
+            inode_tracker.as_ref(),
         )
         .await;
 
@@ -2713,6 +2823,7 @@ pub async fn receive_task_crdt(
                                 Some(&workspace),
                                 Some(&author),
                                 Some(&shared_last_content),
+                                inode_tracker.as_ref(),
                                 mqtt_only_config,
                             )
                             .await
@@ -2793,6 +2904,7 @@ pub async fn receive_task_crdt(
                         Some(&workspace),
                         Some(&author),
                         Some(&shared_last_content),
+                        inode_tracker.as_ref(),
                         mqtt_only_config,
                     )
                     .await;
@@ -2816,6 +2928,7 @@ pub async fn receive_task_crdt(
                     &crdt_state,
                     &author,
                     Some(&shared_last_content),
+                    inode_tracker.as_ref(),
                 )
                 .await;
                 continue;
@@ -2860,6 +2973,7 @@ pub async fn receive_task_crdt(
                                 Some(&workspace),
                                 Some(&author),
                                 Some(&shared_last_content),
+                                inode_tracker.as_ref(),
                                 mqtt_only_config,
                             )
                             .await
@@ -3040,6 +3154,7 @@ pub async fn receive_task_crdt(
                     maybe_content.is_some()
                 );
                 use crate::sync::crdt_merge::MergeResult;
+                let commit_id = commit_id_for_write(&result, &received_cid);
 
                 match result {
                     MergeResult::AlreadyKnown => {
@@ -3108,6 +3223,7 @@ pub async fn receive_task_crdt(
                             &file_path,
                             &author,
                             Some(&shared_last_content),
+                            inode_tracker.as_ref(),
                         )
                         .await
                         {
@@ -3133,6 +3249,8 @@ pub async fn receive_task_crdt(
                         &file_path,
                         &content,
                         Some(&shared_last_content),
+                        inode_tracker.as_ref(),
+                        commit_id,
                     )
                     .await
                     {
@@ -3211,6 +3329,7 @@ async fn check_and_resolve_divergence(
     workspace: Option<&str>,
     author: Option<&str>,
     shared_last_content: Option<&SharedLastContent>,
+    inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
     mqtt_only_config: crate::sync::MqttOnlySyncConfig,
 ) -> bool {
     if mqtt_only_config.mqtt_only {
@@ -3286,6 +3405,7 @@ async fn check_and_resolve_divergence(
                 workspace,
                 author,
                 shared_last_content,
+                inode_tracker,
                 mqtt_only_config,
             )
             .await
@@ -3353,6 +3473,7 @@ async fn check_and_resolve_divergence(
         workspace,
         author,
         shared_last_content,
+        inode_tracker,
         mqtt_only_config,
     )
     .await
@@ -3555,6 +3676,7 @@ mod tests {
             &file_path,
             &crdt_state,
             "author",
+            None,
             None,
         )
         .await;
@@ -3834,6 +3956,7 @@ mod tests {
                 &crdt_state,
                 "note.txt",
                 &file_path,
+                None,
                 None,
                 None,
                 None,

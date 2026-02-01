@@ -303,6 +303,10 @@ pub async fn directory_mqtt_task(
     // after we subscribe. If we create the receiver after subscribing, retained
     // messages may be missed (they're broadcast before our receiver exists).
     let mut message_rx = mqtt_client.subscribe_messages();
+    #[cfg(unix)]
+    let inode_tracker_for_crdt = inode_tracker.clone();
+    #[cfg(not(unix))]
+    let inode_tracker_for_crdt = None;
 
     // Subscribe to edits for the fs-root document (schema changes)
     let fs_root_topic = Topic::edits(&workspace, &fs_root_id).to_topic_string();
@@ -462,6 +466,7 @@ pub async fn directory_mqtt_task(
                     use_paths,
                     &file_states,
                     crdt_context.as_ref(),
+                    inode_tracker_for_crdt.clone(),
                     &author,
                 )
                 .await;
@@ -648,6 +653,7 @@ pub async fn directory_mqtt_task(
                                 &file_states,
                                 pull_only,
                                 &author,
+                                inode_tracker_for_crdt.clone(),
                                 ctx,
                             )
                             .await
@@ -1034,6 +1040,7 @@ async fn ensure_crdt_tasks_for_files(
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
     pull_only: bool,
     author: &str,
+    inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     context: &CrdtFileSyncContext,
 ) -> SyncResult<()> {
     let pending: Vec<(String, String)> = {
@@ -1092,6 +1099,7 @@ async fn ensure_crdt_tasks_for_files(
             Some(&context.workspace),
             Some(author),
             Some(&shared_last_content),
+            inode_tracker.as_ref(),
             context.mqtt_only_config,
         )
         .await
@@ -1134,6 +1142,7 @@ async fn ensure_crdt_tasks_for_files(
             pull_only,
             author.to_string(),
             context.mqtt_only_config,
+            inode_tracker.clone(),
             None, // file_states - not needed, old tasks already aborted above
             None, // relative_path
         );
@@ -1401,6 +1410,7 @@ async fn resync_subscribed_files(
     use_paths: bool,
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
     crdt_context: Option<&CrdtFileSyncContext>,
+    inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     author: &str,
 ) {
     // Log deprecation warning if MQTT-only mode is enabled
@@ -1472,6 +1482,7 @@ async fn resync_subscribed_files(
                         Some(&ctx.workspace),
                         Some(author),
                         shared_last_content.as_ref(),
+                        inode_tracker.as_ref(),
                         ctx.mqtt_only_config,
                     )
                     .await
@@ -2143,6 +2154,10 @@ pub async fn subdir_mqtt_task(
     // Subscribe to edits for the subdirectory document (schema changes)
     let edits_topic = Topic::edits(&workspace, &subdir_node_id);
     let schema_topic_str = edits_topic.to_topic_string();
+    #[cfg(unix)]
+    let inode_tracker_for_crdt = inode_tracker.clone();
+    #[cfg(not(unix))]
+    let inode_tracker_for_crdt = None;
 
     // CRITICAL: Create the broadcast receiver BEFORE subscribing.
     // This ensures we receive retained messages.
@@ -2319,6 +2334,7 @@ pub async fn subdir_mqtt_task(
                     use_paths,
                     &file_states,
                     None, // No CRDT context for subdirs currently
+                    inode_tracker_for_crdt.clone(),
                     &author,
                 )
                 .await;

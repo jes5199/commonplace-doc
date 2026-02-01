@@ -36,7 +36,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use rumqttc::QoS;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +51,21 @@ use tokio::task::JoinHandle;
 /// Maximum number of concurrent file syncs during initial sync.
 /// This limits server load while still providing significant speedup.
 const MAX_CONCURRENT_FILE_SYNCS: usize = 10;
+/// Default shadow dir when running with inode tracking enabled.
+const DEFAULT_SHADOW_DIR: &str = "/tmp/commonplace-sync/hardlinks";
+
+fn resolve_shadow_dir(shadow_dir: &str, base_dir: &Path) -> String {
+    if shadow_dir.is_empty() {
+        return String::new();
+    }
+    if shadow_dir == DEFAULT_SHADOW_DIR {
+        return base_dir
+            .join(".commonplace-shadow")
+            .to_string_lossy()
+            .to_string();
+    }
+    shadow_dir.to_string()
+}
 
 /// Publish initial sync complete event via MQTT.
 async fn publish_initial_sync_complete(
@@ -134,6 +149,7 @@ struct CrdtEventParams {
     crdt_state: Arc<RwLock<DirectorySyncState>>,
     subdir_cache: Arc<SubdirStateCache>,
     mqtt_only_config: MqttOnlySyncConfig,
+    inode_tracker: Option<Arc<RwLock<InodeTracker>>>,
 }
 
 /// Handle a single directory event by dispatching to the appropriate handler.
@@ -568,6 +584,7 @@ async fn handle_file_created_crdt(
                     false, // pull_only = false for new files
                     author.to_string(),
                     crdt.mqtt_only_config,
+                    crdt.inode_tracker.clone(),
                     Some(&*states_snapshot),
                     Some(&relative_path),
                 );
@@ -651,6 +668,7 @@ async fn handle_file_created_crdt(
                     false, // pull_only = false for new files
                     author.to_string(),
                     crdt.mqtt_only_config,
+                    crdt.inode_tracker.clone(),
                     Some(&*states_snapshot),
                     Some(&filename),
                 );
@@ -1098,7 +1116,7 @@ struct Args {
     /// Set to empty string to disable inode tracking.
     #[arg(
         long,
-        default_value = "/tmp/commonplace-sync/hardlinks",
+        default_value = DEFAULT_SHADOW_DIR,
         env = "COMMONPLACE_SHADOW_DIR"
     )]
     shadow_dir: String,
@@ -1757,6 +1775,7 @@ async fn run_file_mode(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Derive author from name parameter, defaulting to "sync-client"
     let author = name.unwrap_or_else(|| "sync-client".to_string());
+    let shadow_dir = resolve_shadow_dir(&shadow_dir, file.parent().unwrap_or(Path::new(".")));
 
     let mode = if force_push {
         "force-push"
@@ -1867,40 +1886,35 @@ async fn run_file_mode(
     let inode_tracker: Option<Arc<RwLock<InodeTracker>>> = if !shadow_dir.is_empty() {
         let shadow_path = PathBuf::from(&shadow_dir);
 
-        // Create shadow directory
-        if let Err(e) = tokio::fs::create_dir_all(&shadow_path).await {
-            warn!(
-                "Failed to create shadow directory {}: {} - disabling inode tracking",
-                shadow_dir, e
-            );
-            None
-        } else {
-            // Create tracker and track the initial file's inode
-            let tracker = Arc::new(RwLock::new(InodeTracker::new(shadow_path)));
+        tokio::fs::create_dir_all(&shadow_path)
+            .await
+            .map_err(|e| format!("Failed to create shadow directory {}: {}", shadow_dir, e))?;
 
-            // Track the initial inode after initial_sync
-            if file.exists() {
-                if let Ok(inode_key) = InodeKey::from_path(&file) {
-                    let cid = {
-                        let s = state.read().await;
-                        s.last_written_cid.clone().unwrap_or_default()
-                    };
-                    if !cid.is_empty() {
-                        let mut t = tracker.write().await;
-                        t.track(inode_key, cid, file.clone());
-                        info!(
-                            "Tracking initial inode {:x}-{:x} for {}",
-                            inode_key.dev,
-                            inode_key.ino,
-                            file.display()
-                        );
-                    }
+        // Create tracker and track the initial file's inode
+        let tracker = Arc::new(RwLock::new(InodeTracker::new(shadow_path)));
+
+        // Track the initial inode after initial_sync
+        if file.exists() {
+            if let Ok(inode_key) = InodeKey::from_path(&file) {
+                let cid = {
+                    let s = state.read().await;
+                    s.last_written_cid.clone().unwrap_or_default()
+                };
+                if !cid.is_empty() {
+                    let mut t = tracker.write().await;
+                    t.track(inode_key, cid, file.clone());
+                    info!(
+                        "Tracking initial inode {:x}-{:x} for {}",
+                        inode_key.dev,
+                        inode_key.ino,
+                        file.display()
+                    );
                 }
             }
-
-            info!("Inode tracking enabled with shadow dir: {}", shadow_dir);
-            Some(tracker)
         }
+
+        info!("Inode tracking enabled with shadow dir: {}", shadow_dir);
+        Some(tracker)
     } else {
         debug!("Inode tracking disabled (no shadow_dir configured)");
         None
@@ -2081,24 +2095,21 @@ async fn run_directory_mode(
         error!("Not a directory: {}", directory.display());
         return Err(format!("Not a directory: {}", directory.display()).into());
     }
+    let shadow_dir = resolve_shadow_dir(&shadow_dir, &directory);
+    let shadow_dir = resolve_shadow_dir(&shadow_dir, &directory);
 
     // Set up inode tracking if shadow_dir is configured (unix only)
     #[cfg(unix)]
     let inode_tracker: Option<Arc<RwLock<InodeTracker>>> = if !shadow_dir.is_empty() {
         let shadow_path = PathBuf::from(&shadow_dir);
 
-        // Create shadow directory
-        if let Err(e) = tokio::fs::create_dir_all(&shadow_path).await {
-            warn!(
-                "Failed to create shadow directory {}: {} - disabling inode tracking",
-                shadow_dir, e
-            );
-            None
-        } else {
-            let tracker = Arc::new(RwLock::new(InodeTracker::new(shadow_path)));
-            info!("Inode tracking enabled with shadow dir: {}", shadow_dir);
-            Some(tracker)
-        }
+        tokio::fs::create_dir_all(&shadow_path)
+            .await
+            .map_err(|e| format!("Failed to create shadow directory {}: {}", shadow_dir, e))?;
+
+        let tracker = Arc::new(RwLock::new(InodeTracker::new(shadow_path)));
+        info!("Inode tracking enabled with shadow dir: {}", shadow_dir);
+        Some(tracker)
     } else {
         debug!("Inode tracking disabled (no shadow_dir configured)");
         None
@@ -2468,6 +2479,7 @@ async fn run_directory_mode(
                 Some(&workspace),
                 Some(&author),
                 Some(&shared_last_content),
+                inode_tracker.as_ref(),
                 mqtt_only_config,
             )
             .await
@@ -2507,6 +2519,7 @@ async fn run_directory_mode(
                 pull_only,
                 author.clone(),
                 mqtt_only_config,
+                inode_tracker.clone(),
                 None, // file_states - initial setup, not needed
                 None, // relative_path
             );
@@ -2559,6 +2572,7 @@ async fn run_directory_mode(
             crdt_state: crdt_state.clone(),
             subdir_cache: subdir_cache.clone(),
             mqtt_only_config,
+            inode_tracker: inode_tracker.clone(),
         };
         async move {
             while let Some(event) = dir_rx.recv().await {
@@ -2696,18 +2710,13 @@ async fn run_exec_mode(
     let inode_tracker: Option<Arc<RwLock<InodeTracker>>> = if !shadow_dir.is_empty() {
         let shadow_path = PathBuf::from(&shadow_dir);
 
-        // Create shadow directory
-        if let Err(e) = tokio::fs::create_dir_all(&shadow_path).await {
-            warn!(
-                "Failed to create shadow directory {}: {} - disabling inode tracking",
-                shadow_dir, e
-            );
-            None
-        } else {
-            let tracker = Arc::new(RwLock::new(InodeTracker::new(shadow_path)));
-            info!("Inode tracking enabled with shadow dir: {}", shadow_dir);
-            Some(tracker)
-        }
+        tokio::fs::create_dir_all(&shadow_path)
+            .await
+            .map_err(|e| format!("Failed to create shadow directory {}: {}", shadow_dir, e))?;
+
+        let tracker = Arc::new(RwLock::new(InodeTracker::new(shadow_path)));
+        info!("Inode tracking enabled with shadow dir: {}", shadow_dir);
+        Some(tracker)
     } else {
         debug!("Inode tracking disabled (no shadow_dir configured)");
         None
@@ -3091,6 +3100,7 @@ async fn run_exec_mode(
                 Some(&workspace),
                 Some(&author),
                 Some(&shared_last_content),
+                inode_tracker.as_ref(),
                 mqtt_only_config,
             )
             .await
@@ -3130,6 +3140,7 @@ async fn run_exec_mode(
                 pull_only,
                 author.clone(),
                 mqtt_only_config,
+                inode_tracker.clone(),
                 None, // file_states - initial setup, not needed
                 None, // relative_path
             );
@@ -3182,6 +3193,7 @@ async fn run_exec_mode(
             crdt_state: crdt_state.clone(),
             subdir_cache: subdir_cache.clone(),
             mqtt_only_config,
+            inode_tracker: inode_tracker.clone(),
         };
         async move {
             while let Some(event) = dir_rx.recv().await {

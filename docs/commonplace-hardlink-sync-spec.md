@@ -11,7 +11,7 @@ Before replacing a file during server sync, hardlink the old inode to a shadow d
 ## Data Structures
 
 ```
-shadow_dir: /tmp/commonplace-sync/hardlinks/  (or user-configured per-filesystem)
+shadow_dir: <sync-root>/.commonplace-shadow/  (default; user-configurable)
 
 InodeKey: (DevId, InodeId)  # (st_dev, st_ino) — inode numbers are only unique per-device
 
@@ -79,7 +79,7 @@ If the inode has no other links and no open fds, it gets reclaimed by the filesy
 
 ## Constraints
 
-**Same filesystem**: Hardlinks don't cross filesystem boundaries. Default shadow directory is `/tmp/commonplace-sync/hardlinks/`. If the synced path is on a different filesystem than `/tmp`, Commonplace will error at startup and require the user to explicitly configure a shadow directory on the same volume.
+**Same filesystem**: Hardlinks don't cross filesystem boundaries. The default shadow directory resolves to `<sync-root>/.commonplace-shadow/` so it shares the same filesystem as synced files. Startup fails if the shadow directory cannot be created.
 
 **Inode identity**: Use `InodeKey = (DevId, InodeId)` as the map key, since inode numbers are only unique per-device.
 

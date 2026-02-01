@@ -755,7 +755,7 @@ pub async fn handle_subdir_new_files(
     pull_only: bool,
     shared_state_file: Option<&crate::sync::SharedStateFile>,
     author: &str,
-    #[cfg(unix)] _inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     crdt_context: Option<&CrdtFileSyncContext>,
     mqtt_schema: Option<(crate::fs::FsSchema, String)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -763,6 +763,11 @@ pub async fn handle_subdir_new_files(
     if push_only {
         return Ok(());
     }
+
+    #[cfg(unix)]
+    let inode_tracker = inode_tracker;
+    #[cfg(not(unix))]
+    let inode_tracker = None;
 
     if crdt_context
         .as_ref()
@@ -1031,6 +1036,7 @@ pub async fn handle_subdir_new_files(
                         pull_only,
                         author.to_string(),
                         ctx.mqtt_only_config,
+                        inode_tracker.clone(),
                         None,
                         None,
                     );
@@ -1194,6 +1200,7 @@ pub async fn handle_subdir_new_files(
                             Some(&ctx.workspace),
                             Some(author),
                             Some(&shared_last_content),
+                            inode_tracker.as_ref(),
                             ctx.mqtt_only_config,
                         )
                         .await
@@ -1219,6 +1226,7 @@ pub async fn handle_subdir_new_files(
                         pull_only,
                         author.to_string(),
                         ctx.mqtt_only_config,
+                        inode_tracker.clone(),
                         None, // Already registered, no need to check
                         None,
                     );
@@ -1377,6 +1385,7 @@ pub async fn handle_subdir_new_files(
                             Some(&ctx.workspace),
                             Some(author),
                             Some(&shared_last_content),
+                            inode_tracker.as_ref(),
                             ctx.mqtt_only_config,
                         )
                         .await
@@ -1403,6 +1412,7 @@ pub async fn handle_subdir_new_files(
                         pull_only,
                         author.to_string(),
                         ctx.mqtt_only_config,
+                        inode_tracker.clone(),
                         Some(&*states_snapshot),
                         Some(root_relative_path),
                     );
@@ -1674,11 +1684,15 @@ pub async fn handle_schema_change(
     _push_only: bool,
     pull_only: bool,
     author: &str,
-    #[cfg(unix)] _inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
     shared_state_file: Option<&crate::sync::SharedStateFile>,
     crdt_context: Option<&CrdtFileSyncContext>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(unix)]
+    let inode_tracker = inode_tracker;
+    #[cfg(not(unix))]
+    let inode_tracker = None;
     // Fetch, parse, and validate schema from server
     let fetched = match fetch_and_validate_schema(client, server, fs_root_id, true).await {
         Some(f) => f,
@@ -1964,6 +1978,7 @@ pub async fn handle_schema_change(
                                     Some(&ctx.workspace),
                                     Some(author),
                                     Some(&shared_last_content),
+                                    inode_tracker.as_ref(),
                                     ctx.mqtt_only_config,
                                 )
                                 .await
@@ -1989,6 +2004,7 @@ pub async fn handle_schema_change(
                                 pull_only,
                                 author.to_string(),
                                 ctx.mqtt_only_config,
+                                inode_tracker.clone(),
                                 Some(&*states_snapshot),
                                 Some(path),
                             );

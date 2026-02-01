@@ -43,6 +43,28 @@ Commonplace uses three complementary mechanisms:
 
 Shadow hardlinks solve the atomic write problem by preserving old inodes.
 
+### Default Shadow Directory
+
+Inode tracking is **enabled by default**. When `--shadow-dir` is left at its
+default, sync resolves it to a per-workspace path inside the sync root:
+
+```
+<sync-root>/.commonplace-shadow/
+```
+
+This keeps shadow hardlinks on the **same filesystem** as the synced files,
+which is required for hardlinks to work. Startup fails if the shadow directory
+cannot be created.
+
+To disable inode tracking (not recommended), pass an empty value:
+
+```
+--shadow-dir ""
+```
+
+When inode tracking is disabled, inbound CRDT writes fall back to non-atomic
+writes and log a warning.
+
 ### How It Works
 
 When sync performs an atomic write:
