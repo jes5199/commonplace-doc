@@ -2020,6 +2020,401 @@ pub async fn initialize_crdt_state_from_server_with_pending(
     }
 }
 
+/// Resync CRDT state via the cyan/sync MQTT channel and apply any pending edits.
+///
+/// This fetches the full commit history (Ancestors(HEAD)), rebuilds the Y.Doc,
+/// initializes state from that snapshot, then processes queued edits. It is used
+/// when MissingHistory is detected so disk writes only happen after gap fill.
+async fn resync_crdt_state_via_cyan_with_pending(
+    mqtt_client: &Arc<MqttClient>,
+    workspace: &str,
+    node_id: Uuid,
+    crdt_state: &Arc<RwLock<DirectorySyncState>>,
+    filename: &str,
+    file_path: &Path,
+    author: &str,
+    shared_last_content: Option<&SharedLastContent>,
+) -> bool {
+    use crate::mqtt::messages::SyncMessage;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use yrs::{updates::decoder::Decode, Doc, ReadTxn, Transact, Update};
+
+    let node_id_str = node_id.to_string();
+    let req_id = Uuid::new_v4().to_string();
+    let sync_client_id = Uuid::new_v4().to_string();
+    let sync_topic = Topic::sync(workspace, &node_id_str, &sync_client_id).to_topic_string();
+
+    debug!(
+        "[CYAN-SYNC] Resyncing file {} via {} (req={})",
+        file_path.display(),
+        sync_topic,
+        req_id
+    );
+
+    let mut message_rx = mqtt_client.subscribe_messages();
+
+    if let Err(e) = mqtt_client.subscribe(&sync_topic, QoS::AtLeastOnce).await {
+        warn!(
+            "[CYAN-SYNC] Failed to subscribe for file {}: {}",
+            file_path.display(),
+            e
+        );
+        return false;
+    }
+
+    let ancestors_msg = SyncMessage::Ancestors {
+        req: req_id.clone(),
+        commit: "HEAD".to_string(),
+        depth: None,
+    };
+    let payload = match serde_json::to_vec(&ancestors_msg) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                "[CYAN-SYNC] Failed to serialize Ancestors for {}: {}",
+                file_path.display(),
+                e
+            );
+            let _ = mqtt_client.unsubscribe(&sync_topic).await;
+            return false;
+        }
+    };
+
+    if let Err(e) = mqtt_client
+        .publish(&sync_topic, &payload, QoS::AtLeastOnce)
+        .await
+    {
+        warn!(
+            "[CYAN-SYNC] Failed to publish Ancestors for {}: {}",
+            file_path.display(),
+            e
+        );
+        let _ = mqtt_client.unsubscribe(&sync_topic).await;
+        return false;
+    }
+
+    let timeout = tokio::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut commits: Vec<(String, String)> = Vec::new();
+    let mut head_cid: Option<String> = None;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            warn!(
+                "[CYAN-SYNC] Timeout waiting for sync response for {}",
+                file_path.display()
+            );
+            let _ = mqtt_client.unsubscribe(&sync_topic).await;
+            return false;
+        }
+
+        match tokio::time::timeout(remaining, message_rx.recv()).await {
+            Ok(Ok(msg)) => {
+                if msg.topic != sync_topic {
+                    continue;
+                }
+
+                let sync_msg: SyncMessage = match serde_json::from_slice(&msg.payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        debug!(
+                            "[CYAN-SYNC] Failed to parse sync message for {}: {}",
+                            file_path.display(),
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                match sync_msg {
+                    SyncMessage::Commit {
+                        ref req,
+                        ref id,
+                        ref data,
+                        ..
+                    } if req == &req_id => {
+                        head_cid = Some(id.clone());
+                        commits.push((id.clone(), data.clone()));
+                    }
+                    SyncMessage::Done {
+                        ref req,
+                        commits: ref done_commits,
+                        ..
+                    } if req == &req_id => {
+                        if let Some(last) = done_commits.last() {
+                            head_cid = Some(last.clone());
+                        }
+                        break;
+                    }
+                    SyncMessage::Error {
+                        ref req,
+                        ref message,
+                        ..
+                    } if req == &req_id => {
+                        warn!(
+                            "[CYAN-SYNC] Server error for {}: {}",
+                            file_path.display(),
+                            message
+                        );
+                        let _ = mqtt_client.unsubscribe(&sync_topic).await;
+                        return false;
+                    }
+                    _ => continue,
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "[CYAN-SYNC] Broadcast channel error for {}: {}",
+                    file_path.display(),
+                    e
+                );
+                let _ = mqtt_client.unsubscribe(&sync_topic).await;
+                return false;
+            }
+            Err(_) => {
+                warn!(
+                    "[CYAN-SYNC] Timeout waiting for sync response for {}",
+                    file_path.display()
+                );
+                let _ = mqtt_client.unsubscribe(&sync_topic).await;
+                return false;
+            }
+        }
+    }
+
+    if let Err(e) = mqtt_client.unsubscribe(&sync_topic).await {
+        debug!("[CYAN-SYNC] Failed to unsubscribe {}: {}", sync_topic, e);
+    }
+
+    // If there's no history, initialize empty and process pending edits.
+    if commits.is_empty() {
+        let pending_edits = {
+            let mut state = crdt_state.write().await;
+            let file_state = state.get_or_create_file(filename, node_id);
+            file_state.initialize_empty();
+            file_state.take_pending_edits()
+        };
+
+        if !pending_edits.is_empty() {
+            info!(
+                "[CYAN-SYNC] Processing {} pending edits for {} after empty init",
+                pending_edits.len(),
+                file_path.display()
+            );
+
+            for pending in pending_edits {
+                if let Ok(edit_msg) = parse_edit_message(&pending.payload) {
+                    let mut state = crdt_state.write().await;
+                    let file_state = state.get_or_create_file(filename, node_id);
+
+                    match process_received_edit(
+                        Some(mqtt_client),
+                        workspace,
+                        &node_id_str,
+                        file_state,
+                        &edit_msg,
+                        author,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok((result, maybe_content)) => {
+                            drop(state);
+
+                            if let Some(content) = maybe_content {
+                                if let Some(slc) = shared_last_content {
+                                    let mut shared = slc.write().await;
+                                    *shared = Some(content.clone());
+                                }
+                                if let Err(e) = tokio::fs::write(file_path, &content).await {
+                                    warn!(
+                                        "[CYAN-SYNC] Failed to write pending edit to {}: {}",
+                                        file_path.display(),
+                                        e
+                                    );
+                                } else {
+                                    info!(
+                                        "[CYAN-SYNC] Applied pending edit to {} ({} bytes, {:?})",
+                                        file_path.display(),
+                                        content.len(),
+                                        result
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "[CYAN-SYNC] Failed to process pending edit for {}: {}",
+                                filename, e
+                            );
+                        }
+                    }
+                }
+            }
+
+            let state = crdt_state.read().await;
+            if let Err(e) = state.save(file_path.parent().unwrap_or(file_path)).await {
+                warn!(
+                    "[CYAN-SYNC] Failed to save state after pending edits: {}",
+                    e
+                );
+            }
+        }
+
+        return true;
+    }
+
+    let doc = Doc::new();
+    for (cid, data_b64) in &commits {
+        let data_bytes = match STANDARD.decode(data_b64) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("[CYAN-SYNC] Failed to decode base64 for {}: {}", cid, e);
+                continue;
+            }
+        };
+
+        if data_bytes.is_empty() {
+            continue;
+        }
+
+        let update = match Update::decode_v1(&data_bytes) {
+            Ok(u) => u,
+            Err(e) => {
+                warn!("[CYAN-SYNC] Failed to decode Yrs update for {}: {}", cid, e);
+                continue;
+            }
+        };
+
+        let mut txn = doc.transact_mut();
+        txn.apply_update(update);
+    }
+
+    let content = {
+        let txn = doc.transact();
+        txn.get_text("content")
+            .map(|text| text.get_string(&txn))
+            .unwrap_or_default()
+    };
+
+    let state_bytes = {
+        let txn = doc.transact();
+        txn.encode_state_as_update_v1(&yrs::StateVector::default())
+    };
+    let state_b64 = STANDARD.encode(&state_bytes);
+    let head_cid = head_cid.unwrap_or_else(|| "unknown".to_string());
+
+    let pending_edits = {
+        let mut state = crdt_state.write().await;
+        let file_state = state.get_or_create_file(filename, node_id);
+        file_state.initialize_from_server(&state_b64, &head_cid);
+        for (cid, _) in &commits {
+            file_state.record_known_cid(cid);
+        }
+        file_state.take_pending_edits()
+    };
+
+    let local_content = tokio::fs::read_to_string(file_path)
+        .await
+        .unwrap_or_default();
+    if local_content != content {
+        if let Some(slc) = shared_last_content {
+            let mut shared = slc.write().await;
+            *shared = Some(content.clone());
+        }
+        if let Err(e) = tokio::fs::write(file_path, &content).await {
+            warn!(
+                "[CYAN-SYNC] Failed to write synced content to {}: {}",
+                file_path.display(),
+                e
+            );
+        } else {
+            info!(
+                "[CYAN-SYNC] Wrote synced content to {} ({} bytes)",
+                file_path.display(),
+                content.len()
+            );
+        }
+    }
+
+    if !pending_edits.is_empty() {
+        info!(
+            "[CYAN-SYNC] Processing {} pending edits for {} after sync",
+            pending_edits.len(),
+            file_path.display()
+        );
+
+        for pending in pending_edits {
+            if let Ok(edit_msg) = parse_edit_message(&pending.payload) {
+                let mut state = crdt_state.write().await;
+                let file_state = state.get_or_create_file(filename, node_id);
+
+                match process_received_edit(
+                    Some(mqtt_client),
+                    workspace,
+                    &node_id_str,
+                    file_state,
+                    &edit_msg,
+                    author,
+                    None,
+                )
+                .await
+                {
+                    Ok((result, maybe_content)) => {
+                        drop(state);
+
+                        if let Some(content) = maybe_content {
+                            if let Some(slc) = shared_last_content {
+                                let mut shared = slc.write().await;
+                                *shared = Some(content.clone());
+                            }
+                            if let Err(e) = tokio::fs::write(file_path, &content).await {
+                                warn!(
+                                    "[CYAN-SYNC] Failed to write pending edit to {}: {}",
+                                    file_path.display(),
+                                    e
+                                );
+                            } else {
+                                info!(
+                                    "[CYAN-SYNC] Applied pending edit to {} ({} bytes, {:?})",
+                                    file_path.display(),
+                                    content.len(),
+                                    result
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[CYAN-SYNC] Failed to process pending edit for {}: {}",
+                            filename, e
+                        );
+                    }
+                }
+            }
+        }
+
+        let state = crdt_state.read().await;
+        if let Err(e) = state.save(file_path.parent().unwrap_or(file_path)).await {
+            warn!(
+                "[CYAN-SYNC] Failed to save state after pending edits: {}",
+                e
+            );
+        }
+    }
+
+    debug!(
+        "[CYAN-SYNC] Resync complete for {} ({} commits, head={})",
+        file_path.display(),
+        commits.len(),
+        head_cid
+    );
+
+    true
+}
+
 /// Spawn CRDT-aware sync tasks for a single file.
 ///
 /// This is the CRDT equivalent of `spawn_file_sync_tasks`.
@@ -2584,7 +2979,7 @@ pub async fn receive_task_crdt(
                         received_cid,
                         current_head,
                     } => {
-                        // Intermediate commits are missing - trigger a resync from server
+                        // Intermediate commits are missing - trigger a cyan/sync gap fill
                         debug!(
                             "CRDT receive_task: missing history for {} (head: {}, received: {}). Triggering resync.",
                             file_path.display(),
@@ -2592,53 +2987,35 @@ pub async fn receive_task_crdt(
                             received_cid
                         );
 
-                        if mqtt_only_config.mqtt_only {
-                            warn!(
-                                "CRDT receive_task: missing history for {} but HTTP is disabled (MQTT-only). Queueing edit and marking for cyan resync.",
-                                file_path.display()
-                            );
-                            file_state.queue_pending_edit(msg.payload.clone());
-                            file_state.mark_needs_resync();
-                            drop(state_guard);
-                            continue;
-                        }
+                        warn!(
+                            "CRDT receive_task: missing history for {} — queueing edit and resyncing via cyan",
+                            file_path.display()
+                        );
+                        file_state.queue_pending_edit(msg.payload.clone());
+                        file_state.mark_needs_resync();
 
                         // Drop state_guard to release the write lock before resyncing.
-                        // The resync function will acquire its own lock.
                         drop(state_guard);
 
-                        // Mark state as needing resync
-                        {
-                            let mut resync_guard = crdt_state.write().await;
-                            if let Some(file_state) = resync_guard.get_file_mut(&filename) {
-                                file_state.mark_needs_resync();
-                            }
-                        }
-
-                        // Re-fetch state from server
-                        if let Err(e) = initialize_crdt_state_from_server_with_pending(
-                            &http_client,
-                            &server,
+                        if !resync_crdt_state_via_cyan_with_pending(
+                            &mqtt_client,
+                            &workspace,
                             node_id,
                             &crdt_state,
                             &filename,
                             &file_path,
-                            Some(&mqtt_client),
-                            Some(&workspace),
-                            Some(&author),
+                            &author,
                             Some(&shared_last_content),
-                            mqtt_only_config,
                         )
                         .await
                         {
                             warn!(
-                                "CRDT receive_task: failed to resync {} from server after missing history: {}",
-                                file_path.display(),
-                                e
+                                "CRDT receive_task: cyan resync failed for {} after missing history",
+                                file_path.display()
                             );
                         } else {
                             debug!(
-                                "CRDT receive_task: successfully resynced {} from server after missing history",
+                                "CRDT receive_task: cyan resync completed for {} after missing history",
                                 file_path.display()
                             );
                         }

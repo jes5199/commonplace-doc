@@ -742,6 +742,7 @@ pub fn find_common_ancestor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mqtt::EditMessage;
     use uuid::Uuid;
     use yrs::{Text, WriteTxn};
 
@@ -856,6 +857,38 @@ mod tests {
             "Expected MissingHistory, got {:?}",
             &result
         );
+    }
+
+    #[tokio::test]
+    async fn test_process_received_edit_missing_history_skips_content() {
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+        state.head_cid = Some("commit_a".to_string());
+        state.local_head_cid = Some("commit_a".to_string());
+        state.record_known_cid("commit_a");
+
+        let edit_msg = EditMessage {
+            update: String::new(),
+            parents: vec!["commit_c".to_string()],
+            author: "peer".to_string(),
+            message: None,
+            timestamp: 1,
+            req: None,
+        };
+
+        let (result, maybe_content) = process_received_edit(
+            None,
+            "workspace",
+            "node",
+            &mut state,
+            &edit_msg,
+            "author",
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, MergeResult::MissingHistory { .. }));
+        assert!(maybe_content.is_none());
     }
 
     #[test]
