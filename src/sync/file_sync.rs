@@ -3,6 +3,7 @@
 //! This module contains functions for syncing a single file with a server document.
 
 // Note: recv_broadcast_with_lag was replaced with direct tokio::select! in receive_task_crdt
+use crate::commit::Commit;
 use crate::mqtt::{IncomingMessage, MqttClient, Topic};
 use crate::sync::client::fetch_head;
 use crate::sync::crdt_merge::{parse_edit_message, process_received_edit};
@@ -10,6 +11,8 @@ use crate::sync::crdt_publish::{publish_text_change, publish_yjs_update};
 use crate::sync::crdt_state::DirectorySyncState;
 use crate::sync::directory::{scan_directory_to_json, ScanOptions};
 use crate::sync::file_events::find_owning_document;
+#[cfg(unix)]
+use crate::sync::flock::{try_flock_exclusive, FlockResult};
 use crate::sync::state::InodeKey;
 use crate::sync::state_file::compute_content_hash;
 use crate::sync::uuid_map::fetch_node_id_from_schema;
@@ -22,6 +25,7 @@ use crate::sync::{
 };
 use reqwest::Client;
 use rumqttc::QoS;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +42,8 @@ pub const PENDING_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const BARRIER_RETRY_COUNT: u32 = 5;
 /// Delay between retries when checking for stable content
 pub const BARRIER_RETRY_DELAY: Duration = Duration::from_millis(50);
+/// Timeout for attempting to acquire a flock before deferring inbound CRDT writes.
+pub const CRDT_FLOCK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Result of preparing file content for upload.
 ///
@@ -328,6 +334,8 @@ pub async fn detect_echo_from_pending_write(
 /// This ensures sync clients detect when they've diverged from the server
 /// even if MQTT messages are missed.
 pub const DIVERGENCE_CHECK_INTERVAL_SECS: u64 = 30;
+/// Interval for retrying deferred CRDT edits while waiting on flock (seconds).
+pub const PENDING_EDIT_FLUSH_INTERVAL_SECS: u64 = 5;
 
 /// Handle refresh logic after an upload attempt.
 ///
@@ -1716,15 +1724,12 @@ pub async fn initialize_crdt_state_from_server_with_pending(
     match fetch_head(client, server, &identifier, false).await {
         Ok(Some(head)) => {
             if let (Some(ref state_b64), Some(ref cid)) = (&head.state, &head.cid) {
-                // Initialize CRDT state and collect pending edits
-                let pending_edits = {
+                // Initialize CRDT state
+                {
                     let mut state = crdt_state.write().await;
                     let file_state = state.get_or_create_file(filename, node_id);
                     file_state.initialize_from_server(state_b64, cid);
-
-                    // Take any pending edits that arrived before init
-                    file_state.take_pending_edits()
-                };
+                }
 
                 // CRITICAL: Also write the server's content to the local file.
                 // This prevents the upload task from computing a diff against
@@ -1830,71 +1835,18 @@ pub async fn initialize_crdt_state_from_server_with_pending(
                     filename, cid
                 );
 
-                // Process any pending edits that arrived before initialization
-                if !pending_edits.is_empty() {
-                    info!(
-                        "Processing {} pending edits for {} after CRDT init",
-                        pending_edits.len(),
-                        filename
-                    );
-
-                    for pending in pending_edits {
-                        if let Ok(edit_msg) = parse_edit_message(&pending.payload) {
-                            let mut state = crdt_state.write().await;
-                            let file_state = state.get_or_create_file(filename, node_id);
-
-                            match process_received_edit(
-                                mqtt_client,
-                                workspace.unwrap_or(""),
-                                &identifier,
-                                file_state,
-                                &edit_msg,
-                                author.unwrap_or(""),
-                                None, // commit_store not available in file_sync init context
-                            )
-                            .await
-                            {
-                                Ok((result, maybe_content)) => {
-                                    drop(state); // Release lock before file I/O
-
-                                    if let Some(content) = maybe_content {
-                                        // Update shared_last_content BEFORE writing to prevent echo
-                                        if let Some(slc) = shared_last_content {
-                                            let mut shared = slc.write().await;
-                                            *shared = Some(content.clone());
-                                        }
-                                        if let Err(e) = tokio::fs::write(file_path, &content).await
-                                        {
-                                            warn!(
-                                                "Failed to write pending edit to {}: {}",
-                                                file_path.display(),
-                                                e
-                                            );
-                                        } else {
-                                            info!(
-                                                "Applied pending edit to {} ({} bytes, {:?})",
-                                                file_path.display(),
-                                                content.len(),
-                                                result
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("Failed to process pending edit for {}: {}", filename, e);
-                                }
-                            }
-                        } else {
-                            warn!("Failed to parse pending edit for {}, skipping", filename);
-                        }
-                    }
-
-                    // Save state after processing pending edits
-                    let state = crdt_state.read().await;
-                    if let Err(e) = state.save(file_path.parent().unwrap_or(file_path)).await {
-                        warn!("Failed to save CRDT state after pending edits: {}", e);
-                    }
-                }
+                handle_pending_edits_with_flock(
+                    "after CRDT init",
+                    mqtt_client,
+                    workspace.unwrap_or(""),
+                    node_id,
+                    filename,
+                    file_path,
+                    crdt_state,
+                    author.unwrap_or(""),
+                    shared_last_content,
+                )
+                .await;
 
                 Ok(())
             } else {
@@ -1908,75 +1860,18 @@ pub async fn initialize_crdt_state_from_server_with_pending(
                     file_state.initialize_empty();
                 }
 
-                // Still need to process pending edits as they may have arrived during init
-                let pending_edits = {
-                    let mut state = crdt_state.write().await;
-                    let file_state = state.get_or_create_file(filename, node_id);
-                    file_state.take_pending_edits()
-                };
-
-                if !pending_edits.is_empty() {
-                    info!(
-                        "Server has no state yet, processing {} pending edits for {}",
-                        pending_edits.len(),
-                        filename
-                    );
-
-                    for pending in pending_edits {
-                        if let Ok(edit_msg) = parse_edit_message(&pending.payload) {
-                            let mut state = crdt_state.write().await;
-                            let file_state = state.get_or_create_file(filename, node_id);
-
-                            match process_received_edit(
-                                mqtt_client,
-                                workspace.unwrap_or(""),
-                                &identifier,
-                                file_state,
-                                &edit_msg,
-                                author.unwrap_or(""),
-                                None, // commit_store not available in file_sync empty-state context
-                            )
-                            .await
-                            {
-                                Ok((result, maybe_content)) => {
-                                    drop(state);
-
-                                    if let Some(content) = maybe_content {
-                                        // Update shared_last_content BEFORE writing to prevent echo
-                                        if let Some(slc) = shared_last_content {
-                                            let mut shared = slc.write().await;
-                                            *shared = Some(content.clone());
-                                        }
-                                        if let Err(e) = tokio::fs::write(file_path, &content).await
-                                        {
-                                            warn!(
-                                                "Failed to write pending edit to {}: {}",
-                                                file_path.display(),
-                                                e
-                                            );
-                                        } else {
-                                            info!(
-                                                "Applied pending edit to {} ({} bytes, {:?})",
-                                                file_path.display(),
-                                                content.len(),
-                                                result
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("Failed to process pending edit for {}: {}", filename, e);
-                                }
-                            }
-                        }
-                    }
-
-                    // Save state after processing pending edits
-                    let state = crdt_state.read().await;
-                    if let Err(e) = state.save(file_path.parent().unwrap_or(file_path)).await {
-                        warn!("Failed to save CRDT state after pending edits: {}", e);
-                    }
-                }
+                handle_pending_edits_with_flock(
+                    "after empty init",
+                    mqtt_client,
+                    workspace.unwrap_or(""),
+                    node_id,
+                    filename,
+                    file_path,
+                    crdt_state,
+                    author.unwrap_or(""),
+                    shared_last_content,
+                )
+                .await;
 
                 debug!(
                     "Server has no Yjs state for {} yet, starting fresh",
@@ -2190,78 +2085,24 @@ async fn resync_crdt_state_via_cyan_with_pending(
 
     // If there's no history, initialize empty and process pending edits.
     if commits.is_empty() {
-        let pending_edits = {
+        {
             let mut state = crdt_state.write().await;
             let file_state = state.get_or_create_file(filename, node_id);
             file_state.initialize_empty();
-            file_state.take_pending_edits()
-        };
-
-        if !pending_edits.is_empty() {
-            info!(
-                "[CYAN-SYNC] Processing {} pending edits for {} after empty init",
-                pending_edits.len(),
-                file_path.display()
-            );
-
-            for pending in pending_edits {
-                if let Ok(edit_msg) = parse_edit_message(&pending.payload) {
-                    let mut state = crdt_state.write().await;
-                    let file_state = state.get_or_create_file(filename, node_id);
-
-                    match process_received_edit(
-                        Some(mqtt_client),
-                        workspace,
-                        &node_id_str,
-                        file_state,
-                        &edit_msg,
-                        author,
-                        None,
-                    )
-                    .await
-                    {
-                        Ok((result, maybe_content)) => {
-                            drop(state);
-
-                            if let Some(content) = maybe_content {
-                                if let Some(slc) = shared_last_content {
-                                    let mut shared = slc.write().await;
-                                    *shared = Some(content.clone());
-                                }
-                                if let Err(e) = tokio::fs::write(file_path, &content).await {
-                                    warn!(
-                                        "[CYAN-SYNC] Failed to write pending edit to {}: {}",
-                                        file_path.display(),
-                                        e
-                                    );
-                                } else {
-                                    info!(
-                                        "[CYAN-SYNC] Applied pending edit to {} ({} bytes, {:?})",
-                                        file_path.display(),
-                                        content.len(),
-                                        result
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "[CYAN-SYNC] Failed to process pending edit for {}: {}",
-                                filename, e
-                            );
-                        }
-                    }
-                }
-            }
-
-            let state = crdt_state.read().await;
-            if let Err(e) = state.save(file_path.parent().unwrap_or(file_path)).await {
-                warn!(
-                    "[CYAN-SYNC] Failed to save state after pending edits: {}",
-                    e
-                );
-            }
         }
+
+        handle_pending_edits_with_flock(
+            "after cyan empty init",
+            Some(mqtt_client),
+            workspace,
+            node_id,
+            filename,
+            file_path,
+            crdt_state,
+            author,
+            shared_last_content,
+        )
+        .await;
 
         return true;
     }
@@ -2306,15 +2147,14 @@ async fn resync_crdt_state_via_cyan_with_pending(
     let state_b64 = STANDARD.encode(&state_bytes);
     let head_cid = head_cid.unwrap_or_else(|| "unknown".to_string());
 
-    let pending_edits = {
+    {
         let mut state = crdt_state.write().await;
         let file_state = state.get_or_create_file(filename, node_id);
         file_state.initialize_from_server(&state_b64, &head_cid);
         for (cid, _) in &commits {
             file_state.record_known_cid(cid);
         }
-        file_state.take_pending_edits()
-    };
+    }
 
     let local_content = tokio::fs::read_to_string(file_path)
         .await
@@ -2339,71 +2179,18 @@ async fn resync_crdt_state_via_cyan_with_pending(
         }
     }
 
-    if !pending_edits.is_empty() {
-        info!(
-            "[CYAN-SYNC] Processing {} pending edits for {} after sync",
-            pending_edits.len(),
-            file_path.display()
-        );
-
-        for pending in pending_edits {
-            if let Ok(edit_msg) = parse_edit_message(&pending.payload) {
-                let mut state = crdt_state.write().await;
-                let file_state = state.get_or_create_file(filename, node_id);
-
-                match process_received_edit(
-                    Some(mqtt_client),
-                    workspace,
-                    &node_id_str,
-                    file_state,
-                    &edit_msg,
-                    author,
-                    None,
-                )
-                .await
-                {
-                    Ok((result, maybe_content)) => {
-                        drop(state);
-
-                        if let Some(content) = maybe_content {
-                            if let Some(slc) = shared_last_content {
-                                let mut shared = slc.write().await;
-                                *shared = Some(content.clone());
-                            }
-                            if let Err(e) = tokio::fs::write(file_path, &content).await {
-                                warn!(
-                                    "[CYAN-SYNC] Failed to write pending edit to {}: {}",
-                                    file_path.display(),
-                                    e
-                                );
-                            } else {
-                                info!(
-                                    "[CYAN-SYNC] Applied pending edit to {} ({} bytes, {:?})",
-                                    file_path.display(),
-                                    content.len(),
-                                    result
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "[CYAN-SYNC] Failed to process pending edit for {}: {}",
-                            filename, e
-                        );
-                    }
-                }
-            }
-        }
-
-        let state = crdt_state.read().await;
-        if let Err(e) = state.save(file_path.parent().unwrap_or(file_path)).await {
-            warn!(
-                "[CYAN-SYNC] Failed to save state after pending edits: {}",
-                e
-            );
-        }
-    }
+    handle_pending_edits_with_flock(
+        "after cyan sync",
+        Some(mqtt_client),
+        workspace,
+        node_id,
+        filename,
+        file_path,
+        crdt_state,
+        author,
+        shared_last_content,
+    )
+    .await;
 
     debug!(
         "[CYAN-SYNC] Resync complete for {} ({} commits, head={})",
@@ -2413,6 +2200,274 @@ async fn resync_crdt_state_via_cyan_with_pending(
     );
 
     true
+}
+
+#[derive(Debug)]
+enum WriteDecision {
+    Written,
+    SkippedRollback,
+    Failed,
+}
+
+async fn write_content_with_rollback_guard(
+    file_path: &Path,
+    content: &str,
+    shared_last_content: Option<&SharedLastContent>,
+) -> WriteDecision {
+    let existing_content = tokio::fs::read_to_string(file_path)
+        .await
+        .unwrap_or_default();
+
+    debug!(
+        "CRDT receive_task: merge produced content for {} - existing={} bytes ({:?}), new={} bytes ({:?})",
+        file_path.display(),
+        existing_content.len(),
+        existing_content.chars().take(40).collect::<String>(),
+        content.len(),
+        content.chars().take(40).collect::<String>()
+    );
+
+    let is_rollback = if content.is_empty() && !existing_content.is_empty() {
+        true
+    } else if !content.is_empty()
+        && !existing_content.is_empty()
+        && content.len() < existing_content.len() / 10
+    {
+        true
+    } else {
+        false
+    };
+
+    if is_rollback {
+        debug!(
+            "CRDT receive_task: refusing rollback write for {} (existing {} bytes, new {} bytes)",
+            file_path.display(),
+            existing_content.len(),
+            content.len()
+        );
+        return WriteDecision::SkippedRollback;
+    }
+
+    let mut previous_content = None;
+    if let Some(slc) = shared_last_content {
+        let mut shared = slc.write().await;
+        previous_content = shared.clone();
+        *shared = Some(content.to_string());
+    }
+
+    match tokio::fs::write(file_path, content).await {
+        Ok(()) => WriteDecision::Written,
+        Err(e) => {
+            if let Some(slc) = shared_last_content {
+                let mut shared = slc.write().await;
+                *shared = previous_content;
+            }
+            error!(
+                "CRDT receive_task: failed to write to {}: {}",
+                file_path.display(),
+                e
+            );
+            WriteDecision::Failed
+        }
+    }
+}
+
+async fn process_pending_edits_with_flock(
+    pending_edits: Vec<crate::sync::PendingEdit>,
+    mqtt_client: Option<&Arc<MqttClient>>,
+    workspace: &str,
+    node_id: Uuid,
+    filename: &str,
+    file_path: &Path,
+    crdt_state: &Arc<RwLock<DirectorySyncState>>,
+    author: &str,
+    shared_last_content: Option<&SharedLastContent>,
+) -> Vec<crate::sync::PendingEdit> {
+    let node_id_str = node_id.to_string();
+    let mut remaining = pending_edits;
+    let mut processed_any = false;
+    let mut deferred: Option<Vec<crate::sync::PendingEdit>> = None;
+
+    while !remaining.is_empty() {
+        let pending = remaining.remove(0);
+        let edit_msg = match parse_edit_message(&pending.payload) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    "Failed to parse pending edit for {}, skipping: {}",
+                    filename, e
+                );
+                continue;
+            }
+        };
+
+        let received_cid = Commit::with_timestamp(
+            edit_msg.parents.clone(),
+            edit_msg.update.clone(),
+            edit_msg.author.clone(),
+            edit_msg.message.clone(),
+            edit_msg.timestamp,
+        )
+        .calculate_cid();
+
+        let already_known = {
+            let state_guard = crdt_state.read().await;
+            state_guard
+                .get_file(filename)
+                .map(|f| f.is_cid_known(&received_cid))
+                .unwrap_or(false)
+        };
+
+        if already_known {
+            continue;
+        }
+
+        #[cfg(unix)]
+        let mut flock_guard = None;
+        #[cfg(unix)]
+        {
+            match try_flock_exclusive(file_path, Some(CRDT_FLOCK_TIMEOUT)).await {
+                Ok(FlockResult::Acquired(guard)) => {
+                    flock_guard = Some(guard);
+                }
+                Ok(FlockResult::Timeout) => {
+                    let mut queued = Vec::new();
+                    queued.push(pending);
+                    queued.extend(remaining);
+                    deferred = Some(queued);
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!("Failed to acquire flock for {}: {}", file_path.display(), e);
+                    let mut queued = Vec::new();
+                    queued.push(pending);
+                    queued.extend(remaining);
+                    deferred = Some(queued);
+                    break;
+                }
+            }
+        }
+
+        let result = {
+            let mut state_guard = crdt_state.write().await;
+            let file_state = state_guard.get_or_create_file(filename, node_id);
+            process_received_edit(
+                mqtt_client,
+                workspace,
+                &node_id_str,
+                file_state,
+                &edit_msg,
+                author,
+                None,
+            )
+            .await
+        };
+
+        match result {
+            Ok((merge_result, maybe_content)) => {
+                processed_any = true;
+                if let Some(content) = maybe_content {
+                    match write_content_with_rollback_guard(
+                        file_path,
+                        &content,
+                        shared_last_content,
+                    )
+                    .await
+                    {
+                        WriteDecision::Written => {
+                            info!(
+                                "Applied pending edit to {} ({} bytes, {:?})",
+                                file_path.display(),
+                                content.len(),
+                                merge_result
+                            );
+                        }
+                        WriteDecision::SkippedRollback => continue,
+                        WriteDecision::Failed => continue,
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to process pending edit for {}: {}", filename, e);
+            }
+        }
+
+        #[cfg(unix)]
+        let _ = flock_guard;
+    }
+
+    if processed_any {
+        let state_guard = crdt_state.read().await;
+        if let Err(e) = state_guard
+            .save(file_path.parent().unwrap_or(file_path))
+            .await
+        {
+            warn!("Failed to save CRDT state after pending edits: {}", e);
+        }
+    }
+
+    deferred.unwrap_or_default()
+}
+
+async fn handle_pending_edits_with_flock(
+    context: &str,
+    mqtt_client: Option<&Arc<MqttClient>>,
+    workspace: &str,
+    node_id: Uuid,
+    filename: &str,
+    file_path: &Path,
+    crdt_state: &Arc<RwLock<DirectorySyncState>>,
+    author: &str,
+    shared_last_content: Option<&SharedLastContent>,
+) {
+    let pending_edits = {
+        let mut state_guard = crdt_state.write().await;
+        let file_state = state_guard.get_or_create_file(filename, node_id);
+        if file_state.should_queue_edits().is_some() {
+            return;
+        }
+        file_state.take_pending_edits()
+    };
+
+    if pending_edits.is_empty() {
+        return;
+    }
+
+    info!(
+        "CRDT receive_task: processing {} pending edits for {} {}",
+        pending_edits.len(),
+        file_path.display(),
+        context
+    );
+
+    let mut deferred = process_pending_edits_with_flock(
+        pending_edits,
+        mqtt_client,
+        workspace,
+        node_id,
+        filename,
+        file_path,
+        crdt_state,
+        author,
+        shared_last_content,
+    )
+    .await;
+
+    if !deferred.is_empty() {
+        let mut state_guard = crdt_state.write().await;
+        let file_state = state_guard.get_or_create_file(filename, node_id);
+        if !file_state.pending_edits.is_empty() {
+            deferred.extend(file_state.take_pending_edits());
+        }
+        let deferred_len = deferred.len();
+        file_state.pending_edits = deferred;
+        warn!(
+            "CRDT receive_task: deferred {} pending edits for {} (flock locked)",
+            deferred_len,
+            file_path.display()
+        );
+    }
 }
 
 /// Spawn CRDT-aware sync tasks for a single file.
@@ -2573,79 +2628,32 @@ pub async fn receive_task_crdt(
         file_state.mark_receive_task_ready()
     };
 
-    // Process any pending edits that were queued before we were ready
     if !pending_edits.is_empty() {
-        info!(
-            "CRDT receive_task: processing {} pending edits for {} after becoming ready",
-            pending_edits.len(),
-            file_path.display()
-        );
+        let mut deferred = process_pending_edits_with_flock(
+            pending_edits,
+            Some(&mqtt_client),
+            &workspace,
+            node_id,
+            &filename,
+            &file_path,
+            &crdt_state,
+            &author,
+            Some(&shared_last_content),
+        )
+        .await;
 
-        for pending in pending_edits {
-            if let Ok(edit_msg) = parse_edit_message(&pending.payload) {
-                let mut state_guard = crdt_state.write().await;
-                let file_state = state_guard.get_or_create_file(&filename, node_id);
-
-                match process_received_edit(
-                    Some(&mqtt_client),
-                    &workspace,
-                    &node_id_str,
-                    file_state,
-                    &edit_msg,
-                    &author,
-                    None, // commit_store not available in receive_task_crdt
-                )
-                .await
-                {
-                    Ok((result, maybe_content)) => {
-                        debug!(
-                            "CRDT receive_task: processed pending edit for {}: {:?}",
-                            file_path.display(),
-                            result
-                        );
-
-                        // Write content if merge produced new content
-                        if let Some(content) = maybe_content {
-                            // Update shared_last_content BEFORE writing
-                            {
-                                let mut shared = shared_last_content.write().await;
-                                *shared = Some(content.clone());
-                            }
-                            if let Err(e) = tokio::fs::write(&file_path, &content).await {
-                                error!(
-                                    "CRDT receive_task: failed to write pending edit content to {}: {}",
-                                    file_path.display(),
-                                    e
-                                );
-                            } else {
-                                info!(
-                                    "CRDT receive_task: wrote {} bytes from pending edit to {}",
-                                    content.len(),
-                                    file_path.display()
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "CRDT receive_task: failed to process pending edit for {}: {}",
-                            file_path.display(),
-                            e
-                        );
-                    }
-                }
+        if !deferred.is_empty() {
+            let mut state_guard = crdt_state.write().await;
+            let file_state = state_guard.get_or_create_file(&filename, node_id);
+            if !file_state.pending_edits.is_empty() {
+                deferred.extend(file_state.take_pending_edits());
             }
-        }
-
-        // Save state after processing pending edits
-        let state_guard = crdt_state.read().await;
-        if let Err(e) = state_guard
-            .save(file_path.parent().unwrap_or(&file_path))
-            .await
-        {
+            let deferred_len = deferred.len();
+            file_state.pending_edits = deferred;
             warn!(
-                "CRDT receive_task: failed to save state after pending edits: {}",
-                e
+                "CRDT receive_task: deferred {} pending edits for {} after becoming ready (flock locked)",
+                deferred_len,
+                file_path.display()
             );
         }
     }
@@ -2754,6 +2762,10 @@ pub async fn receive_task_crdt(
     divergence_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Skip the first tick which fires immediately
     divergence_check_interval.tick().await;
+    let mut pending_edit_flush_interval =
+        tokio::time::interval(Duration::from_secs(PENDING_EDIT_FLUSH_INTERVAL_SECS));
+    pending_edit_flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    pending_edit_flush_interval.tick().await;
 
     loop {
         // Use select! to either receive a message or trigger the periodic divergence check
@@ -2792,6 +2804,21 @@ pub async fn receive_task_crdt(
                     }
                 }
                 continue; // Go back to waiting for messages
+            }
+            _ = pending_edit_flush_interval.tick() => {
+                handle_pending_edits_with_flock(
+                    "during periodic flush",
+                    Some(&mqtt_client),
+                    &workspace,
+                    node_id,
+                    &filename,
+                    &file_path,
+                    &crdt_state,
+                    &author,
+                    Some(&shared_last_content),
+                )
+                .await;
+                continue;
             }
             // Receive MQTT message
             recv_result = message_rx.recv() => {
@@ -2892,6 +2919,15 @@ pub async fn receive_task_crdt(
             }
         };
 
+        let received_cid = Commit::with_timestamp(
+            edit_msg.parents.clone(),
+            edit_msg.update.clone(),
+            edit_msg.author.clone(),
+            edit_msg.message.clone(),
+            edit_msg.timestamp,
+        )
+        .calculate_cid();
+
         // Get or create the CRDT state for this file
         let mut state_guard = crdt_state.write().await;
         let file_state = state_guard.get_or_create_file(&filename, node_id);
@@ -2915,6 +2951,72 @@ pub async fn receive_task_crdt(
             );
             drop(state_guard);
             continue; // Skip to next message
+        }
+
+        if file_state.is_cid_known(&received_cid) {
+            debug!(
+                "CRDT receive_task: commit already known for {}",
+                file_path.display()
+            );
+            drop(state_guard);
+            continue;
+        }
+
+        drop(state_guard);
+
+        #[cfg(unix)]
+        let mut _flock_guard = None;
+        #[cfg(unix)]
+        {
+            match try_flock_exclusive(&file_path, Some(CRDT_FLOCK_TIMEOUT)).await {
+                Ok(FlockResult::Acquired(guard)) => {
+                    _flock_guard = Some(guard);
+                }
+                Ok(FlockResult::Timeout) => {
+                    let mut state_guard = crdt_state.write().await;
+                    let file_state = state_guard.get_or_create_file(&filename, node_id);
+                    file_state.queue_pending_edit(msg.payload.clone());
+                    warn!(
+                        "CRDT receive_task: deferring edit for {} due to flock timeout",
+                        file_path.display()
+                    );
+                    continue;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    let mut state_guard = crdt_state.write().await;
+                    let file_state = state_guard.get_or_create_file(&filename, node_id);
+                    file_state.queue_pending_edit(msg.payload.clone());
+                    warn!(
+                        "CRDT receive_task: failed to acquire flock for {} ({}), deferring edit",
+                        file_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let mut state_guard = crdt_state.write().await;
+        let file_state = state_guard.get_or_create_file(&filename, node_id);
+
+        if let Some(reason) = file_state.should_queue_edits() {
+            file_state.queue_pending_edit(msg.payload.clone());
+            debug!(
+                "[SANDBOX-TRACE] receive_task_crdt QUEUED file={} uuid={} queue_size={} reason={:?}",
+                file_path.display(),
+                node_id,
+                file_state.pending_edits.len(),
+                reason
+            );
+            debug!(
+                "CRDT receive_task: queuing edit for {} (reason: {:?}, queue size: {})",
+                file_path.display(),
+                reason,
+                file_state.pending_edits.len()
+            );
+            drop(state_guard);
+            continue;
         }
 
         // Process the received edit
@@ -3027,103 +3129,36 @@ pub async fn receive_task_crdt(
 
                 // Write content to file if merge produced new content
                 if let Some(content) = maybe_content {
-                    // Check for rollback writes - don't write if it would truncate existing content
-                    // This enforces the "no rollback writes" invariant from the CRDT design spec
-                    let existing_content = tokio::fs::read_to_string(&file_path)
-                        .await
-                        .unwrap_or_default();
-
-                    debug!(
-                        "CRDT receive_task: merge produced content for {} - existing={} bytes ({:?}), new={} bytes ({:?})",
-                        file_path.display(),
-                        existing_content.len(),
-                        existing_content.chars().take(40).collect::<String>(),
-                        content.len(),
-                        content.chars().take(40).collect::<String>()
-                    );
-
-                    // Determine if this is a rollback write that would lose data
-                    // We use a threshold to distinguish legitimate edits from merge conflicts:
-                    // - Legitimate edits may shorten content (deleting text)
-                    // - Merge conflicts often produce drastically shorter content (90%+ reduction)
-                    // Note: 50% was too aggressive - legitimate large edits exist
-                    let is_rollback = if content.is_empty() && !existing_content.is_empty() {
-                        // Writing empty content when file has content - could be legitimate delete
-                        // Log at debug level since this can happen legitimately
-                        true
-                    } else if !content.is_empty()
-                        && !existing_content.is_empty()
-                        && content.len() < existing_content.len() / 10
+                    match write_content_with_rollback_guard(
+                        &file_path,
+                        &content,
+                        Some(&shared_last_content),
+                    )
+                    .await
                     {
-                        // Content reduced by more than 90% - likely a merge conflict, not an edit.
-                        // This prevents sync loops where clients flip-flop between versions
-                        // while still allowing legitimate edits that shorten content.
-                        true
-                    } else {
-                        false
-                    };
-
-                    if is_rollback {
-                        debug!(
-                            "CRDT receive_task: refusing rollback write for {} (existing {} bytes, new {} bytes)",
-                            file_path.display(),
-                            existing_content.len(),
-                            content.len()
-                        );
-                        // Don't write AND don't save state - skip to next message
-                        // This prevents divergence between file and CRDT state
-                        continue;
-                    } else {
-                        // Update shared last_content BEFORE writing to avoid echo publishes.
-                        let previous_content = {
-                            let mut shared = shared_last_content.write().await;
-                            let prev = shared.clone();
-                            debug!(
-                                "[RECEIVE-TRACE] receive_task_crdt updating shared_last_content for {} from {:?} to {:?}",
-                                file_path.display(),
-                                prev.as_ref().map(|s| s.chars().take(30).collect::<String>()),
-                                content.chars().take(30).collect::<String>()
+                        WriteDecision::Written => {
+                            // Trace FIRST_WRITE milestone for sync readiness timeline
+                            // Note: This traces every write for debugging; the "first" is
+                            // the one that appears first in chronological order
+                            trace_timeline(
+                                TimelineMilestone::FirstWrite,
+                                &file_path.display().to_string(),
+                                Some(&node_id_str),
                             );
-                            *shared = Some(content.clone());
-                            prev
-                        };
-
-                        match tokio::fs::write(&file_path, &content).await {
-                            Ok(()) => {
-                                // Trace FIRST_WRITE milestone for sync readiness timeline
-                                // Note: This traces every write for debugging; the "first" is
-                                // the one that appears first in chronological order
-                                trace_timeline(
-                                    TimelineMilestone::FirstWrite,
-                                    &file_path.display().to_string(),
-                                    Some(&node_id_str),
-                                );
-                                debug!(
-                                    "[SANDBOX-TRACE] receive_task_crdt DISK_WRITE file={} uuid={} content_len={}",
-                                    file_path.display(),
-                                    node_id,
-                                    content.len()
-                                );
-                                debug!(
-                                    "CRDT receive_task: wrote {} bytes to {}",
-                                    content.len(),
-                                    file_path.display()
-                                );
-                            }
-                            Err(e) => {
-                                // Restore previous content marker on failure.
-                                let mut shared = shared_last_content.write().await;
-                                *shared = previous_content;
-                                error!(
-                                    "CRDT receive_task: failed to write to {}: {}",
-                                    file_path.display(),
-                                    e
-                                );
-                                // Don't save CRDT state - prevents divergence between file and state.
-                                // On restart, we'll re-receive the edit and try again.
-                                continue;
-                            }
+                            debug!(
+                                "[SANDBOX-TRACE] receive_task_crdt DISK_WRITE file={} uuid={} content_len={}",
+                                file_path.display(),
+                                node_id,
+                                content.len()
+                            );
+                            debug!(
+                                "CRDT receive_task: wrote {} bytes to {}",
+                                content.len(),
+                                file_path.display()
+                            );
                         }
+                        WriteDecision::SkippedRollback => continue,
+                        WriteDecision::Failed => continue,
                     }
                 }
 
@@ -3463,6 +3498,70 @@ mod tests {
         assert!(!result.echo_detected);
         assert!(!result.should_refresh);
         assert_eq!(result.updated_content, Some("updated".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_pending_edits_defer_when_flocked() {
+        use crate::mqtt::EditMessage;
+        use crate::sync::PendingEdit;
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use std::fs::File;
+        use std::os::unix::io::AsRawFd;
+        use yrs::{Doc, StateVector, Text, Transact, WriteTxn};
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("note.txt");
+        tokio::fs::write(&file_path, "").await.unwrap();
+
+        let file = File::open(&file_path).unwrap();
+        let lock_result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(lock_result, 0);
+
+        let node_id = Uuid::new_v4();
+        let crdt_state = Arc::new(RwLock::new(DirectorySyncState::new(node_id)));
+        {
+            let mut state = crdt_state.write().await;
+            let file_state = state.get_or_create_file("note.txt", node_id);
+            file_state.initialize_empty();
+        }
+
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "hello");
+        }
+        let update_bytes = doc
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        let edit_msg = EditMessage {
+            update: STANDARD.encode(update_bytes),
+            parents: vec![],
+            author: "test".to_string(),
+            message: None,
+            timestamp: 1,
+            req: None,
+        };
+        let payload = serde_json::to_vec(&edit_msg).unwrap();
+        let pending_edits = vec![PendingEdit { payload }];
+
+        let deferred = process_pending_edits_with_flock(
+            pending_edits,
+            None,
+            "ws",
+            node_id,
+            "note.txt",
+            &file_path,
+            &crdt_state,
+            "author",
+            None,
+        )
+        .await;
+
+        assert_eq!(deferred.len(), 1);
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert!(content.is_empty());
     }
 
     // Async tests for detect_echo_from_pending_write

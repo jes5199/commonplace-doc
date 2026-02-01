@@ -99,6 +99,7 @@ pub fn trace_timeline(milestone: TimelineMilestone, path: &str, uuid: Option<&st
 
 use super::client::fetch_head;
 use super::urls::encode_node_id;
+use crate::commit::Commit;
 use crate::events::{recv_broadcast_with_lag, BroadcastRecvResult};
 use crate::fs::FsSchema;
 use crate::mqtt::{MqttClient, Topic};
@@ -107,11 +108,14 @@ use crate::sync::dir_sync::{
     decode_schema_from_mqtt_payload, handle_schema_change_with_dedup, handle_subdir_new_files,
 };
 use crate::sync::error::SyncResult;
+#[cfg(unix)]
+use crate::sync::flock::{try_flock_exclusive, FlockResult};
 use crate::sync::subdir_spawn::{spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport};
 use crate::sync::{spawn_file_sync_tasks_crdt, FileSyncState, SharedLastContent};
 use reqwest::Client;
 use rumqttc::QoS;
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -819,95 +823,162 @@ pub async fn directory_mqtt_task(
                                 .unwrap_or(&doc_id)
                                 .to_string();
 
+                            let received_cid = Commit::with_timestamp(
+                                edit_msg.parents.clone(),
+                                edit_msg.update.clone(),
+                                edit_msg.author.clone(),
+                                edit_msg.message.clone(),
+                                edit_msg.timestamp,
+                            )
+                            .calculate_cid();
+
                             let mut state_guard = ctx.crdt_state.write().await;
                             let file_state = state_guard.get_or_create_file(&filename, node_id);
 
-                            // Check if CRDT state needs initialization.
-                            // If so, queue the edit for later processing instead of
-                            // trying to merge it now (which would fail or produce
-                            // incorrect results without shared history).
-                            if file_state.needs_server_init() {
+                            // Check if CRDT state needs initialization or receive task isn't ready.
+                            if let Some(reason) = file_state.should_queue_edits() {
                                 file_state.queue_pending_edit(msg.payload.clone());
                                 debug!(
-                                    "CRDT needs init for {}, queued edit (queue size: {})",
+                                    "CRDT not ready for {}, queued edit (reason: {:?}, queue size: {})",
                                     filename,
+                                    reason,
                                     file_state.pending_edits.len()
                                 );
                                 drop(state_guard);
                                 // Don't fall back to server fetch - we'll apply after init
                                 true
+                            } else if file_state.is_cid_known(&received_cid) {
+                                drop(state_guard);
+                                true
                             } else {
-                                match crate::sync::crdt_merge::process_received_edit(
-                                    Some(&ctx.mqtt_client),
-                                    &ctx.workspace,
-                                    &doc_id,
-                                    file_state,
-                                    &edit_msg,
-                                    &author,
-                                    None, // No local commit store in subscription context
-                                )
-                                .await
+                                drop(state_guard);
+
+                                let mut deferred = false;
+                                #[cfg(unix)]
+                                let mut _flock_guard = None;
+                                #[cfg(unix)]
                                 {
-                                    Ok((result, maybe_content)) => {
-                                        drop(state_guard); // Release lock before file I/O
+                                    let lock_path = directory
+                                        .join(paths.first().map(|p| p.as_str()).unwrap_or(""));
+                                    match try_flock_exclusive(
+                                        &lock_path,
+                                        Some(crate::sync::file_sync::CRDT_FLOCK_TIMEOUT),
+                                    )
+                                    .await
+                                    {
+                                        Ok(FlockResult::Acquired(guard)) => {
+                                            _flock_guard = Some(guard);
+                                        }
+                                        Ok(FlockResult::Timeout) => {
+                                            let mut state_guard = ctx.crdt_state.write().await;
+                                            let file_state =
+                                                state_guard.get_or_create_file(&filename, node_id);
+                                            file_state.queue_pending_edit(msg.payload.clone());
+                                            warn!(
+                                                "CRDT edit deferred for {} due to flock timeout",
+                                                filename
+                                            );
+                                            drop(state_guard);
+                                            deferred = true;
+                                        }
+                                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                                        Err(e) => {
+                                            let mut state_guard = ctx.crdt_state.write().await;
+                                            let file_state =
+                                                state_guard.get_or_create_file(&filename, node_id);
+                                            file_state.queue_pending_edit(msg.payload.clone());
+                                            warn!(
+                                                "CRDT edit deferred for {} (flock error: {})",
+                                                filename, e
+                                            );
+                                            drop(state_guard);
+                                            deferred = true;
+                                        }
+                                    }
+                                }
 
-                                        if let Some(content) = maybe_content {
-                                            // Write to all paths
-                                            for rel_path in paths {
-                                                let file_path = directory.join(rel_path);
+                                if deferred {
+                                    true
+                                } else {
+                                    let mut state_guard = ctx.crdt_state.write().await;
+                                    let file_state =
+                                        state_guard.get_or_create_file(&filename, node_id);
+                                    match crate::sync::crdt_merge::process_received_edit(
+                                        Some(&ctx.mqtt_client),
+                                        &ctx.workspace,
+                                        &doc_id,
+                                        file_state,
+                                        &edit_msg,
+                                        &author,
+                                        None, // No local commit store in subscription context
+                                    )
+                                    .await
+                                    {
+                                        Ok((result, maybe_content)) => {
+                                            drop(state_guard); // Release lock before file I/O
 
-                                                // Update shared_last_content before writing to prevent echo
-                                                // If we can't update it, log a warning since this may cause
-                                                // echo loops when the file watcher detects our write
-                                                {
-                                                    let states = file_states.read().await;
-                                                    if let Some(state) = states.get(rel_path) {
-                                                        if let Some(ref slc) =
-                                                            state.crdt_last_content
-                                                        {
-                                                            let mut shared = slc.write().await;
-                                                            *shared = Some(content.clone());
-                                                        } else {
-                                                            warn!(
+                                            if let Some(content) = maybe_content {
+                                                // Write to all paths
+                                                for rel_path in paths {
+                                                    let file_path = directory.join(rel_path);
+
+                                                    // Update shared_last_content before writing to prevent echo
+                                                    // If we can't update it, log a warning since this may cause
+                                                    // echo loops when the file watcher detects our write
+                                                    {
+                                                        let states = file_states.read().await;
+                                                        if let Some(state) = states.get(rel_path) {
+                                                            if let Some(ref slc) =
+                                                                state.crdt_last_content
+                                                            {
+                                                                let mut shared = slc.write().await;
+                                                                *shared = Some(content.clone());
+                                                            } else {
+                                                                warn!(
                                                                 "No crdt_last_content for {} - echo suppression may fail",
                                                                 rel_path
                                                             );
-                                                        }
-                                                    } else {
-                                                        warn!(
+                                                            }
+                                                        } else {
+                                                            warn!(
                                                             "No file state for {} - echo suppression may fail",
                                                             rel_path
                                                         );
+                                                        }
                                                     }
-                                                }
 
-                                                if let Some(parent) = file_path.parent() {
-                                                    let _ = tokio::fs::create_dir_all(parent).await;
-                                                }
-                                                if let Err(e) =
-                                                    tokio::fs::write(&file_path, &content).await
-                                                {
-                                                    warn!("Failed to write {}: {}", rel_path, e);
-                                                } else {
-                                                    debug!(
+                                                    if let Some(parent) = file_path.parent() {
+                                                        let _ =
+                                                            tokio::fs::create_dir_all(parent).await;
+                                                    }
+                                                    if let Err(e) =
+                                                        tokio::fs::write(&file_path, &content).await
+                                                    {
+                                                        warn!(
+                                                            "Failed to write {}: {}",
+                                                            rel_path, e
+                                                        );
+                                                    } else {
+                                                        debug!(
                                                         "CRDT edit applied to {} ({} bytes, {:?})",
                                                         rel_path,
                                                         content.len(),
                                                         result
                                                     );
+                                                    }
                                                 }
+                                                true // Handled via CRDT
+                                            } else {
+                                                debug!(
+                                                    "CRDT merge returned no content (already known)"
+                                                );
+                                                true // Handled (no-op)
                                             }
-                                            true // Handled via CRDT
-                                        } else {
-                                            debug!(
-                                                "CRDT merge returned no content (already known)"
-                                            );
-                                            true // Handled (no-op)
                                         }
-                                    }
-                                    Err(e) => {
-                                        warn!("CRDT merge failed for {}: {}", doc_id, e);
-                                        false // Fall back to server fetch
+                                        Err(e) => {
+                                            warn!("CRDT merge failed for {}: {}", doc_id, e);
+                                            false // Fall back to server fetch
+                                        }
                                     }
                                 }
                             }
