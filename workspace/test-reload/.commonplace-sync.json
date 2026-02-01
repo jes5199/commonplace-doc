@@ -1,9 +1,14 @@
 {
   "version": 2,
   "schema": {
-    "node_id": "1112f7f2-c2b8-4b06-9819-5d03aa44fa3f",
-    "local_head_cid": "56e858411080284b1ec7d9a06b36566f765bb4f78e087e99f0856989ce379826",
-    "yjs_state": "Agat69a5CwAoAQdjb250ZW50B3ZlcnNpb24BegAAAAAAAAABJwEHY29udGVudARyb290ASgArevWuQsBBHR5cGUBdwNkaXInAK3r1rkLAQdlbnRyaWVzASEArevWuQsDEF9fcHJvY2Vzc2VzLmpzb24BAAIDuKSXrgkAp63r1rkLBAEoALikl64JAAR0eXBlAXcDZG9jKAC4pJeuCQAHbm9kZV9pZAF3JDRkMzAwYzU5LTAwZGItNDBmNy1iYmY5LWNhYjNmMTk4YWFmZgGt69a5CwEEAw=="
+    "node_id": "18abaf4d-50c4-4eca-a5a3-f74ad9fad947",
+    "head_cid": "9e0185ad21fd8287337e4db32d49ad218145cbe96838cb9d69cc3a8131903c5d",
+    "local_head_cid": "0ba839c1e7d60746cfa9eff4c58ec51c9a65d48703f83a5549e073584e9fb308",
+    "yjs_state": "AQIBACgBB2NvbnRlbnQEcm9vdAF2BAdub2RlX2lkfgdlbnRyaWVzdgAMY29udGVudF90eXBlfgR0eXBldwNkaXIoAQdjb250ZW50B3ZlcnNpb24BegAAAAAAAAABAA==",
+    "known_cids": [
+      "031ba86be6d13c10bae610dd08d995a40e4defc15e3a46ac0006865a84ba7320",
+      "0ba839c1e7d60746cfa9eff4c58ec51c9a65d48703f83a5549e073584e9fb308"
+    ]
   },
   "files": {
     "__processes.json": {

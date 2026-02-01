@@ -1,9 +1,13 @@
 {
   "version": 2,
   "schema": {
-    "node_id": "e0454401-49d0-4ff3-a1aa-1f90ed6e7557",
-    "local_head_cid": "6bb75a73666970a5c6561685d675798b6f5c7f9b65c0de66ae2976844313a9d0",
-    "yjs_state": "BAr8ra3JCgAoAQdjb250ZW50B3ZlcnNpb24BegAAAAAAAAABJwEHY29udGVudARyb290ASgA/K2tyQoBBHR5cGUBdwNkaXInAPytrckKAQdlbnRyaWVzASEA/K2tyQoDBm1vZC50cwEAAiEA/K2tyQoDCHR5cGVzLnRzAQACIQD8ra3JCgMHbXF0dC50cwEAAgOq4sf+CACn/K2tyQoEASgAquLH/ggABHR5cGUBdwNkb2MoAKrix/4IAAdub2RlX2lkAXckYjI0YzhkMDktNzk3YS00ODU0LTllMzUtMmM3MjA3NTdjMTI0A7mip+8GAKf8ra3JCgoBKAC5oqfvBgAEdHlwZQF3A2RvYygAuaKn7wYAB25vZGVfaWQBdyQ5MWJmMWRhMC04NTk2LTRiNGUtYWI5NC01MDNiMWE3MzM4MTkDxYeU8QQAp/ytrckKBwEoAMWHlPEEAAR0eXBlAXcDZG9jKADFh5TxBAAHbm9kZV9pZAF3JDE3YWIyOWQ1LTFlZTctNGUzMS05ODNkLThlYWNjZGU5MTdkNwH8ra3JCgEECQ=="
+    "node_id": "e29fc9e4-8443-40fb-b6b2-407f3f794d59",
+    "head_cid": "6010ffe27392f458d8c60df2850e0361ca618a6df3787a71d7695f0be209dc84",
+    "local_head_cid": "d4d843872b2b8aec73e7dabb3700a36d8b04f2bbe6ea4371a4bac359b0ddd4e8",
+    "yjs_state": "AQIBACgBB2NvbnRlbnQEcm9vdAF2BAR0eXBldwNkaXIHZW50cmllc3YADGNvbnRlbnRfdHlwZX4Hbm9kZV9pZH4oAQdjb250ZW50B3ZlcnNpb24BegAAAAAAAAABAA==",
+    "known_cids": [
+      "d4d843872b2b8aec73e7dabb3700a36d8b04f2bbe6ea4371a4bac359b0ddd4e8"
+    ]
   },
   "files": {
     "types.ts": {

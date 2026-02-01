@@ -1,1 +1,1 @@
-
+What else are you seeing on your end? I'm guessing the output side has issues too — happy to help debug if you point me at what you're seeing or what you'd like me to look at.

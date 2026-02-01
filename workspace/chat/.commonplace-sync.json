@@ -1,11 +1,21 @@
 {
   "version": 2,
   "schema": {
-    "node_id": "099ed9f7-fd16-436b-b1e9-b5db30dab994",
-    "local_head_cid": "445c81b691e5a2732b9e938fa38266317a433e0b39e4defa93a83dfb31d1800d",
-    "yjs_state": "BgKUr/f1CwAhAIi0qN0DAwppbmRleC5odG1sAQACA4Hcop4LAKeItKjdAwQBKACB3KKeCwAEdHlwZQF3A2RvYygAgdyingsAB25vZGVfaWQBdyRiNTc2N2Q5Yy0wMzEzLTQ3ZmQtYWMyNy03MGQwYTVmZWFhMTID67nGnAUAp4i0qN0DBwEoAOu5xpwFAAR0eXBlAXcDZG9jKADrucacBQAHbm9kZV9pZAF3JDNlZWNlZTM4LTU3OTYtNGQ0NC04OWU5LTVlNWZmMTJiYzAzZAqItKjdAwAoAQdjb250ZW50B3ZlcnNpb24BegAAAAAAAAABJwEHY29udGVudARyb290ASgAiLSo3QMBBHR5cGUBdwNkaXInAIi0qN0DAQdlbnRyaWVzASEAiLSo3QMDDm1lc3NhZ2VzLmpzb25sAQACIQCItKjdAwMHY2hhdC50cwEAAiEAiLSo3QMDEF9fcHJvY2Vzc2VzLmpzb24BAAIDzNKezQIAp5Sv9/ULAAEoAMzSns0CAAR0eXBlAXcDZG9jKADM0p7NAgAHbm9kZV9pZAF3JDFhYzI2YzA4LTVlN2EtNDVkNS05YmY3LWFjOTljZjJjYjlmNAOYj8Z2AKeItKjdAwoBKACYj8Z2AAR0eXBlAXcDZG9jKACYj8Z2AAdub2RlX2lkAXckYWM0NzJmMzUtZThhNS00NzMwLThjM2YtZWFiZjUzODBiZjg3Aoi0qN0DAQQJlK/39QsBAAM="
+    "node_id": "7c7757c6-f788-4cb5-8638-d9c20204c1ab",
+    "head_cid": "e3a9928e50d72b649018dfd10d6995870b7a74f372d5ffccaae0a0cf62fbac87",
+    "local_head_cid": "df7e3ca92d127fb9c5efd8604a178de94b6743cf776896ffab1451c6001861d2",
+    "yjs_state": "AQIBACgBB2NvbnRlbnQEcm9vdAF2BAdlbnRyaWVzdgAHbm9kZV9pZH4EdHlwZXcDZGlyDGNvbnRlbnRfdHlwZX4oAQdjb250ZW50B3ZlcnNpb24BegAAAAAAAAABAA==",
+    "known_cids": [
+      "df7e3ca92d127fb9c5efd8604a178de94b6743cf776896ffab1451c6001861d2",
+      "bf003ff51d930b6a5f21f707bbf352159bb042e6ac2cf3f39188fca29289f31c"
+    ]
   },
   "files": {
+    "messages.jsonl": {
+      "node_id": "b5767d9c-0313-47fd-ac27-70d0a5feaa12",
+      "local_head_cid": "228ae315b90f3c3da2435500b01ca184eceb9bbcd691511b504b4b88a0d16234",
+      "yjs_state": "AAA="
+    },
     "__processes.json": {
       "node_id": "ac472f35-e8a5-4730-8c3f-eabf5380bf87",
       "local_head_cid": "7404774a0af66f914285145f3243ede2a51c2fd7c56bce67de2163b9ef4f0c29",
@@ -19,11 +29,6 @@
     "chat.ts": {
       "node_id": "3eecee38-5796-4d44-89e9-5e5ff12bc03d",
       "local_head_cid": "3e44b5fe19806c9e47d3e9912328803589d0b76d87df063e47cdddaed986ed30",
-      "yjs_state": "AAA="
-    },
-    "messages.jsonl": {
-      "node_id": "b5767d9c-0313-47fd-ac27-70d0a5feaa12",
-      "local_head_cid": "228ae315b90f3c3da2435500b01ca184eceb9bbcd691511b504b4b88a0d16234",
       "yjs_state": "AAA="
     }
   }

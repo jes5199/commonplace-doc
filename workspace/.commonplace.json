@@ -1,1 +1,15 @@
-{"root":{"content_type":null,"entries":{"__processes.json":{"content_type":"application/json","node_id":"f6de69a0-e92d-4c5d-8512-2764fe7a1683","type":"doc"},"bartleby":{"content_type":"application/json","entries":null,"node_id":"0e1967af-362b-4cb5-93a8-ab465c57d69f","type":"dir"},"beads":{"content_type":"application/json","entries":null,"node_id":"d9ca70cf-0b82-491e-aed7-44fc16ac138b","type":"dir"},"chat":{"content_type":"application/json","entries":null,"node_id":"4ecd6bab-8604-4dea-b7a7-ef1610a056e5","type":"dir"},"echo":{"content_type":"application/json","entries":null,"node_id":"400a0d91-f44c-463d-9eef-bdf19f058250","type":"dir"},"filetree":{"content_type":"application/json","entries":null,"node_id":"5aca67a9-dda2-4795-b8ea-8d3de7ae3b86","type":"dir"},"form":{"content_type":"application/json","entries":null,"node_id":"6718565b-c704-4053-a0e8-714ad1879b31","type":"dir"},"mqtt-test.txt":{"content_type":"text/plain","node_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","type":"doc"},"sdk":{"content_type":"application/json","entries":null,"node_id":"ae6195f2-cb0c-4a14-b688-471b3a4ecd0d","type":"dir"},"test-eval":{"content_type":"application/json","entries":null,"node_id":"d7c35284-795b-496a-84c1-644ceb046ab6","type":"dir"},"test-reload":{"content_type":"application/json","entries":null,"node_id":"4bd2b231-c3db-4fc9-a920-e914da3449fb","type":"dir"},"text-to-telegram":{"content_type":"application/json","entries":null,"node_id":"a025fc99-8702-49e8-a38d-0fa60ff4ab3d","type":"dir"},"tmux":{"content_type":"application/json","entries":null,"node_id":"15e487c0-79fd-4699-b46e-fd5cea4009d7","type":"dir"}},"node_id":null,"type":"dir"},"version":1}
+{
+  "version": 1,
+  "root": {
+    "type": "dir",
+    "entries": {
+      "mqtt-test.txt": {
+        "type": "doc",
+        "node_id": "5847cae5-e7f3-4ec9-ae2d-ef555ea288b8",
+        "content_type": null
+      }
+    },
+    "node_id": null,
+    "content_type": null
+  }
+}

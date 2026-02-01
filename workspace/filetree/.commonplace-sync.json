@@ -1,9 +1,14 @@
 {
   "version": 2,
   "schema": {
-    "node_id": "12c23c71-f158-4d5f-8ff6-3758186c3579",
-    "local_head_cid": "7cda148e2ad6ca0773f0016b3e8173616dafc25725beb1191917ecae1625f9f1",
-    "yjs_state": "BAOLvv64DgCnytHy4A0KASgAi77+uA4ABHR5cGUBdwNkb2MoAIu+/rgOAAdub2RlX2lkAXckNGZkNjdjMDEtODgwMi00ZGMzLTg5NTktYmM0ZDdiNDYyYjE3CsrR8uANACgBB2NvbnRlbnQHdmVyc2lvbgF6AAAAAAAAAAEnAQdjb250ZW50BHJvb3QBKADK0fLgDQEEdHlwZQF3A2RpcicAytHy4A0BB2VudHJpZXMBIQDK0fLgDQMSZmlsZXRyZWUtdG8teG1sLnRzAQACIQDK0fLgDQMMZmlsZXRyZWUueG1sAQACIQDK0fLgDQMQX19wcm9jZXNzZXMuanNvbgEAAgP+2t7oBQCnytHy4A0EASgA/tre6AUABHR5cGUBdwNkb2MoAP7a3ugFAAdub2RlX2lkAXckNzA4MTc5ZDItOTY1Mi00Y2RiLWE2NTgtMjdlNzc0MDIyYTQ4A/zI6TcAp8rR8uANBwEoAPzI6TcABHR5cGUBdwNkb2MoAPzI6TcAB25vZGVfaWQBdyRiNDJhZjVjMi00ZDgxLTQwZjMtYjJmNS03OTdkOWMzYzM1NGMBytHy4A0BBAk="
+    "node_id": "f9bfe0ab-ff13-4a74-aed3-494f82db77be",
+    "head_cid": "4ac3e64d62f7ec5f3ca74fbb49a8abb3dcfe2ae9634ce8e12debacce681f407d",
+    "local_head_cid": "acad49df323f289e3e7a072290b4049416391c04b6679a598fb6632ce1a64539",
+    "yjs_state": "AQIBACgBB2NvbnRlbnQEcm9vdAF2BAdlbnRyaWVzdgAMY29udGVudF90eXBlfgR0eXBldwNkaXIHbm9kZV9pZH4oAQdjb250ZW50B3ZlcnNpb24BegAAAAAAAAABAA==",
+    "known_cids": [
+      "acad49df323f289e3e7a072290b4049416391c04b6679a598fb6632ce1a64539",
+      "c8ec74b93bd451ec42221eb6eeb0cff054688d3a864812049225bc39063018ef"
+    ]
   },
   "files": {
     "__processes.json": {

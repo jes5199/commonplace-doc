@@ -1,9 +1,14 @@
 {
   "version": 2,
   "schema": {
-    "node_id": "abfe2679-d86e-4c1e-bc50-46f787848ec8",
-    "local_head_cid": "ee49b2f9b5560eb8cca3b525a2d90ca7b1040fbdbb5beabdf3724a3f4c32edfd",
-    "yjs_state": "AwPmy/GlCACnhpLa3QMHASgA5svxpQgABHR5cGUBdwNkb2MoAObL8aUIAAdub2RlX2lkAXckY2Y1MjMwMTAtM2Y5YS00YzNiLThiMTctOGMwMmUxNGU4ZjUyA6+mtusGAKeGktrdAwQBKACvprbrBgAEdHlwZQF3A2RvYygAr6a26wYAB25vZGVfaWQBdyRiOGU5MmVhMS1lZGY5LTRkMTItOTRiOC1hMjFjMzM2MjY2YjIKhpLa3QMAKAEHY29udGVudAd2ZXJzaW9uAXoAAAAAAAAAAScBB2NvbnRlbnQEcm9vdAEoAIaS2t0DAQR0eXBlAXcDZGlyJwCGktrdAwEHZW50cmllcwEhAIaS2t0DAwx0cmFuc2Zvcm0udHMBAAIhAIaS2t0DAxBfX3Byb2Nlc3Nlcy5qc29uAQACIQCGktrdAwMJaW5wdXQudHh0AQACAYaS2t0DAQQJ"
+    "node_id": "fb5a8e0f-f7a1-47f2-ba8c-b3c5d73e6ac7",
+    "head_cid": "47bb58c0fee6bed7e3f8a484380b023f6691fa981f2b3184142d54e6b37b87cc",
+    "local_head_cid": "a6449863ea9e0bf3b411931a73cbf6eac229198213eb713fd0b3f8af56b17556",
+    "yjs_state": "AQIBACgBB2NvbnRlbnQEcm9vdAF2BAdlbnRyaWVzdgAEdHlwZXcDZGlyDGNvbnRlbnRfdHlwZX4Hbm9kZV9pZH4oAQdjb250ZW50B3ZlcnNpb24BegAAAAAAAAABAA==",
+    "known_cids": [
+      "52dfdbbc3e0329af517c265735716a8bd39c53a30a898203f1c2dc0150cadd6d",
+      "a6449863ea9e0bf3b411931a73cbf6eac229198213eb713fd0b3f8af56b17556"
+    ]
   },
   "files": {
     "transform.ts": {
