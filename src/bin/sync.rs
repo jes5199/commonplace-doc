@@ -133,6 +133,7 @@ struct CrdtEventParams {
     workspace: String,
     crdt_state: Arc<RwLock<DirectorySyncState>>,
     subdir_cache: Arc<SubdirStateCache>,
+    mqtt_only_config: MqttOnlySyncConfig,
 }
 
 /// Handle a single directory event by dispatching to the appropriate handler.
@@ -566,6 +567,7 @@ async fn handle_file_created_crdt(
                     shared_last_content.clone(),
                     false, // pull_only = false for new files
                     author.to_string(),
+                    crdt.mqtt_only_config,
                     Some(&*states_snapshot),
                     Some(&relative_path),
                 );
@@ -648,6 +650,7 @@ async fn handle_file_created_crdt(
                     shared_last_content.clone(),
                     false, // pull_only = false for new files
                     author.to_string(),
+                    crdt.mqtt_only_config,
                     Some(&*states_snapshot),
                     Some(&filename),
                 );
@@ -1129,9 +1132,9 @@ struct Args {
     #[arg(long, env = "COMMONPLACE_COMMIT_STORE")]
     commit_store: Option<PathBuf>,
 
-    /// Enable MQTT-only sync mode (deprecated HTTP fallback).
-    /// When enabled, HTTP calls for sync operations log warnings.
-    /// This is a transitional flag for gradual migration to MQTT-only sync.
+    /// Enable MQTT-only sync mode (HTTP disabled).
+    /// When enabled, HTTP calls for sync operations are rejected and skipped.
+    /// State initialization and resync must use MQTT/cyan sync.
     /// Default: false (HTTP fallback enabled)
     #[arg(long, default_value = "false", env = "COMMONPLACE_MQTT_ONLY_SYNC")]
     mqtt_only_sync: bool,
@@ -2465,6 +2468,7 @@ async fn run_directory_mode(
                 Some(&workspace),
                 Some(&author),
                 Some(&shared_last_content),
+                mqtt_only_config,
             )
             .await
             {
@@ -2502,6 +2506,7 @@ async fn run_directory_mode(
                 shared_last_content,
                 pull_only,
                 author.clone(),
+                mqtt_only_config,
                 None, // file_states - initial setup, not needed
                 None, // relative_path
             );
@@ -2553,6 +2558,7 @@ async fn run_directory_mode(
             workspace: workspace.clone(),
             crdt_state: crdt_state.clone(),
             subdir_cache: subdir_cache.clone(),
+            mqtt_only_config,
         };
         async move {
             while let Some(event) = dir_rx.recv().await {
@@ -3085,6 +3091,7 @@ async fn run_exec_mode(
                 Some(&workspace),
                 Some(&author),
                 Some(&shared_last_content),
+                mqtt_only_config,
             )
             .await
             {
@@ -3122,6 +3129,7 @@ async fn run_exec_mode(
                 shared_last_content,
                 pull_only,
                 author.clone(),
+                mqtt_only_config,
                 None, // file_states - initial setup, not needed
                 None, // relative_path
             );
@@ -3173,6 +3181,7 @@ async fn run_exec_mode(
             workspace: workspace.clone(),
             crdt_state: crdt_state.clone(),
             subdir_cache: subdir_cache.clone(),
+            mqtt_only_config,
         };
         async move {
             while let Some(event) = dir_rx.recv().await {

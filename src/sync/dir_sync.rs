@@ -764,6 +764,18 @@ pub async fn handle_subdir_new_files(
         return Ok(());
     }
 
+    if crdt_context
+        .as_ref()
+        .map(|ctx| ctx.mqtt_only_config.mqtt_only)
+        .unwrap_or(false)
+    {
+        warn!(
+            "Skipping subdir new file sync for '{}' (MQTT-only mode, HTTP disabled)",
+            subdir_path
+        );
+        return Ok(());
+    }
+
     // Use MQTT schema if provided, otherwise fetch from HTTP
     let schema = if let Some((schema, _content)) = mqtt_schema {
         schema
@@ -1018,6 +1030,7 @@ pub async fn handle_subdir_new_files(
                         shared_last_content.clone(),
                         pull_only,
                         author.to_string(),
+                        ctx.mqtt_only_config,
                         None,
                         None,
                     );
@@ -1181,6 +1194,7 @@ pub async fn handle_subdir_new_files(
                             Some(&ctx.workspace),
                             Some(author),
                             Some(&shared_last_content),
+                            ctx.mqtt_only_config,
                         )
                         .await
                     {
@@ -1204,6 +1218,7 @@ pub async fn handle_subdir_new_files(
                         shared_last_content.clone(),
                         pull_only,
                         author.to_string(),
+                        ctx.mqtt_only_config,
                         None, // Already registered, no need to check
                         None,
                     );
@@ -1362,6 +1377,7 @@ pub async fn handle_subdir_new_files(
                             Some(&ctx.workspace),
                             Some(author),
                             Some(&shared_last_content),
+                            ctx.mqtt_only_config,
                         )
                         .await
                     {
@@ -1386,6 +1402,7 @@ pub async fn handle_subdir_new_files(
                         shared_last_content.clone(),
                         pull_only,
                         author.to_string(),
+                        ctx.mqtt_only_config,
                         Some(&*states_snapshot),
                         Some(root_relative_path),
                     );
@@ -1947,6 +1964,7 @@ pub async fn handle_schema_change(
                                     Some(&ctx.workspace),
                                     Some(author),
                                     Some(&shared_last_content),
+                                    ctx.mqtt_only_config,
                                 )
                                 .await
                             {
@@ -1970,6 +1988,7 @@ pub async fn handle_schema_change(
                                 shared_last_content.clone(),
                                 pull_only,
                                 author.to_string(),
+                                ctx.mqtt_only_config,
                                 Some(&*states_snapshot),
                                 Some(path),
                             );
@@ -2531,9 +2550,47 @@ pub async fn sync_schema(
         schema_json.len()
     );
 
-    // Decide whether to push local schema based on strategy
+    // Decide whether to push local schema based on strategy.
+    // Guard against pushing a stripped-down local schema over a richer server schema.
+    // This prevents data loss when --initial-sync local runs with a stale/minimal local
+    // .commonplace.json (e.g., after sandbox readiness timeout). See CP-z7a8.
     let should_push_schema = match initial_sync_strategy {
-        "local" => true,
+        "local" => {
+            if server_has_content {
+                // Check if server has MORE entries than local — don't overwrite richer schema.
+                // Count entries from the local scanned schema.
+                let local_entry_count = schema
+                    .root
+                    .as_ref()
+                    .and_then(|e| match e {
+                        Entry::Dir(d) => d.entries.as_ref().map(|entries| entries.len()),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                let server_entry_count = match fetch_head(client, server, fs_root_id, false).await {
+                    Ok(Some(head)) => serde_json::from_str::<FsSchema>(&head.content)
+                        .ok()
+                        .and_then(|s| s.root)
+                        .and_then(|e| match e {
+                            Entry::Dir(d) => d.entries.map(|entries| entries.len()),
+                            _ => None,
+                        })
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                if server_entry_count > local_entry_count {
+                    warn!(
+                        "Skipping initial-sync local schema push: server has {} entries but local has only {} (CP-z7a8)",
+                        server_entry_count, local_entry_count
+                    );
+                    false
+                } else {
+                    true
+                }
+            } else {
+                true
+            }
+        }
         "server" => !server_has_content,
         "skip" => !server_has_content,
         _ => !server_has_content,

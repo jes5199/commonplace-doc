@@ -179,38 +179,49 @@ pub async fn handle_subdir_edit(
         );
     }
 
-    // Then, sync NEW files from server
-    match handle_subdir_new_files(
-        client,
-        server,
-        subdir_node_id,
-        subdir_path,
-        subdir_full_path,
-        directory,
-        file_states,
-        use_paths,
-        push_only,
-        pull_only,
-        shared_state_file,
-        author,
-        #[cfg(unix)]
-        inode_tracker,
-        crdt_context,
-        mqtt_schema,
-    )
-    .await
+    // Then, sync NEW files from server (skip in MQTT-only mode to avoid HTTP calls)
+    if crdt_context
+        .as_ref()
+        .map(|ctx| ctx.mqtt_only_config.mqtt_only)
+        .unwrap_or(false)
     {
-        Ok(()) => {
-            debug!(
-                "{}: Subdir {} new files sync completed",
-                log_prefix, subdir_path
-            );
-        }
-        Err(e) => {
-            warn!(
-                "{}: Failed to sync new files for subdir {}: {}",
-                log_prefix, subdir_path, e
-            );
+        warn!(
+            "{}: Skipping new file sync for {} (MQTT-only mode, HTTP disabled)",
+            log_prefix, subdir_path
+        );
+    } else {
+        match handle_subdir_new_files(
+            client,
+            server,
+            subdir_node_id,
+            subdir_path,
+            subdir_full_path,
+            directory,
+            file_states,
+            use_paths,
+            push_only,
+            pull_only,
+            shared_state_file,
+            author,
+            #[cfg(unix)]
+            inode_tracker,
+            crdt_context,
+            mqtt_schema,
+        )
+        .await
+        {
+            Ok(()) => {
+                debug!(
+                    "{}: Subdir {} new files sync completed",
+                    log_prefix, subdir_path
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "{}: Failed to sync new files for subdir {}: {}",
+                    log_prefix, subdir_path, e
+                );
+            }
         }
     }
 
@@ -374,15 +385,27 @@ pub async fn directory_mqtt_task(
                 if initialized {
                     debug!("Schema CRDT initialized via cyan sync for {}", fs_root_id);
                 } else {
-                    warn!(
-                        "Cyan sync failed for {} — falling back to HTTP bootstrap",
-                        fs_root_id
-                    );
+                    if ctx.mqtt_only_config.mqtt_only {
+                        warn!(
+                            "Cyan sync failed for {} and HTTP bootstrap is disabled (MQTT-only)",
+                            fs_root_id
+                        );
+                    } else {
+                        warn!(
+                            "Cyan sync failed for {} — falling back to HTTP bootstrap",
+                            fs_root_id
+                        );
+                    }
                 }
             }
 
             // Bootstrap files from the schema (whether initialized via cyan or already present)
-            if let Err(e) = handle_subdir_new_files(
+            if ctx.mqtt_only_config.mqtt_only {
+                warn!(
+                    "Skipping HTTP file bootstrap for {} (MQTT-only mode)",
+                    fs_root_id
+                );
+            } else if let Err(e) = handle_subdir_new_files(
                 &http_client,
                 &server,
                 &fs_root_id,
@@ -561,7 +584,12 @@ pub async fn directory_mqtt_task(
                             // Handle new files using MQTT schema
                             let schema_tuple = (schema.clone(), schema_json.clone());
                             if !push_only {
-                                if let Err(e) = handle_subdir_new_files(
+                                if ctx.mqtt_only_config.mqtt_only {
+                                    warn!(
+                                        "MQTT: Skipping new file sync for {} (MQTT-only mode, HTTP disabled)",
+                                        fs_root_id
+                                    );
+                                } else if let Err(e) = handle_subdir_new_files(
                                     &http_client,
                                     &server,
                                     &fs_root_id,
@@ -638,29 +666,36 @@ pub async fn directory_mqtt_task(
                         "MQTT: Failed to decode schema from CRDT state, falling back to HTTP",
                     );
                     debug!("MQTT: Failed to decode schema from CRDT state, falling back to HTTP");
-                    // Fall through to HTTP-based processing
-                    if let Err(e) = handle_schema_change_with_dedup(
-                        &http_client,
-                        &server,
-                        &fs_root_id,
-                        &directory,
-                        &file_states,
-                        true,
-                        use_paths,
-                        &mut last_schema_hash,
-                        &mut last_schema_cid,
-                        push_only,
-                        pull_only,
-                        &author,
-                        #[cfg(unix)]
-                        inode_tracker.clone(),
-                        written_schemas.as_ref(),
-                        shared_state_file.as_ref(),
-                        crdt_context.as_ref(),
-                    )
-                    .await
-                    {
-                        warn!("MQTT: Failed to handle schema change: {}", e);
+                    if ctx.mqtt_only_config.mqtt_only {
+                        warn!(
+                            "MQTT: Schema decode failed for {} but HTTP fallback is disabled (MQTT-only)",
+                            fs_root_id
+                        );
+                    } else {
+                        // Fall through to HTTP-based processing
+                        if let Err(e) = handle_schema_change_with_dedup(
+                            &http_client,
+                            &server,
+                            &fs_root_id,
+                            &directory,
+                            &file_states,
+                            true,
+                            use_paths,
+                            &mut last_schema_hash,
+                            &mut last_schema_cid,
+                            push_only,
+                            pull_only,
+                            &author,
+                            #[cfg(unix)]
+                            inode_tracker.clone(),
+                            written_schemas.as_ref(),
+                            shared_state_file.as_ref(),
+                            crdt_context.as_ref(),
+                        )
+                        .await
+                        {
+                            warn!("MQTT: Failed to handle schema change: {}", e);
+                        }
                     }
                 }
             } else {
@@ -889,6 +924,13 @@ pub async fn directory_mqtt_task(
 
                 // Fallback: fetch from server for non-CRDT paths or if CRDT handling failed
                 if !crdt_handled {
+                    if let Some(ctx) = crdt_context.as_ref() {
+                        if ctx.mqtt_only_config.mqtt_only {
+                            warn!("Skipping HTTP fallback for {} (MQTT-only mode)", doc_id);
+                            continue;
+                        }
+                    }
+
                     if let Err(e) = handle_file_uuid_edit(
                         &http_client,
                         &server,
@@ -979,6 +1021,7 @@ async fn ensure_crdt_tasks_for_files(
             Some(&context.workspace),
             Some(author),
             Some(&shared_last_content),
+            context.mqtt_only_config,
         )
         .await
         {
@@ -1019,6 +1062,7 @@ async fn ensure_crdt_tasks_for_files(
             shared_last_content.clone(),
             pull_only,
             author.to_string(),
+            context.mqtt_only_config,
             None, // file_states - not needed, old tasks already aborted above
             None, // relative_path
         );
@@ -1290,8 +1334,13 @@ async fn resync_subscribed_files(
 ) {
     // Log deprecation warning if MQTT-only mode is enabled
     if let Some(ctx) = crdt_context {
-        ctx.mqtt_only_config
-            .log_http_deprecation("resync_subscribed_files");
+        if let Err(e) = ctx
+            .mqtt_only_config
+            .require_no_http("resync_subscribed_files")
+        {
+            warn!("Resync skipped in MQTT-only mode (no HTTP allowed): {}", e);
+            return;
+        }
     }
 
     debug!(
@@ -1352,6 +1401,7 @@ async fn resync_subscribed_files(
                         Some(&ctx.workspace),
                         Some(author),
                         shared_last_content.as_ref(),
+                        ctx.mqtt_only_config,
                     )
                     .await
                 {
@@ -1453,13 +1503,21 @@ async fn resync_schema_from_server(
     }
 
     // Step 3: Fall back to HTTP if cyan sync failed
+    if let Err(e) = crdt_context
+        .mqtt_only_config
+        .require_no_http("resync_schema_from_server")
+    {
+        warn!(
+            "Schema resync: cyan sync failed for {} but HTTP fallback is disabled: {}",
+            fs_root_id, e
+        );
+        return;
+    }
+
     warn!(
         "Schema resync: Cyan sync failed for {} — falling back to HTTP",
         fs_root_id
     );
-    crdt_context
-        .mqtt_only_config
-        .log_http_deprecation("resync_schema_from_server");
 
     let head = match fetch_head(http_client, server, &encode_node_id(fs_root_id), false).await {
         Ok(Some(h)) => h,
@@ -1609,6 +1667,17 @@ async fn resync_subdir_schema_from_server(
     }
 
     // Step 3: Fall back to HTTP
+    if let Err(e) = crdt_context
+        .mqtt_only_config
+        .require_no_http("resync_subdir_schema_from_server")
+    {
+        warn!(
+            "Subdir schema resync: cyan sync failed for {} but HTTP fallback is disabled: {}",
+            subdir_path, e
+        );
+        return;
+    }
+
     warn!(
         "Subdir schema resync: Cyan sync failed for {} — falling back to HTTP",
         subdir_path

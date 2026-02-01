@@ -227,6 +227,17 @@ impl MqttOnlySyncConfig {
             );
         }
     }
+
+    /// Enforce MQTT-only mode by rejecting HTTP usage.
+    pub fn require_no_http(&self, operation: &str) -> SyncResult<()> {
+        if self.mqtt_only {
+            return Err(SyncError::http(format!(
+                "HTTP disabled in MQTT-only mode: {}",
+                operation
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Reason why edits are being queued (for logging/debugging).

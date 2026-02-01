@@ -73,6 +73,25 @@ cargo run --bin commonplace-sync -- \
   --file ./myfile.txt
 ```
 
+### MQTT-Only Mode (No HTTP)
+
+`commonplace-sync` can run in MQTT-only mode, which forbids HTTP sync calls.
+This is the safe default for CRDT peer sync: state initialization, resync, and
+gap filling must come from MQTT/cyan sync. Any HTTP call in sync paths will
+error and be skipped.
+
+MQTT-only mode requires a running MQTT broker and the sync client configured
+to connect to it (see orchestrator config / env).
+
+Enable with:
+
+```bash
+COMMONPLACE_MQTT_ONLY_SYNC=true cargo run --bin commonplace-sync -- \
+  --server http://localhost:3000 \
+  --node <node-id> \
+  --file ./myfile.txt
+```
+
 ### Testing Bidirectional Sync
 
 This test demonstrates two sync clients keeping separate files in sync through the server.
