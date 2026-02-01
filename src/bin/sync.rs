@@ -2238,6 +2238,7 @@ async fn run_directory_mode(
             let initial_sync_strategy = initial_sync_strategy.clone();
             let file_states = file_states.clone();
             let author = author.clone();
+            let shared_state_file = shared_state_file.clone();
 
             async move {
                 // Acquire permit to limit concurrency
@@ -2254,6 +2255,7 @@ async fn run_directory_mode(
                     &file_states,
                     use_paths,
                     &author,
+                    Some(&shared_state_file),
                 )
                 .await
                 .map_err(|e| e.to_string());
@@ -2857,6 +2859,7 @@ async fn run_exec_mode(
             let initial_sync_strategy = initial_sync_strategy.clone();
             let file_states = file_states.clone();
             let author = author.clone();
+            let shared_state_file = shared_state_file.clone();
 
             async move {
                 // Acquire permit to limit concurrency
@@ -2873,6 +2876,7 @@ async fn run_exec_mode(
                     &file_states,
                     use_paths,
                     &author,
+                    Some(&shared_state_file),
                 )
                 .await
                 .map_err(|e| e.to_string());

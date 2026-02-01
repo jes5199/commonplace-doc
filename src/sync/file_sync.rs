@@ -1097,6 +1097,7 @@ pub async fn sync_single_file(
     >,
     use_paths: bool,
     author: &str,
+    shared_state_file: Option<&crate::sync::SharedStateFile>,
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!(
         "=== SYNC_SINGLE_FILE: {} use_paths={} ===",
@@ -1169,6 +1170,15 @@ pub async fn sync_single_file(
         let states = file_states.read().await;
         if let Some(existing) = states.get(&file.relative_path) {
             existing.state.clone()
+        } else if let Some(shared) = shared_state_file {
+            let initial_cid = shared.read().await.get_file_cid(&file.relative_path);
+            std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::sync::SyncState::for_directory_file(
+                    initial_cid,
+                    shared.clone(),
+                    file.relative_path.clone(),
+                ),
+            ))
         } else {
             std::sync::Arc::new(tokio::sync::RwLock::new(crate::sync::SyncState::new()))
         }
@@ -1184,14 +1194,20 @@ pub async fn sync_single_file(
             // initialization completes (e.g., sandbox readiness timeout).
             let local_is_empty_or_default = file.content.is_empty()
                 || is_default_content_for_mime(&file.content, &file.content_type);
+            let local_cid = {
+                let s = state.read().await;
+                s.last_written_cid.clone()
+            };
             let should_push = if head.content.is_empty()
-                || (initial_sync_strategy == "local" && !local_is_empty_or_default)
+                || (initial_sync_strategy == "local"
+                    && !local_is_empty_or_default
+                    && local_cid.is_some())
             {
                 true
             } else if initial_sync_strategy == "local" {
                 // local content is empty/default but server has real data — don't overwrite
                 warn!(
-                    "Skipping initial-sync local push for {}: local content is empty/default but server has {} bytes",
+                    "Skipping initial-sync local push for {}: local content is empty/default or missing prior CID; server has {} bytes (CP-z7a8)",
                     identifier,
                     head.content.len()
                 );
@@ -1220,18 +1236,32 @@ pub async fn sync_single_file(
                 )
                 .await?;
             } else {
-                // Server has content - use CRDT ancestry to determine sync direction
-                if initial_sync_strategy == "server" {
+                if initial_sync_strategy == "local" {
+                    // Safety-first local strategy: pull server content when local has no history.
+                    // This prevents blanking server state after sandbox readiness timeouts.
+                    let written_content = if file.is_binary {
+                        if let Ok(decoded) = STANDARD.decode(&head.content) {
+                            tokio::fs::write(file_path, &decoded).await?;
+                            head.content.clone() // Binary: store base64
+                        } else {
+                            head.content.clone()
+                        }
+                    } else {
+                        // Ensure text files end with a trailing newline
+                        let content_with_newline = ensure_trailing_newline(&head.content);
+                        tokio::fs::write(file_path, &content_with_newline).await?;
+                        content_with_newline // Store content WITH newline for echo detection
+                    };
+                    // Seed SyncState with ACTUAL written content for echo detection
+                    let mut s = state.write().await;
+                    s.last_written_cid = head.cid.clone();
+                    s.last_written_content = written_content;
+                } else if initial_sync_strategy == "server" {
+                    // Server has content - use CRDT ancestry to determine sync direction
                     // Check if server has only default content (e.g., {} for JSON)
                     // Default content indicates newly created doc that should be overwritten
                     let server_has_default =
                         is_default_content_for_mime(&head.content, &file.content_type);
-
-                    // Get local CID from state (if we've synced before)
-                    let local_cid = {
-                        let s = state.read().await;
-                        s.last_written_cid.clone()
-                    };
 
                     // Determine sync direction using CRDT ancestry
                     let should_push = if server_has_default {
