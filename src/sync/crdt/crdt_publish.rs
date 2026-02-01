@@ -29,6 +29,30 @@ pub struct PublishResult {
     pub update_bytes: Vec<u8>,
 }
 
+/// Ensure the Y.Doc text content matches the expected old content before publish.
+fn check_text_publish_preconditions(
+    doc: &Doc,
+    old_content: &str,
+    new_content: &str,
+) -> SyncResult<String> {
+    let current_content = get_doc_text_content(doc);
+
+    if current_content == new_content {
+        return Err(SyncError::ContentUnchanged);
+    }
+
+    if current_content != old_content {
+        return Err(SyncError::stale_crdt_state(format!(
+            "doc_len={} old_len={} new_len={}",
+            current_content.len(),
+            old_content.len(),
+            new_content.len()
+        )));
+    }
+
+    Ok(current_content)
+}
+
 /// Publish a local text file change as a CRDT commit.
 ///
 /// This implements the new local change flow:
@@ -53,22 +77,7 @@ pub async fn publish_text_change(
     let doc = state.to_doc()?;
 
     // Compute a minimal update against the current Y.Doc state.
-    let current_content = get_doc_text_content(&doc);
-    if old_content != current_content {
-        debug!(
-            "CRDT publish content mismatch for {} (file_len={}, ydoc_len={})",
-            node_id,
-            old_content.len(),
-            current_content.len()
-        );
-    }
-    if current_content == new_content {
-        debug!(
-            "Content unchanged after doc load, skipping publish for {}",
-            node_id
-        );
-        return Err(SyncError::ContentUnchanged);
-    }
+    let current_content = check_text_publish_preconditions(&doc, old_content, new_content)?;
 
     let update_bytes = match compute_text_update(&doc, &current_content, new_content)? {
         Some(update) => update,
@@ -162,6 +171,12 @@ pub async fn publish_yjs_update(
     update_bytes: Vec<u8>,
     author: &str,
 ) -> SyncResult<PublishResult> {
+    if state.needs_server_init() {
+        return Err(SyncError::stale_crdt_state(
+            "CRDT state not initialized".to_string(),
+        ));
+    }
+
     // Apply update to local doc
     let doc = state.to_doc()?;
     {
@@ -514,5 +529,20 @@ mod tests {
         );
         assert!(content.contains('\n'), "Content should contain newlines");
         assert_eq!(content.matches('\n').count(), 4, "Should have 4 newlines");
+    }
+
+    #[test]
+    fn test_check_text_publish_preconditions_stale() {
+        use yrs::{Doc, Text, WriteTxn};
+
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "server");
+        }
+
+        let result = check_text_publish_preconditions(&doc, "local", "local updated");
+        assert!(matches!(result, Err(SyncError::StaleCrdtState(_))));
     }
 }

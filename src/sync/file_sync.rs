@@ -10,7 +10,7 @@ use crate::sync::atomic_write_with_shadow;
 use crate::sync::client::fetch_head;
 use crate::sync::crdt_merge::{parse_edit_message, process_received_edit};
 use crate::sync::crdt_publish::{publish_text_change, publish_yjs_update};
-use crate::sync::crdt_state::DirectorySyncState;
+use crate::sync::crdt_state::{CrdtPeerState, DirectorySyncState};
 use crate::sync::directory::{scan_directory_to_json, ScanOptions};
 use crate::sync::file_events::find_owning_document;
 #[cfg(unix)]
@@ -27,6 +27,7 @@ use crate::sync::{
 };
 use reqwest::Client;
 use rumqttc::QoS;
+use serde_json::Value;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +63,77 @@ pub struct PreparedContent {
     pub is_json: bool,
     /// Whether this is a JSONL file (application/x-ndjson)
     pub is_jsonl: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DocContentMatch {
+    MatchesOld,
+    MatchesNew,
+    Diverged,
+    Unknown,
+}
+
+fn parse_jsonl_values(content: &str) -> Result<Vec<Value>, serde_json::Error> {
+    let mut values = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        values.push(serde_json::from_str(line)?);
+    }
+    Ok(values)
+}
+
+fn match_doc_structured_content(
+    file_state: &CrdtPeerState,
+    old_content: &str,
+    new_content: &str,
+    is_jsonl: bool,
+) -> SyncResult<DocContentMatch> {
+    let doc = file_state.to_doc()?;
+    let Some(doc_value) = crate::sync::crdt::yjs::doc_to_json_value(&doc) else {
+        return Ok(DocContentMatch::Unknown);
+    };
+
+    if is_jsonl {
+        let old_values = match parse_jsonl_values(old_content) {
+            Ok(values) => values,
+            Err(_) => return Ok(DocContentMatch::Unknown),
+        };
+        let new_values = match parse_jsonl_values(new_content) {
+            Ok(values) => values,
+            Err(_) => return Ok(DocContentMatch::Unknown),
+        };
+        let old_value = Value::Array(old_values);
+        let new_value = Value::Array(new_values);
+
+        if doc_value == new_value {
+            return Ok(DocContentMatch::MatchesNew);
+        }
+        if doc_value == old_value {
+            return Ok(DocContentMatch::MatchesOld);
+        }
+        return Ok(DocContentMatch::Diverged);
+    }
+
+    let old_value: Value = match serde_json::from_str(old_content) {
+        Ok(value) => value,
+        Err(_) => return Ok(DocContentMatch::Unknown),
+    };
+    let new_value: Value = match serde_json::from_str(new_content) {
+        Ok(value) => value,
+        Err(_) => return Ok(DocContentMatch::Unknown),
+    };
+
+    if doc_value == new_value {
+        return Ok(DocContentMatch::MatchesNew);
+    }
+    if doc_value == old_value {
+        return Ok(DocContentMatch::MatchesOld);
+    }
+
+    Ok(DocContentMatch::Diverged)
 }
 
 /// Prepare raw file content for upload.
@@ -1372,6 +1444,7 @@ pub async fn sync_single_file(
 /// * `filename` - Filename within the directory (for state lookup)
 /// * `rx` - Channel for file modification events
 /// * `author` - Author name for commits
+/// * `inode_tracker` - Optional inode tracker for atomic writes
 #[allow(clippy::too_many_arguments)]
 pub async fn upload_task_crdt(
     mqtt_client: Arc<MqttClient>,
@@ -1381,6 +1454,7 @@ pub async fn upload_task_crdt(
     crdt_state: Arc<RwLock<DirectorySyncState>>,
     filename: String,
     shared_last_content: SharedLastContent,
+    inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     mut rx: mpsc::Receiver<FileEvent>,
     author: String,
 ) {
@@ -1498,128 +1572,243 @@ pub async fn upload_task_crdt(
             new_content.chars().take(50).collect::<String>()
         );
 
-        // Get or create the CRDT state for this file
-        let mut state_guard = crdt_state.write().await;
-        let file_state = state_guard.get_or_create_file(&filename, node_id);
+        let mut resync_attempted = false;
 
-        // Skip publishing if CRDT state hasn't been initialized from server yet.
-        // Publishing from an empty Y.Doc creates Yjs insert operations with a new
-        // client ID. When the server merges these with its existing state, the same
-        // text gets inserted twice (once per client ID), causing content duplication
-        // like "{}" becoming "{}{}".
-        if file_state.needs_server_init() {
-            debug!(
-                "CRDT upload_task: skipping publish for {} - CRDT state not yet initialized from server",
-                file_path.display()
-            );
-            drop(state_guard);
-            continue;
-        }
+        loop {
+            // Get or create the CRDT state for this file
+            let mut state_guard = crdt_state.write().await;
+            let file_state = state_guard.get_or_create_file(&filename, node_id);
 
-        // Publish the change via MQTT.
-        // For JSON files, create a YMap update to match the server's document type.
-        // For text files, use character-level YText diffs (more efficient).
-        let publish_result = if prepared.is_json || prepared.is_jsonl {
-            // JSON/JSONL files: create structured update (YMap/YArray)
-            let content_type = if prepared.is_jsonl {
-                crate::content_type::ContentType::Jsonl
-            } else {
-                crate::content_type::ContentType::Json
-            };
-            let base_state = file_state.yjs_state.as_deref();
-            match crate::sync::crdt::yjs::create_yjs_structured_update(
-                content_type,
-                &new_content,
-                base_state,
-            ) {
-                Ok(update_b64) => match crate::sync::crdt::yjs::base64_decode(&update_b64) {
-                    Ok(update_bytes) => {
-                        publish_yjs_update(
+            // Skip publishing if CRDT state hasn't been initialized from server yet.
+            // Publishing from an empty Y.Doc creates Yjs insert operations with a new
+            // client ID. When the server merges these with its existing state, the same
+            // text gets inserted twice (once per client ID), causing content duplication
+            // like "{}" becoming "{}{}".
+            if file_state.needs_server_init() {
+                debug!(
+                    "CRDT upload_task: skipping publish for {} - CRDT state not yet initialized from server",
+                    file_path.display()
+                );
+                drop(state_guard);
+                break;
+            }
+
+            if prepared.is_json || prepared.is_jsonl {
+                match match_doc_structured_content(
+                    file_state,
+                    &old_content,
+                    &new_content,
+                    prepared.is_jsonl,
+                ) {
+                    Ok(DocContentMatch::MatchesNew) => {
+                        drop(state_guard);
+                        let mut shared = shared_last_content.write().await;
+                        *shared = Some(new_content);
+                        break;
+                    }
+                    Ok(DocContentMatch::Diverged) => {
+                        warn!(
+                            "CRDT upload_task: Y.Doc diverged from file for {}, resyncing via cyan",
+                            file_path.display()
+                        );
+                        file_state.mark_needs_resync();
+                        drop(state_guard);
+                        if resync_attempted {
+                            warn!(
+                                "CRDT upload_task: resync already attempted for {}, skipping publish",
+                                file_path.display()
+                            );
+                            break;
+                        }
+                        let resynced = resync_crdt_state_via_cyan_with_pending(
+                            &mqtt_client,
+                            &workspace,
+                            node_id,
+                            &crdt_state,
+                            &filename,
+                            &file_path,
+                            &author,
+                            Some(&shared_last_content),
+                            inode_tracker.as_ref(),
+                            false,
+                            false,
+                        )
+                        .await;
+                        if !resynced {
+                            warn!(
+                                "CRDT upload_task: cyan resync failed for {}, skipping publish",
+                                file_path.display()
+                            );
+                            break;
+                        }
+                        resync_attempted = true;
+                        continue;
+                    }
+                    Ok(DocContentMatch::Unknown) => {
+                        debug!(
+                            "CRDT upload_task: unable to compare structured content for {}, proceeding with publish",
+                            file_path.display()
+                        );
+                    }
+                    Ok(DocContentMatch::MatchesOld) => {}
+                    Err(e) => {
+                        warn!(
+                            "CRDT upload_task: failed to compare structured content for {}: {}",
+                            file_path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+
+            // Publish the change via MQTT.
+            // For JSON files, create a YMap update to match the server's document type.
+            // For text files, use character-level YText diffs (more efficient).
+            let publish_result = if prepared.is_json || prepared.is_jsonl {
+                // JSON/JSONL files: create structured update (YMap/YArray)
+                let content_type = if prepared.is_jsonl {
+                    crate::content_type::ContentType::Jsonl
+                } else {
+                    crate::content_type::ContentType::Json
+                };
+                let base_state = file_state.yjs_state.as_deref();
+                match crate::sync::crdt::yjs::create_yjs_structured_update(
+                    content_type,
+                    &new_content,
+                    base_state,
+                ) {
+                    Ok(update_b64) => match crate::sync::crdt::yjs::base64_decode(&update_b64) {
+                        Ok(update_bytes) => {
+                            publish_yjs_update(
+                                &mqtt_client,
+                                &workspace,
+                                &node_id.to_string(),
+                                file_state,
+                                update_bytes,
+                                &author,
+                            )
+                            .await
+                        }
+                        Err(e) => Err(crate::sync::error::SyncError::other(format!(
+                            "Failed to decode structured update: {}",
+                            e
+                        ))),
+                    },
+                    Err(e) => {
+                        // Fall back to text change if structured update fails
+                        // (e.g., content isn't valid JSON)
+                        warn!(
+                            "Structured update failed for {}, falling back to text: {}",
+                            file_path.display(),
+                            e
+                        );
+                        publish_text_change(
                             &mqtt_client,
                             &workspace,
                             &node_id.to_string(),
                             file_state,
-                            update_bytes,
+                            &old_content,
+                            &new_content,
                             &author,
                         )
                         .await
                     }
-                    Err(e) => Err(crate::sync::error::SyncError::other(format!(
-                        "Failed to decode structured update: {}",
-                        e
-                    ))),
-                },
-                Err(e) => {
-                    // Fall back to text change if structured update fails
-                    // (e.g., content isn't valid JSON)
-                    warn!(
-                        "Structured update failed for {}, falling back to text: {}",
-                        file_path.display(),
-                        e
-                    );
-                    publish_text_change(
-                        &mqtt_client,
-                        &workspace,
-                        &node_id.to_string(),
-                        file_state,
-                        &old_content,
-                        &new_content,
-                        &author,
-                    )
-                    .await
                 }
-            }
-        } else {
-            // Text files: use efficient character-level diffs
-            publish_text_change(
-                &mqtt_client,
-                &workspace,
-                &node_id.to_string(),
-                file_state,
-                &old_content,
-                &new_content,
-                &author,
-            )
-            .await
-        };
-        match publish_result {
-            Ok(result) => {
-                debug!(
-                    "[SANDBOX-TRACE] upload_task_crdt PUBLISHED file={} uuid={} cid={} update_bytes={}",
-                    file_path.display(),
-                    node_id,
-                    result.cid,
-                    result.update_bytes.len()
-                );
-                debug!(
-                    "CRDT upload: published commit {} for {} ({} bytes)",
-                    result.cid,
-                    file_path.display(),
-                    result.update_bytes.len()
-                );
-                // Update our last known content
-                let mut shared = shared_last_content.write().await;
-                *shared = Some(new_content);
+            } else {
+                // Text files: use efficient character-level diffs
+                publish_text_change(
+                    &mqtt_client,
+                    &workspace,
+                    &node_id.to_string(),
+                    file_state,
+                    &old_content,
+                    &new_content,
+                    &author,
+                )
+                .await
+            };
 
-                // Save the state to persist CID tracking
-                drop(state_guard);
-                let state_guard = crdt_state.read().await;
-                if let Err(e) = state_guard
-                    .save(file_path.parent().unwrap_or(&file_path))
-                    .await
-                {
-                    warn!("Failed to save CRDT state: {}", e);
-                }
-            }
-            Err(e) => {
-                drop(state_guard); // Release CRDT state lock before acquiring shared_last_content
-                if matches!(e, crate::sync::error::SyncError::ContentUnchanged) {
-                    // Y.Doc already matches new_content. Update shared_last_content
-                    // to prevent repeated echo check failures on subsequent file events.
+            match publish_result {
+                Ok(result) => {
+                    debug!(
+                        "[SANDBOX-TRACE] upload_task_crdt PUBLISHED file={} uuid={} cid={} update_bytes={}",
+                        file_path.display(),
+                        node_id,
+                        result.cid,
+                        result.update_bytes.len()
+                    );
+                    debug!(
+                        "CRDT upload: published commit {} for {} ({} bytes)",
+                        result.cid,
+                        file_path.display(),
+                        result.update_bytes.len()
+                    );
+                    // Update our last known content
                     let mut shared = shared_last_content.write().await;
                     *shared = Some(new_content);
-                } else {
+
+                    // Save the state to persist CID tracking
+                    drop(state_guard);
+                    let state_guard = crdt_state.read().await;
+                    if let Err(e) = state_guard
+                        .save(file_path.parent().unwrap_or(&file_path))
+                        .await
+                    {
+                        warn!("Failed to save CRDT state: {}", e);
+                    }
+                    break;
+                }
+                Err(crate::sync::error::SyncError::ContentUnchanged) => {
+                    drop(state_guard); // Release CRDT state lock before acquiring shared_last_content
+                                       // Y.Doc already matches new_content. Update shared_last_content
+                                       // to prevent repeated echo check failures on subsequent file events.
+                    let mut shared = shared_last_content.write().await;
+                    *shared = Some(new_content);
+                    break;
+                }
+                Err(crate::sync::error::SyncError::StaleCrdtState(reason)) => {
+                    warn!(
+                        "CRDT upload_task: stale CRDT state for {} ({}), resyncing via cyan",
+                        file_path.display(),
+                        reason
+                    );
+                    file_state.mark_needs_resync();
+                    drop(state_guard);
+                    if resync_attempted {
+                        warn!(
+                            "CRDT upload_task: resync already attempted for {}, skipping publish",
+                            file_path.display()
+                        );
+                        break;
+                    }
+                    let resynced = resync_crdt_state_via_cyan_with_pending(
+                        &mqtt_client,
+                        &workspace,
+                        node_id,
+                        &crdt_state,
+                        &filename,
+                        &file_path,
+                        &author,
+                        Some(&shared_last_content),
+                        inode_tracker.as_ref(),
+                        false,
+                        false,
+                    )
+                    .await;
+                    if !resynced {
+                        warn!(
+                            "CRDT upload_task: cyan resync failed for {}, skipping publish",
+                            file_path.display()
+                        );
+                        break;
+                    }
+                    resync_attempted = true;
+                    continue;
+                }
+                Err(e) => {
+                    drop(state_guard); // Release CRDT state lock before acquiring shared_last_content
                     error!("CRDT upload failed for {}: {}", file_path.display(), e);
+                    break;
                 }
             }
         }
@@ -1932,11 +2121,12 @@ pub async fn initialize_crdt_state_from_server_with_pending(
     }
 }
 
-/// Resync CRDT state via the cyan/sync MQTT channel and apply any pending edits.
+/// Resync CRDT state via the cyan/sync MQTT channel.
 ///
 /// This fetches the full commit history (Ancestors(HEAD)), rebuilds the Y.Doc,
-/// initializes state from that snapshot, then processes queued edits. It is used
-/// when MissingHistory is detected so disk writes only happen after gap fill.
+/// initializes state from that snapshot, and can optionally write content and
+/// process queued edits. It is used when MissingHistory is detected so disk
+/// writes only happen after gap fill.
 async fn resync_crdt_state_via_cyan_with_pending(
     mqtt_client: &Arc<MqttClient>,
     workspace: &str,
@@ -1947,6 +2137,8 @@ async fn resync_crdt_state_via_cyan_with_pending(
     author: &str,
     shared_last_content: Option<&SharedLastContent>,
     inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
+    write_to_disk: bool,
+    process_pending_edits: bool,
 ) -> bool {
     use crate::mqtt::messages::SyncMessage;
     use base64::engine::general_purpose::STANDARD;
@@ -2109,19 +2301,21 @@ async fn resync_crdt_state_via_cyan_with_pending(
             file_state.initialize_empty();
         }
 
-        handle_pending_edits_with_flock(
-            "after cyan empty init",
-            Some(mqtt_client),
-            workspace,
-            node_id,
-            filename,
-            file_path,
-            crdt_state,
-            author,
-            shared_last_content,
-            inode_tracker,
-        )
-        .await;
+        if process_pending_edits {
+            handle_pending_edits_with_flock(
+                "after cyan empty init",
+                Some(mqtt_client),
+                workspace,
+                node_id,
+                filename,
+                file_path,
+                crdt_state,
+                author,
+                shared_last_content,
+                inode_tracker,
+            )
+            .await;
+        }
 
         return true;
     }
@@ -2180,47 +2374,51 @@ async fn resync_crdt_state_via_cyan_with_pending(
         }
     }
 
-    let local_content = tokio::fs::read_to_string(file_path)
-        .await
-        .unwrap_or_default();
-    if local_content != content {
-        if let Err(e) = write_content_with_tracker(
-            file_path,
-            &content,
-            shared_last_content,
-            inode_tracker,
-            commit_id,
-            "CYAN-SYNC",
-        )
-        .await
-        {
-            warn!(
-                "[CYAN-SYNC] Failed to write synced content to {}: {}",
-                file_path.display(),
-                e
-            );
-        } else {
-            info!(
-                "[CYAN-SYNC] Wrote synced content to {} ({} bytes)",
-                file_path.display(),
-                content.len()
-            );
+    if write_to_disk {
+        let local_content = tokio::fs::read_to_string(file_path)
+            .await
+            .unwrap_or_default();
+        if local_content != content {
+            if let Err(e) = write_content_with_tracker(
+                file_path,
+                &content,
+                shared_last_content,
+                inode_tracker,
+                commit_id,
+                "CYAN-SYNC",
+            )
+            .await
+            {
+                warn!(
+                    "[CYAN-SYNC] Failed to write synced content to {}: {}",
+                    file_path.display(),
+                    e
+                );
+            } else {
+                info!(
+                    "[CYAN-SYNC] Wrote synced content to {} ({} bytes)",
+                    file_path.display(),
+                    content.len()
+                );
+            }
         }
     }
 
-    handle_pending_edits_with_flock(
-        "after cyan sync",
-        Some(mqtt_client),
-        workspace,
-        node_id,
-        filename,
-        file_path,
-        crdt_state,
-        author,
-        shared_last_content,
-        inode_tracker,
-    )
-    .await;
+    if process_pending_edits {
+        handle_pending_edits_with_flock(
+            "after cyan sync",
+            Some(mqtt_client),
+            workspace,
+            node_id,
+            filename,
+            file_path,
+            crdt_state,
+            author,
+            shared_last_content,
+            inode_tracker,
+        )
+        .await;
+    }
 
     debug!(
         "[CYAN-SYNC] Resync complete for {} ({} commits, head={})",
@@ -2648,6 +2846,7 @@ pub fn spawn_file_sync_tasks_crdt(
             crdt_state.clone(),
             filename.clone(),
             shared_last_content.clone(),
+            inode_tracker.clone(),
             file_rx,
             author.clone(),
         )));
@@ -3224,6 +3423,8 @@ pub async fn receive_task_crdt(
                             &author,
                             Some(&shared_last_content),
                             inode_tracker.as_ref(),
+                            true,
+                            true,
                         )
                         .await
                         {

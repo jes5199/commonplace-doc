@@ -45,6 +45,10 @@ pub enum SyncError {
     #[error("Content unchanged")]
     ContentUnchanged,
 
+    /// CRDT state is stale compared to local content
+    #[error("CRDT state stale: {0}")]
+    StaleCrdtState(String),
+
     /// Document not found
     #[error("Document not found: {0}")]
     NotFound(String),
@@ -82,6 +86,11 @@ impl SyncError {
     /// Create a Yjs decode error
     pub fn yjs_decode(msg: impl Into<String>) -> Self {
         Self::YjsDecode(msg.into())
+    }
+
+    /// Create a stale CRDT state error
+    pub fn stale_crdt_state(msg: impl Into<String>) -> Self {
+        Self::StaleCrdtState(msg.into())
     }
 
     /// Create a generic error

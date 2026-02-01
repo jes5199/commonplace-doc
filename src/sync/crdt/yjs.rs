@@ -491,6 +491,23 @@ pub fn yjs_array_to_jsonl(
     Ok(content)
 }
 
+/// Convert a Y.Doc's root map/array into a JSON value.
+pub fn doc_to_json_value(doc: &Doc) -> Option<serde_json::Value> {
+    let txn = doc.transact();
+
+    if let Some(map) = txn.get_map(TEXT_ROOT_NAME) {
+        let any = map.to_json(&txn);
+        return Some(any_to_json_value(any));
+    }
+
+    if let Some(array) = txn.get_array(TEXT_ROOT_NAME) {
+        let any = array.to_json(&txn);
+        return Some(any_to_json_value(any));
+    }
+
+    None
+}
+
 /// Convert yrs::Any to serde_json::Value
 pub fn any_to_json_value(any: Any) -> serde_json::Value {
     match any {
