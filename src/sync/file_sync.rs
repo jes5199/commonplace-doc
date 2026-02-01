@@ -1578,8 +1578,13 @@ pub async fn upload_task_crdt(
                 }
             }
             Err(e) => {
-                // ContentUnchanged is not really an error
-                if !matches!(e, crate::sync::error::SyncError::ContentUnchanged) {
+                drop(state_guard); // Release CRDT state lock before acquiring shared_last_content
+                if matches!(e, crate::sync::error::SyncError::ContentUnchanged) {
+                    // Y.Doc already matches new_content. Update shared_last_content
+                    // to prevent repeated echo check failures on subsequent file events.
+                    let mut shared = shared_last_content.write().await;
+                    *shared = Some(new_content);
+                } else {
                     error!("CRDT upload failed for {}: {}", file_path.display(), e);
                 }
             }

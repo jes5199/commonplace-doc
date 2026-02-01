@@ -112,6 +112,7 @@ pub async fn publish_text_change(
     // our published commit, causing LocalAhead instead of FastForward.
     state.local_head_cid = Some(cid.clone());
     state.head_cid = Some(cid.clone());
+    state.record_known_cid(&cid);
     state.update_from_doc(&doc);
 
     // Publish via MQTT
@@ -196,6 +197,7 @@ pub async fn publish_yjs_update(
     // our published commit, causing LocalAhead instead of FastForward.
     state.local_head_cid = Some(cid.clone());
     state.head_cid = Some(cid.clone());
+    state.record_known_cid(&cid);
     state.update_from_doc(&doc);
 
     // Publish via MQTT
