@@ -124,10 +124,10 @@ async fn test_edit_document() {
     assert_eq!(doc.content, "hello");
 }
 
-/// Test edit_document fails without commit store.
+/// Test edit_document succeeds without commit store (no persistence).
 #[tokio::test]
 async fn test_edit_document_no_persistence() {
-    let (service, _doc_store) = create_service_without_store();
+    let (service, doc_store) = create_service_without_store();
 
     let id = service.create_document(ContentType::Text).await;
 
@@ -136,8 +136,16 @@ async fn test_edit_document_no_persistence() {
 
     let result = service.edit_document(&id, &update_b64, None, None).await;
 
-    // Should fail - NoPersistence
-    assert!(result.is_err());
+    // Should succeed, but without persisted HEAD
+    let result = result.unwrap();
+    assert!(!result.cid.is_empty());
+    assert!(result.timestamp > 0);
+
+    let doc = doc_store.get_document(&id).await.unwrap();
+    assert_eq!(doc.content, "hello");
+
+    let head = service.get_head(&id, None).await.unwrap();
+    assert!(head.cid.is_none());
 }
 
 /// Test replace_content computes diff and creates commit.
