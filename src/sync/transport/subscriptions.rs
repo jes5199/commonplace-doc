@@ -97,8 +97,6 @@ pub fn trace_timeline(milestone: TimelineMilestone, path: &str, uuid: Option<&st
     }
 }
 
-use super::client::fetch_head;
-use super::urls::encode_node_id;
 use crate::commit::Commit;
 use crate::events::{recv_broadcast_with_lag, BroadcastRecvResult};
 use crate::fs::FsSchema;
@@ -475,15 +473,7 @@ pub async fn directory_mqtt_task(
                 // Without this, the local schema Y.Doc can drift from server state,
                 // causing issues with subsequent deltas that reference missing items.
                 if let Some(ref ctx) = crdt_context {
-                    resync_schema_from_server(
-                        &http_client,
-                        &server,
-                        &fs_root_id,
-                        ctx,
-                        &directory,
-                        written_schemas.as_ref(),
-                    )
-                    .await;
+                    resync_schema_from_server(&fs_root_id, ctx).await;
                 }
 
                 // Process the next message if available
@@ -1528,28 +1518,14 @@ async fn resync_subscribed_files(
 ///
 /// This function:
 /// 1. Marks the schema state as needing resync (clears yjs_state)
-/// 2. Fetches the authoritative schema HEAD from server (including Yjs state)
-/// 3. Re-initializes the local CRDT state with the server's state
+/// 2. Initializes the local CRDT state via cyan sync (MQTT-only)
 ///
-/// **DEPRECATED in MQTT-only mode**: This function uses HTTP which can race with MQTT.
-/// When `mqtt_only_config.mqtt_only` is true, this logs a deprecation warning.
-/// In the future, resync should rely on MQTT retained messages.
+/// HTTP fallback has been removed; cyan sync is the only resync path.
 ///
 /// # Arguments
-/// * `http_client` - HTTP client for server requests
-/// * `server` - Server base URL
 /// * `fs_root_id` - The fs-root document ID (schema document)
 /// * `crdt_context` - CRDT context containing the schema state to resync
-/// * `directory` - Local directory path (for writing schema file)
-/// * `written_schemas` - Schema write tracking for deduplication
-async fn resync_schema_from_server(
-    http_client: &Client,
-    server: &str,
-    fs_root_id: &str,
-    crdt_context: &CrdtFileSyncContext,
-    directory: &Path,
-    written_schemas: Option<&crate::sync::WrittenSchemas>,
-) {
+async fn resync_schema_from_server(fs_root_id: &str, crdt_context: &CrdtFileSyncContext) {
     debug!(
         "Resyncing schema CRDT state via cyan sync for {}",
         fs_root_id
@@ -1584,70 +1560,10 @@ async fn resync_schema_from_server(
         return;
     }
 
-    // Step 3: Fall back to HTTP if cyan sync failed
-    if let Err(e) = crdt_context
-        .mqtt_only_config
-        .require_no_http("resync_schema_from_server")
-    {
-        warn!(
-            "Schema resync: cyan sync failed for {} but HTTP fallback is disabled: {}",
-            fs_root_id, e
-        );
-        return;
-    }
-
     warn!(
-        "Schema resync: Cyan sync failed for {} — falling back to HTTP",
+        "Schema resync: cyan sync failed for {} — no HTTP fallback available",
         fs_root_id
     );
-
-    let head = match fetch_head(http_client, server, &encode_node_id(fs_root_id), false).await {
-        Ok(Some(h)) => h,
-        Ok(None) => {
-            warn!(
-                "Schema resync: Document {} not found on server, skipping",
-                fs_root_id
-            );
-            return;
-        }
-        Err(e) => {
-            warn!(
-                "Schema resync: Failed to fetch HEAD for {}: {}",
-                fs_root_id, e
-            );
-            return;
-        }
-    };
-
-    if let Some(ref server_state) = head.state {
-        let cid = head.cid.as_deref().unwrap_or("unknown");
-        let mut state_guard = crdt_context.crdt_state.write().await;
-        state_guard.schema.initialize_from_server(server_state, cid);
-        debug!(
-            "Schema resync: HTTP fallback initialized for {} at cid={}",
-            fs_root_id, cid
-        );
-    } else {
-        let mut state_guard = crdt_context.crdt_state.write().await;
-        state_guard.schema.initialize_empty();
-        debug!(
-            "Schema resync: Initialized empty CRDT state for {} (server has no state)",
-            fs_root_id
-        );
-    }
-
-    if !head.content.is_empty() {
-        if let Err(e) =
-            crate::sync::write_schema_file(directory, &head.content, written_schemas).await
-        {
-            warn!(
-                "Schema resync: Failed to write schema file for {}: {}",
-                fs_root_id, e
-            );
-        }
-    }
-
-    debug!("Schema resync completed for {}", fs_root_id);
 }
 
 /// Resync subdirectory schema CRDT state from server after broadcast lag.
@@ -1656,15 +1572,11 @@ async fn resync_schema_from_server(
 /// cached CRDT state (via `subdir_cache`) instead of the root schema state.
 ///
 /// # Arguments
-/// * `http_client` - HTTP client for server requests
-/// * `server` - Server base URL
 /// * `subdir_node_id` - The subdirectory's document ID
 /// * `subdir_path` - Relative path to subdirectory
 /// * `crdt_context` - CRDT context containing the subdir state cache
 /// * `directory` - Root local directory path
 async fn resync_subdir_schema_from_server(
-    http_client: &Client,
-    server: &str,
     subdir_node_id: &str,
     subdir_path: &str,
     crdt_context: &CrdtFileSyncContext,
@@ -1748,83 +1660,10 @@ async fn resync_subdir_schema_from_server(
         return;
     }
 
-    // Step 3: Fall back to HTTP
-    if let Err(e) = crdt_context
-        .mqtt_only_config
-        .require_no_http("resync_subdir_schema_from_server")
-    {
-        warn!(
-            "Subdir schema resync: cyan sync failed for {} but HTTP fallback is disabled: {}",
-            subdir_path, e
-        );
-        return;
-    }
-
     warn!(
-        "Subdir schema resync: Cyan sync failed for {} — falling back to HTTP",
+        "Subdir schema resync: cyan sync failed for {} — no HTTP fallback available",
         subdir_path
     );
-
-    let head = match fetch_head(http_client, server, &encode_node_id(subdir_node_id), false).await {
-        Ok(Some(h)) => h,
-        Ok(None) => {
-            warn!(
-                "Subdir schema resync: Document {} not found on server",
-                subdir_node_id
-            );
-            return;
-        }
-        Err(e) => {
-            warn!(
-                "Subdir schema resync: Failed to fetch HEAD for {}: {}",
-                subdir_node_id, e
-            );
-            return;
-        }
-    };
-
-    match crdt_context
-        .subdir_cache
-        .get_or_load(&subdir_full_path, subdir_uuid)
-        .await
-    {
-        Ok(subdir_state) => {
-            let mut state = subdir_state.write().await;
-            if let Some(ref server_state) = head.state {
-                let cid = head.cid.as_deref().unwrap_or("unknown");
-                state.schema.initialize_from_server(server_state, cid);
-                debug!(
-                    "Subdir schema resync: HTTP fallback initialized for {} at cid={}",
-                    subdir_path, cid
-                );
-            } else {
-                state.schema.initialize_empty();
-                debug!(
-                    "Subdir schema resync: Initialized empty for {} (no server state)",
-                    subdir_path
-                );
-            }
-        }
-        Err(e) => {
-            warn!(
-                "Subdir schema resync: Failed to update state for {}: {}",
-                subdir_path, e
-            );
-            return;
-        }
-    }
-
-    if !head.content.is_empty() {
-        if let Err(e) = crate::sync::write_schema_file(&subdir_full_path, &head.content, None).await
-        {
-            warn!(
-                "Subdir schema resync: Failed to write schema file for {}: {}",
-                subdir_path, e
-            );
-        }
-    }
-
-    debug!("Subdir schema resync completed for {}", subdir_path);
 }
 
 /// Initialize schema CRDT state via the cyan (sync) MQTT channel.
@@ -2343,8 +2182,6 @@ pub async fn subdir_mqtt_task(
                 // Without this, the local subdirectory Y.Doc can drift from server state.
                 if let Some(ref ctx) = crdt_context {
                     resync_subdir_schema_from_server(
-                        &http_client,
-                        &server,
                         &subdir_node_id,
                         &subdir_path,
                         ctx,
