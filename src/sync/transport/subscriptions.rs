@@ -2500,138 +2500,172 @@ pub async fn subdir_mqtt_task(
                         };
 
                         if !node_id.is_nil() {
-                            // Get the filename from the first path
-                            let filename = paths
+                            // Use bare filename as key since per-subdir state
+                            // scopes correctly (no cross-directory collisions).
+                            let file_key = paths
                                 .first()
-                                .and_then(|p| std::path::Path::new(p).file_name())
+                                .and_then(|p| std::path::Path::new(p.as_str()).file_name())
                                 .and_then(|n| n.to_str())
                                 .unwrap_or(&doc_id)
                                 .to_string();
 
-                            let mut state_guard = ctx.crdt_state.write().await;
-                            let file_state = state_guard.get_or_create_file(&filename, node_id);
+                            // Load per-subdirectory state instead of root state
+                            let subdir_full_path = directory.join(&subdir_path);
+                            let subdir_state_arc = match Uuid::parse_str(&subdir_node_id) {
+                                Ok(subdir_uuid) => {
+                                    match ctx
+                                        .subdir_cache
+                                        .get_or_load(&subdir_full_path, subdir_uuid)
+                                        .await
+                                    {
+                                        Ok(s) => Some(s),
+                                        Err(e) => {
+                                            warn!(
+                                                "Subdir {}: Failed to load subdir state: {}, falling back to server fetch",
+                                                subdir_path, e
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Subdir {}: Invalid subdir_node_id '{}': {}, falling back to server fetch",
+                                        subdir_path, subdir_node_id, e
+                                    );
+                                    None
+                                }
+                            };
 
-                            // Check if CRDT state needs initialization.
-                            // If so, queue the edit for later processing instead of
-                            // trying to merge it now (which would fail or produce
-                            // incorrect results without shared history).
-                            if file_state.needs_server_init() {
-                                file_state.queue_pending_edit(msg.payload.clone());
-                                info!(
+                            if let Some(subdir_state_arc) = subdir_state_arc {
+                                let mut state_guard = subdir_state_arc.write().await;
+                                let file_state = state_guard.get_or_create_file(&file_key, node_id);
+
+                                // Check if CRDT state needs initialization.
+                                // If so, queue the edit for later processing instead of
+                                // trying to merge it now (which would fail or produce
+                                // incorrect results without shared history).
+                                if file_state.needs_server_init() {
+                                    file_state.queue_pending_edit(msg.payload.clone());
+                                    info!(
                                     "[SANDBOX-TRACE] subdir_mqtt_task CRDT_QUEUED subdir={} file={} queue_size={}",
                                     subdir_path,
-                                    filename,
+                                    file_key,
                                     file_state.pending_edits.len()
                                 );
-                                debug!(
+                                    debug!(
                                     "Subdir {}: CRDT needs init for {}, queued edit (queue size: {})",
                                     subdir_path,
-                                    filename,
+                                    file_key,
                                     file_state.pending_edits.len()
                                 );
-                                drop(state_guard);
-                                // Don't fall back to server fetch - we'll apply after init
-                                true
-                            } else {
-                                match crate::sync::crdt_merge::process_received_edit(
-                                    Some(&ctx.mqtt_client),
-                                    &ctx.workspace,
-                                    &doc_id,
-                                    file_state,
-                                    &edit_msg,
-                                    &author,
-                                    None, // No local commit store in subscription context
-                                )
-                                .await
-                                {
-                                    Ok((result, maybe_content)) => {
-                                        info!(
+                                    drop(state_guard);
+                                    // Don't fall back to server fetch - we'll apply after init
+                                    true
+                                } else {
+                                    match crate::sync::crdt_merge::process_received_edit(
+                                        Some(&ctx.mqtt_client),
+                                        &ctx.workspace,
+                                        &doc_id,
+                                        file_state,
+                                        &edit_msg,
+                                        &author,
+                                        None, // No local commit store in subscription context
+                                    )
+                                    .await
+                                    {
+                                        Ok((result, maybe_content)) => {
+                                            info!(
                                             "[SANDBOX-TRACE] subdir_mqtt_task CRDT_MERGE subdir={} file={} result={:?} has_content={}",
                                             subdir_path,
-                                            filename,
+                                            file_key,
                                             result,
                                             maybe_content.is_some()
                                         );
-                                        drop(state_guard); // Release lock before file I/O
+                                            drop(state_guard); // Release lock before file I/O
 
-                                        if let Some(content) = maybe_content {
-                                            // Write to all paths
-                                            for rel_path in paths {
-                                                let file_path = directory.join(rel_path);
+                                            if let Some(content) = maybe_content {
+                                                // Write to all paths
+                                                for rel_path in paths {
+                                                    let file_path = directory.join(rel_path);
 
-                                                // Update shared_last_content before writing to prevent echo
-                                                // If we can't update it, log a warning since this may cause
-                                                // echo loops when the file watcher detects our write
-                                                {
-                                                    let states = file_states.read().await;
-                                                    if let Some(state) = states.get(rel_path) {
-                                                        if let Some(ref slc) =
-                                                            state.crdt_last_content
-                                                        {
-                                                            let mut shared = slc.write().await;
-                                                            *shared = Some(content.clone());
-                                                        } else {
-                                                            warn!(
+                                                    // Update shared_last_content before writing to prevent echo
+                                                    // If we can't update it, log a warning since this may cause
+                                                    // echo loops when the file watcher detects our write
+                                                    {
+                                                        let states = file_states.read().await;
+                                                        if let Some(state) = states.get(rel_path) {
+                                                            if let Some(ref slc) =
+                                                                state.crdt_last_content
+                                                            {
+                                                                let mut shared = slc.write().await;
+                                                                *shared = Some(content.clone());
+                                                            } else {
+                                                                warn!(
                                                                 "Subdir {}: No crdt_last_content for {} - echo suppression may fail",
                                                                 subdir_path, rel_path
                                                             );
-                                                        }
-                                                    } else {
-                                                        warn!(
+                                                            }
+                                                        } else {
+                                                            warn!(
                                                             "Subdir {}: No file state for {} - echo suppression may fail",
                                                             subdir_path, rel_path
                                                         );
+                                                        }
                                                     }
-                                                }
 
-                                                if let Some(parent) = file_path.parent() {
-                                                    let _ = tokio::fs::create_dir_all(parent).await;
-                                                }
-                                                if let Err(e) =
-                                                    tokio::fs::write(&file_path, &content).await
-                                                {
-                                                    warn!(
-                                                        "Subdir {}: Failed to write {}: {}",
-                                                        subdir_path, rel_path, e
-                                                    );
-                                                } else {
-                                                    info!(
+                                                    if let Some(parent) = file_path.parent() {
+                                                        let _ =
+                                                            tokio::fs::create_dir_all(parent).await;
+                                                    }
+                                                    if let Err(e) =
+                                                        tokio::fs::write(&file_path, &content).await
+                                                    {
+                                                        warn!(
+                                                            "Subdir {}: Failed to write {}: {}",
+                                                            subdir_path, rel_path, e
+                                                        );
+                                                    } else {
+                                                        info!(
                                                         "[SANDBOX-TRACE] subdir_mqtt_task DISK_WRITE subdir={} file={} content_len={}",
                                                         subdir_path,
                                                         rel_path,
                                                         content.len()
                                                     );
-                                                    debug!(
+                                                        debug!(
                                                         "Subdir {}: CRDT edit applied to {} ({} bytes, {:?})",
                                                         subdir_path,
                                                         rel_path,
                                                         content.len(),
                                                         result
                                                     );
+                                                    }
                                                 }
-                                            }
-                                            true // Handled via CRDT
-                                        } else {
-                                            info!(
+                                                true // Handled via CRDT
+                                            } else {
+                                                info!(
                                                 "[SANDBOX-TRACE] subdir_mqtt_task CRDT_NO_CONTENT subdir={} file={} (already known)",
                                                 subdir_path,
-                                                filename
+                                                file_key
                                             );
-                                            debug!(
+                                                debug!(
                                                 "Subdir {}: CRDT merge returned no content (already known)",
                                                 subdir_path
                                             );
-                                            true // Handled (no-op)
+                                                true // Handled (no-op)
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Subdir {}: CRDT merge failed for {}: {}",
+                                                subdir_path, doc_id, e
+                                            );
+                                            false // Fall back to server fetch
                                         }
                                     }
-                                    Err(e) => {
-                                        warn!(
-                                            "Subdir {}: CRDT merge failed for {}: {}",
-                                            subdir_path, doc_id, e
-                                        );
-                                        false // Fall back to server fetch
-                                    }
                                 }
+                            } else {
+                                false // Failed to load subdir state
                             }
                         } else {
                             false

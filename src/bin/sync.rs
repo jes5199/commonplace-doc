@@ -2451,12 +2451,34 @@ async fn run_directory_mode(
             let node_id = uuid::Uuid::parse_str(&file_state.identifier)
                 .map_err(|e| format!("Invalid file UUID {}: {}", file_state.identifier, e))?;
 
-            // Extract filename from relative_path
-            let filename = std::path::Path::new(relative_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(relative_path)
-                .to_string();
+            // Determine which state owns this file (root or subdirectory)
+            let owning_doc = find_owning_document(&directory, &fs_root_id, relative_path);
+            let is_subdirectory = owning_doc.document_id != fs_root_id;
+
+            let (file_crdt_state, filename) = if is_subdirectory {
+                let subdir_node_id =
+                    uuid::Uuid::parse_str(&owning_doc.document_id).map_err(|e| {
+                        format!("Invalid subdir node_id '{}': {}", owning_doc.document_id, e)
+                    })?;
+                let subdir_state = subdir_cache
+                    .get_or_load(&owning_doc.directory, subdir_node_id)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "Failed to load subdir state for {}: {}",
+                            owning_doc.directory.display(),
+                            e
+                        )
+                    })?;
+                (subdir_state, owning_doc.relative_path.clone())
+            } else {
+                let filename = std::path::Path::new(relative_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(relative_path)
+                    .to_string();
+                (crdt_state.clone(), filename)
+            };
 
             // Create shared_last_content BEFORE init so we can update it during init.
             // This prevents the file watcher from detecting init writes as local changes,
@@ -2474,7 +2496,7 @@ async fn run_directory_mode(
                 &client,
                 &server,
                 node_id,
-                &crdt_state,
+                &file_crdt_state,
                 &filename,
                 &file_path,
                 Some(&mqtt_client),
@@ -2515,7 +2537,7 @@ async fn run_directory_mode(
                 workspace.clone(),
                 node_id,
                 file_path,
-                crdt_state.clone(),
+                file_crdt_state.clone(),
                 filename,
                 shared_last_content,
                 pull_only,
@@ -3074,12 +3096,34 @@ async fn run_exec_mode(
             let node_id = uuid::Uuid::parse_str(&file_state.identifier)
                 .map_err(|e| format!("UUID required for CRDT mode: {}", e))?;
 
-            // Extract filename from relative_path
-            let filename = std::path::Path::new(relative_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(relative_path)
-                .to_string();
+            // Determine which state owns this file (root or subdirectory)
+            let owning_doc = find_owning_document(&directory, &fs_root_id, relative_path);
+            let is_subdirectory = owning_doc.document_id != fs_root_id;
+
+            let (file_crdt_state, filename) = if is_subdirectory {
+                let subdir_node_id =
+                    uuid::Uuid::parse_str(&owning_doc.document_id).map_err(|e| {
+                        format!("Invalid subdir node_id '{}': {}", owning_doc.document_id, e)
+                    })?;
+                let subdir_state = subdir_cache
+                    .get_or_load(&owning_doc.directory, subdir_node_id)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "Failed to load subdir state for {}: {}",
+                            owning_doc.directory.display(),
+                            e
+                        )
+                    })?;
+                (subdir_state, owning_doc.relative_path.clone())
+            } else {
+                let filename = std::path::Path::new(relative_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(relative_path)
+                    .to_string();
+                (crdt_state.clone(), filename)
+            };
 
             // Create shared_last_content BEFORE init so we can update it during init.
             // This prevents the file watcher from detecting init writes as local changes,
@@ -3097,7 +3141,7 @@ async fn run_exec_mode(
                 &client,
                 &server,
                 node_id,
-                &crdt_state,
+                &file_crdt_state,
                 &filename,
                 &file_path,
                 Some(&mqtt_client),
@@ -3138,7 +3182,7 @@ async fn run_exec_mode(
                 workspace.clone(),
                 node_id,
                 file_path,
-                crdt_state.clone(),
+                file_crdt_state.clone(),
                 filename,
                 shared_last_content,
                 pull_only,

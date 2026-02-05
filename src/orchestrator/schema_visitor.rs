@@ -127,6 +127,10 @@ impl SchemaVisitor {
                     );
                     continue;
                 }
+                Err(VisitorError::RequestError(msg)) if msg.contains("not found") => {
+                    tracing::warn!("Skipping missing schema node {}: {}", node_id, msg);
+                    continue;
+                }
                 Err(e) => return Err(e),
             };
 
@@ -172,6 +176,15 @@ impl SchemaVisitor {
                 Err(VisitorError::ParseError(msg)) => {
                     tracing::warn!(
                         "Skipping unparseable schema at path '{}' node {}: {} (CP-urp5)",
+                        path,
+                        node_id,
+                        msg
+                    );
+                    continue;
+                }
+                Err(VisitorError::RequestError(msg)) if msg.contains("not found") => {
+                    tracing::warn!(
+                        "Skipping missing schema at path '{}' node {}: {}",
                         path,
                         node_id,
                         msg
@@ -236,6 +249,15 @@ impl SchemaVisitor {
                 Err(VisitorError::ParseError(msg)) => {
                     tracing::warn!(
                         "Skipping unparseable schema at path '{}' node {}: {} (CP-urp5)",
+                        path,
+                        schema_node_id,
+                        msg
+                    );
+                    continue;
+                }
+                Err(VisitorError::RequestError(msg)) if msg.contains("not found") => {
+                    tracing::warn!(
+                        "Skipping missing schema at path '{}' node {}: {}",
                         path,
                         schema_node_id,
                         msg

@@ -853,6 +853,9 @@ impl DirectorySyncState {
                     state.schema.yjs_state = None;
                     state.schema.head_cid = None;
                     state.schema.local_head_cid = None;
+                    // Clear files from previous incarnation - they'll be
+                    // repopulated by reconcile_with_schema() or sync operations
+                    state.files.clear();
 
                     // NOTE: We no longer initialize from local file here.
                     // This was causing Y.Doc client ID mismatches that broke DELETE operations.
@@ -1026,9 +1029,29 @@ impl DirectorySyncState {
             }
         }
 
+        // Prune files from sync state that aren't in the schema.
+        // This prevents orphaned entries from previous directory incarnations
+        // from causing cross-directory data leakage via UUID collisions.
+        let schema_filenames: std::collections::HashSet<&String> = entries.keys().collect();
+        let orphaned: Vec<String> = self
+            .files
+            .keys()
+            .filter(|k| !schema_filenames.contains(k))
+            .cloned()
+            .collect();
+        for filename in &orphaned {
+            warn!(
+                "Pruning orphaned file '{}' from sync state in {} (not in schema)",
+                filename,
+                directory.display()
+            );
+            self.files.remove(filename);
+            corrections += 1;
+        }
+
         if corrections > 0 {
             info!(
-                "Reconciled {} correction(s)/addition(s) with schema in {}",
+                "Reconciled {} correction(s)/addition(s)/prune(s) with schema in {}",
                 corrections,
                 directory.display()
             );
