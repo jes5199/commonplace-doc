@@ -11,7 +11,6 @@ use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
     build_head_url, build_health_url, discover_fs_root, DiscoverFsRootError,
 };
-use commonplace_doc::DEFAULT_WORKSPACE;
 use fs2::FileExt;
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
@@ -541,12 +540,11 @@ async fn main() {
     );
 
     // Connect to MQTT if configured (for sync-complete event subscription)
-    // Use DEFAULT_WORKSPACE to match what sync client uses for MQTT topics
     let mqtt_client: Option<Arc<MqttClient>> = if !broker_raw.is_empty() {
         let mqtt_config = MqttConfig {
             broker_url: broker_raw.to_string(),
             client_id: format!("orchestrator-{}", std::process::id()),
-            workspace: DEFAULT_WORKSPACE.to_string(),
+            workspace: config.workspace.clone(),
             keep_alive_secs: 30,
             clean_session: true,
         };
@@ -618,7 +616,7 @@ async fn main() {
     // Create MQTT request client for document fetching (used by discovery)
     let request_client: Arc<MqttRequestClient> = if let Some(ref mqtt) = mqtt_client {
         Arc::new(
-            MqttRequestClient::new(mqtt.clone(), DEFAULT_WORKSPACE.to_string())
+            MqttRequestClient::new(mqtt.clone(), config.workspace.clone())
                 .await
                 .expect("Failed to create MQTT request client"),
         )
@@ -638,7 +636,7 @@ async fn main() {
 
     // Set up MQTT client for discovered process manager
     if let Some(ref mqtt) = mqtt_client {
-        discovered_manager.set_mqtt_client(mqtt.clone(), DEFAULT_WORKSPACE.to_string());
+        discovered_manager.set_mqtt_client(mqtt.clone(), config.workspace.clone());
     }
 
     tracing::info!(

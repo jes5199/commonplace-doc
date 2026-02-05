@@ -24,6 +24,7 @@
 //! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use yrs::{Any, Doc, Map, MapRef, ReadTxn, Transact, TransactionMut, WriteTxn};
 
 /// Entry type in the schema.
@@ -62,6 +63,11 @@ pub struct SchemaEntry {
 ///
 /// Creates the FsSchema-compatible structure:
 /// content -> { version: 1, root: { type: "dir", entries: {...} } }
+///
+/// When the schema was loaded from server (via cyan sync or `create_yjs_json_merge`),
+/// the nested maps may be stored as `Any::Map` (static/immutable) rather than native
+/// `YMap` (live CRDT). This function migrates `Any::Map` to `YMap` while preserving
+/// existing entries, preventing data loss when new entries are added.
 fn get_or_create_entries<'a>(txn: &mut TransactionMut<'a>) -> MapRef {
     // Get or create "content" (the root name server expects for JSON docs)
     let content = txn.get_or_insert_map("content");
@@ -73,13 +79,39 @@ fn get_or_create_entries<'a>(txn: &mut TransactionMut<'a>) -> MapRef {
         content.insert(txn, "version", Any::BigInt(1));
     }
 
-    // Get or create "root" map
-    let schema_root = match content.get(txn, "root") {
-        Some(yrs::Value::YMap(map)) => map,
-        _ => {
-            let root_map = content.insert(txn, "root", yrs::MapPrelim::<Any>::new());
-            root_map.insert(txn, "type", "dir");
-            root_map
+    // Phase 1: Check if "root" needs migration from Any::Map to YMap.
+    // We must release the immutable borrow before doing mutable inserts.
+    let root_migration_data = match content.get(txn, "root") {
+        Some(yrs::Value::YMap(_)) => None, // Already a YMap, no migration needed
+        Some(yrs::Value::Any(Any::Map(any_map))) => {
+            // Extract data for migration: entries Any::Map
+            Some(any_map.get("entries").and_then(|e| {
+                if let Any::Map(entries) = e {
+                    Some(entries.clone())
+                } else {
+                    None
+                }
+            }))
+        }
+        _ => Some(None), // Needs creation, no data to migrate
+    };
+
+    // Phase 2: Create/migrate "root" if needed
+    let schema_root = if let Some(existing_entries_data) = root_migration_data {
+        let root_map = content.insert(txn, "root", yrs::MapPrelim::<Any>::new());
+        root_map.insert(txn, "type", "dir");
+
+        // Migrate entries from Any::Map to YMap
+        if let Some(entries_any) = existing_entries_data {
+            let entries_map = root_map.insert(txn, "entries", yrs::MapPrelim::<Any>::new());
+            migrate_any_map_entries(txn, &entries_map, &entries_any);
+        }
+        root_map
+    } else {
+        // Already a YMap, retrieve it
+        match content.get(txn, "root") {
+            Some(yrs::Value::YMap(map)) => map,
+            _ => unreachable!("checked above"),
         }
     };
 
@@ -88,10 +120,44 @@ fn get_or_create_entries<'a>(txn: &mut TransactionMut<'a>) -> MapRef {
         schema_root.insert(txn, "type", "dir");
     }
 
-    // Get or create "entries" map
-    match schema_root.get(txn, "entries") {
-        Some(yrs::Value::YMap(map)) => map,
-        _ => schema_root.insert(txn, "entries", yrs::MapPrelim::<Any>::new()),
+    // Phase 3: Check if "entries" needs migration from Any::Map to YMap
+    let entries_migration_data = match schema_root.get(txn, "entries") {
+        Some(yrs::Value::YMap(_)) => None,
+        Some(yrs::Value::Any(Any::Map(any_map))) => Some(Some(any_map.clone())),
+        _ => Some(None),
+    };
+
+    // Phase 4: Create/migrate "entries" if needed
+    if let Some(existing_data) = entries_migration_data {
+        let entries_map = schema_root.insert(txn, "entries", yrs::MapPrelim::<Any>::new());
+        if let Some(entries_any) = existing_data {
+            migrate_any_map_entries(txn, &entries_map, &entries_any);
+        }
+        entries_map
+    } else {
+        match schema_root.get(txn, "entries") {
+            Some(yrs::Value::YMap(map)) => map,
+            _ => unreachable!("checked above"),
+        }
+    }
+}
+
+/// Migrate entries from an Any::Map into a live YMap, preserving all entry data.
+///
+/// Each entry is expected to be an Any::Map with fields like "type", "node_id", etc.
+/// These are converted to nested YMap entries for proper CRDT semantics.
+fn migrate_any_map_entries(
+    txn: &mut TransactionMut<'_>,
+    entries_map: &MapRef,
+    source: &Arc<HashMap<String, Any>>,
+) {
+    for (key, value) in source.as_ref() {
+        if let Any::Map(entry_map) = value {
+            let entry = entries_map.insert(txn, key.as_str(), yrs::MapPrelim::<Any>::new());
+            for (entry_key, entry_value) in entry_map.as_ref() {
+                entry.insert(txn, entry_key.as_str(), entry_value.clone());
+            }
+        }
     }
 }
 
@@ -106,6 +172,39 @@ fn get_entries<T: ReadTxn>(txn: &T) -> Option<MapRef> {
         Some(yrs::Value::YMap(map)) => Some(map),
         _ => None,
     }
+}
+
+/// Get the "entries" as an Any::Map from a schema Y.Doc (read-only).
+///
+/// Fallback for schemas created by `create_yjs_json_merge()`, which stores
+/// nested objects as `Any::Map` instead of native YMap types.
+fn get_entries_any<T: ReadTxn>(txn: &T) -> Option<Arc<HashMap<String, Any>>> {
+    let content = txn.get_map("content")?;
+    let root_map = match content.get(txn, "root") {
+        Some(yrs::Value::Any(Any::Map(map))) => map,
+        _ => return None,
+    };
+    match root_map.get("entries") {
+        Some(Any::Map(entries)) => Some(entries.clone()),
+        _ => None,
+    }
+}
+
+/// Parse a SchemaEntry from an Any::Map.
+fn schema_entry_from_any_map(map: &HashMap<String, Any>) -> Option<SchemaEntry> {
+    let type_str = match map.get("type") {
+        Some(Any::String(s)) => s.to_string(),
+        _ => return None,
+    };
+    let entry_type = SchemaEntryType::from_str(&type_str)?;
+    let node_id = match map.get("node_id") {
+        Some(Any::String(s)) => Some(s.to_string()),
+        _ => None,
+    };
+    Some(SchemaEntry {
+        entry_type,
+        node_id,
+    })
 }
 
 /// Add a file entry to the schema.
@@ -135,6 +234,10 @@ pub fn add_directory(doc: &Doc, dirname: &str, node_id: Option<&str>) {
                 Some(yrs::Value::Any(Any::String(s))) => Some(s.to_string()),
                 _ => None,
             },
+            Some(yrs::Value::Any(Any::Map(existing))) => match existing.get("node_id") {
+                Some(Any::String(s)) => Some(s.to_string()),
+                _ => None,
+            },
             _ => None,
         }
     } else {
@@ -162,45 +265,14 @@ pub fn remove_entry(doc: &Doc, name: &str) {
 /// Get an entry from the schema.
 pub fn get_entry(doc: &Doc, name: &str) -> Option<SchemaEntry> {
     let txn = doc.transact();
-    let entries = get_entries(&txn)?;
 
-    match entries.get(&txn, name) {
-        Some(yrs::Value::YMap(entry_map)) => {
-            let entry_type = match entry_map.get(&txn, "type") {
-                Some(yrs::Value::Any(Any::String(s))) => SchemaEntryType::from_str(s.as_ref())?,
-                _ => return None,
-            };
-
-            let node_id = match entry_map.get(&txn, "node_id") {
-                Some(yrs::Value::Any(Any::String(s))) => Some(s.to_string()),
-                _ => None,
-            };
-
-            Some(SchemaEntry {
-                entry_type,
-                node_id,
-            })
-        }
-        _ => None,
-    }
-}
-
-/// List all entries in the schema.
-pub fn list_entries(doc: &Doc) -> HashMap<String, SchemaEntry> {
-    let txn = doc.transact();
-    let mut result = HashMap::new();
-
+    // Try YMap path first
     if let Some(entries) = get_entries(&txn) {
-        for (key, value) in entries.iter(&txn) {
-            if let yrs::Value::YMap(entry_map) = value {
+        match entries.get(&txn, name) {
+            Some(yrs::Value::YMap(entry_map)) => {
                 let entry_type = match entry_map.get(&txn, "type") {
-                    Some(yrs::Value::Any(Any::String(s))) => {
-                        match SchemaEntryType::from_str(s.as_ref()) {
-                            Some(t) => t,
-                            None => continue,
-                        }
-                    }
-                    _ => continue,
+                    Some(yrs::Value::Any(Any::String(s))) => SchemaEntryType::from_str(s.as_ref())?,
+                    _ => return None,
                 };
 
                 let node_id = match entry_map.get(&txn, "node_id") {
@@ -208,13 +280,80 @@ pub fn list_entries(doc: &Doc) -> HashMap<String, SchemaEntry> {
                     _ => None,
                 };
 
-                result.insert(
-                    key.to_string(),
-                    SchemaEntry {
-                        entry_type,
-                        node_id,
-                    },
-                );
+                return Some(SchemaEntry {
+                    entry_type,
+                    node_id,
+                });
+            }
+            Some(yrs::Value::Any(Any::Map(entry_map))) => {
+                return schema_entry_from_any_map(&entry_map);
+            }
+            _ => {}
+        }
+    }
+
+    // Fallback: try Any::Map path
+    if let Some(entries) = get_entries_any(&txn) {
+        if let Some(Any::Map(entry_map)) = entries.get(name) {
+            return schema_entry_from_any_map(entry_map);
+        }
+    }
+
+    None
+}
+
+/// List all entries in the schema.
+pub fn list_entries(doc: &Doc) -> HashMap<String, SchemaEntry> {
+    let txn = doc.transact();
+    let mut result = HashMap::new();
+
+    // Try YMap path first (native Yjs types)
+    if let Some(entries) = get_entries(&txn) {
+        for (key, value) in entries.iter(&txn) {
+            match value {
+                yrs::Value::YMap(entry_map) => {
+                    let entry_type = match entry_map.get(&txn, "type") {
+                        Some(yrs::Value::Any(Any::String(s))) => {
+                            match SchemaEntryType::from_str(s.as_ref()) {
+                                Some(t) => t,
+                                None => continue,
+                            }
+                        }
+                        _ => continue,
+                    };
+
+                    let node_id = match entry_map.get(&txn, "node_id") {
+                        Some(yrs::Value::Any(Any::String(s))) => Some(s.to_string()),
+                        _ => None,
+                    };
+
+                    result.insert(
+                        key.to_string(),
+                        SchemaEntry {
+                            entry_type,
+                            node_id,
+                        },
+                    );
+                }
+                yrs::Value::Any(Any::Map(entry_map)) => {
+                    if let Some(entry) = schema_entry_from_any_map(&entry_map) {
+                        result.insert(key.to_string(), entry);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Fallback: try Any::Map path (for schemas from create_yjs_json_merge)
+    if result.is_empty() {
+        if let Some(entries) = get_entries_any(&txn) {
+            for (key, value) in entries.as_ref() {
+                if let Any::Map(entry_map) = value {
+                    if let Some(entry) = schema_entry_from_any_map(entry_map) {
+                        result.insert(key.to_string(), entry);
+                    }
+                }
             }
         }
     }
@@ -234,15 +373,28 @@ pub fn list_entry_names(doc: &Doc) -> std::collections::HashSet<String> {
         }
     }
 
+    // Fallback: try Any::Map path
+    if names.is_empty() {
+        if let Some(entries) = get_entries_any(&txn) {
+            for key in entries.keys() {
+                names.insert(key.to_string());
+            }
+        }
+    }
+
     names
 }
 
 /// Check if the doc uses the new YMap format (has YMap at "content" with "root" submap).
+/// Also returns true for Any::Map format (from create_yjs_json_merge).
 pub fn is_ymap_format(doc: &Doc) -> bool {
     let txn = doc.transact();
-    // Check for YMap at "content" with "root" submap (new format)
+    // Check for YMap or Any::Map at "content" with "root" submap (new format)
     if let Some(content) = txn.get_map("content") {
-        matches!(content.get(&txn, "root"), Some(yrs::Value::YMap(_)))
+        matches!(
+            content.get(&txn, "root"),
+            Some(yrs::Value::YMap(_)) | Some(yrs::Value::Any(Any::Map(_)))
+        )
     } else {
         false
     }

@@ -32,6 +32,10 @@ pub struct Args {
     #[clap(long, value_name = "ID")]
     pub mqtt_client_id: Option<String>,
 
+    /// Workspace name for MQTT topic namespacing
+    #[clap(long, env = "MQTT_WORKSPACE", default_value = DEFAULT_WORKSPACE)]
+    pub workspace: String,
+
     /// Document paths to subscribe via MQTT (repeatable, requires --mqtt-broker)
     /// Paths must include file extensions (e.g., notes/todo.txt, config.json)
     #[clap(long = "mqtt-subscribe", value_name = "PATH")]

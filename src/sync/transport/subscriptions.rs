@@ -651,6 +651,22 @@ pub async fn directory_mqtt_task(
                                 warn!("MQTT: Failed to ensure CRDT tasks: {}", e);
                             }
 
+                            // Update UUID subscriptions in CRDT mode too —
+                            // new files need MQTT topic subscriptions and initial content fetch
+                            sync_uuid_subscriptions(
+                                &http_client,
+                                &server,
+                                &fs_root_id,
+                                &mqtt_client,
+                                &workspace,
+                                &mut subscribed_uuids,
+                                &mut uuid_to_paths,
+                                &directory,
+                                use_paths,
+                                &file_states,
+                            )
+                            .await;
+
                             // Update dedup state (hash and CID for ancestry tracking)
                             last_schema_hash = Some(current_hash);
                             // Sync last_schema_cid from CRDT state to maintain ancestry checks

@@ -55,6 +55,7 @@ async fn async_main() {
         MqttConfig {
             broker_url: broker_url.clone(),
             client_id,
+            workspace: args.workspace.clone(),
             ..Default::default()
         }
     });

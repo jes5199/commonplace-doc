@@ -146,8 +146,9 @@ impl ProcessManager {
             cmd.current_dir(cwd);
         }
 
-        // Set MQTT_WORKSPACE environment variable for child processes
+        // Set workspace environment variables for child processes
         cmd.env("MQTT_WORKSPACE", &workspace);
+        cmd.env("COMMONPLACE_WORKSPACE", &workspace);
 
         // Add mqtt-broker arg if the process likely needs it and doesn't already have it
         let already_has_mqtt_broker = config.args.iter().any(|arg| arg == "--mqtt-broker");

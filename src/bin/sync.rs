@@ -452,6 +452,13 @@ async fn handle_file_created_crdt(
         // Create file via CRDT using subdirectory state
         let result = {
             let mut subdir_state = subdir_state_arc.write().await;
+            // Ensure schema Y.Doc has existing entries before adding new file.
+            // Without this, initial HTTP-only sync leaves yjs_state=None and
+            // the published schema would only contain the new file, causing
+            // peers to delete all previously existing files.
+            subdir_state
+                .ensure_schema_initialized(&owning_doc.directory)
+                .await;
             create_new_file(
                 &crdt.mqtt_client,
                 &crdt.workspace,
@@ -632,6 +639,7 @@ async fn handle_file_created_crdt(
         // Create file via CRDT using root state
         let result = {
             let mut state = crdt.crdt_state.write().await;
+            state.ensure_schema_initialized(directory).await;
             create_new_file(
                 &crdt.mqtt_client,
                 &crdt.workspace,

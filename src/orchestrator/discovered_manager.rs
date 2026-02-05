@@ -421,6 +421,10 @@ impl DiscoveredProcessManager {
         cmd.env("COMMONPLACE_MQTT", &mqtt_broker);
         cmd.env("COMMONPLACE_SERVER", &self.server_url);
         cmd.env("COMMONPLACE_INITIAL_SYNC", "server");
+        if let Some(ref workspace) = self.mqtt_workspace {
+            cmd.env("MQTT_WORKSPACE", workspace);
+            cmd.env("COMMONPLACE_WORKSPACE", workspace);
+        }
 
         let result = spawn_managed_process_with_logging(cmd, name)?;
         process.handle = Some(result.child);

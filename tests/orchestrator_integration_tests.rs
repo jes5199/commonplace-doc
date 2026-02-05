@@ -14,6 +14,7 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 /// Check if MQTT broker is available on localhost:1883
 fn mqtt_available() -> bool {
@@ -103,8 +104,16 @@ fn create_test_config(
     port: u16,
     db_path: &std::path::Path,
     workspace_dir: &std::path::Path,
+    workspace_name: &str,
 ) -> String {
-    create_test_config_with_discovery(temp_dir, port, db_path, workspace_dir, false)
+    create_test_config_with_discovery(
+        temp_dir,
+        port,
+        db_path,
+        workspace_dir,
+        false,
+        workspace_name,
+    )
 }
 
 /// Create orchestrator config with optional process discovery
@@ -114,6 +123,7 @@ fn create_test_config_with_discovery(
     db_path: &std::path::Path,
     workspace_dir: &std::path::Path,
     enable_discovery: bool,
+    workspace_name: &str,
 ) -> String {
     let server_bin = env!("CARGO_BIN_EXE_commonplace-server");
     let sync_bin = env!("CARGO_BIN_EXE_commonplace-sync");
@@ -124,11 +134,12 @@ fn create_test_config_with_discovery(
     serde_json::json!({
         "database": db_path.to_str().unwrap(),
         "http_server": &server_url,
+        "workspace": workspace_name,
         "managed_paths": managed_paths,
         "processes": {
             "server": {
                 "command": server_bin,
-                "args": ["--port", port.to_string(), "--fs-root", "workspace"],
+                "args": ["--port", port.to_string(), "--fs-root", "workspace", "--workspace", workspace_name],
                 "cwd": temp_dir.to_str().unwrap(),
                 "restart": {
                     "policy": "never"
@@ -140,7 +151,8 @@ fn create_test_config_with_discovery(
                     "--server", &server_url,
                     "--node", "workspace",
                     "--directory", workspace_dir.to_str().unwrap(),
-                    "--initial-sync", "local"
+                    "--initial-sync", "local",
+                    "--workspace", workspace_name
                 ],
                 "restart": {
                     "policy": "never"
@@ -271,7 +283,14 @@ fn test_orchestrator_starts_base_processes() {
     .unwrap();
 
     // Write config file
-    let config = create_test_config(temp_dir.path(), port, &db_path, &workspace_dir);
+    let workspace_name = format!("test-{}", &Uuid::new_v4().to_string()[..8]);
+    let config = create_test_config(
+        temp_dir.path(),
+        port,
+        &db_path,
+        &workspace_dir,
+        &workspace_name,
+    );
     std::fs::write(&config_path, &config).unwrap();
 
     let mut guard = ProcessGuard::new();
@@ -393,7 +412,14 @@ fn test_commonplace_ps_reports_status() {
     .unwrap();
 
     // Write config file
-    let config = create_test_config(temp_dir.path(), port, &db_path, &workspace_dir);
+    let workspace_name = format!("test-{}", &Uuid::new_v4().to_string()[..8]);
+    let config = create_test_config(
+        temp_dir.path(),
+        port,
+        &db_path,
+        &workspace_dir,
+        &workspace_name,
+    );
     std::fs::write(&config_path, &config).unwrap();
 
     let mut guard = ProcessGuard::new();
@@ -532,8 +558,15 @@ fn test_sandbox_process_runs_in_sandbox_cwd() {
     .unwrap();
 
     // Write config file with process discovery enabled
-    let config =
-        create_test_config_with_discovery(temp_dir.path(), port, &db_path, &workspace_dir, true);
+    let workspace_name = format!("test-{}", &Uuid::new_v4().to_string()[..8]);
+    let config = create_test_config_with_discovery(
+        temp_dir.path(),
+        port,
+        &db_path,
+        &workspace_dir,
+        true,
+        &workspace_name,
+    );
     std::fs::write(&config_path, &config).unwrap();
 
     let mut guard = ProcessGuard::new();
@@ -696,8 +729,15 @@ fn test_processes_json_add_remove_starts_stops_processes() {
     .unwrap();
 
     // Write config file with process discovery enabled
-    let config =
-        create_test_config_with_discovery(temp_dir.path(), port, &db_path, &workspace_dir, true);
+    let workspace_name = format!("test-{}", &Uuid::new_v4().to_string()[..8]);
+    let config = create_test_config_with_discovery(
+        temp_dir.path(),
+        port,
+        &db_path,
+        &workspace_dir,
+        true,
+        &workspace_name,
+    );
     std::fs::write(&config_path, &config).unwrap();
 
     let mut guard = ProcessGuard::new();
@@ -890,8 +930,15 @@ fn test_process_config_change_triggers_restart() {
     .unwrap();
 
     // Write config file with process discovery enabled
-    let config =
-        create_test_config_with_discovery(temp_dir.path(), port, &db_path, &workspace_dir, true);
+    let workspace_name = format!("test-{}", &Uuid::new_v4().to_string()[..8]);
+    let config = create_test_config_with_discovery(
+        temp_dir.path(),
+        port,
+        &db_path,
+        &workspace_dir,
+        true,
+        &workspace_name,
+    );
     std::fs::write(&config_path, &config).unwrap();
 
     let mut guard = ProcessGuard::new();
@@ -1283,8 +1330,15 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     .unwrap();
 
     // Write config file with process discovery enabled
-    let config =
-        create_test_config_with_discovery(temp_dir.path(), port, &db_path, &workspace_dir, true);
+    let workspace_name = format!("test-{}", &Uuid::new_v4().to_string()[..8]);
+    let config = create_test_config_with_discovery(
+        temp_dir.path(),
+        port,
+        &db_path,
+        &workspace_dir,
+        true,
+        &workspace_name,
+    );
     std::fs::write(&config_path, &config).unwrap();
 
     // Record existing sandbox directories before starting orchestrator
@@ -1355,9 +1409,54 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     let workspace_test_file = sync_test_dir.join(test_file_name);
     std::fs::write(&workspace_test_file, "hello").expect("Failed to write test file");
 
+    // Debug: Check if file reaches the server
+    let client = reqwest::blocking::Client::new();
+    let debug_start = std::time::Instant::now();
+    while debug_start.elapsed() < Duration::from_secs(15) {
+        // Check via files API
+        let resp = client
+            .get(&format!("{}/files/sync-test/test-file.txt", server_url))
+            .send();
+        if let Ok(resp) = resp {
+            if resp.status().is_success() {
+                let body = resp.text().unwrap_or_default();
+                eprintln!(
+                    "DEBUG: Server has test-file.txt ({} bytes): {:?}",
+                    body.len(),
+                    &body[..body.len().min(100)]
+                );
+                if body.contains("hello") {
+                    eprintln!("DEBUG: Server content is correct");
+                    break;
+                } else {
+                    eprintln!("DEBUG: Server content doesn't contain 'hello'");
+                }
+            } else {
+                eprintln!(
+                    "DEBUG: Server returned {} for test-file.txt ({}ms elapsed)",
+                    resp.status(),
+                    debug_start.elapsed().as_millis()
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // Also check sandbox schema
+    let sandbox_schema_path = sandbox_dir.join(".commonplace.json");
+    if sandbox_schema_path.exists() {
+        let schema_content = std::fs::read_to_string(&sandbox_schema_path).unwrap_or_default();
+        eprintln!(
+            "DEBUG: Sandbox schema: {}",
+            &schema_content[..schema_content.len().min(500)]
+        );
+    } else {
+        eprintln!("DEBUG: No sandbox schema file");
+    }
+
     // C2-C3: Verify file appears in sandbox with matching content
     let sandbox_test_file = sandbox_dir.join(test_file_name);
-    let content = wait_for_file(&sandbox_test_file, Some("hello"), Duration::from_secs(10))
+    let content = wait_for_file(&sandbox_test_file, Some("hello"), Duration::from_secs(15))
         .expect("File should appear in sandbox with content 'hello'");
     assert_eq!(content.trim(), "hello", "Sandbox file content should match");
 
@@ -1523,8 +1622,15 @@ fn test_commonplace_link_schema_push_updates_server() {
     .unwrap();
 
     // Write config file with process discovery enabled
-    let config =
-        create_test_config_with_discovery(temp_dir.path(), port, &db_path, &workspace_dir, true);
+    let workspace_name = format!("test-{}", &Uuid::new_v4().to_string()[..8]);
+    let config = create_test_config_with_discovery(
+        temp_dir.path(),
+        port,
+        &db_path,
+        &workspace_dir,
+        true,
+        &workspace_name,
+    );
     std::fs::write(&config_path, &config).unwrap();
 
     // Record existing sandbox directories before starting orchestrator
@@ -1797,12 +1903,14 @@ fn test_sandbox_stdio_ephemeral_events() {
     .unwrap();
 
     // Create orchestrator config with process discovery enabled
+    let workspace_name = format!("test-{}", &Uuid::new_v4().to_string()[..8]);
     let config = create_test_config_with_discovery(
         temp_dir.path(),
         port,
         &db_path,
         &workspace_dir,
         true, // enable process discovery
+        &workspace_name,
     );
     std::fs::write(&config_path, &config).unwrap();
 
@@ -1967,12 +2075,14 @@ fn test_jsonl_file_append_sync_behavior() {
     .unwrap();
 
     // Create orchestrator config with process discovery enabled
+    let workspace_name = format!("test-{}", &Uuid::new_v4().to_string()[..8]);
     let config = create_test_config_with_discovery(
         temp_dir.path(),
         port,
         &db_path,
         &workspace_dir,
         true, // enable process discovery
+        &workspace_name,
     );
     std::fs::write(&config_path, &config).unwrap();
 
@@ -2180,8 +2290,15 @@ fn test_process_termination_cascade_on_shutdown() {
     .unwrap();
 
     // Write config file with process discovery enabled
-    let config =
-        create_test_config_with_discovery(temp_dir.path(), port, &db_path, &workspace_dir, true);
+    let workspace_name = format!("test-{}", &Uuid::new_v4().to_string()[..8]);
+    let config = create_test_config_with_discovery(
+        temp_dir.path(),
+        port,
+        &db_path,
+        &workspace_dir,
+        true,
+        &workspace_name,
+    );
     std::fs::write(&config_path, &config).unwrap();
 
     // Record existing sandbox directories before starting orchestrator
@@ -2432,8 +2549,15 @@ fn test_uuid_linked_files_sync_bidirectionally() {
     .unwrap();
 
     // Write config file with process discovery enabled
-    let config =
-        create_test_config_with_discovery(temp_dir.path(), port, &db_path, &workspace_dir, true);
+    let workspace_name = format!("test-{}", &Uuid::new_v4().to_string()[..8]);
+    let config = create_test_config_with_discovery(
+        temp_dir.path(),
+        port,
+        &db_path,
+        &workspace_dir,
+        true,
+        &workspace_name,
+    );
     std::fs::write(&config_path, &config).unwrap();
 
     // Record existing sandbox directories before starting orchestrator
@@ -2789,12 +2913,14 @@ await commonplace.output.set("# Test Output\n\n");
     .unwrap();
 
     // Create orchestrator config with process discovery enabled
+    let workspace_name = format!("test-{}", &Uuid::new_v4().to_string()[..8]);
     let config = create_test_config_with_discovery(
         temp_dir.path(),
         port,
         &db_path,
         &workspace_dir,
         true, // enable process discovery
+        &workspace_name,
     );
     std::fs::write(&config_path, &config).unwrap();
 

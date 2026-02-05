@@ -875,12 +875,30 @@ impl DirectorySyncState {
         }
     }
 
+    /// Ensure the schema Y.Doc is initialized before publishing updates.
+    ///
+    /// When `yjs_state` is None (e.g., initial sync used HTTP-only and never
+    /// populated the CRDT state), this reads the local `.commonplace.json` to
+    /// pre-populate the Y.Doc. Without this, publishing a full-state schema
+    /// update would only contain newly-added entries, causing peers to delete
+    /// all previously existing files.
+    ///
+    /// This is NOT called during `load_or_create` to avoid Y.Doc client ID
+    /// mismatches that break DELETE operations (see CP-1ual). Instead, it is
+    /// called just before `create_new_file` — the only place where an
+    /// uninitialized schema would cause data loss.
+    pub async fn ensure_schema_initialized(&mut self, directory: &Path) {
+        if self.schema.yjs_state.is_some() {
+            return;
+        }
+        Self::initialize_schema_from_local_file(self, directory).await;
+    }
+
     /// Initialize the schema Y.Doc from an existing .commonplace.json file.
     ///
     /// This preserves existing schema entries when creating a new state or
     /// recovering from corrupted state, preventing data loss when the Y.Doc
     /// is later written back to disk.
-    #[allow(dead_code)]
     async fn initialize_schema_from_local_file(state: &mut Self, directory: &Path) {
         use super::ymap_schema;
         use crate::fs::FsSchema;

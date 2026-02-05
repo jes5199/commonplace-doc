@@ -1198,7 +1198,9 @@ pub async fn sync_single_file(
                 let s = state.read().await;
                 s.last_written_cid.clone()
             };
-            let should_push = if head.content.is_empty()
+            let server_is_empty_or_default = head.content.is_empty()
+                || is_default_content_for_mime(&head.content, &file.content_type);
+            let should_push = if server_is_empty_or_default
                 || (initial_sync_strategy == "local"
                     && !local_is_empty_or_default
                     && local_cid.is_some())
