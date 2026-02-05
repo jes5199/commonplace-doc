@@ -97,6 +97,13 @@ fn match_doc_structured_content(
     };
 
     if is_jsonl {
+        // Guard: if Y.Doc doesn't have a YArray root, we can't compare
+        // structurally.  This happens when the file was initially created as
+        // YText (before the JSONL-as-YArray fix).
+        if !doc_value.is_array() {
+            return Ok(DocContentMatch::Unknown);
+        }
+
         let old_values = match parse_jsonl_values(old_content) {
             Ok(values) => values,
             Err(_) => return Ok(DocContentMatch::Unknown),
@@ -1625,6 +1632,7 @@ pub async fn upload_task_crdt(
                 break;
             }
 
+            let mut use_text_diff_for_jsonl = false;
             if prepared.is_json || prepared.is_jsonl {
                 match match_doc_structured_content(
                     file_state,
@@ -1677,10 +1685,21 @@ pub async fn upload_task_crdt(
                         continue;
                     }
                     Ok(DocContentMatch::Unknown) => {
-                        debug!(
-                            "CRDT upload_task: unable to compare structured content for {}, proceeding with publish",
-                            file_path.display()
-                        );
+                        if prepared.is_jsonl {
+                            // Y.Doc has YText instead of YArray for JSONL.
+                            // Use text diff to stay compatible with the existing
+                            // Y.Doc type on the server.
+                            debug!(
+                                "CRDT upload_task: JSONL type mismatch for {}, using text diff",
+                                file_path.display()
+                            );
+                            use_text_diff_for_jsonl = true;
+                        } else {
+                            debug!(
+                                "CRDT upload_task: unable to compare structured content for {}, proceeding with publish",
+                                file_path.display()
+                            );
+                        }
                     }
                     Ok(DocContentMatch::MatchesOld) => {}
                     Err(e) => {
@@ -1694,9 +1713,12 @@ pub async fn upload_task_crdt(
             }
 
             // Publish the change via MQTT.
-            // For JSON files, create a YMap update to match the server's document type.
-            // For text files, use character-level YText diffs (more efficient).
-            let publish_result = if prepared.is_json || prepared.is_jsonl {
+            // For JSON/JSONL files, create a structured update (YMap/YArray).
+            // For text files (or JSONL with YText Y.Doc), use character-level
+            // YText diffs.
+            let publish_result = if !use_text_diff_for_jsonl
+                && (prepared.is_json || prepared.is_jsonl)
+            {
                 // JSON/JSONL files: create structured update (YMap/YArray)
                 let content_type = if prepared.is_jsonl {
                     crate::content_type::ContentType::Jsonl
