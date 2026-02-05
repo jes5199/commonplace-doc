@@ -8,7 +8,7 @@ use crate::mqtt::{IncomingMessage, MqttClient, Topic};
 #[cfg(unix)]
 use crate::sync::atomic_write_with_shadow;
 use crate::sync::client::fetch_head;
-use crate::sync::crdt_merge::{parse_edit_message, process_received_edit};
+use crate::sync::crdt_merge::{get_doc_text_content, parse_edit_message, process_received_edit};
 use crate::sync::crdt_publish::{publish_text_change, publish_yjs_update};
 use crate::sync::crdt_state::{CrdtPeerState, DirectorySyncState};
 use crate::sync::directory::{scan_directory_to_json, ScanOptions};
@@ -38,7 +38,6 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
-use yrs::{GetString, ReadTxn, Transact};
 
 /// Timeout for pending write barrier (30 seconds)
 pub const PENDING_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -92,28 +91,30 @@ fn match_doc_structured_content(
     is_jsonl: bool,
 ) -> SyncResult<DocContentMatch> {
     let doc = file_state.to_doc()?;
+
     let Some(doc_value) = crate::sync::crdt::yjs::doc_to_json_value(&doc) else {
         return Ok(DocContentMatch::Unknown);
     };
 
     if is_jsonl {
         // Guard: if Y.Doc doesn't have a YArray root, we can't compare
-        // structurally.  This happens when the file was initially created as
-        // YText (before the JSONL-as-YArray fix).
+        // structurally. This happens when the file was initially created as
+        // YText (legacy, before CP-74q1).
         if !doc_value.is_array() {
             return Ok(DocContentMatch::Unknown);
         }
 
-        let old_values = match parse_jsonl_values(old_content) {
-            Ok(values) => values,
+        // Parse JSONL content as arrays of JSON values for comparison.
+        // JSONL is NOT valid JSON — each line is a separate JSON value,
+        // so we must use parse_jsonl_values instead of serde_json::from_str.
+        let old_value = match parse_jsonl_values(old_content) {
+            Ok(v) => Value::Array(v),
             Err(_) => return Ok(DocContentMatch::Unknown),
         };
-        let new_values = match parse_jsonl_values(new_content) {
-            Ok(values) => values,
+        let new_value = match parse_jsonl_values(new_content) {
+            Ok(v) => Value::Array(v),
             Err(_) => return Ok(DocContentMatch::Unknown),
         };
-        let old_value = Value::Array(old_values);
-        let new_value = Value::Array(new_values);
 
         if doc_value == new_value {
             return Ok(DocContentMatch::MatchesNew);
@@ -121,6 +122,19 @@ fn match_doc_structured_content(
         if doc_value == old_value {
             return Ok(DocContentMatch::MatchesOld);
         }
+
+        // If the Y.Doc contains the file content as a prefix (the doc has strictly
+        // more items), this is likely a receive-task echo: the doc has been updated
+        // with additional MQTT edits that haven't been written to disk yet.
+        // Treat as MatchesNew to skip the upload and avoid false divergence.
+        if let (Some(doc_arr), Some(new_arr)) = (doc_value.as_array(), new_value.as_array()) {
+            if doc_arr.len() > new_arr.len()
+                && doc_arr.iter().zip(new_arr.iter()).all(|(d, n)| d == n)
+            {
+                return Ok(DocContentMatch::MatchesNew);
+            }
+        }
+
         return Ok(DocContentMatch::Diverged);
     }
 
@@ -1632,6 +1646,9 @@ pub async fn upload_task_crdt(
                 break;
             }
 
+            // Legacy fallback: JSONL files created before CP-74q1 may have YText
+            // Y.Docs instead of YArray. When detected, we fall back to text diffs
+            // to stay compatible with the existing Y.Doc type on the server.
             let mut use_text_diff_for_jsonl = false;
             if prepared.is_json || prepared.is_jsonl {
                 match match_doc_structured_content(
@@ -2025,11 +2042,7 @@ pub async fn initialize_crdt_state_from_server_with_pending(
                         if let Some(file_state) = state.get_file(filename) {
                             match file_state.to_doc() {
                                 Ok(doc) => {
-                                    let txn = doc.transact();
-                                    let content = txn
-                                        .get_text("content")
-                                        .map(|text| text.get_string(&txn))
-                                        .unwrap_or_default();
+                                    let content = get_doc_text_content(&doc);
                                     if content.is_empty() {
                                         None
                                     } else {
@@ -2400,12 +2413,7 @@ async fn resync_crdt_state_via_cyan_with_pending(
         txn.apply_update(update);
     }
 
-    let content = {
-        let txn = doc.transact();
-        txn.get_text("content")
-            .map(|text| text.get_string(&txn))
-            .unwrap_or_default()
-    };
+    let content = get_doc_text_content(&doc);
 
     let state_bytes = {
         let txn = doc.transact();
@@ -3755,6 +3763,7 @@ mod tests {
     use reqwest::Client;
     use std::path::Path;
     use tempfile::tempdir;
+    use yrs::{ReadTxn, Transact};
 
     #[test]
     fn test_prepare_content_for_upload_text() {

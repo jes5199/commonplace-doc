@@ -31,6 +31,7 @@ use rumqttc::QoS;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
+use yrs::types::ToJson;
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, GetString, ReadTxn, Transact, Update};
 
@@ -421,12 +422,49 @@ fn create_merge_update(_doc: &Doc) -> SyncResult<Vec<u8>> {
 }
 
 /// Get text content from a Y.Doc.
-fn get_doc_text_content(doc: &Doc) -> String {
+///
+/// Handles both YText (most file types) and YArray (JSONL files stored as
+/// structured CRDT data). For YArray, converts back to JSONL text format.
+///
+/// Note: Yrs `get_text`/`get_array` always succeed regardless of actual type
+/// (they reinterpret). We rely on the fact that `get_string()` on a YArray
+/// returns empty string (array items are `Any` values, not `ItemContent::String`),
+/// so we try YText first and fall back to YArray if the result is empty.
+pub fn get_doc_text_content(doc: &Doc) -> String {
     let txn = doc.transact();
-    match txn.get_text("content") {
-        Some(text) => text.get_string(&txn),
-        None => String::new(),
+    // Try reading as YText first (covers most file types).
+    // For actual YText roots this returns the content.
+    // For YArray roots this returns "" because array items aren't string chunks.
+    if let Some(text) = txn.get_text("content") {
+        let s = text.get_string(&txn);
+        if !s.is_empty() {
+            return s;
+        }
     }
+    // If YText returned empty, try reading as YArray (JSONL files).
+    if let Some(array) = txn.get_array("content") {
+        let any_array = array.to_json(&txn);
+        if let Ok(serde_json::Value::Array(items)) = serde_json::to_value(&any_array) {
+            if !items.is_empty() {
+                let lines: Vec<String> = items
+                    .iter()
+                    .filter_map(|item| serde_json::to_string(item).ok())
+                    .collect();
+                let mut content = lines.join("\n");
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                return content;
+            }
+        }
+    }
+    String::new()
+}
+
+/// Test-only accessor for get_doc_text_content (used by cross-module tests).
+#[cfg(test)]
+pub fn get_doc_text_content_for_test(doc: &Doc) -> String {
+    get_doc_text_content(doc)
 }
 
 /// Parse an MQTT edit message payload.
@@ -1645,5 +1683,176 @@ mod tests {
         // Parents should be [local_head, server_head] in that order
         assert_eq!(result.commit.parents[0], "local_first");
         assert_eq!(result.commit.parents[1], "server_second");
+    }
+
+    #[test]
+    fn test_get_doc_text_content_ytext() {
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "hello world");
+        }
+        assert_eq!(get_doc_text_content(&doc), "hello world");
+    }
+
+    #[test]
+    fn test_get_doc_text_content_yarray_jsonl() {
+        // Create a doc with YArray content (as JSONL files now use)
+        let jsonl = r#"{"name":"alice","age":30}
+{"name":"bob","age":25}
+"#;
+        let update_b64 = crate::sync::crdt::yjs::create_yjs_jsonl_update(jsonl, None).unwrap();
+        let update_bytes = STANDARD.decode(&update_b64).unwrap();
+
+        let doc = Doc::new();
+        {
+            let update = Update::decode_v1(&update_bytes).unwrap();
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update);
+        }
+
+        // get_doc_text_content should return valid JSONL
+        let content = get_doc_text_content(&doc);
+        assert!(!content.is_empty(), "Content should not be empty");
+        assert!(content.ends_with('\n'), "JSONL should end with newline");
+
+        let lines: Vec<&str> = content.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2, "Should have 2 JSONL lines");
+
+        // Verify each line is valid JSON with expected content
+        let obj1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(obj1["name"], "alice");
+        let obj2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(obj2["name"], "bob");
+    }
+
+    #[test]
+    fn test_get_doc_text_content_empty_doc() {
+        let doc = Doc::new();
+        assert_eq!(get_doc_text_content(&doc), "");
+    }
+
+    /// Test that YArray content matches parsed JSONL values for content comparison.
+    ///
+    /// This verifies that `doc_to_json_array_value` returns values identical to
+    /// what `parse_jsonl_values` would produce, which is critical for the
+    /// `match_doc_structured_content` divergence check.
+    #[test]
+    fn test_yarray_matches_parsed_jsonl_values() {
+        let content = "{\"id\": 1, \"message\": \"first line\"}\n\
+                       {\"id\": 2, \"message\": \"second line\"}\n";
+
+        // Create YArray from content
+        let update_b64 = crate::sync::crdt::yjs::create_yjs_jsonl_update(content, None).unwrap();
+        let update_bytes = STANDARD.decode(&update_b64).unwrap();
+
+        let doc = Doc::new();
+        {
+            let update = Update::decode_v1(&update_bytes).unwrap();
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update);
+        }
+
+        // Extract via doc_to_json_array_value (as match_doc_structured_content does)
+        let doc_value = crate::sync::crdt::yjs::doc_to_json_array_value(&doc)
+            .expect("Should extract array value");
+
+        // Parse as JSONL values (as match_doc_structured_content does)
+        let parsed_values: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let expected = serde_json::Value::Array(parsed_values);
+
+        eprintln!("doc_value: {:?}", doc_value);
+        eprintln!("expected:  {:?}", expected);
+        assert_eq!(
+            doc_value, expected,
+            "YArray content should match parsed JSONL values"
+        );
+    }
+
+    /// Test the full workspace→sandbox→workspace JSONL roundtrip.
+    ///
+    /// Simulates: workspace creates JSONL, sandbox receives it, sandbox appends
+    /// a line, workspace receives sandbox's update. Verifies content is correct
+    /// at each step.
+    #[test]
+    fn test_jsonl_roundtrip_workspace_sandbox() {
+        // Step 1: Workspace creates JSONL with 2 lines
+        let initial_content = "{\"id\":1,\"message\":\"first line\"}\n\
+                               {\"id\":2,\"message\":\"second line\"}\n";
+        let initial_b64 =
+            crate::sync::crdt::yjs::create_yjs_jsonl_update(initial_content, None).unwrap();
+        let initial_bytes = STANDARD.decode(&initial_b64).unwrap();
+
+        // Workspace doc
+        let ws_doc = Doc::new();
+        {
+            let update = Update::decode_v1(&initial_bytes).unwrap();
+            let mut txn = ws_doc.transact_mut();
+            txn.apply_update(update);
+        }
+
+        // Step 2: Sandbox receives it
+        let sandbox_doc = Doc::new();
+        {
+            let update = Update::decode_v1(&initial_bytes).unwrap();
+            let mut txn = sandbox_doc.transact_mut();
+            txn.apply_update(update);
+        }
+        let sandbox_state = {
+            let txn = sandbox_doc.transact();
+            STANDARD.encode(txn.encode_state_as_update_v1(&yrs::StateVector::default()))
+        };
+
+        // Sandbox reads content
+        let sandbox_content = get_doc_text_content(&sandbox_doc);
+        assert!(
+            sandbox_content.contains("first line"),
+            "Sandbox should have first line"
+        );
+        assert!(
+            sandbox_content.contains("second line"),
+            "Sandbox should have second line"
+        );
+
+        // Step 3: Sandbox edits (appends third line)
+        let new_content = "{\"id\":1,\"message\":\"first line\"}\n\
+                           {\"id\":2,\"message\":\"second line\"}\n\
+                           {\"id\":3,\"message\":\"third line from sandbox\"}\n";
+        let sandbox_update_b64 =
+            crate::sync::crdt::yjs::create_yjs_jsonl_update(new_content, Some(&sandbox_state))
+                .unwrap();
+        let sandbox_update_bytes = STANDARD.decode(&sandbox_update_b64).unwrap();
+
+        // Step 4: Workspace receives sandbox's update
+        {
+            let update = Update::decode_v1(&sandbox_update_bytes).unwrap();
+            let mut txn = ws_doc.transact_mut();
+            txn.apply_update(update);
+        }
+
+        // Step 5: Workspace reads content
+        let ws_content = get_doc_text_content(&ws_doc);
+        eprintln!("Workspace content after sandbox update: {:?}", ws_content);
+        assert!(!ws_content.is_empty(), "WS content should not be empty");
+        assert!(
+            ws_content.contains("first line"),
+            "WS should have first line, got: {}",
+            ws_content
+        );
+        assert!(
+            ws_content.contains("second line"),
+            "WS should have second line, got: {}",
+            ws_content
+        );
+        assert!(
+            ws_content.contains("third line from sandbox"),
+            "WS should have third line, got: {}",
+            ws_content
+        );
     }
 }

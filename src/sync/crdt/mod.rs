@@ -26,8 +26,8 @@ pub use ack_handler::{
 };
 pub use crdt_merge::{
     apply_commits_to_doc, create_and_publish_merge_commit, create_merge_commit,
-    find_common_ancestor, parse_edit_message, process_received_edit, MergeCommitInput,
-    MergeCommitResult, MergeResult,
+    find_common_ancestor, get_doc_text_content, parse_edit_message, process_received_edit,
+    MergeCommitInput, MergeCommitResult, MergeResult,
 };
 pub use crdt_new_file::{
     create_new_file, generate_file_uuid, remove_file_from_schema, NewFileResult,

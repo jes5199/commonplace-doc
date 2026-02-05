@@ -1077,22 +1077,32 @@ async fn ensure_crdt_tasks_for_files(
             .unwrap_or(&relative_path)
             .to_string();
 
-        // Create shared_last_content BEFORE init so we can update it during init
-        // This prevents the file watcher from detecting init writes as local changes
-        let initial_content = match tokio::fs::read_to_string(&file_path).await {
-            Ok(s) if !s.is_empty() => Some(s),
-            Ok(_) => None, // Empty file treated as no initial content
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                error!(
-                    "Failed to read initial content from {}: {}",
-                    file_path.display(),
-                    e
-                );
-                None
-            }
-        };
-        let shared_last_content: SharedLastContent = Arc::new(RwLock::new(initial_content));
+        // Reuse existing shared_last_content from file_states if available.
+        // This preserves content written by the receive task, preventing a race where
+        // respawned tasks start with stale/empty content.
+        let shared_last_content: SharedLastContent = {
+            let states = file_states.read().await;
+            states
+                .get(&relative_path)
+                .and_then(|s| s.crdt_last_content.clone())
+        }
+        .unwrap_or_else(|| {
+            // No existing state — create fresh from file content
+            let initial_content = match std::fs::read_to_string(&file_path) {
+                Ok(s) if !s.is_empty() => Some(s),
+                Ok(_) => None,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    error!(
+                        "Failed to read initial content from {}: {}",
+                        file_path.display(),
+                        e
+                    );
+                    None
+                }
+            };
+            Arc::new(RwLock::new(initial_content))
+        });
 
         if let Err(e) = crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
             http_client,
@@ -1372,6 +1382,23 @@ async fn handle_file_uuid_edit(
         // Ensure parent directory exists
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
+        }
+
+        // Don't overwrite a file that has content with empty content from the server.
+        // This can happen when the server stores JSONL as YArray but extracts content
+        // using the Text handler (ContentType mismatch), returning empty content.
+        // The CRDT receive task will deliver the actual content via MQTT.
+        if content_bytes.is_empty() {
+            if let Ok(existing) = tokio::fs::read_to_string(&file_path).await {
+                if !existing.is_empty() {
+                    debug!(
+                        "Skipping empty content write for {} - file already has {} bytes",
+                        rel_path,
+                        existing.len()
+                    );
+                    continue;
+                }
+            }
         }
 
         // Update shared_last_content BEFORE writing to prevent echo publishes

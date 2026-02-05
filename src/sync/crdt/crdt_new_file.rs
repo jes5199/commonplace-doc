@@ -8,6 +8,7 @@
 //! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
 
 use super::crdt_state::{CrdtPeerState, DirectorySyncState};
+use super::yjs::create_yjs_jsonl_update;
 use super::ymap_schema;
 use crate::commit::Commit;
 use crate::mqtt::{EditMessage, MqttClient, Topic};
@@ -107,6 +108,7 @@ pub async fn create_new_file(
         file_state,
         content,
         author,
+        filename,
     )
     .await?;
 
@@ -241,10 +243,30 @@ async fn publish_file_content(
     file_state: &mut CrdtPeerState,
     content: &str,
     author: &str,
+    filename: &str,
 ) -> SyncResult<String> {
+    let is_jsonl = filename.ends_with(".jsonl") || filename.ends_with(".ndjson");
+
     // Create Y.Doc with content
+    // For JSONL files, use YArray (structured CRDT); for all others, use YText.
     let doc = Doc::new();
-    let update_bytes = {
+    let update_bytes = if is_jsonl {
+        let update_b64 = create_yjs_jsonl_update(content, None)
+            .map_err(|e| SyncError::crdt_state(format!("Failed to create JSONL update: {}", e)))?;
+        let decoded = STANDARD
+            .decode(&update_b64)
+            .map_err(|e| SyncError::crdt_state(format!("Failed to decode JSONL update: {}", e)))?;
+        // Apply to our doc so we can update state from it
+        {
+            use yrs::updates::decoder::Decode;
+            let update = yrs::Update::decode_v1(&decoded).map_err(|e| {
+                SyncError::crdt_state(format!("Failed to decode Yjs update: {}", e))
+            })?;
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update);
+        }
+        decoded
+    } else {
         let mut txn = doc.transact_mut();
         let text = txn.get_or_insert_text("content");
         text.insert(&mut txn, 0, content);
@@ -720,5 +742,70 @@ mod tests {
         // Verify schema no longer has the file
         let restored_doc = dir_state.schema.to_doc().unwrap();
         assert!(ymap_schema::get_entry(&restored_doc, "deleteme.txt").is_none());
+    }
+
+    /// Test that JSONL content stored via create_yjs_jsonl_update round-trips
+    /// correctly through get_doc_text_content (the receive-side extraction).
+    #[test]
+    fn test_publish_jsonl_roundtrips_through_get_doc_text_content() {
+        let jsonl_content = r#"{"name":"alice","age":30}
+{"name":"bob","age":25}
+"#;
+
+        // Simulate what publish_file_content does for JSONL
+        let update_b64 =
+            create_yjs_jsonl_update(jsonl_content, None).expect("Should create JSONL update");
+        let update_bytes = STANDARD.decode(&update_b64).expect("Should decode base64");
+
+        // Apply to a fresh doc (as the receiving peer does)
+        let doc = Doc::new();
+        {
+            use yrs::updates::decoder::Decode;
+            let update = yrs::Update::decode_v1(&update_bytes).expect("Should decode Yjs update");
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update);
+        }
+
+        // Verify get_text returns empty (YArray items aren't string chunks)
+        let txn = doc.transact();
+        let text_content = txn
+            .get_text("content")
+            .map(|t| yrs::GetString::get_string(&t, &txn))
+            .unwrap_or_default();
+        assert!(
+            text_content.is_empty(),
+            "YArray content should not be readable as YText"
+        );
+        drop(txn);
+
+        // Verify the content round-trips via get_doc_text_content
+        let extracted = super::super::crdt_merge::get_doc_text_content_for_test(&doc);
+        assert!(!extracted.is_empty(), "Should extract JSONL content");
+        assert!(extracted.ends_with('\n'), "JSONL should end with newline");
+
+        let lines: Vec<&str> = extracted.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+
+        let obj1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(obj1["name"], "alice");
+        let obj2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(obj2["name"], "bob");
+    }
+
+    /// Test that non-JSONL content stored via YText round-trips correctly.
+    #[test]
+    fn test_publish_text_roundtrips_through_get_doc_text_content() {
+        let content = "Hello, world!";
+
+        // Simulate what publish_file_content does for non-JSONL
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, content);
+        }
+
+        let extracted = super::super::crdt_merge::get_doc_text_content_for_test(&doc);
+        assert_eq!(extracted, content);
     }
 }

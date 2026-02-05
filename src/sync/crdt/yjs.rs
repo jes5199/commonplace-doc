@@ -492,12 +492,24 @@ pub fn yjs_array_to_jsonl(
 }
 
 /// Convert a Y.Doc's root map/array into a JSON value.
+///
+/// Note: Due to Yrs type reinterpretation (get_map/get_array always succeed
+/// regardless of actual type), this function tries map first then array.
+/// For JSONL files that use YArray, use `doc_to_json_array_value` instead.
 pub fn doc_to_json_value(doc: &Doc) -> Option<serde_json::Value> {
     let txn = doc.transact();
 
     if let Some(map) = txn.get_map(TEXT_ROOT_NAME) {
         let any = map.to_json(&txn);
-        return Some(any_to_json_value(any));
+        let value = any_to_json_value(any);
+        // Skip empty objects (reinterpretation artifact from YArray roots)
+        if let serde_json::Value::Object(ref m) = value {
+            if !m.is_empty() {
+                return Some(value);
+            }
+        } else {
+            return Some(value);
+        }
     }
 
     if let Some(array) = txn.get_array(TEXT_ROOT_NAME) {
@@ -505,6 +517,24 @@ pub fn doc_to_json_value(doc: &Doc) -> Option<serde_json::Value> {
         return Some(any_to_json_value(any));
     }
 
+    None
+}
+
+/// Extract YArray content from a Y.Doc as a JSON array value.
+///
+/// This bypasses the Yrs type reinterpretation issue by reading the array
+/// directly. For JSONL files stored as YArray, this returns the correct
+/// array content. For non-array docs, returns None.
+#[allow(dead_code)] // Used in tests; will be used when JSONL structured upload is enabled
+pub fn doc_to_json_array_value(doc: &Doc) -> Option<serde_json::Value> {
+    let txn = doc.transact();
+    if let Some(array) = txn.get_array(TEXT_ROOT_NAME) {
+        let any = array.to_json(&txn);
+        let value = any_to_json_value(any);
+        if value.is_array() {
+            return Some(value);
+        }
+    }
     None
 }
 
