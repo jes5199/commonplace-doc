@@ -1005,28 +1005,12 @@ pub async fn directory_mqtt_task(
                     false // No CRDT context, use server fetch
                 };
 
-                // Fallback: fetch from server for non-CRDT paths or if CRDT handling failed
+                // If CRDT handling failed, log and continue — next MQTT message will retry
                 if !crdt_handled {
-                    if let Some(ctx) = crdt_context.as_ref() {
-                        if ctx.mqtt_only_config.mqtt_only {
-                            warn!("Skipping HTTP fallback for {} (MQTT-only mode)", doc_id);
-                            continue;
-                        }
-                    }
-
-                    if let Err(e) = handle_file_uuid_edit(
-                        &http_client,
-                        &server,
-                        &doc_id,
-                        paths,
-                        &directory,
-                        use_paths,
-                        &file_states,
-                    )
-                    .await
-                    {
-                        warn!("Failed to handle file UUID edit for {}: {}", doc_id, e);
-                    }
+                    warn!(
+                        "CRDT handling failed for {} — will retry on next MQTT message",
+                        doc_id
+                    );
                 }
             }
         } else {
@@ -1104,29 +1088,29 @@ async fn ensure_crdt_tasks_for_files(
             Arc::new(RwLock::new(initial_content))
         });
 
-        if let Err(e) = crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
-            http_client,
-            server,
+        if let Err(e) = crate::sync::file_sync::resync_crdt_state_via_cyan_with_pending(
+            &context.mqtt_client,
+            &context.workspace,
             node_id,
             &context.crdt_state,
             &filename,
             &file_path,
-            Some(&context.mqtt_client),
-            Some(&context.workspace),
-            Some(author),
+            author,
             Some(&shared_last_content),
             inode_tracker.as_ref(),
-            context.mqtt_only_config,
+            true,
+            true,
         )
         .await
         {
-            // Log as error and skip spawning sync tasks - continuing without proper
-            // initialization risks data divergence or loss
-            error!(
-                "Failed to initialize CRDT state for {}: {} - skipping sync task spawn",
+            warn!(
+                "Failed to initialize CRDT state for {}: {} — initializing empty",
                 relative_path, e
             );
-            continue;
+            // Initialize empty so MQTT edits can still be applied
+            let mut state = context.crdt_state.write().await;
+            let fs = state.get_or_create_file(&filename, node_id);
+            fs.initialize_empty();
         }
 
         let old_handles = {
@@ -1189,9 +1173,9 @@ async fn sync_uuid_subscriptions(
     workspace: &str,
     subscribed_uuids: &mut HashSet<String>,
     uuid_to_paths: &mut crate::sync::UuidToPathsMap,
-    directory: &std::path::Path,
-    use_paths: bool,
-    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    _directory: &std::path::Path,
+    _use_paths: bool,
+    _file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
 ) {
     // Fetch the current UUID map from the schema, with status to detect failures
     let (new_uuid_map, fetch_succeeded) =
@@ -1248,35 +1232,8 @@ async fn sync_uuid_subscriptions(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    // Fetch and write initial content for newly added UUIDs.
-    // This is a fallback for when MQTT messages are missed (e.g., published before
-    // we subscribed and not retained). The MQTT retained messages should normally
-    // handle this, but server fetch provides a safety net.
-    if !to_add.is_empty() {
-        info!(
-            "Fetching initial content for {} newly subscribed UUIDs",
-            to_add.len()
-        );
-        for uuid in &to_add {
-            if let Some(paths) = uuid_to_paths.get(uuid) {
-                if let Err(e) = handle_file_uuid_edit(
-                    http_client,
-                    server,
-                    uuid,
-                    paths,
-                    directory,
-                    use_paths,
-                    file_states,
-                )
-                .await
-                {
-                    warn!("Failed to fetch initial content for UUID {}: {}", uuid, e);
-                } else {
-                    debug!("Fetched initial content for UUID {}", uuid);
-                }
-            }
-        }
-    }
+    // Initial content for newly subscribed UUIDs arrives via MQTT retained messages
+    // and is handled by the CRDT receive path. No HTTP fetch needed.
 
     if !to_add.is_empty() || !to_remove.is_empty() {
         info!(
@@ -1286,139 +1243,6 @@ async fn sync_uuid_subscriptions(
             subscribed_uuids.len()
         );
     }
-}
-
-/// Handle a file UUID edit by fetching content from server and writing to local files.
-///
-/// Also updates shared_last_content for CRDT-managed files to prevent echo publishes
-/// when the file watcher detects the write.
-///
-/// Retries with backoff if server returns empty content, as the server may not have
-/// committed the MQTT edit yet (server and sync clients receive MQTT simultaneously).
-async fn handle_file_uuid_edit(
-    http_client: &Client,
-    server: &str,
-    uuid: &str,
-    paths: &[String],
-    directory: &Path,
-    use_paths: bool,
-    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use crate::sync::fetch_head;
-    use std::time::Duration;
-    use tokio::time::sleep;
-
-    const MAX_RETRIES: u32 = 15;
-    const INITIAL_DELAY_MS: u64 = 100;
-
-    // Retry fetching with exponential backoff if content is empty.
-    // The server may not have committed the MQTT edit yet.
-    // With 15 retries and exponential backoff (100, 200, 400, 800, 1600, ...),
-    // we wait up to about 3 seconds total for server to have content.
-    let mut head = None;
-    let mut delay_ms = INITIAL_DELAY_MS;
-    let max_delay_ms = 500; // Cap at 500ms per retry
-
-    for attempt in 0..MAX_RETRIES {
-        match fetch_head(http_client, server, uuid, use_paths).await? {
-            Some(h) if !h.content.is_empty() => {
-                head = Some(h);
-                break;
-            }
-            Some(h) => {
-                // Got a response but content is empty - server may still be processing
-                if attempt < MAX_RETRIES - 1 {
-                    debug!(
-                        "Server returned empty content for {}, retrying in {}ms (attempt {}/{})",
-                        uuid,
-                        delay_ms,
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
-                    sleep(Duration::from_millis(delay_ms)).await;
-                    delay_ms = (delay_ms * 2).min(max_delay_ms); // Exponential backoff, capped
-                } else {
-                    // Last attempt, content still empty - use it, will write empty file
-                    // This is better than not creating the file at all
-                    head = Some(h);
-                }
-            }
-            None => {
-                if attempt < MAX_RETRIES - 1 {
-                    debug!(
-                        "Document {} not found, retrying in {}ms (attempt {}/{})",
-                        uuid,
-                        delay_ms,
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
-                    sleep(Duration::from_millis(delay_ms)).await;
-                    delay_ms = (delay_ms * 2).min(max_delay_ms);
-                }
-            }
-        }
-    }
-
-    let head =
-        head.ok_or_else(|| format!("Document {} not found after {} retries", uuid, MAX_RETRIES))?;
-
-    // Decode if binary (base64)
-    let content_bytes = if crate::sync::looks_like_base64_binary(&head.content) {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        match STANDARD.decode(&head.content) {
-            Ok(decoded) if crate::sync::is_binary_content(&decoded) => decoded,
-            _ => head.content.as_bytes().to_vec(),
-        }
-    } else {
-        head.content.as_bytes().to_vec()
-    };
-
-    let content_string = String::from_utf8_lossy(&content_bytes).to_string();
-
-    // Write content to all local paths that share this UUID
-    for rel_path in paths {
-        let file_path = directory.join(rel_path);
-
-        // Ensure parent directory exists
-        if let Some(parent) = file_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        // Don't overwrite a file that has content with empty content from the server.
-        // This can happen when the server stores JSONL as YArray but extracts content
-        // using the Text handler (ContentType mismatch), returning empty content.
-        // The CRDT receive task will deliver the actual content via MQTT.
-        if content_bytes.is_empty() {
-            if let Ok(existing) = tokio::fs::read_to_string(&file_path).await {
-                if !existing.is_empty() {
-                    debug!(
-                        "Skipping empty content write for {} - file already has {} bytes",
-                        rel_path,
-                        existing.len()
-                    );
-                    continue;
-                }
-            }
-        }
-
-        // Update shared_last_content BEFORE writing to prevent echo publishes
-        // This is critical for CRDT-managed files where upload_task_crdt is watching
-        {
-            let states = file_states.read().await;
-            if let Some(state) = states.get(rel_path) {
-                if let Some(ref shared_last_content) = state.crdt_last_content {
-                    let mut shared = shared_last_content.write().await;
-                    *shared = Some(content_string.clone());
-                    debug!("Updated shared_last_content for {} before write", rel_path);
-                }
-            }
-        }
-
-        tokio::fs::write(&file_path, &content_bytes).await?;
-        debug!("Wrote {} bytes to {}", content_bytes.len(), rel_path);
-    }
-
-    Ok(())
 }
 
 /// Resync all subscribed file UUIDs from server after broadcast lag.
@@ -1435,28 +1259,17 @@ async fn handle_file_uuid_edit(
 /// In the future, resync should rely on MQTT retained messages.
 #[allow(clippy::too_many_arguments)]
 async fn resync_subscribed_files(
-    http_client: &Client,
-    server: &str,
+    _http_client: &Client,
+    _server: &str,
     subscribed_uuids: &HashSet<String>,
     uuid_to_paths: &crate::sync::UuidToPathsMap,
     directory: &Path,
-    use_paths: bool,
+    _use_paths: bool,
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
     crdt_context: Option<&CrdtFileSyncContext>,
     inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     author: &str,
 ) {
-    // Log deprecation warning if MQTT-only mode is enabled
-    if let Some(ctx) = crdt_context {
-        if let Err(e) = ctx
-            .mqtt_only_config
-            .require_no_http("resync_subscribed_files")
-        {
-            warn!("Resync skipped in MQTT-only mode (no HTTP allowed): {}", e);
-            return;
-        }
-    }
-
     debug!(
         "Resyncing {} subscribed file UUIDs after broadcast lag",
         subscribed_uuids.len()
@@ -1485,7 +1298,7 @@ async fn resync_subscribed_files(
                     .map(|p| directory.join(p))
                     .unwrap_or_else(|| directory.join(&filename));
 
-                // Mark state as needing re-init so initialize_crdt_state_from_server_with_pending
+                // Mark state as needing re-init so resync_crdt_state_via_cyan_with_pending
                 // will actually fetch fresh state
                 {
                     let mut state_guard = ctx.crdt_state.write().await;
@@ -1503,27 +1316,28 @@ async fn resync_subscribed_files(
                         .and_then(|s| s.crdt_last_content.clone())
                 };
 
-                if let Err(e) =
-                    crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
-                        http_client,
-                        server,
-                        node_id,
-                        &ctx.crdt_state,
-                        &filename,
-                        &file_path,
-                        Some(&ctx.mqtt_client),
-                        Some(&ctx.workspace),
-                        Some(author),
-                        shared_last_content.as_ref(),
-                        inode_tracker.as_ref(),
-                        ctx.mqtt_only_config,
-                    )
-                    .await
+                if let Err(e) = crate::sync::file_sync::resync_crdt_state_via_cyan_with_pending(
+                    &ctx.mqtt_client,
+                    &ctx.workspace,
+                    node_id,
+                    &ctx.crdt_state,
+                    &filename,
+                    &file_path,
+                    author,
+                    shared_last_content.as_ref(),
+                    inode_tracker.as_ref(),
+                    true,
+                    true,
+                )
+                .await
                 {
                     warn!(
-                        "Resync: Failed to re-initialize CRDT state for {}: {}",
+                        "Resync: Failed to re-initialize CRDT state for {}: {} — initializing empty",
                         uuid, e
                     );
+                    let mut state_guard = ctx.crdt_state.write().await;
+                    let fs = state_guard.get_or_create_file(&filename, node_id);
+                    fs.initialize_empty();
                 } else {
                     debug!("Resync: Re-initialized CRDT state for {}", uuid);
                 }
@@ -1531,22 +1345,11 @@ async fn resync_subscribed_files(
             }
         }
 
-        // Fallback for non-CRDT files: fetch from server
-        if let Err(e) = handle_file_uuid_edit(
-            http_client,
-            server,
-            uuid,
-            paths,
-            directory,
-            use_paths,
-            file_states,
-        )
-        .await
-        {
-            warn!("Resync: Failed to fetch UUID {}: {}", uuid, e);
-        } else {
-            debug!("Resync: Fetched UUID {} from server", uuid);
-        }
+        // Non-CRDT files: content will arrive via MQTT retained messages
+        debug!(
+            "Resync: No CRDT context for UUID {} — relying on MQTT retained messages",
+            uuid
+        );
     }
 
     debug!("Resync completed for subscribed file UUIDs");
@@ -2724,24 +2527,12 @@ pub async fn subdir_mqtt_task(
                     false // No CRDT context, use server fetch
                 };
 
-                // Fallback: fetch from server for non-CRDT paths or if CRDT handling failed
+                // If CRDT handling failed, log and continue — next MQTT message will retry
                 if !crdt_handled {
-                    if let Err(e) = handle_file_uuid_edit(
-                        &http_client,
-                        &server,
-                        &doc_id,
-                        paths,
-                        &directory,
-                        use_paths,
-                        &file_states,
-                    )
-                    .await
-                    {
-                        warn!(
-                            "Subdir {}: Failed to handle file UUID edit for {}: {}",
-                            subdir_path, doc_id, e
-                        );
-                    }
+                    warn!(
+                        "Subdir {}: CRDT handling failed for {} — will retry on next MQTT message",
+                        subdir_path, doc_id
+                    );
                 }
             }
         } else {
@@ -2771,9 +2562,9 @@ async fn sync_subdir_uuid_subscriptions(
     workspace: &str,
     subscribed_uuids: &mut HashSet<String>,
     uuid_to_paths: &mut crate::sync::UuidToPathsMap,
-    directory: &std::path::Path,
-    use_paths: bool,
-    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    _directory: &std::path::Path,
+    _use_paths: bool,
+    _file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
 ) {
     // Fetch the current UUID map from the subdirectory's schema
     let (new_uuid_map, fetch_succeeded) =
@@ -2856,39 +2647,8 @@ async fn sync_subdir_uuid_subscriptions(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    // Fetch and write initial content for newly added UUIDs
-    if !to_add.is_empty() {
-        info!(
-            "Subdir {}: Fetching initial content for {} newly subscribed UUIDs",
-            subdir_path,
-            to_add.len()
-        );
-        for uuid in &to_add {
-            if let Some(paths) = uuid_to_paths.get(uuid) {
-                if let Err(e) = handle_file_uuid_edit(
-                    http_client,
-                    server,
-                    uuid,
-                    paths,
-                    directory,
-                    use_paths,
-                    file_states,
-                )
-                .await
-                {
-                    warn!(
-                        "Subdir {}: Failed to fetch initial content for UUID {}: {}",
-                        subdir_path, uuid, e
-                    );
-                } else {
-                    debug!(
-                        "Subdir {}: Fetched initial content for UUID {}",
-                        subdir_path, uuid
-                    );
-                }
-            }
-        }
-    }
+    // Initial content for newly subscribed UUIDs arrives via MQTT retained messages
+    // and is handled by the CRDT receive path. No HTTP fetch needed.
 
     if !to_add.is_empty() || !to_remove.is_empty() {
         info!(

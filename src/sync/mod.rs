@@ -246,8 +246,7 @@ pub use dir_sync::{
 };
 pub use error::{SyncError, SyncResult};
 pub use file_sync::{
-    initial_sync, initialize_crdt_state_from_server,
-    initialize_crdt_state_from_server_with_pending, prepare_content_for_upload,
+    initial_sync, prepare_content_for_upload, resync_crdt_state_via_cyan_with_pending,
     spawn_file_sync_tasks_crdt, sync_single_file, upload_task, upload_task_crdt, PreparedContent,
     PENDING_WRITE_TIMEOUT,
 };

@@ -20,10 +20,12 @@ use crate::sync::state_file::compute_content_hash;
 use crate::sync::uuid_map::fetch_node_id_from_schema;
 use crate::sync::{
     build_edit_url, build_replace_url, create_yjs_text_update, detect_from_path,
-    ensure_trailing_newline, error::SyncResult, file_watcher_task, is_binary_content,
-    is_default_content_for_mime, looks_like_base64_binary, push_json_content, push_jsonl_content,
-    push_schema_to_server, refresh_from_head, trace_timeline, EditRequest, EditResponse, FileEvent,
-    ReplaceResponse, SharedLastContent, SyncState, TimelineMilestone,
+    ensure_trailing_newline,
+    error::{SyncError, SyncResult},
+    file_watcher_task, is_binary_content, is_default_content_for_mime, looks_like_base64_binary,
+    push_json_content, push_jsonl_content, push_schema_to_server, refresh_from_head,
+    trace_timeline, EditRequest, EditResponse, FileEvent, ReplaceResponse, SharedLastContent,
+    SyncState, TimelineMilestone,
 };
 use reqwest::Client;
 use rumqttc::QoS;
@@ -1690,7 +1692,8 @@ pub async fn upload_task_crdt(
                             false,
                             false,
                         )
-                        .await;
+                        .await
+                        .is_ok();
                         if !resynced {
                             warn!(
                                 "CRDT upload_task: cyan resync failed for {}, skipping publish",
@@ -1865,7 +1868,8 @@ pub async fn upload_task_crdt(
                         false,
                         false,
                     )
-                    .await;
+                    .await
+                    .is_ok();
                     if !resynced {
                         warn!(
                             "CRDT upload_task: cyan resync failed for {}, skipping publish",
@@ -1891,310 +1895,13 @@ pub async fn upload_task_crdt(
     );
 }
 
-/// Initialize CRDT state for a file from the server's HEAD.
-///
-/// This is critical for CRDT sync to work correctly. Without initializing from
-/// the server's Yjs state, each sync client would create its own independent
-/// operation history. This causes merge failures where:
-/// - Client A deletes text (delete operation references A's operations)
-/// - Client B has different history (different client ID, different operation IDs)
-/// - B receives the delete but can't find operations to delete (different origin)
-/// - B's content is restored, triggering a loop
-///
-/// By fetching the server's Yjs state and using it to initialize our local state,
-/// all clients share the same operation history and merges work correctly.
-///
-/// # Arguments
-/// * `client` - HTTP client for fetching from server
-/// * `server` - Server URL
-/// * `node_id` - UUID of the document
-/// * `crdt_state` - Shared CRDT state to initialize
-/// * `filename` - Filename within the directory (for state lookup)
-pub async fn initialize_crdt_state_from_server(
-    client: &Client,
-    server: &str,
-    node_id: Uuid,
-    crdt_state: &Arc<RwLock<DirectorySyncState>>,
-    filename: &str,
-    file_path: &Path,
-    mqtt_only_config: crate::sync::MqttOnlySyncConfig,
-) -> SyncResult<()> {
-    initialize_crdt_state_from_server_with_pending(
-        client,
-        server,
-        node_id,
-        crdt_state,
-        filename,
-        file_path,
-        None,
-        None,
-        None,
-        None,
-        None,
-        mqtt_only_config,
-    )
-    .await
-}
-
-/// Initialize CRDT state from server and process any pending edits.
-///
-/// This extended version accepts optional MQTT client, workspace, and author
-/// to process pending edits that arrived before initialization completed.
-///
-/// **Note**: This function uses HTTP to fetch HEAD from server, which can
-/// race with MQTT messages causing stale data issues. Consider using
-/// MQTT retained messages for initialization in MQTT-only mode.
-/// See CP-cpcu for the deprecation plan.
-///
-/// # Arguments
-/// * `client` - HTTP client for fetching from server
-/// * `server` - Server URL
-/// * `node_id` - UUID of the document
-/// * `crdt_state` - Shared CRDT state to initialize
-/// * `filename` - Filename within the directory (for state lookup)
-/// * `file_path` - Path to the local file
-/// * `mqtt_client` - Optional MQTT client for processing pending edits
-/// * `workspace` - Optional workspace name for MQTT topics
-/// * `author` - Optional author for merge commits
-#[allow(clippy::too_many_arguments)]
-pub async fn initialize_crdt_state_from_server_with_pending(
-    client: &Client,
-    server: &str,
-    node_id: Uuid,
-    crdt_state: &Arc<RwLock<DirectorySyncState>>,
-    filename: &str,
-    file_path: &Path,
-    mqtt_client: Option<&Arc<MqttClient>>,
-    workspace: Option<&str>,
-    author: Option<&str>,
-    shared_last_content: Option<&SharedLastContent>,
-    inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
-    mqtt_only_config: crate::sync::MqttOnlySyncConfig,
-) -> SyncResult<()> {
-    // Check if we need initialization
-    {
-        let state = crdt_state.read().await;
-        if let Some(file_state) = state.get_file(filename) {
-            if !file_state.needs_server_init() {
-                debug!(
-                    "CRDT state already initialized for {}, skipping server fetch",
-                    filename
-                );
-                return Ok(());
-            }
-        }
-    }
-
-    // Fetch HEAD from server (disallowed in MQTT-only mode).
-    mqtt_only_config.require_no_http("initialize_crdt_state_from_server_with_pending")?;
-    let identifier = node_id.to_string();
-    match fetch_head(client, server, &identifier, false).await {
-        Ok(Some(head)) => {
-            if let (Some(ref state_b64), Some(ref cid)) = (&head.state, &head.cid) {
-                // Initialize CRDT state
-                {
-                    let mut state = crdt_state.write().await;
-                    let file_state = state.get_or_create_file(filename, node_id);
-                    file_state.initialize_from_server(state_b64, cid);
-                }
-
-                // CRITICAL: Also write the server's content to the local file.
-                // This prevents the upload task from computing a diff against
-                // empty/stale local content and publishing deletes that wipe
-                // out the server state.
-                if !head.content.is_empty() {
-                    // Read current local content
-                    let local_content = tokio::fs::read_to_string(file_path)
-                        .await
-                        .unwrap_or_default();
-
-                    // Only write if local differs from server
-                    if local_content != head.content {
-                        if let Err(e) = write_content_with_tracker(
-                            file_path,
-                            &head.content,
-                            shared_last_content,
-                            inode_tracker,
-                            Some(cid.clone()),
-                            "CRDT init",
-                        )
-                        .await
-                        {
-                            warn!(
-                                "Failed to write server content to {}: {}",
-                                file_path.display(),
-                                e
-                            );
-                        } else {
-                            info!(
-                                "Wrote server content to {} ({} bytes)",
-                                file_path.display(),
-                                head.content.len()
-                            );
-                        }
-                    }
-                } else {
-                    // Server returned empty content but has CRDT state - extract from state.
-                    // This happens when content was only written via CRDT operations
-                    // (not full content replacement), leaving the content field empty.
-                    let extracted_content = {
-                        let state = crdt_state.read().await;
-                        if let Some(file_state) = state.get_file(filename) {
-                            match file_state.to_doc() {
-                                Ok(doc) => {
-                                    let content = get_doc_text_content(&doc);
-                                    if content.is_empty() {
-                                        None
-                                    } else {
-                                        info!(
-                                            "Extracted {} bytes from CRDT state for {} (server content was empty)",
-                                            content.len(),
-                                            filename
-                                        );
-                                        Some(content)
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to convert file_state to doc for {}: {}",
-                                        filename, e
-                                    );
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        }
-                    }; // state lock and transaction dropped here
-
-                    if let Some(content) = extracted_content {
-                        // Read current local content
-                        let local_content = tokio::fs::read_to_string(file_path)
-                            .await
-                            .unwrap_or_default();
-
-                        // Only write if local differs from extracted content
-                        if local_content != content {
-                            if let Err(e) = write_content_with_tracker(
-                                file_path,
-                                &content,
-                                shared_last_content,
-                                inode_tracker,
-                                Some(cid.clone()),
-                                "CRDT init",
-                            )
-                            .await
-                            {
-                                warn!(
-                                    "Failed to write CRDT-extracted content to {}: {}",
-                                    file_path.display(),
-                                    e
-                                );
-                            } else {
-                                info!(
-                                    "Wrote CRDT-extracted content to {} ({} bytes)",
-                                    file_path.display(),
-                                    content.len()
-                                );
-                            }
-                        }
-                    }
-                }
-
-                debug!(
-                    "Initialized CRDT state for {} from server HEAD {}",
-                    filename, cid
-                );
-
-                handle_pending_edits_with_flock(
-                    "after CRDT init",
-                    mqtt_client,
-                    workspace.unwrap_or(""),
-                    node_id,
-                    filename,
-                    file_path,
-                    crdt_state,
-                    author.unwrap_or(""),
-                    shared_last_content,
-                    inode_tracker,
-                )
-                .await;
-
-                Ok(())
-            } else {
-                // Server has no state yet (empty document) - that's fine
-                // CRITICAL: Initialize to empty state so should_queue_edits() doesn't
-                // return NeedsServerInit. Without this, incoming MQTT edits would be
-                // queued forever because yjs_state remains None.
-                {
-                    let mut state = crdt_state.write().await;
-                    let file_state = state.get_or_create_file(filename, node_id);
-                    file_state.initialize_empty();
-                }
-
-                handle_pending_edits_with_flock(
-                    "after empty init",
-                    mqtt_client,
-                    workspace.unwrap_or(""),
-                    node_id,
-                    filename,
-                    file_path,
-                    crdt_state,
-                    author.unwrap_or(""),
-                    shared_last_content,
-                    inode_tracker,
-                )
-                .await;
-
-                debug!(
-                    "Server has no Yjs state for {} yet, starting fresh",
-                    filename
-                );
-                Ok(())
-            }
-        }
-        Ok(None) => {
-            // Document doesn't exist on server yet - that's fine
-            // CRITICAL: Initialize to empty state so should_queue_edits() doesn't
-            // return NeedsServerInit. Without this, incoming MQTT edits would be
-            // queued forever because yjs_state remains None.
-            {
-                let mut state = crdt_state.write().await;
-                let file_state = state.get_or_create_file(filename, node_id);
-                file_state.initialize_empty();
-            }
-            debug!(
-                "Document {} doesn't exist on server yet, initialized empty",
-                identifier
-            );
-            Ok(())
-        }
-        Err(e) => {
-            warn!(
-                "Failed to fetch HEAD for CRDT initialization of {}: {:?}",
-                filename, e
-            );
-            // CRITICAL: Initialize to empty state so should_queue_edits() doesn't
-            // return NeedsServerInit. Without this, incoming MQTT edits would be
-            // queued forever because yjs_state remains None.
-            {
-                let mut state = crdt_state.write().await;
-                let file_state = state.get_or_create_file(filename, node_id);
-                file_state.initialize_empty();
-            }
-            // Don't fail - we can still try to sync via MQTT
-            Ok(())
-        }
-    }
-}
-
 /// Resync CRDT state via the cyan/sync MQTT channel.
 ///
 /// This fetches the full commit history (Ancestors(HEAD)), rebuilds the Y.Doc,
 /// initializes state from that snapshot, and can optionally write content and
 /// process queued edits. It is used when MissingHistory is detected so disk
 /// writes only happen after gap fill.
-async fn resync_crdt_state_via_cyan_with_pending(
+pub async fn resync_crdt_state_via_cyan_with_pending(
     mqtt_client: &Arc<MqttClient>,
     workspace: &str,
     node_id: Uuid,
@@ -2206,7 +1913,7 @@ async fn resync_crdt_state_via_cyan_with_pending(
     inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
     write_to_disk: bool,
     process_pending_edits: bool,
-) -> bool {
+) -> SyncResult<()> {
     use crate::mqtt::messages::SyncMessage;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
@@ -2232,7 +1939,11 @@ async fn resync_crdt_state_via_cyan_with_pending(
             file_path.display(),
             e
         );
-        return false;
+        return Err(SyncError::Mqtt(format!(
+            "Failed to subscribe for file {}: {}",
+            file_path.display(),
+            e
+        )));
     }
 
     let ancestors_msg = SyncMessage::Ancestors {
@@ -2249,7 +1960,11 @@ async fn resync_crdt_state_via_cyan_with_pending(
                 e
             );
             let _ = mqtt_client.unsubscribe(&sync_topic).await;
-            return false;
+            return Err(SyncError::Other(format!(
+                "Failed to serialize Ancestors for {}: {}",
+                file_path.display(),
+                e
+            )));
         }
     };
 
@@ -2263,10 +1978,14 @@ async fn resync_crdt_state_via_cyan_with_pending(
             e
         );
         let _ = mqtt_client.unsubscribe(&sync_topic).await;
-        return false;
+        return Err(SyncError::Mqtt(format!(
+            "Failed to publish Ancestors for {}: {}",
+            file_path.display(),
+            e
+        )));
     }
 
-    let timeout = tokio::time::Duration::from_secs(5);
+    let timeout = tokio::time::Duration::from_secs(2);
     let deadline = tokio::time::Instant::now() + timeout;
     let mut commits: Vec<(String, String)> = Vec::new();
     let mut head_cid: Option<String> = None;
@@ -2279,7 +1998,10 @@ async fn resync_crdt_state_via_cyan_with_pending(
                 file_path.display()
             );
             let _ = mqtt_client.unsubscribe(&sync_topic).await;
-            return false;
+            return Err(SyncError::Other(format!(
+                "Timeout waiting for sync response for {}",
+                file_path.display()
+            )));
         }
 
         match tokio::time::timeout(remaining, message_rx.recv()).await {
@@ -2331,7 +2053,11 @@ async fn resync_crdt_state_via_cyan_with_pending(
                             message
                         );
                         let _ = mqtt_client.unsubscribe(&sync_topic).await;
-                        return false;
+                        return Err(SyncError::Other(format!(
+                            "Server error for {}: {}",
+                            file_path.display(),
+                            message
+                        )));
                     }
                     _ => continue,
                 }
@@ -2343,7 +2069,11 @@ async fn resync_crdt_state_via_cyan_with_pending(
                     e
                 );
                 let _ = mqtt_client.unsubscribe(&sync_topic).await;
-                return false;
+                return Err(SyncError::Other(format!(
+                    "Broadcast channel error for {}: {}",
+                    file_path.display(),
+                    e
+                )));
             }
             Err(_) => {
                 warn!(
@@ -2351,7 +2081,10 @@ async fn resync_crdt_state_via_cyan_with_pending(
                     file_path.display()
                 );
                 let _ = mqtt_client.unsubscribe(&sync_topic).await;
-                return false;
+                return Err(SyncError::Other(format!(
+                    "Timeout waiting for sync response for {}",
+                    file_path.display()
+                )));
             }
         }
     }
@@ -2384,7 +2117,7 @@ async fn resync_crdt_state_via_cyan_with_pending(
             .await;
         }
 
-        return true;
+        return Ok(());
     }
 
     let doc = Doc::new();
@@ -2489,7 +2222,7 @@ async fn resync_crdt_state_via_cyan_with_pending(
         head_cid
     );
 
-    true
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3072,20 +2805,19 @@ pub async fn receive_task_crdt(
                                 }
                             }
 
-                            // Resync from server
-                            if let Err(e) = initialize_crdt_state_from_server_with_pending(
-                                &http_client,
-                                &server,
+                            // Resync via cyan (MQTT)
+                            if let Err(e) = resync_crdt_state_via_cyan_with_pending(
+                                &mqtt_client,
+                                &workspace,
                                 node_id,
                                 &crdt_state,
                                 &filename,
                                 &file_path,
-                                Some(&mqtt_client),
-                                Some(&workspace),
-                                Some(&author),
+                                &author,
                                 Some(&shared_last_content),
                                 inode_tracker.as_ref(),
-                                mqtt_only_config,
+                                true,
+                                true,
                             )
                             .await
                             {
@@ -3148,33 +2880,23 @@ pub async fn receive_task_crdt(
                     "CRDT receive_task: periodic divergence check for {}",
                     file_path.display()
                 );
-                if mqtt_only_config.mqtt_only {
-                    debug!(
-                        "CRDT receive_task: skipping HTTP divergence check for {} (MQTT-only mode)",
+                let diverged = check_and_resolve_divergence(
+                    node_id,
+                    &file_path,
+                    &crdt_state,
+                    &filename,
+                    &mqtt_client,
+                    &workspace,
+                    &author,
+                    Some(&shared_last_content),
+                    inode_tracker.as_ref(),
+                )
+                .await;
+                if diverged {
+                    info!(
+                        "CRDT receive_task: divergence detected and resolved for {}",
                         file_path.display()
                     );
-                } else {
-                    let diverged = check_and_resolve_divergence(
-                        &http_client,
-                        &server,
-                        node_id,
-                        &file_path,
-                        &crdt_state,
-                        &filename,
-                        Some(&mqtt_client),
-                        Some(&workspace),
-                        Some(&author),
-                        Some(&shared_last_content),
-                        inode_tracker.as_ref(),
-                        mqtt_only_config,
-                    )
-                    .await;
-                    if diverged {
-                        info!(
-                            "CRDT receive_task: divergence detected and resolved for {}",
-                            file_path.display()
-                        );
-                    }
                 }
                 continue; // Go back to waiting for messages
             }
@@ -3216,26 +2938,20 @@ pub async fn receive_task_crdt(
                             }
                         }
 
-                        if mqtt_only_config.mqtt_only {
-                            warn!(
-                                "CRDT receive_task: lag detected for {} but HTTP is disabled (MQTT-only). Leaving state marked for cyan resync.",
-                                file_path.display()
-                            );
-                        } else {
-                            // Re-initialize from server to get the latest state
-                            if let Err(e) = initialize_crdt_state_from_server_with_pending(
-                                &http_client,
-                                &server,
+                        {
+                            // Resync via cyan (MQTT) to get latest state after lag
+                            if let Err(e) = resync_crdt_state_via_cyan_with_pending(
+                                &mqtt_client,
+                                &workspace,
                                 node_id,
                                 &crdt_state,
                                 &filename,
                                 &file_path,
-                                Some(&mqtt_client),
-                                Some(&workspace),
-                                Some(&author),
+                                &author,
                                 Some(&shared_last_content),
                                 inode_tracker.as_ref(),
-                                mqtt_only_config,
+                                true,
+                                true,
                             )
                             .await
                             {
@@ -3475,7 +3191,7 @@ pub async fn receive_task_crdt(
                         // Drop state_guard to release the write lock before resyncing.
                         drop(state_guard);
 
-                        if !resync_crdt_state_via_cyan_with_pending(
+                        if resync_crdt_state_via_cyan_with_pending(
                             &mqtt_client,
                             &workspace,
                             node_id,
@@ -3489,6 +3205,7 @@ pub async fn receive_task_crdt(
                             true,
                         )
                         .await
+                        .is_err()
                         {
                             warn!(
                                 "CRDT receive_task: cyan resync failed for {} after missing history",
@@ -3582,140 +3299,17 @@ pub async fn receive_task_crdt(
 /// Returns true if divergence was detected and handled, false otherwise.
 #[allow(clippy::too_many_arguments)]
 async fn check_and_resolve_divergence(
-    http_client: &Client,
-    server: &str,
     node_id: Uuid,
     file_path: &Path,
     crdt_state: &Arc<RwLock<DirectorySyncState>>,
     filename: &str,
-    mqtt_client: Option<&Arc<MqttClient>>,
-    workspace: Option<&str>,
-    author: Option<&str>,
+    mqtt_client: &Arc<MqttClient>,
+    workspace: &str,
+    author: &str,
     shared_last_content: Option<&SharedLastContent>,
     inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
-    mqtt_only_config: crate::sync::MqttOnlySyncConfig,
 ) -> bool {
-    if mqtt_only_config.mqtt_only {
-        debug!(
-            "Divergence check skipped for {} (MQTT-only mode)",
-            file_path.display()
-        );
-        return false;
-    }
-
-    let node_id_str = node_id.to_string();
-
-    // Get our current state
-    let (local_head_cid, server_head_cid_known) = {
-        let state_guard = crdt_state.read().await;
-        let file_state = state_guard.get_file(filename);
-        match file_state {
-            Some(f) => (f.head_cid.clone(), f.local_head_cid.clone()),
-            None => return false, // File not tracked
-        }
-    };
-
-    // Fetch server HEAD
-    let server_head = match fetch_head(http_client, server, &node_id_str, false).await {
-        Ok(Some(head)) => head,
-        Ok(None) => {
-            debug!(
-                "Divergence check: no server HEAD for {}",
-                file_path.display()
-            );
-            return false;
-        }
-        Err(e) => {
-            warn!(
-                "Divergence check: failed to fetch server HEAD for {}: {}",
-                file_path.display(),
-                e
-            );
-            return false;
-        }
-    };
-
-    let server_cid = match &server_head.cid {
-        Some(cid) => cid.clone(),
-        None => return false, // No server commit yet
-    };
-
-    // Check if we're in sync
-    let local_cid = match &local_head_cid {
-        Some(cid) => cid,
-        None => {
-            // We have no local head, server has content - need to pull
-            info!(
-                "Divergence check: no local HEAD for {}, server has {}, pulling",
-                file_path.display(),
-                server_cid
-            );
-            // Mark as needing resync and pull
-            {
-                let mut state_guard = crdt_state.write().await;
-                if let Some(file_state) = state_guard.get_file_mut(filename) {
-                    file_state.mark_needs_resync();
-                }
-            }
-            if let Err(e) = initialize_crdt_state_from_server_with_pending(
-                http_client,
-                server,
-                node_id,
-                crdt_state,
-                filename,
-                file_path,
-                mqtt_client,
-                workspace,
-                author,
-                shared_last_content,
-                inode_tracker,
-                mqtt_only_config,
-            )
-            .await
-            {
-                warn!(
-                    "Divergence check: failed to pull server state for {}: {}",
-                    file_path.display(),
-                    e
-                );
-            }
-            return true;
-        }
-    };
-
-    if local_cid == &server_cid {
-        // In sync - nothing to do
-        return false;
-    }
-
-    // Divergence detected!
-    info!(
-        "Divergence check: {} has local HEAD {} but server HEAD {}",
-        file_path.display(),
-        local_cid,
-        server_cid
-    );
-
-    // Check if we have local changes that haven't been synced
-    let has_local_changes = server_head_cid_known.as_ref() != Some(&server_cid);
-
-    if has_local_changes {
-        // We have local changes AND server has different content
-        // This is true divergence - need to merge
-        info!(
-            "Divergence check: true divergence for {} (local_head_cid={:?}), triggering resync with merge",
-            file_path.display(),
-            server_head_cid_known
-        );
-    } else {
-        // Server is ahead and we don't have local changes - just pull
-        info!(
-            "Divergence check: server ahead for {}, pulling",
-            file_path.display()
-        );
-    }
-
-    // Mark as needing resync
+    // Mark state as needing resync
     {
         let mut state_guard = crdt_state.write().await;
         if let Some(file_state) = state_guard.get_file_mut(filename) {
@@ -3723,37 +3317,38 @@ async fn check_and_resolve_divergence(
         }
     }
 
-    // Resync from server - the merge logic in initialize_crdt_state_from_server_with_pending
-    // will handle merging local changes with server state
-    if let Err(e) = initialize_crdt_state_from_server_with_pending(
-        http_client,
-        server,
+    // Resync via cyan (MQTT) - the caller already suspects divergence
+    match resync_crdt_state_via_cyan_with_pending(
+        mqtt_client,
+        workspace,
         node_id,
         crdt_state,
         filename,
         file_path,
-        mqtt_client,
-        workspace,
         author,
         shared_last_content,
         inode_tracker,
-        mqtt_only_config,
+        true,
+        true,
     )
     .await
     {
-        warn!(
-            "Divergence check: failed to resync {} from server: {}",
-            file_path.display(),
-            e
-        );
-    } else {
-        info!(
-            "Divergence check: successfully resynced {} from server",
-            file_path.display()
-        );
+        Ok(()) => {
+            info!(
+                "Divergence check: successfully resynced {} via cyan",
+                file_path.display()
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                "Divergence check: failed to resync {} via cyan: {}",
+                file_path.display(),
+                e
+            );
+            false
+        }
     }
-
-    true
 }
 
 #[cfg(test)]
@@ -4198,38 +3793,6 @@ mod tests {
             .await;
 
             assert!(result.echo_detected);
-        }
-
-        #[tokio::test]
-        async fn test_mqtt_only_blocks_http_init() {
-            let dir = tempdir().unwrap();
-            let file_path = dir.path().join("note.txt");
-            let node_id = Uuid::new_v4();
-            let crdt_state = Arc::new(RwLock::new(DirectorySyncState::new(node_id)));
-
-            {
-                let mut state = crdt_state.write().await;
-                state.get_or_create_file("note.txt", node_id);
-            }
-
-            let client = Client::new();
-            let result = initialize_crdt_state_from_server_with_pending(
-                &client,
-                "http://localhost:1",
-                node_id,
-                &crdt_state,
-                "note.txt",
-                &file_path,
-                None,
-                None,
-                None,
-                None,
-                None,
-                crate::sync::MqttOnlySyncConfig::mqtt_only(),
-            )
-            .await;
-
-            assert!(matches!(result, Err(SyncError::Http(_))));
         }
     }
 }

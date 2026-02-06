@@ -1186,27 +1186,28 @@ pub async fn handle_subdir_new_files(
                         }
                     };
 
-                    if let Err(e) =
-                        crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
-                            client,
-                            server,
-                            node_uuid,
-                            &subdir_state,
-                            &filename,
-                            &file_path,
-                            Some(&ctx.mqtt_client),
-                            Some(&ctx.workspace),
-                            Some(author),
-                            Some(&shared_last_content),
-                            inode_tracker.as_ref(),
-                            ctx.mqtt_only_config,
-                        )
-                        .await
+                    if let Err(e) = crate::sync::file_sync::resync_crdt_state_via_cyan_with_pending(
+                        &ctx.mqtt_client,
+                        &ctx.workspace,
+                        node_uuid,
+                        &subdir_state,
+                        &filename,
+                        &file_path,
+                        author,
+                        Some(&shared_last_content),
+                        inode_tracker.as_ref(),
+                        true,
+                        true,
+                    )
+                    .await
                     {
                         warn!(
-                            "Failed to initialize CRDT state for {}: {}",
+                            "Failed to initialize CRDT state for {}: {} — initializing empty",
                             root_relative_path, e
                         );
+                        let mut state = subdir_state.write().await;
+                        let fs = state.get_or_create_file(&filename, node_uuid);
+                        fs.initialize_empty();
                     }
 
                     // State is already registered, spawn tasks using subdirectory state
@@ -1370,28 +1371,29 @@ pub async fn handle_subdir_new_files(
                         }
                     };
 
-                    // Initialize CRDT state from server (will handle empty/404 case)
-                    if let Err(e) =
-                        crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
-                            client,
-                            server,
-                            node_uuid,
-                            &subdir_state,
-                            &filename,
-                            &file_path,
-                            Some(&ctx.mqtt_client),
-                            Some(&ctx.workspace),
-                            Some(author),
-                            Some(&shared_last_content),
-                            inode_tracker.as_ref(),
-                            ctx.mqtt_only_config,
-                        )
-                        .await
+                    // Initialize CRDT state via cyan (will handle empty/404 case)
+                    if let Err(e) = crate::sync::file_sync::resync_crdt_state_via_cyan_with_pending(
+                        &ctx.mqtt_client,
+                        &ctx.workspace,
+                        node_uuid,
+                        &subdir_state,
+                        &filename,
+                        &file_path,
+                        author,
+                        Some(&shared_last_content),
+                        inode_tracker.as_ref(),
+                        true,
+                        true,
+                    )
+                    .await
                     {
                         warn!(
-                            "Failed to initialize CRDT state for {} (MQTT fallback): {}",
+                            "Failed to initialize CRDT state for {} (MQTT fallback): {} — initializing empty",
                             root_relative_path, e
                         );
+                        let mut state = subdir_state.write().await;
+                        let fs = state.get_or_create_file(&filename, node_uuid);
+                        fs.initialize_empty();
                     }
 
                     // Spawn CRDT tasks using subdirectory state
@@ -1963,26 +1965,28 @@ pub async fn handle_schema_change(
                             };
 
                             if let Err(e) =
-                                crate::sync::file_sync::initialize_crdt_state_from_server_with_pending(
-                                    client,
-                                    server,
+                                crate::sync::file_sync::resync_crdt_state_via_cyan_with_pending(
+                                    &ctx.mqtt_client,
+                                    &ctx.workspace,
                                     node_uuid,
                                     &dir_state,
                                     &filename,
                                     &file_path,
-                                    Some(&ctx.mqtt_client),
-                                    Some(&ctx.workspace),
-                                    Some(author),
+                                    author,
                                     Some(&shared_last_content),
                                     inode_tracker.as_ref(),
-                                    ctx.mqtt_only_config,
+                                    true,
+                                    true,
                                 )
                                 .await
                             {
                                 warn!(
-                                    "Failed to initialize CRDT state for {}: {}",
+                                    "Failed to initialize CRDT state for {}: {} — initializing empty",
                                     path, e
                                 );
+                                let mut state = dir_state.write().await;
+                                let fs = state.get_or_create_file(&filename, node_uuid);
+                                fs.initialize_empty();
                             }
 
                             // Check for existing tasks before spawning (prevents duplicates)

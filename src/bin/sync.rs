@@ -20,8 +20,8 @@ use commonplace_doc::sync::{
     directory_watcher_task, discover_fs_root, ensure_fs_root_exists,
     ensure_parent_directories_exist, file_watcher_task, find_owning_document, fork_node,
     handle_file_deleted, handle_file_modified, handle_schema_change, handle_schema_modified,
-    initial_sync, initialize_crdt_state_from_server_with_pending, is_binary_content,
-    push_schema_to_server, remove_file_from_schema, scan_directory_with_contents, schema_to_json,
+    initial_sync, is_binary_content, push_schema_to_server, remove_file_from_schema,
+    resync_crdt_state_via_cyan_with_pending, scan_directory_with_contents, schema_to_json,
     spawn_command_listener, spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file,
     trace_timeline, upload_task, wait_for_file_stability, wait_for_uuid_map_ready,
     write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent, FileEvent, FileSyncState,
@@ -2497,29 +2497,35 @@ async fn run_directory_mode(
                 .filter(|s| !s.is_empty());
             let shared_last_content: SharedLastContent = Arc::new(RwLock::new(initial_content));
 
-            // Initialize CRDT state from server before spawning tasks.
+            // Initialize CRDT state via cyan sync (MQTT) before spawning tasks.
             // This ensures all sync clients share the same Yjs operation history,
             // which is critical for merges to work correctly (especially deletions).
-            if let Err(e) = initialize_crdt_state_from_server_with_pending(
-                &client,
-                &server,
+            if let Err(e) = resync_crdt_state_via_cyan_with_pending(
+                &mqtt_client,
+                &workspace,
                 node_id,
                 &file_crdt_state,
                 &filename,
                 &file_path,
-                Some(&mqtt_client),
-                Some(&workspace),
-                Some(&author),
+                &author,
                 Some(&shared_last_content),
                 inode_tracker.as_ref(),
-                mqtt_only_config,
+                true,
+                true,
             )
             .await
             {
                 warn!(
-                    "Failed to initialize CRDT state for {}: {}",
+                    "Failed to initialize CRDT state for {}: {} — initializing empty",
                     relative_path, e
                 );
+                // Initialize empty so should_queue_edits() doesn't return NeedsServerInit
+                // and MQTT edits can still be applied
+                {
+                    let mut state = file_crdt_state.write().await;
+                    let fs = state.get_or_create_file(&filename, node_id);
+                    fs.initialize_empty();
+                }
             } else {
                 // Trace CRDT_INIT_COMPLETE milestone (directory mode)
                 trace_timeline(
@@ -3142,29 +3148,35 @@ async fn run_exec_mode(
                 .filter(|s| !s.is_empty());
             let shared_last_content: SharedLastContent = Arc::new(RwLock::new(initial_content));
 
-            // Initialize CRDT state from server before spawning tasks.
+            // Initialize CRDT state via cyan sync (MQTT) before spawning tasks.
             // This ensures all sync clients share the same Yjs operation history,
             // which is critical for merges to work correctly (especially deletions).
-            if let Err(e) = initialize_crdt_state_from_server_with_pending(
-                &client,
-                &server,
+            if let Err(e) = resync_crdt_state_via_cyan_with_pending(
+                &mqtt_client,
+                &workspace,
                 node_id,
                 &file_crdt_state,
                 &filename,
                 &file_path,
-                Some(&mqtt_client),
-                Some(&workspace),
-                Some(&author),
+                &author,
                 Some(&shared_last_content),
                 inode_tracker.as_ref(),
-                mqtt_only_config,
+                true,
+                true,
             )
             .await
             {
                 warn!(
-                    "Failed to initialize CRDT state for {}: {}",
+                    "Failed to initialize CRDT state for {}: {} — initializing empty",
                     relative_path, e
                 );
+                // Initialize empty so should_queue_edits() doesn't return NeedsServerInit
+                // and MQTT edits can still be applied
+                {
+                    let mut state = file_crdt_state.write().await;
+                    let fs = state.get_or_create_file(&filename, node_id);
+                    fs.initialize_empty();
+                }
             } else {
                 // Trace CRDT_INIT_COMPLETE milestone
                 trace_timeline(
