@@ -20,13 +20,14 @@ use commonplace_doc::sync::{
     directory_watcher_task, discover_fs_root, ensure_fs_root_exists,
     ensure_parent_directories_exist, file_watcher_task, find_owning_document, fork_node,
     handle_file_deleted, handle_file_modified, handle_schema_change, handle_schema_modified,
-    initial_sync, is_binary_content, push_schema_to_server, remove_file_from_schema,
-    resync_crdt_state_via_cyan_with_pending, scan_directory_with_contents, schema_to_json,
-    spawn_command_listener, spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file,
-    trace_timeline, upload_task, wait_for_file_stability, wait_for_uuid_map_ready,
-    write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent, FileEvent, FileSyncState,
-    InodeKey, InodeTracker, MqttOnlySyncConfig, ReplaceResponse, ScanOptions, SharedLastContent,
-    SubdirStateCache, SyncState, TimelineMilestone, SCHEMA_FILENAME,
+    initial_sync, is_binary_content, push_local_if_differs, push_schema_to_server,
+    remove_file_from_schema, resync_crdt_state_via_cyan_with_pending, scan_directory_with_contents,
+    schema_to_json, spawn_command_listener, spawn_file_sync_tasks_crdt, sse_task, sync_schema,
+    sync_single_file, trace_timeline, upload_task, wait_for_file_stability,
+    wait_for_uuid_map_ready, write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent,
+    FileEvent, FileSyncState, InodeKey, InodeTracker, MqttOnlySyncConfig, ReplaceResponse,
+    ScanOptions, SharedLastContent, SubdirStateCache, SyncState, TimelineMilestone,
+    SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -1749,9 +1750,10 @@ async fn main() -> ExitCode {
             file,
             args.push_only,
             args.pull_only,
-            args.force_push,
             args.shadow_dir,
             args.name.clone(),
+            mqtt_client,
+            args.workspace,
         )
         .await
         .map(|_| 0u8)
@@ -1768,7 +1770,12 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Run single-file sync mode (original behavior)
+/// Run single-file sync mode using CRDT/MQTT infrastructure.
+///
+/// This is a thin wrapper around the same CRDT infrastructure that directory mode uses:
+/// - Initializes CRDT state via cyan sync (MQTT)
+/// - Pushes local content if it differs from server
+/// - Spawns upload_task_crdt + receive_task_crdt for ongoing sync
 #[allow(clippy::too_many_arguments)]
 async fn run_file_mode(
     client: Client,
@@ -1777,17 +1784,14 @@ async fn run_file_mode(
     file: PathBuf,
     push_only: bool,
     pull_only: bool,
-    force_push: bool,
     shadow_dir: String,
     name: Option<String>,
+    mqtt_client: Arc<MqttClient>,
+    workspace: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Derive author from name parameter, defaulting to "sync-client"
     let author = name.unwrap_or_else(|| "sync-client".to_string());
-    let shadow_dir = resolve_shadow_dir(&shadow_dir, file.parent().unwrap_or(Path::new(".")));
 
-    let mode = if force_push {
-        "force-push"
-    } else if push_only {
+    let mode = if push_only {
         "push-only"
     } else if pull_only {
         "pull-only"
@@ -1795,257 +1799,191 @@ async fn run_file_mode(
         "bidirectional"
     };
     info!(
-        "Starting commonplace-sync (file mode, {}): server={}, node={}, file={}",
+        "Starting commonplace-sync (file mode CRDT, {}): node={}, file={}",
         mode,
-        server,
         node_id,
         file.display()
     );
 
-    // Verify document exists
-    let doc_url = build_info_url(&server, &node_id);
-    let resp = client.get(&doc_url).send().await?;
-    if !resp.status().is_success() {
-        error!("Document {} not found on server", node_id);
-        return Err(format!("Document {} not found", node_id).into());
-    }
-    info!("Connected to document {}", node_id);
+    // Parse node_id as UUID (required for CRDT)
+    let node_id_uuid = uuid::Uuid::parse_str(&node_id)
+        .map_err(|e| format!("Invalid node UUID {}: {}", node_id, e))?;
 
-    // Load or create state file for offline change detection
-    let state_file_path = SyncStateFile::state_file_path(&file);
-    let state_file = SyncStateFile::load_or_create(&file, &server, &node_id)
+    let parent_dir = file.parent().unwrap_or(Path::new("."));
+    let filename = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Invalid filename")?
+        .to_string();
+
+    // Create CRDT state (use Uuid::nil() for schema since file mode has no schema document)
+    let crdt_state = Arc::new(RwLock::new(
+        DirectorySyncState::load_or_create(parent_dir, uuid::Uuid::nil())
+            .await
+            .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
+    ));
+
+    // Read initial content for echo detection
+    let initial_content = tokio::fs::read_to_string(&file)
         .await
-        .map_err(|e| format!("Failed to load state file: {}", e))?;
+        .ok()
+        .filter(|s| !s.is_empty());
+    let shared_last_content: SharedLastContent = Arc::new(RwLock::new(initial_content));
 
-    // Check for offline local changes and merge them before initial_sync
-    if let Some(last_cid) = &state_file.last_synced_cid {
-        if file.exists() {
-            let current_content = tokio::fs::read(&file).await?;
-            let current_hash = compute_content_hash(&current_content);
-            let file_name = file.file_name().unwrap_or_default().to_string_lossy();
+    // Start MQTT event loop
+    let mqtt_for_loop = mqtt_client.clone();
+    tokio::spawn(async move {
+        if let Err(e) = mqtt_for_loop.run_event_loop().await {
+            error!("MQTT event loop error: {}", e);
+        }
+    });
 
-            if state_file.has_file_changed(&file_name, &current_hash) {
-                info!(
-                    "Detected offline local changes (last synced at {})",
-                    last_cid
-                );
+    // Initialize CRDT state via cyan sync (MQTT).
+    // Don't write to disk yet — we need to check if local content should take precedence.
+    let cyan_ok = resync_crdt_state_via_cyan_with_pending(
+        &mqtt_client,
+        &workspace,
+        node_id_uuid,
+        &crdt_state,
+        &filename,
+        &file,
+        &author,
+        Some(&shared_last_content),
+        None,  // inode_tracker not needed during init
+        false, // write_to_disk=false: defer disk write until we compare local vs server
+        true,  // process_pending_edits
+    )
+    .await
+    .is_ok();
 
-                // Push offline changes using replace endpoint with last_synced_cid as parent.
-                // The server computes a diff from historical state and creates a CRDT update,
-                // which automatically merges with any concurrent server changes.
-                let content_info = detect_from_path(&file);
-                let is_binary = content_info.is_binary || is_binary_content(&current_content);
-                let content_str = if is_binary {
-                    use base64::{engine::general_purpose::STANDARD, Engine};
-                    STANDARD.encode(&current_content)
+    if !cyan_ok {
+        warn!(
+            "Failed to init CRDT state for {} — initializing empty",
+            filename
+        );
+        let mut state = crdt_state.write().await;
+        let fs = state.get_or_create_file(&filename, node_id_uuid);
+        fs.initialize_empty();
+    }
+
+    // Reconcile local file vs server CRDT state:
+    // - If local file has non-default content → push local to server
+    // - If local file is missing/empty/default → write server content to disk
+    let content_type_info = commonplace_doc::sync::detect_from_path(&file);
+    let local_content = tokio::fs::read_to_string(&file).await.ok();
+    let local_has_content = local_content
+        .as_ref()
+        .map(|c| !c.is_empty() && !commonplace_doc::sync::is_default_content(c, &content_type_info))
+        .unwrap_or(false);
+
+    if local_has_content {
+        // Local file has meaningful content — push it to server if different
+        if let Err(e) = push_local_if_differs(
+            &mqtt_client,
+            &workspace,
+            &crdt_state,
+            &filename,
+            node_id_uuid,
+            &file,
+            &author,
+        )
+        .await
+        {
+            warn!("Failed to push local content for {}: {}", filename, e);
+        }
+    } else if cyan_ok {
+        // No local content — write server content to disk
+        let content_to_write = {
+            let state = crdt_state.read().await;
+            state.get_file(&filename).and_then(|fs| {
+                // Try YText first (get_text_content), then try all types (get_doc_text_content)
+                let text_content =
+                    commonplace_doc::sync::crdt::crdt_publish::get_text_content(fs).ok();
+                if text_content.as_ref().is_none_or(|s| s.is_empty()) {
+                    let doc = fs.to_doc().ok()?;
+                    let c = commonplace_doc::sync::crdt_merge::get_doc_text_content(&doc);
+                    if c.is_empty() {
+                        None
+                    } else {
+                        Some(c)
+                    }
                 } else {
-                    String::from_utf8_lossy(&current_content).to_string()
-                };
-
-                let replace_url = build_replace_url(&server, &node_id, last_cid, false, &author);
-                info!("Pushing offline changes via CRDT merge...");
-
-                match client
-                    .post(&replace_url)
-                    .header("content-type", "text/plain")
-                    .body(content_str)
-                    .send()
-                    .await
-                {
-                    Ok(resp) => {
-                        if resp.status().is_success() {
-                            match resp.json::<ReplaceResponse>().await {
-                                Ok(result) => {
-                                    info!(
-                                        "Merged offline changes: {} chars inserted, {} deleted (new cid: {})",
-                                        result.summary.chars_inserted,
-                                        result.summary.chars_deleted,
-                                        &result.cid[..8.min(result.cid.len())]
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!("Failed to parse replace response: {}", e);
-                                }
-                            }
-                        } else {
-                            let status = resp.status();
-                            let body = resp.text().await.unwrap_or_default();
-                            warn!("Failed to push offline changes: {} - {}", status, body);
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to push offline changes: {}", e);
-                    }
+                    text_content
+                }
+            })
+        };
+        if let Some(content) = content_to_write {
+            if !content.is_empty()
+                && !commonplace_doc::sync::is_default_content(&content, &content_type_info)
+            {
+                let content_with_newline = commonplace_doc::sync::ensure_trailing_newline(&content);
+                if let Err(e) = tokio::fs::write(&file, &content_with_newline).await {
+                    warn!(
+                        "Failed to write server content to {}: {}",
+                        file.display(),
+                        e
+                    );
+                } else {
+                    info!(
+                        "Wrote server content to {} ({} bytes)",
+                        file.display(),
+                        content_with_newline.len()
+                    );
+                    // Update shared_last_content for echo detection
+                    let mut last = shared_last_content.write().await;
+                    *last = Some(content_with_newline);
                 }
             }
         }
     }
 
-    // Initialize shared state with loaded state file
-    let state = Arc::new(RwLock::new(SyncState::with_state_file(
-        state_file,
-        state_file_path,
-    )));
-
-    // Perform initial sync
-    initial_sync(&client, &server, &node_id, &file, &state).await?;
+    // Save CRDT state after initialization so it persists across restarts
+    {
+        let state = crdt_state.read().await;
+        if let Err(e) = state.save(parent_dir).await {
+            warn!("Failed to save initial CRDT state: {}", e);
+        }
+    }
 
     // Set up inode tracking if shadow_dir is configured
+    let shadow_dir = resolve_shadow_dir(&shadow_dir, parent_dir);
     let inode_tracker: Option<Arc<RwLock<InodeTracker>>> = if !shadow_dir.is_empty() {
         let shadow_path = PathBuf::from(&shadow_dir);
-
         tokio::fs::create_dir_all(&shadow_path)
             .await
             .map_err(|e| format!("Failed to create shadow directory {}: {}", shadow_dir, e))?;
-
-        // Create tracker and track the initial file's inode
         let tracker = Arc::new(RwLock::new(InodeTracker::new(shadow_path)));
-
-        // Track the initial inode after initial_sync
-        if file.exists() {
-            if let Ok(inode_key) = InodeKey::from_path(&file) {
-                let cid = {
-                    let s = state.read().await;
-                    s.last_written_cid.clone().unwrap_or_default()
-                };
-                if !cid.is_empty() {
-                    let mut t = tracker.write().await;
-                    t.track(inode_key, cid, file.clone());
-                    info!(
-                        "Tracking initial inode {:x}-{:x} for {}",
-                        inode_key.dev,
-                        inode_key.ino,
-                        file.display()
-                    );
-                }
-            }
-        }
-
         info!("Inode tracking enabled with shadow dir: {}", shadow_dir);
         Some(tracker)
     } else {
-        debug!("Inode tracking disabled (no shadow_dir configured)");
         None
     };
 
-    // Create channel for file events
-    let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
-
-    // Start file watcher task (skip if pull-only)
-    let watcher_handle = if !pull_only {
-        Some(tokio::spawn(file_watcher_task(file.clone(), file_tx)))
-    } else {
-        info!("Pull-only mode: skipping file watcher");
-        None
-    };
-
-    // Start file change handler task (skip if pull-only)
-    // File mode always uses ID-based API (use_paths=false)
-    let upload_handle = if !pull_only {
-        Some(tokio::spawn(upload_task(
-            client.clone(),
-            server.clone(),
-            node_id.clone(),
-            file.clone(),
-            state.clone(),
-            file_rx,
-            false, // use_paths: file mode uses ID-based API
-            force_push,
-            author.clone(),
-        )))
-    } else {
-        None
-    };
-
-    // Start shadow watcher, handler, and GC if inode tracking is enabled (unix only)
-    #[cfg(unix)]
-    let (shadow_watcher_handle, shadow_handler_handle, shadow_gc_handle) =
-        if let Some(ref tracker) = inode_tracker {
-            let shadow_path = {
-                let t = tracker.read().await;
-                t.shadow_dir.clone()
-            };
-
-            let (watcher, handler, gc) = spawn_shadow_tasks(
-                shadow_path,
-                client.clone(),
-                server.clone(),
-                tracker.clone(),
-                false, // use_paths: file mode uses ID-based API
-                author.clone(),
-            );
-
-            (Some(watcher), Some(handler), Some(gc))
-        } else {
-            (None, None, None)
-        };
-    #[cfg(not(unix))]
-    let (shadow_watcher_handle, shadow_handler_handle, shadow_gc_handle): (
-        Option<tokio::task::JoinHandle<()>>,
-        Option<tokio::task::JoinHandle<()>>,
-        Option<tokio::task::JoinHandle<()>>,
-    ) = (None, None, None);
-
-    // Start SSE subscription task (skip if push-only)
-    // Use tracker-aware version if inode tracking is enabled (unix only)
-    let sse_handle = if !push_only {
-        #[cfg(unix)]
-        let handle = if let Some(ref tracker) = inode_tracker {
-            Some(tokio::spawn(sse_task_with_tracker(
-                client.clone(),
-                server.clone(),
-                node_id.clone(),
-                file.clone(),
-                state.clone(),
-                false, // use_paths: file mode uses ID-based API
-                tracker.clone(),
-            )))
-        } else {
-            Some(tokio::spawn(sse_task(
-                client.clone(),
-                server.clone(),
-                node_id.clone(),
-                file.clone(),
-                state.clone(),
-                false, // use_paths: file mode uses ID-based API
-            )))
-        };
-        #[cfg(not(unix))]
-        let handle = Some(tokio::spawn(sse_task(
-            client.clone(),
-            server.clone(),
-            node_id.clone(),
-            file.clone(),
-            state.clone(),
-            false, // use_paths: file mode uses ID-based API
-        )));
-        handle
-    } else {
-        info!("Push-only mode: skipping SSE subscription");
-        None
-    };
+    // Spawn CRDT sync tasks (watcher + upload + receive)
+    let mqtt_only_config = MqttOnlySyncConfig::mqtt_only();
+    let task_handles = spawn_file_sync_tasks_crdt(
+        mqtt_client.clone(),
+        client.clone(),
+        server.clone(),
+        workspace.clone(),
+        node_id_uuid,
+        file.clone(),
+        crdt_state.clone(),
+        filename,
+        shared_last_content,
+        pull_only,
+        author.clone(),
+        mqtt_only_config,
+        inode_tracker,
+        None, // file_states: no deduplication needed
+        None, // relative_path
+    );
 
     // Wait for Ctrl+C
     tokio::signal::ctrl_c().await?;
     info!("Shutting down...");
 
-    // Cancel tasks
-    if let Some(handle) = watcher_handle {
-        handle.abort();
-    }
-    if let Some(handle) = upload_handle {
-        handle.abort();
-    }
-    if let Some(handle) = sse_handle {
-        handle.abort();
-    }
-    if let Some(handle) = shadow_watcher_handle {
-        handle.abort();
-    }
-    if let Some(handle) = shadow_handler_handle {
-        handle.abort();
-    }
-    if let Some(handle) = shadow_gc_handle {
+    for handle in task_handles {
         handle.abort();
     }
 

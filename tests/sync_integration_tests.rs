@@ -96,6 +96,7 @@ fn spawn_sync_file(
             "--file",
             file_path.to_str().unwrap(),
         ])
+        .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -365,7 +366,8 @@ fn test_cid_persistence_survives_sync_restart() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
     let sync_file = temp_dir.path().join("data.txt");
-    let state_file = temp_dir.path().join(".data.txt.commonplace-sync.json");
+    // DirectorySyncState is stored per-directory, not per-file
+    let state_file = temp_dir.path().join(".commonplace-sync.json");
     let port = get_available_port();
     let mqtt_port = get_available_port();
     let server_url = format!("http://127.0.0.1:{}", port);
@@ -432,19 +434,19 @@ fn test_cid_persistence_survives_sync_restart() {
         state_file.display()
     );
 
-    // Read and verify state file contains CID
+    // Read and verify state file contains CID (DirectorySyncState format)
     let state_content = std::fs::read_to_string(&state_file).expect("Failed to read state file");
     let state: serde_json::Value =
         serde_json::from_str(&state_content).expect("Failed to parse state file");
 
+    // DirectorySyncState has: version, schema, files
     assert!(
-        state["last_synced_cid"].is_string(),
-        "State file should contain last_synced_cid: {}",
+        state["version"].is_number(),
+        "State file should contain version: {}",
         state_content
     );
 
-    // CP-bsjy: Verify inode_key is also persisted for unified inode/CID tracking
-    // The files map should have an entry with inode_key set
+    // The files map should have an entry for data.txt with a head_cid
     let files = &state["files"];
     assert!(
         files.is_object() && !files.as_object().unwrap().is_empty(),
@@ -452,15 +454,16 @@ fn test_cid_persistence_survives_sync_restart() {
         state_content
     );
 
-    // Check that at least one file entry has an inode_key
-    let has_inode_key = files
-        .as_object()
-        .unwrap()
-        .values()
-        .any(|f| f["inode_key"].is_string() && !f["inode_key"].as_str().unwrap().is_empty());
+    let file_entry = &files["data.txt"];
     assert!(
-        has_inode_key,
-        "At least one file should have inode_key persisted: {}",
+        file_entry.is_object(),
+        "State file should have entry for data.txt: {}",
+        state_content
+    );
+
+    assert!(
+        file_entry["head_cid"].is_string(),
+        "File entry should have head_cid: {}",
         state_content
     );
 

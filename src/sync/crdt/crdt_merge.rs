@@ -458,6 +458,19 @@ pub fn get_doc_text_content(doc: &Doc) -> String {
             }
         }
     }
+    // If YArray also empty, try reading as YMap (JSON object files).
+    if let Some(map) = txn.get_map("content") {
+        let any_map = map.to_json(&txn);
+        let json_value = crate::sync::crdt::yjs::any_to_json_value(any_map);
+        if let serde_json::Value::Object(obj) = &json_value {
+            if !obj.is_empty() {
+                if let Ok(mut s) = serde_json::to_string(&json_value) {
+                    s.push('\n');
+                    return s;
+                }
+            }
+        }
+    }
     String::new()
 }
 

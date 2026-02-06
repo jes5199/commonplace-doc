@@ -1895,6 +1895,150 @@ pub async fn upload_task_crdt(
     );
 }
 
+/// After CRDT initialization, push local file content to MQTT if it differs
+/// from the CRDT state. This handles:
+/// - Offline edits made while sync was not running
+/// - Initial file content that hasn't been pushed yet
+/// - Local-first scenarios where the file has non-default content
+///
+/// Skips push if local content is empty or default content for its type.
+pub async fn push_local_if_differs(
+    mqtt_client: &Arc<MqttClient>,
+    workspace: &str,
+    crdt_state: &Arc<RwLock<DirectorySyncState>>,
+    filename: &str,
+    node_id: Uuid,
+    file_path: &Path,
+    author: &str,
+) -> SyncResult<()> {
+    let local_content = match tokio::fs::read_to_string(file_path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(SyncError::other(format!(
+                "Failed to read {}: {}",
+                file_path.display(),
+                e
+            )));
+        }
+    };
+
+    // Skip if local content is empty or default
+    let content_info = crate::sync::content_type::detect_from_path(file_path);
+    if local_content.is_empty()
+        || crate::sync::content_type::is_default_content(&local_content, &content_info)
+    {
+        return Ok(());
+    }
+
+    // Get CRDT content for comparison
+    let crdt_content = {
+        let state = crdt_state.read().await;
+        state
+            .get_file(filename)
+            .and_then(|fs| crate::sync::crdt::crdt_publish::get_text_content(fs).ok())
+    };
+
+    // Normalize for comparison (trim trailing newlines)
+    let local_trimmed = local_content.trim_end();
+    let crdt_trimmed = crdt_content
+        .as_deref()
+        .map(|s: &str| s.trim_end())
+        .unwrap_or("");
+    if local_trimmed == crdt_trimmed {
+        return Ok(());
+    }
+
+    info!(
+        "Local content differs from CRDT state for {} — pushing via MQTT",
+        file_path.display()
+    );
+
+    let node_id_str = node_id.to_string();
+    let is_json = content_info.mime_type == "application/json";
+    let is_jsonl = content_info.mime_type == "application/x-ndjson";
+
+    let mut state = crdt_state.write().await;
+    let file_state = state.get_or_create_file(filename, node_id);
+
+    if is_json || is_jsonl {
+        // Structured content: create Yjs update and publish
+        let content_type = if is_jsonl {
+            crate::content_type::ContentType::Jsonl
+        } else {
+            crate::content_type::ContentType::Json
+        };
+        let base_state = file_state.yjs_state.as_deref();
+        match crate::sync::crdt::yjs::create_yjs_structured_update(
+            content_type,
+            &local_content,
+            base_state,
+        ) {
+            Ok(update_b64) => match crate::sync::crdt::yjs::base64_decode(&update_b64) {
+                Ok(update_bytes) => {
+                    publish_yjs_update(
+                        mqtt_client,
+                        workspace,
+                        &node_id_str,
+                        file_state,
+                        update_bytes,
+                        author,
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    warn!("Failed to decode structured update: {}", e);
+                    // Fall back to text change
+                    let old = crdt_content.as_deref().unwrap_or("");
+                    publish_text_change(
+                        mqtt_client,
+                        workspace,
+                        &node_id_str,
+                        file_state,
+                        old,
+                        &local_content,
+                        author,
+                    )
+                    .await?;
+                }
+            },
+            Err(e) => {
+                warn!(
+                    "Structured update failed for {}, falling back to text: {}",
+                    file_path.display(),
+                    e
+                );
+                let old = crdt_content.as_deref().unwrap_or("");
+                publish_text_change(
+                    mqtt_client,
+                    workspace,
+                    &node_id_str,
+                    file_state,
+                    old,
+                    &local_content,
+                    author,
+                )
+                .await?;
+            }
+        }
+    } else {
+        // Text: compute diff and publish
+        let old = crdt_content.as_deref().unwrap_or("");
+        publish_text_change(
+            mqtt_client,
+            workspace,
+            &node_id_str,
+            file_state,
+            old,
+            &local_content,
+            author,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 /// Resync CRDT state via the cyan/sync MQTT channel.
 ///
 /// This fetches the full commit history (Ancestors(HEAD)), rebuilds the Y.Doc,

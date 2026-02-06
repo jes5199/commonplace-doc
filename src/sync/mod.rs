@@ -246,9 +246,9 @@ pub use dir_sync::{
 };
 pub use error::{SyncError, SyncResult};
 pub use file_sync::{
-    initial_sync, prepare_content_for_upload, resync_crdt_state_via_cyan_with_pending,
-    spawn_file_sync_tasks_crdt, sync_single_file, upload_task, upload_task_crdt, PreparedContent,
-    PENDING_WRITE_TIMEOUT,
+    initial_sync, prepare_content_for_upload, push_local_if_differs,
+    resync_crdt_state_via_cyan_with_pending, spawn_file_sync_tasks_crdt, sync_single_file,
+    upload_task, upload_task_crdt, PreparedContent, PENDING_WRITE_TIMEOUT,
 };
 pub use types::{
     build_uuid_to_paths_map, remove_file_state_and_abort, CommitData, DirEvent, EditEventData,
