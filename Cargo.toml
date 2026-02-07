@@ -1,5 +1,5 @@
 [workspace]
-members = ["."]
+members = [".", "crates/commonplace-types"]
 resolver = "2"
 
 [package]
@@ -84,6 +84,7 @@ name = "commonplace-beads-bridge"
 path = "src/bin/beads_bridge.rs"
 
 [dependencies]
+commonplace-types = { path = "crates/commonplace-types" }
 bytes = "1.5"
 rmcp = { version = "0.12", features = ["server", "transport-io"] }
 axum = { version = "0.7", features = ["ws"] }

@@ -11,8 +11,7 @@ use reqwest::Client;
 use std::path::Path;
 use tracing::{debug, info, warn};
 
-/// Schema filename constant.
-pub const SCHEMA_FILENAME: &str = ".commonplace.json";
+pub use commonplace_types::SCHEMA_FILENAME;
 
 /// Result of fetching and validating a schema from the server.
 pub struct FetchedSchema {

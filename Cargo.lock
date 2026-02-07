@@ -364,6 +364,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "commonplace-types",
  "fs2",
  "futures",
  "futures-util",
@@ -390,6 +391,21 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "urlencoding",
+ "uuid",
+ "yrs",
+]
+
+[[package]]
+name = "commonplace-types"
+version = "0.1.0"
+dependencies = [
+ "base64 0.21.7",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "similar",
+ "thiserror 1.0.69",
  "uuid",
  "yrs",
 ]
