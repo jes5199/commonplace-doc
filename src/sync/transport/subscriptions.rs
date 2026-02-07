@@ -922,7 +922,7 @@ pub async fn directory_mqtt_task(
                                         file_state,
                                         &edit_msg,
                                         &author,
-                                        None, // No local commit store in subscription context
+                                        None::<&Arc<crate::store::CommitStore>>, // No local commit store in subscription context
                                     )
                                     .await
                                     {
@@ -2416,7 +2416,7 @@ pub async fn subdir_mqtt_task(
                                         file_state,
                                         &edit_msg,
                                         &author,
-                                        None, // No local commit store in subscription context
+                                        None::<&Arc<crate::store::CommitStore>>, // No local commit store in subscription context
                                     )
                                     .await
                                     {

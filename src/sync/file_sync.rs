@@ -1562,7 +1562,7 @@ async fn process_pending_edits_with_flock(
                 file_state,
                 &edit_msg,
                 author,
-                None,
+                None::<&Arc<crate::store::CommitStore>>,
             )
             .await
         };
@@ -2245,7 +2245,7 @@ pub async fn receive_task_crdt(
             file_state,
             &edit_msg,
             &author,
-            None, // commit_store not available in receive_task_crdt main loop
+            None::<&Arc<crate::store::CommitStore>>, // commit_store not available in receive_task_crdt main loop
         )
         .await
         {

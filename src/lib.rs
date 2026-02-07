@@ -20,6 +20,7 @@ pub mod services;
 pub mod sse;
 pub mod store;
 pub mod sync;
+pub mod trait_impls;
 pub mod viewer;
 pub mod workspace;
 pub mod ws;

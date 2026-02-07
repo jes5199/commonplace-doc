@@ -11,10 +11,10 @@ use super::crdt_state::{CrdtPeerState, DirectorySyncState};
 use super::yjs::create_yjs_jsonl_update;
 use super::ymap_schema;
 use crate::commit::Commit;
-use crate::mqtt::{EditMessage, MqttClient, Topic};
+use crate::mqtt::EditMessage;
 use crate::sync::error::{SyncError, SyncResult};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use rumqttc::QoS;
+use commonplace_types::traits::{edits_topic, MqttPublisher};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -49,7 +49,7 @@ pub fn generate_file_uuid() -> Uuid {
 ///
 /// Returns the new file's UUID and commit CIDs.
 pub async fn create_new_file(
-    mqtt_client: &Arc<MqttClient>,
+    mqtt_client: &Arc<impl MqttPublisher>,
     workspace: &str,
     dir_state: &mut DirectorySyncState,
     filename: &str,
@@ -125,7 +125,7 @@ pub async fn create_new_file(
 
 /// Update schema Y.Doc with a new file entry and publish commit.
 async fn update_schema_with_new_file(
-    mqtt_client: &Arc<MqttClient>,
+    mqtt_client: &Arc<impl MqttPublisher>,
     workspace: &str,
     schema_state: &mut CrdtPeerState,
     filename: &str,
@@ -192,7 +192,7 @@ async fn update_schema_with_new_file(
     };
 
     let schema_node_id = schema_state.node_id.to_string();
-    let topic = Topic::edits(workspace, &schema_node_id).to_topic_string();
+    let topic = edits_topic(workspace, &schema_node_id);
     let payload = serde_json::to_vec(&edit_msg)?;
 
     // Trace log for debugging
@@ -217,7 +217,7 @@ async fn update_schema_with_new_file(
     // This is critical for sync: subscribers may join after schema updates are published,
     // and the retained message ensures they receive the current file mappings.
     mqtt_client
-        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
+        .publish_retained(&topic, &payload)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
 
@@ -231,7 +231,7 @@ async fn update_schema_with_new_file(
 
 /// Publish file content as initial commit.
 async fn publish_file_content(
-    mqtt_client: &Arc<MqttClient>,
+    mqtt_client: &Arc<impl MqttPublisher>,
     workspace: &str,
     file_uuid: &str,
     file_state: &mut CrdtPeerState,
@@ -286,7 +286,7 @@ async fn publish_file_content(
         req: None,
     };
 
-    let topic = Topic::edits(workspace, file_uuid).to_topic_string();
+    let topic = edits_topic(workspace, file_uuid);
     let payload = serde_json::to_vec(&edit_msg)?;
 
     // Use retained message so new subscribers get the content immediately.
@@ -294,7 +294,7 @@ async fn publish_file_content(
     // after the content edit is published, and the retained message ensures
     // it still receives the content.
     mqtt_client
-        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
+        .publish_retained(&topic, &payload)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish file edit: {}", e)))?;
 
@@ -308,7 +308,7 @@ async fn publish_file_content(
 
 /// Remove a file from the schema and publish the update.
 pub async fn remove_file_from_schema(
-    mqtt_client: &Arc<MqttClient>,
+    mqtt_client: &Arc<impl MqttPublisher>,
     workspace: &str,
     dir_state: &mut DirectorySyncState,
     filename: &str,
@@ -384,14 +384,14 @@ pub async fn remove_file_from_schema(
         req: None,
     };
 
-    let topic = Topic::edits(workspace, &schema_node_id).to_topic_string();
+    let topic = edits_topic(workspace, &schema_node_id);
     let payload = serde_json::to_vec(&edit_msg)?;
 
     // Use retained message so new subscribers get the latest schema state immediately.
     // This is critical for sync: subscribers may join after schema updates are published,
     // and the retained message ensures they receive the current file mappings.
     mqtt_client
-        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
+        .publish_retained(&topic, &payload)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
 
@@ -413,7 +413,7 @@ pub async fn remove_file_from_schema(
 /// Used by `handle_schema_modified` to push user schema edits via MQTT
 /// instead of HTTP.
 pub async fn publish_schema_via_mqtt(
-    mqtt_client: &Arc<MqttClient>,
+    mqtt_client: &Arc<impl MqttPublisher>,
     workspace: &str,
     schema_state: &mut CrdtPeerState,
     schema: &crate::fs::FsSchema,
@@ -474,11 +474,11 @@ pub async fn publish_schema_via_mqtt(
     };
 
     let schema_node_id = schema_state.node_id.to_string();
-    let topic = Topic::edits(workspace, &schema_node_id).to_topic_string();
+    let topic = edits_topic(workspace, &schema_node_id);
     let payload = serde_json::to_vec(&edit_msg)?;
 
     mqtt_client
-        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
+        .publish_retained(&topic, &payload)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
 
@@ -493,7 +493,7 @@ pub async fn publish_schema_via_mqtt(
 /// node-backed subdirectories in CRDT mode, replacing the HTTP POST /docs
 /// + push_schema_to_server pattern.
 pub async fn add_directory_to_schema(
-    mqtt_client: &Arc<MqttClient>,
+    mqtt_client: &Arc<impl MqttPublisher>,
     workspace: &str,
     schema_state: &mut CrdtPeerState,
     dirname: &str,
@@ -555,11 +555,11 @@ pub async fn add_directory_to_schema(
     };
 
     let schema_node_id = schema_state.node_id.to_string();
-    let topic = Topic::edits(workspace, &schema_node_id).to_topic_string();
+    let topic = edits_topic(workspace, &schema_node_id);
     let payload = serde_json::to_vec(&edit_msg)?;
 
     mqtt_client
-        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
+        .publish_retained(&topic, &payload)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
 

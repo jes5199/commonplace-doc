@@ -224,13 +224,13 @@ mod no_echo_tests {
 
         // Process with no MQTT client - if it tried to publish, it would fail
         let (result, content) = process_received_edit(
-            None, // No MQTT client - cannot publish
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>, // No MQTT client - cannot publish
             "workspace",
             "node1",
             &mut state,
             &edit_msg,
             "test_author",
-            None, // No commit store
+            None::<&Arc<commonplace_doc::store::CommitStore>>, // No commit store
         )
         .await
         .expect("Should process without error");
@@ -281,13 +281,13 @@ mod no_echo_tests {
         };
 
         let (result1, _) = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &msg1,
             "author",
-            None,
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
         )
         .await
         .expect("First commit should succeed");
@@ -327,13 +327,13 @@ mod no_echo_tests {
 
         // Process second commit with no MQTT client
         let (result2, content2) = process_received_edit(
-            None, // No MQTT client - verifies no publish attempt
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>, // No MQTT client - verifies no publish attempt
             "workspace",
             "node1",
             &mut state,
             &msg2,
             "author",
-            None, // No commit store
+            None::<&Arc<commonplace_doc::store::CommitStore>>, // No commit store
         )
         .await
         .expect("Second commit should succeed");
@@ -445,13 +445,13 @@ mod no_echo_tests {
         };
 
         let (result, content) = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &remote_msg,
             "local_author",
-            None, // No commit store
+            None::<&Arc<commonplace_doc::store::CommitStore>>, // No commit store
         )
         .await
         .expect("Should process");
@@ -514,13 +514,13 @@ mod no_echo_tests {
 
         // Process with NO mqtt_client
         let result = process_received_edit(
-            None, // Cannot publish
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>, // Cannot publish
             "workspace",
             "node1",
             &mut state,
             &msg,
             "author",
-            None, // No commit store
+            None::<&Arc<commonplace_doc::store::CommitStore>>, // No commit store
         )
         .await;
 
@@ -597,13 +597,13 @@ mod no_echo_tests {
         };
 
         let (result, content) = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &echo_msg,
             "me",
-            None,
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
         )
         .await
         .expect("Should process");
@@ -663,13 +663,13 @@ mod no_echo_tests {
         };
 
         let (result, _content) = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &merge_msg,
             "author",
-            None,
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
         )
         .await
         .expect("Should process empty update");
@@ -860,6 +860,7 @@ mod edit_buffering_tests {
     use commonplace_doc::mqtt::EditMessage;
     use commonplace_doc::sync::crdt_state::{CrdtPeerState, MAX_PENDING_EDITS};
     use commonplace_doc::sync::{process_received_edit, MergeResult};
+    use std::sync::Arc;
     use uuid::Uuid;
     use yrs::{Doc, GetString, ReadTxn, Text, Transact, WriteTxn};
 
@@ -998,13 +999,13 @@ mod edit_buffering_tests {
         // Parse and apply the pending edit
         let parsed: EditMessage = serde_json::from_slice(&pending[0].payload).unwrap();
         let (result, maybe_content) = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &parsed,
             "local",
-            None,
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
         )
         .await
         .expect("Should process pending edit");
@@ -1233,13 +1234,13 @@ mod edit_buffering_tests {
 
         let edit_msg: EditMessage = serde_json::from_slice(&pending[0].payload).unwrap();
         let (result, content) = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &edit_msg,
             "local",
-            None,
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
         )
         .await
         .expect("Should apply pending edit");
@@ -2195,6 +2196,7 @@ mod crdt_merge_tests {
     use commonplace_doc::mqtt::EditMessage;
     use commonplace_doc::sync::crdt_state::CrdtPeerState;
     use commonplace_doc::sync::{process_received_edit, MergeResult};
+    use std::sync::Arc;
     use uuid::Uuid;
     use yrs::updates::decoder::Decode;
     use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update, WriteTxn};
@@ -2382,10 +2384,17 @@ mod crdt_merge_tests {
             req: None,
         };
 
-        let (_, _) =
-            process_received_edit(None, "ws", "node", &mut state_a, &msg_b, "peer_a", None)
-                .await
-                .expect("Peer A should process B's edit");
+        let (_, _) = process_received_edit(
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
+            "ws",
+            "node",
+            &mut state_a,
+            &msg_b,
+            "peer_a",
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
+        )
+        .await
+        .expect("Peer A should process B's edit");
 
         let msg_a = EditMessage {
             update: update_a_b64.clone(),
@@ -2396,10 +2405,17 @@ mod crdt_merge_tests {
             req: None,
         };
 
-        let (_, _) =
-            process_received_edit(None, "ws", "node", &mut state_b, &msg_a, "peer_b", None)
-                .await
-                .expect("Peer B should process A's edit");
+        let (_, _) = process_received_edit(
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
+            "ws",
+            "node",
+            &mut state_b,
+            &msg_a,
+            "peer_b",
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
+        )
+        .await
+        .expect("Peer B should process A's edit");
 
         let final_doc_a = state_a.to_doc().expect("State A should have valid doc");
         let final_doc_b = state_b.to_doc().expect("State B should have valid doc");
@@ -2497,10 +2513,17 @@ mod crdt_merge_tests {
             req: None,
         };
 
-        let (result1, _) =
-            process_received_edit(None, "ws", "node", &mut state, &msg1, "author", None)
-                .await
-                .expect("Commit 1 should succeed");
+        let (result1, _) = process_received_edit(
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
+            "ws",
+            "node",
+            &mut state,
+            &msg1,
+            "author",
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
+        )
+        .await
+        .expect("Commit 1 should succeed");
 
         assert!(
             matches!(result1, MergeResult::FastForward { .. }),
@@ -2536,10 +2559,17 @@ mod crdt_merge_tests {
             req: None,
         };
 
-        let (result2, content) =
-            process_received_edit(None, "ws", "node", &mut state, &msg2, "author", None)
-                .await
-                .expect("Commit 2 should succeed");
+        let (result2, content) = process_received_edit(
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
+            "ws",
+            "node",
+            &mut state,
+            &msg2,
+            "author",
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
+        )
+        .await
+        .expect("Commit 2 should succeed");
 
         assert!(
             matches!(result2, MergeResult::FastForward { .. }),
@@ -2609,10 +2639,17 @@ mod crdt_merge_tests {
             req: None,
         };
 
-        let (result, _) =
-            process_received_edit(None, "ws", "node", &mut state, &remote_msg, "local", None)
-                .await
-                .expect("Should process remote edit");
+        let (result, _) = process_received_edit(
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
+            "ws",
+            "node",
+            &mut state,
+            &remote_msg,
+            "local",
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
+        )
+        .await
+        .expect("Should process remote edit");
 
         assert!(
             matches!(
@@ -2803,10 +2840,17 @@ mod crdt_merge_tests {
             req: None,
         };
 
-        let (result, _) =
-            process_received_edit(None, "ws", "node", &mut state, &empty_msg, "author", None)
-                .await
-                .expect("Empty edit should process");
+        let (result, _) = process_received_edit(
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
+            "ws",
+            "node",
+            &mut state,
+            &empty_msg,
+            "author",
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
+        )
+        .await
+        .expect("Empty edit should process");
 
         assert!(
             matches!(result, MergeResult::FastForward { .. }),
@@ -2995,13 +3039,13 @@ mod receive_pipeline_tests {
 
         // Process the edit
         let (result, maybe_content) = process_received_edit(
-            None, // No MQTT client needed
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>, // No MQTT client needed
             "workspace",
             "node1",
             &mut state,
             &edit_msg,
             "local_author",
-            None, // No commit store
+            None::<&Arc<commonplace_doc::store::CommitStore>>, // No commit store
         )
         .await
         .expect("Should process edit");
@@ -3050,13 +3094,13 @@ mod receive_pipeline_tests {
 
         // Process the edit
         let (result, maybe_content) = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &edit_msg,
             "local",
-            None,
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
         )
         .await
         .expect("Should process edit");
@@ -3102,13 +3146,13 @@ mod receive_pipeline_tests {
 
         // Process the edit
         let (result, maybe_content) = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &edit_msg,
             "local",
-            None,
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
         )
         .await
         .expect("Should process edit");
@@ -3188,13 +3232,13 @@ mod receive_pipeline_tests {
         // Process with None mqtt_client - this is the key test
         // If process_received_edit tried to publish, it would need an mqtt_client
         let (result, content) = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &edit_msg,
             "local",
-            None,
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
         )
         .await
         .expect("Should succeed without mqtt_client");
@@ -3253,13 +3297,13 @@ mod receive_pipeline_tests {
 
         // Process edit A
         let (result_a, _) = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &msg_a,
             "local",
-            None,
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
         )
         .await
         .expect("Process A");
@@ -3270,13 +3314,13 @@ mod receive_pipeline_tests {
 
         // Process edit B (arrives shortly after A)
         let (result_b, _content_b) = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &msg_b,
             "local",
-            None,
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
         )
         .await
         .expect("Process B");
@@ -3345,13 +3389,13 @@ mod receive_pipeline_tests {
 
         // First receive - should succeed
         let (result1, content1) = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &edit_msg,
             "local",
-            None,
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
         )
         .await
         .expect("First receive");
@@ -3370,13 +3414,13 @@ mod receive_pipeline_tests {
 
         // Second receive with same message - should be detected as duplicate
         let (result2, content2) = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &edit_msg,
             "local",
-            None,
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
         )
         .await
         .expect("Second receive");
@@ -3427,13 +3471,13 @@ mod receive_pipeline_tests {
 
         // Process should still work - Yjs updates are self-describing
         let result = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &edit_msg,
             "local",
-            None,
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
         )
         .await;
 
@@ -3522,13 +3566,13 @@ mod receive_pipeline_tests {
         );
 
         let (result, content) = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &remote_msg,
             "local",
-            None,
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
         )
         .await
         .expect("Should process");
@@ -3594,13 +3638,13 @@ mod receive_pipeline_tests {
         };
 
         let result = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &empty_msg,
             "local",
-            None,
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
         )
         .await;
 
@@ -3630,13 +3674,13 @@ mod receive_pipeline_tests {
         let edit_msg = make_edit_message(&update_b64, vec![], "author", 1000);
 
         let result = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &edit_msg,
             "local",
-            None,
+            None::<&Arc<commonplace_doc::store::CommitStore>>,
         )
         .await;
 
@@ -3694,13 +3738,13 @@ mod receive_pipeline_tests {
                 make_edit_message(&update_b64, parents, "author", (1000 + i as u64) * 1000);
 
             let result = process_received_edit(
-                None,
+                None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
                 "workspace",
                 "node1",
                 &mut state,
                 &edit_msg,
                 "local",
-                None,
+                None::<&Arc<commonplace_doc::store::CommitStore>>,
             )
             .await;
 
@@ -3748,6 +3792,7 @@ mod edit_propagation_tests {
     use commonplace_doc::mqtt::EditMessage;
     use commonplace_doc::sync::crdt_state::CrdtPeerState;
     use commonplace_doc::sync::{process_received_edit, MergeResult};
+    use std::sync::Arc;
     use uuid::Uuid;
     use yrs::{Doc, GetString, ReadTxn, Text, Transact, WriteTxn};
 
@@ -3868,13 +3913,13 @@ mod edit_propagation_tests {
 
         // === Step 4: Sandbox receives and applies the edit ===
         let (result, maybe_content) = process_received_edit(
-            None, // No MQTT client needed for this test
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>, // No MQTT client needed for this test
             "sandbox",
             &node_id.to_string(),
             &mut sandbox_state,
             &publish_msg_2,
             "sandbox_author",
-            None, // No commit store
+            None::<&Arc<commonplace_doc::store::CommitStore>>, // No commit store
         )
         .await
         .expect("Sandbox should process the edit successfully");
@@ -3952,13 +3997,13 @@ mod edit_propagation_tests {
 
         // Workspace receives sandbox's edit
         let (result_w, _) = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "workspace",
             &node_id.to_string(),
             &mut workspace_state,
             &msg_2,
             "workspace_author",
-            None, // No commit store
+            None::<&Arc<commonplace_doc::store::CommitStore>>, // No commit store
         )
         .await
         .expect("Workspace should process sandbox edit");
@@ -3996,13 +4041,13 @@ mod edit_propagation_tests {
 
         // Sandbox receives workspace's edit
         let (result_s, _) = process_received_edit(
-            None,
+            None::<&Arc<commonplace_doc::mqtt::MqttClient>>,
             "sandbox",
             &node_id.to_string(),
             &mut sandbox_state,
             &msg_3,
             "sandbox_author",
-            None, // No commit store
+            None::<&Arc<commonplace_doc::store::CommitStore>>, // No commit store
         )
         .await
         .expect("Sandbox should process workspace edit");

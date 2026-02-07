@@ -23,11 +23,10 @@
 
 use super::crdt_state::CrdtPeerState;
 use crate::commit::Commit;
-use crate::mqtt::{EditMessage, MqttClient, Topic};
-use crate::store::CommitStore;
+use crate::mqtt::EditMessage;
 use crate::sync::error::{SyncError, SyncResult};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use rumqttc::QoS;
+use commonplace_types::traits::{edits_topic, CommitPersistence, MqttPublisher};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use yrs::types::ToJson;
@@ -81,13 +80,13 @@ pub enum MergeResult {
 ///
 /// Returns the merge result and optionally the new content to write to disk.
 pub async fn process_received_edit(
-    mqtt_client: Option<&Arc<MqttClient>>,
+    mqtt_client: Option<&Arc<impl MqttPublisher>>,
     workspace: &str,
     node_id: &str,
     state: &mut CrdtPeerState,
     edit_msg: &EditMessage,
     author: &str,
-    commit_store: Option<&Arc<CommitStore>>,
+    commit_store: Option<&Arc<impl CommitPersistence>>,
 ) -> SyncResult<(MergeResult, Option<String>)> {
     // Compute CID for the received commit using the original timestamp
     // This ensures we get the same CID as when the commit was created
@@ -231,14 +230,12 @@ pub async fn process_received_edit(
                     req: None,
                 };
 
-                let topic = Topic::edits(workspace, node_id).to_topic_string();
+                let topic = edits_topic(workspace, node_id);
                 let payload = serde_json::to_vec(&publish_msg)?;
 
-                mqtt.publish_retained(&topic, &payload, QoS::AtLeastOnce)
-                    .await
-                    .map_err(|e| {
-                        SyncError::mqtt(format!("Failed to publish merge commit: {}", e))
-                    })?;
+                mqtt.publish_retained(&topic, &payload).await.map_err(|e| {
+                    SyncError::mqtt(format!("Failed to publish merge commit: {}", e))
+                })?;
 
                 info!(
                     "Published merge commit {} for {} (parents: {}, {})",
@@ -626,14 +623,14 @@ pub fn create_merge_commit(input: MergeCommitInput) -> SyncResult<MergeCommitRes
 /// * `Err(SyncError)` - If the merge or publish fails
 #[allow(clippy::too_many_arguments)]
 pub async fn create_and_publish_merge_commit(
-    mqtt_client: Option<&Arc<MqttClient>>,
+    mqtt_client: Option<&Arc<impl MqttPublisher>>,
     workspace: &str,
     node_id: &str,
     state: &mut CrdtPeerState,
     server_head: String,
     server_doc_state: Vec<u8>,
     author: &str,
-    commit_store: Option<&Arc<CommitStore>>,
+    commit_store: Option<&Arc<impl CommitPersistence>>,
 ) -> SyncResult<MergeCommitResult> {
     // Get local state
     let local_head = state
@@ -686,10 +683,10 @@ pub async fn create_and_publish_merge_commit(
             req: None,
         };
 
-        let topic = Topic::edits(workspace, node_id).to_topic_string();
+        let topic = edits_topic(workspace, node_id);
         let payload = serde_json::to_vec(&publish_msg)?;
 
-        mqtt.publish_retained(&topic, &payload, QoS::AtLeastOnce)
+        mqtt.publish_retained(&topic, &payload)
             .await
             .map_err(|e| SyncError::mqtt(format!("Failed to publish merge commit: {}", e)))?;
 
@@ -916,13 +913,13 @@ mod tests {
         };
 
         let (result, maybe_content) = process_received_edit(
-            None,
+            None::<&Arc<crate::mqtt::MqttClient>>,
             "workspace",
             "node",
             &mut state,
             &edit_msg,
             "author",
-            None,
+            None::<&Arc<crate::store::CommitStore>>,
         )
         .await
         .unwrap();
@@ -1090,13 +1087,13 @@ mod tests {
             req: None,
         };
         let (result_a, _content_a) = process_received_edit(
-            None, // No MQTT client needed for test
+            None::<&Arc<crate::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state_a,
             &edit_from_b,
             "user_a",
-            None, // No commit store in tests
+            None::<&Arc<crate::store::CommitStore>>,
         )
         .await
         .expect("Should process edit");
@@ -1121,13 +1118,13 @@ mod tests {
             req: None,
         };
         let (result_b, _content_b) = process_received_edit(
-            None,
+            None::<&Arc<crate::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state_b,
             &edit_from_a,
             "user_b",
-            None, // No commit store in tests
+            None::<&Arc<crate::store::CommitStore>>,
         )
         .await
         .expect("Should process edit");
@@ -1211,13 +1208,13 @@ mod tests {
         };
 
         let (result, _) = process_received_edit(
-            None,
+            None::<&Arc<crate::mqtt::MqttClient>>,
             "workspace",
             "node1",
             &mut state,
             &echo_msg,
             "me",
-            None,
+            None::<&Arc<crate::store::CommitStore>>,
         )
         .await
         .expect("Should process edit");
@@ -1263,9 +1260,17 @@ mod tests {
             timestamp: timestamp1,
             req: None,
         };
-        let (result1, _) = process_received_edit(None, "ws", "n1", &mut state, &msg1, "user", None)
-            .await
-            .unwrap();
+        let (result1, _) = process_received_edit(
+            None::<&Arc<crate::mqtt::MqttClient>>,
+            "ws",
+            "n1",
+            &mut state,
+            &msg1,
+            "user",
+            None::<&Arc<crate::store::CommitStore>>,
+        )
+        .await
+        .unwrap();
         assert!(matches!(result1, MergeResult::FastForward { .. }));
 
         // Create second commit that builds on first
@@ -1293,10 +1298,17 @@ mod tests {
             timestamp: 1001,
             req: None,
         };
-        let (result2, content) =
-            process_received_edit(None, "ws", "n1", &mut state, &msg2, "user", None)
-                .await
-                .unwrap();
+        let (result2, content) = process_received_edit(
+            None::<&Arc<crate::mqtt::MqttClient>>,
+            "ws",
+            "n1",
+            &mut state,
+            &msg2,
+            "user",
+            None::<&Arc<crate::store::CommitStore>>,
+        )
+        .await
+        .unwrap();
 
         // Should be fast-forward since it's a descendant
         assert!(
@@ -1355,10 +1367,17 @@ mod tests {
             req: None,
         };
 
-        let (result, _) =
-            process_received_edit(None, "ws", "n1", &mut state, &remote_msg, "me", None)
-                .await
-                .unwrap();
+        let (result, _) = process_received_edit(
+            None::<&Arc<crate::mqtt::MqttClient>>,
+            "ws",
+            "n1",
+            &mut state,
+            &remote_msg,
+            "me",
+            None::<&Arc<crate::store::CommitStore>>,
+        )
+        .await
+        .unwrap();
 
         // Should trigger merge or LocalAhead since we have divergent local changes
         assert!(

@@ -10,10 +10,10 @@
 use super::crdt_state::CrdtPeerState;
 use crate::commit::Commit;
 use crate::diff;
-use crate::mqtt::{EditMessage, MqttClient, Topic};
+use crate::mqtt::EditMessage;
 use crate::sync::error::{SyncError, SyncResult};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use rumqttc::QoS;
+use commonplace_types::traits::{edits_topic, MqttPublisher};
 use std::sync::Arc;
 use tracing::debug;
 use yrs::updates::decoder::Decode;
@@ -64,7 +64,7 @@ fn check_text_publish_preconditions(
 ///
 /// Returns the new commit ID and the update bytes.
 pub async fn publish_text_change(
-    mqtt_client: &Arc<MqttClient>,
+    mqtt_client: &Arc<impl MqttPublisher>,
     workspace: &str,
     node_id: &str,
     state: &mut CrdtPeerState,
@@ -134,14 +134,14 @@ pub async fn publish_text_change(
         req: None,
     };
 
-    let topic = Topic::edits(workspace, node_id).to_topic_string();
+    let topic = edits_topic(workspace, node_id);
     let payload = serde_json::to_vec(&edit_msg)?;
 
     // Use retained message so new subscribers get the latest content immediately.
     // This is critical for sync: subscribers may join after messages are published,
     // and the retained message ensures they receive the current content.
     mqtt_client
-        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
+        .publish_retained(&topic, &payload)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish edit: {}", e)))?;
 
@@ -159,7 +159,7 @@ pub async fn publish_text_change(
 ///
 /// Used when you already have a Yjs update (e.g., from structured content).
 pub async fn publish_yjs_update(
-    mqtt_client: &Arc<MqttClient>,
+    mqtt_client: &Arc<impl MqttPublisher>,
     workspace: &str,
     node_id: &str,
     state: &mut CrdtPeerState,
@@ -221,12 +221,12 @@ pub async fn publish_yjs_update(
         req: None,
     };
 
-    let topic = Topic::edits(workspace, node_id).to_topic_string();
+    let topic = edits_topic(workspace, node_id);
     let payload = serde_json::to_vec(&edit_msg)?;
 
     // Use retained message so new subscribers get the latest content immediately.
     mqtt_client
-        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
+        .publish_retained(&topic, &payload)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish edit: {}", e)))?;
 
