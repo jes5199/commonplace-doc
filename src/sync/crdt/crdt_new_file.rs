@@ -16,7 +16,6 @@ use crate::sync::error::{SyncError, SyncResult};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rumqttc::QoS;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use yrs::{Doc, ReadTxn, Text, Transact, WriteTxn};
@@ -183,17 +182,12 @@ async fn update_schema_with_new_file(
     schema_state.update_from_doc(&doc);
 
     // Publish via MQTT
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
     let edit_msg = EditMessage {
         update: update_b64,
         parents,
         author: author.to_string(),
         message: Some(format!("Add file: {}", filename)),
-        timestamp,
+        timestamp: commit.timestamp,
         req: None,
     };
 
@@ -283,17 +277,12 @@ async fn publish_file_content(
     file_state.update_from_doc(&doc);
 
     // Publish via MQTT
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
     let edit_msg = EditMessage {
         update: update_b64,
         parents: vec![],
         author: author.to_string(),
         message: Some("Initial content".to_string()),
-        timestamp,
+        timestamp: commit.timestamp,
         req: None,
     };
 
@@ -386,17 +375,12 @@ pub async fn remove_file_from_schema(
     dir_state.remove_file(filename);
 
     // Publish via MQTT
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
     let edit_msg = EditMessage {
         update: update_b64,
         parents,
         author: author.to_string(),
         message: Some(format!("Remove file: {}", filename)),
-        timestamp,
+        timestamp: commit.timestamp,
         req: None,
     };
 
@@ -480,17 +464,12 @@ pub async fn publish_schema_via_mqtt(
     schema_state.update_from_doc(&doc);
 
     // Publish via MQTT
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
     let edit_msg = EditMessage {
         update: update_b64,
         parents,
         author: author.to_string(),
         message: Some("Schema update".to_string()),
-        timestamp,
+        timestamp: commit.timestamp,
         req: None,
     };
 
@@ -566,17 +545,12 @@ pub async fn add_directory_to_schema(
     schema_state.update_from_doc(&doc);
 
     // Publish via MQTT
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
     let edit_msg = EditMessage {
         update: update_b64,
         parents,
         author: author.to_string(),
         message: Some(format!("Add directory: {}", dirname)),
-        timestamp,
+        timestamp: commit.timestamp,
         req: None,
     };
 

@@ -15,7 +15,6 @@ use crate::sync::error::{SyncError, SyncResult};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rumqttc::QoS;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, GetString, ReadTxn, Transact, Update};
@@ -124,18 +123,14 @@ pub async fn publish_text_change(
     state.record_known_cid(&cid);
     state.update_from_doc(&doc);
 
-    // Publish via MQTT
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
+    // Publish via MQTT — use the commit's timestamp so receivers can reconstruct
+    // the same CID for echo detection (is_cid_known).
     let edit_msg = EditMessage {
         update: update_b64,
         parents,
         author: author.to_string(),
         message: None,
-        timestamp,
+        timestamp: commit.timestamp,
         req: None,
     };
 
@@ -215,18 +210,14 @@ pub async fn publish_yjs_update(
     state.record_known_cid(&cid);
     state.update_from_doc(&doc);
 
-    // Publish via MQTT
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
+    // Publish via MQTT — use the commit's timestamp so receivers can reconstruct
+    // the same CID for echo detection (is_cid_known).
     let edit_msg = EditMessage {
         update: update_b64,
         parents,
         author: author.to_string(),
         message: None,
-        timestamp,
+        timestamp: commit.timestamp,
         req: None,
     };
 

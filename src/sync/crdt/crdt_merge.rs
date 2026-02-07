@@ -29,7 +29,6 @@ use crate::sync::error::{SyncError, SyncResult};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rumqttc::QoS;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 use yrs::types::ToJson;
 use yrs::updates::decoder::Decode;
@@ -223,17 +222,12 @@ pub async fn process_received_edit(
 
             // Publish via MQTT if client is provided
             if let Some(mqtt) = mqtt_client {
-                let timestamp = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-
                 let publish_msg = EditMessage {
                     update: merge_commit.update.clone(),
                     parents: merge_commit.parents.clone(),
                     author: author.to_string(),
                     message: Some("Merge commit".to_string()),
-                    timestamp,
+                    timestamp: merge_commit.timestamp,
                     req: None,
                 };
 
@@ -683,17 +677,12 @@ pub async fn create_and_publish_merge_commit(
 
     // Publish to MQTT if client is provided
     if let Some(mqtt) = mqtt_client {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
         let publish_msg = EditMessage {
             update: result.commit.update.clone(),
             parents: result.commit.parents.clone(),
             author: author.to_string(),
             message: Some("Merge commit".to_string()),
-            timestamp,
+            timestamp: result.commit.timestamp,
             req: None,
         };
 
