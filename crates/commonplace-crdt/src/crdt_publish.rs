@@ -7,12 +7,12 @@
 //!
 //! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
 
-use super::crdt_state::CrdtPeerState;
-use crate::commit::Commit;
-use crate::diff;
-use crate::mqtt::EditMessage;
-use crate::sync::error::{SyncError, SyncResult};
+use crate::crdt_state::CrdtPeerState;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use commonplace_types::commit::Commit;
+use commonplace_types::diff;
+use commonplace_types::mqtt::EditMessage;
+use commonplace_types::sync::error::{SyncError, SyncResult};
 use commonplace_types::traits::{edits_topic, MqttPublisher};
 use std::sync::Arc;
 use tracing::debug;

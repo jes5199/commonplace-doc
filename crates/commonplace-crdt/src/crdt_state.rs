@@ -5,11 +5,11 @@
 //!
 //! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
 
-use super::sync_state_machine::SyncStateMachine;
-use crate::fs::{Entry, FsSchema};
-use crate::sync::error::{SyncError, SyncResult};
-use crate::sync::schema_io::SCHEMA_FILENAME;
+use crate::sync_state_machine::SyncStateMachine;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use commonplace_types::fs::{Entry, FsSchema};
+use commonplace_types::sync::error::{SyncError, SyncResult};
+use commonplace_types::SCHEMA_FILENAME;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -900,9 +900,9 @@ impl DirectorySyncState {
     /// recovering from corrupted state, preventing data loss when the Y.Doc
     /// is later written back to disk.
     async fn initialize_schema_from_local_file(state: &mut Self, directory: &Path) {
-        use super::ymap_schema;
-        use crate::fs::FsSchema;
-        use crate::sync::SCHEMA_FILENAME;
+        use crate::ymap_schema;
+        use commonplace_types::fs::FsSchema;
+        use commonplace_types::SCHEMA_FILENAME;
 
         let schema_path = directory.join(SCHEMA_FILENAME);
         if !schema_path.exists() {
@@ -925,7 +925,9 @@ impl DirectorySyncState {
                         .root
                         .as_ref()
                         .and_then(|e| match e {
-                            crate::fs::Entry::Dir(d) => d.entries.as_ref().map(|e| e.len()),
+                            commonplace_types::fs::Entry::Dir(d) => {
+                                d.entries.as_ref().map(|e| e.len())
+                            }
                             _ => None,
                         })
                         .unwrap_or(0);
@@ -1079,164 +1081,6 @@ impl DirectorySyncState {
 
         Ok(corrections)
     }
-}
-
-/// Migrate from old SyncStateFile format to new DirectorySyncState.
-///
-/// The old format stored:
-/// - server, node_id, last_synced_cid, files (with hash, last_cid, inode_key)
-///
-/// The new format stores:
-/// - schema state with Y.Doc
-/// - file states with Y.Docs
-///
-/// Migration creates empty Y.Docs but preserves CID information.
-/// File UUIDs are looked up from the `.commonplace.json` schema file.
-pub async fn migrate_from_old_state(
-    old_state: &crate::sync::state_file::SyncStateFile,
-    directory: &Path,
-) -> SyncResult<DirectorySyncState> {
-    // Parse the node_id as UUID
-    let schema_node_id = Uuid::parse_str(&old_state.node_id)?;
-
-    let mut new_state = DirectorySyncState::new(schema_node_id);
-
-    // Preserve the last synced CID as both head_cid and local_head_cid
-    // (we assume they're in sync at migration time)
-    new_state.schema.head_cid = old_state.last_synced_cid.clone();
-    new_state.schema.local_head_cid = old_state.last_synced_cid.clone();
-
-    // Load schema to look up file UUIDs
-    let schema_path = directory.join(SCHEMA_FILENAME);
-    let schema_entries: Option<HashMap<String, Entry>> = if schema_path.exists() {
-        match fs::read_to_string(&schema_path).await {
-            Ok(content) => match serde_json::from_str::<FsSchema>(&content) {
-                Ok(fs_schema) => match &fs_schema.root {
-                    Some(Entry::Dir(dir)) => dir.entries.clone(),
-                    _ => None,
-                },
-                Err(e) => {
-                    warn!(
-                        "Failed to parse {} during migration: {}",
-                        schema_path.display(),
-                        e
-                    );
-                    None
-                }
-            },
-            Err(e) => {
-                warn!(
-                    "Failed to read {} during migration: {}",
-                    schema_path.display(),
-                    e
-                );
-                None
-            }
-        }
-    } else {
-        debug!(
-            "No schema file at {} during migration",
-            schema_path.display()
-        );
-        None
-    };
-
-    // Migrate file states
-    for (path, file_state) in &old_state.files {
-        // Look up the UUID from the schema (authoritative source)
-        let file_node_id = if let Some(ref entries) = schema_entries {
-            if let Some(Entry::Doc(doc)) = entries.get(path) {
-                if let Some(ref node_id_str) = doc.node_id {
-                    match Uuid::parse_str(node_id_str) {
-                        Ok(uuid) => {
-                            debug!(
-                                "Using schema UUID {} for file '{}' during migration",
-                                uuid, path
-                            );
-                            uuid
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Invalid UUID '{}' for '{}' in schema: {}, generating new one",
-                                node_id_str, path, e
-                            );
-                            Uuid::new_v4()
-                        }
-                    }
-                } else {
-                    warn!(
-                        "File '{}' in schema has no node_id, generating new UUID",
-                        path
-                    );
-                    Uuid::new_v4()
-                }
-            } else {
-                warn!(
-                    "File '{}' not found in schema during migration, generating new UUID",
-                    path
-                );
-                Uuid::new_v4()
-            }
-        } else {
-            warn!(
-                "No schema available during migration for '{}', generating new UUID",
-                path
-            );
-            Uuid::new_v4()
-        };
-
-        let mut peer_state = CrdtPeerState::new(file_node_id);
-        peer_state.head_cid = file_state.last_cid.clone();
-        peer_state.local_head_cid = file_state.last_cid.clone();
-        // Y.Doc state will be populated on first sync
-
-        new_state.files.insert(path.clone(), peer_state);
-    }
-
-    debug!(
-        "Migrated old state with {} files to new CRDT state",
-        new_state.files.len()
-    );
-
-    Ok(new_state)
-}
-
-/// Attempt to load state, migrating from old format if necessary.
-pub async fn load_or_migrate(
-    directory: &Path,
-    schema_node_id: Uuid,
-) -> io::Result<DirectorySyncState> {
-    // First try loading new format
-    if let Some(state) = DirectorySyncState::load(directory).await? {
-        return Ok(state);
-    }
-
-    // Check for old format state file (sibling dotfile)
-    let old_state_path = crate::sync::state_file::SyncStateFile::state_file_path(directory);
-    if old_state_path.exists() {
-        if let Some(old_state) =
-            crate::sync::state_file::SyncStateFile::load(&old_state_path).await?
-        {
-            match migrate_from_old_state(&old_state, directory).await {
-                Ok(new_state) => {
-                    // Save the migrated state
-                    new_state.save(directory).await?;
-                    warn!(
-                        "Migrated old sync state to new CRDT format: {}",
-                        directory.display()
-                    );
-                    return Ok(new_state);
-                }
-                Err(e) => {
-                    warn!("Failed to migrate old state: {}", e);
-                    // Fall through to create new state
-                }
-            }
-        }
-    }
-
-    // No existing state, create new
-    Ok(DirectorySyncState::new(schema_node_id))
 }
 
 /// Cache for subdirectory CRDT states to prevent race conditions.
@@ -1752,7 +1596,7 @@ mod tests {
 
     #[test]
     fn test_should_buffer_for_sync_in_active_states() {
-        use super::super::SyncEvent;
+        use crate::sync_state_machine::SyncEvent;
 
         let mut state = CrdtPeerState::new(Uuid::new_v4());
 
@@ -1887,22 +1731,22 @@ mod tests {
         // Access immutable reference
         assert_eq!(
             state.sync_state().state(),
-            super::super::ClientSyncState::Idle
+            crate::sync_state_machine::ClientSyncState::Idle
         );
 
         // Access mutable reference and make transition
-        use super::super::SyncEvent;
+        use crate::sync_state_machine::SyncEvent;
         state.sync_state_mut().apply(SyncEvent::StartSync).unwrap();
 
         assert_eq!(
             state.sync_state().state(),
-            super::super::ClientSyncState::Comparing
+            crate::sync_state_machine::ClientSyncState::Comparing
         );
     }
 
     #[test]
     fn test_sync_state_not_serialized() {
-        use super::super::SyncEvent;
+        use crate::sync_state_machine::SyncEvent;
 
         let mut state = CrdtPeerState::new(Uuid::new_v4());
 

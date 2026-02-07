@@ -144,9 +144,8 @@ pub use crdt::crdt_publish::{
     publish_yjs_update, PublishResult,
 };
 pub use crdt::crdt_state::{
-    load_or_migrate, migrate_from_old_state, CrdtPeerState, DirectorySyncState, MqttOnlySyncConfig,
-    PendingEdit, QueueReason, SubdirStateCache, SyncBufferedEdit, SyncGuardrails,
-    CRDT_STATE_FILENAME, MAX_PENDING_EDITS,
+    CrdtPeerState, DirectorySyncState, MqttOnlySyncConfig, PendingEdit, QueueReason,
+    SubdirStateCache, SyncBufferedEdit, SyncGuardrails, CRDT_STATE_FILENAME, MAX_PENDING_EDITS,
 };
 pub use crdt::sync_state_machine::{
     transition, ClientSyncState, InvalidTransition, SyncEvent, SyncStateMachine,
@@ -157,6 +156,7 @@ pub use crdt::yjs::{
     create_yjs_text_diff_update, create_yjs_text_update, json_value_to_any, TEXT_ROOT_NAME,
 };
 pub use crdt::ymap_schema;
+pub use crdt::{load_or_migrate, migrate_from_old_state};
 
 // --- From watcher/ ---
 pub use watcher::file_events::{

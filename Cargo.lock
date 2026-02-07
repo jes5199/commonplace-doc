@@ -354,6 +354,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
 
 [[package]]
+name = "commonplace-crdt"
+version = "0.1.0"
+dependencies = [
+ "base64 0.21.7",
+ "commonplace-types",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "yrs",
+]
+
+[[package]]
 name = "commonplace-doc"
 version = "0.1.0"
 dependencies = [
@@ -364,6 +380,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "commonplace-crdt",
  "commonplace-types",
  "fs2",
  "futures",

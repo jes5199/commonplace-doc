@@ -2,8 +2,8 @@
 //!
 //! This module provides functions to create Yjs CRDT updates for text and JSON content.
 
-use crate::b64;
-use crate::content_type::ContentType;
+use commonplace_types::b64;
+use commonplace_types::content_type::ContentType;
 use yrs::any::Any;
 use yrs::types::ToJson;
 use yrs::updates::decoder::Decode;

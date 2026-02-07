@@ -410,7 +410,7 @@ pub fn is_json_text_format(doc: &Doc) -> bool {
 ///
 /// Returns true if migration was performed, false if already in YMap format.
 pub fn migrate_from_json_text(doc: &Doc) -> Result<bool, String> {
-    use crate::fs::{Entry, FsSchema};
+    use commonplace_types::fs::{Entry, FsSchema};
     use yrs::{GetString, Text};
 
     // Check if already in YMap format
@@ -472,8 +472,8 @@ pub fn migrate_from_json_text(doc: &Doc) -> Result<bool, String> {
 /// already has a .commonplace.json file. It ensures the Y.Doc CRDT state
 /// starts with the existing schema entries, preventing data loss when we
 /// later write the Y.Doc back to .commonplace.json.
-pub fn from_fs_schema(doc: &Doc, schema: &crate::fs::FsSchema) {
-    use crate::fs::Entry;
+pub fn from_fs_schema(doc: &Doc, schema: &commonplace_types::fs::FsSchema) {
+    use commonplace_types::fs::Entry;
 
     if let Some(Entry::Dir(dir)) = &schema.root {
         if let Some(entries) = &dir.entries {
@@ -494,8 +494,8 @@ pub fn from_fs_schema(doc: &Doc, schema: &crate::fs::FsSchema) {
 }
 
 /// Convert YMap schema back to FsSchema for compatibility with existing code.
-pub fn to_fs_schema(doc: &Doc) -> crate::fs::FsSchema {
-    use crate::fs::{DirEntry, DocEntry, Entry, FsSchema};
+pub fn to_fs_schema(doc: &Doc) -> commonplace_types::fs::FsSchema {
+    use commonplace_types::fs::{DirEntry, DocEntry, Entry, FsSchema};
 
     let entries_map = list_entries(doc);
 
@@ -689,7 +689,7 @@ mod tests {
         assert_eq!(schema.version, 1);
         assert!(schema.root.is_some());
 
-        if let Some(crate::fs::Entry::Dir(dir)) = &schema.root {
+        if let Some(commonplace_types::fs::Entry::Dir(dir)) = &schema.root {
             let entries = dir.entries.as_ref().unwrap();
             assert_eq!(entries.len(), 2);
             assert!(entries.contains_key("file1.txt"));
@@ -706,7 +706,7 @@ mod tests {
     /// structure produces JSON that parses as a valid FsSchema.
     #[test]
     fn test_ymap_to_json_produces_valid_fs_schema() {
-        use crate::fs::FsSchema;
+        use commonplace_types::fs::FsSchema;
 
         let doc = Doc::new();
         add_file(&doc, "test.txt", "uuid-123");
@@ -728,13 +728,13 @@ mod tests {
         assert_eq!(schema.version, 1);
         assert!(schema.root.is_some());
 
-        if let Some(crate::fs::Entry::Dir(dir)) = &schema.root {
+        if let Some(commonplace_types::fs::Entry::Dir(dir)) = &schema.root {
             let entries = dir.entries.as_ref().expect("should have entries");
             assert_eq!(entries.len(), 2, "should have 2 entries");
 
             // Check file entry
             let file_entry = entries.get("test.txt").expect("test.txt should exist");
-            if let crate::fs::Entry::Doc(doc_entry) = file_entry {
+            if let commonplace_types::fs::Entry::Doc(doc_entry) = file_entry {
                 assert_eq!(doc_entry.node_id, Some("uuid-123".to_string()));
             } else {
                 panic!("test.txt should be a Doc entry");
@@ -742,7 +742,7 @@ mod tests {
 
             // Check dir entry
             let dir_entry = entries.get("mydir").expect("mydir should exist");
-            if let crate::fs::Entry::Dir(sub_dir) = dir_entry {
+            if let commonplace_types::fs::Entry::Dir(sub_dir) = dir_entry {
                 assert_eq!(sub_dir.node_id, Some("uuid-456".to_string()));
             } else {
                 panic!("mydir should be a Dir entry");
@@ -755,7 +755,7 @@ mod tests {
     /// Test that empty schema produces valid empty FsSchema JSON.
     #[test]
     fn test_empty_ymap_to_json() {
-        use crate::fs::FsSchema;
+        use commonplace_types::fs::FsSchema;
 
         let doc = Doc::new();
         // Trigger creation of the FsSchema structure without adding entries
@@ -778,7 +778,7 @@ mod tests {
         assert_eq!(schema.version, 1);
         assert!(schema.root.is_some());
 
-        if let Some(crate::fs::Entry::Dir(dir)) = &schema.root {
+        if let Some(commonplace_types::fs::Entry::Dir(dir)) = &schema.root {
             // Empty entries map
             let entries = dir.entries.as_ref().expect("should have entries");
             assert!(entries.is_empty(), "entries should be empty");

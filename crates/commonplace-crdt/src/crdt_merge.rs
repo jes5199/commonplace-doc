@@ -21,11 +21,11 @@
 //! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
 //! See: docs/plans/2026-01-27-cyan-sync-protocol-design.md
 
-use super::crdt_state::CrdtPeerState;
-use crate::commit::Commit;
-use crate::mqtt::EditMessage;
-use crate::sync::error::{SyncError, SyncResult};
+use crate::crdt_state::CrdtPeerState;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use commonplace_types::commit::Commit;
+use commonplace_types::mqtt::EditMessage;
+use commonplace_types::sync::error::{SyncError, SyncResult};
 use commonplace_types::traits::{edits_topic, CommitPersistence, MqttPublisher};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -452,7 +452,7 @@ pub fn get_doc_text_content(doc: &Doc) -> String {
     // If YArray also empty, try reading as YMap (JSON object files).
     if let Some(map) = txn.get_map("content") {
         let any_map = map.to_json(&txn);
-        let json_value = crate::sync::crdt::yjs::any_to_json_value(any_map);
+        let json_value = crate::yjs::any_to_json_value(any_map);
         if let serde_json::Value::Object(obj) = &json_value {
             if !obj.is_empty() {
                 if let Ok(mut s) = serde_json::to_string(&json_value) {
@@ -779,7 +779,7 @@ pub fn find_common_ancestor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mqtt::EditMessage;
+    use commonplace_types::mqtt::EditMessage;
     use uuid::Uuid;
     use yrs::{Text, WriteTxn};
 
@@ -913,13 +913,13 @@ mod tests {
         };
 
         let (result, maybe_content) = process_received_edit(
-            None::<&Arc<crate::mqtt::MqttClient>>,
+            None::<&Arc<crate::test_helpers::NoOpPublisher>>,
             "workspace",
             "node",
             &mut state,
             &edit_msg,
             "author",
-            None::<&Arc<crate::store::CommitStore>>,
+            None::<&Arc<crate::test_helpers::NoOpStore>>,
         )
         .await
         .unwrap();
@@ -1087,13 +1087,13 @@ mod tests {
             req: None,
         };
         let (result_a, _content_a) = process_received_edit(
-            None::<&Arc<crate::mqtt::MqttClient>>,
+            None::<&Arc<crate::test_helpers::NoOpPublisher>>,
             "workspace",
             "node1",
             &mut state_a,
             &edit_from_b,
             "user_a",
-            None::<&Arc<crate::store::CommitStore>>,
+            None::<&Arc<crate::test_helpers::NoOpStore>>,
         )
         .await
         .expect("Should process edit");
@@ -1118,13 +1118,13 @@ mod tests {
             req: None,
         };
         let (result_b, _content_b) = process_received_edit(
-            None::<&Arc<crate::mqtt::MqttClient>>,
+            None::<&Arc<crate::test_helpers::NoOpPublisher>>,
             "workspace",
             "node1",
             &mut state_b,
             &edit_from_a,
             "user_b",
-            None::<&Arc<crate::store::CommitStore>>,
+            None::<&Arc<crate::test_helpers::NoOpStore>>,
         )
         .await
         .expect("Should process edit");
@@ -1208,13 +1208,13 @@ mod tests {
         };
 
         let (result, _) = process_received_edit(
-            None::<&Arc<crate::mqtt::MqttClient>>,
+            None::<&Arc<crate::test_helpers::NoOpPublisher>>,
             "workspace",
             "node1",
             &mut state,
             &echo_msg,
             "me",
-            None::<&Arc<crate::store::CommitStore>>,
+            None::<&Arc<crate::test_helpers::NoOpStore>>,
         )
         .await
         .expect("Should process edit");
@@ -1261,13 +1261,13 @@ mod tests {
             req: None,
         };
         let (result1, _) = process_received_edit(
-            None::<&Arc<crate::mqtt::MqttClient>>,
+            None::<&Arc<crate::test_helpers::NoOpPublisher>>,
             "ws",
             "n1",
             &mut state,
             &msg1,
             "user",
-            None::<&Arc<crate::store::CommitStore>>,
+            None::<&Arc<crate::test_helpers::NoOpStore>>,
         )
         .await
         .unwrap();
@@ -1299,13 +1299,13 @@ mod tests {
             req: None,
         };
         let (result2, content) = process_received_edit(
-            None::<&Arc<crate::mqtt::MqttClient>>,
+            None::<&Arc<crate::test_helpers::NoOpPublisher>>,
             "ws",
             "n1",
             &mut state,
             &msg2,
             "user",
-            None::<&Arc<crate::store::CommitStore>>,
+            None::<&Arc<crate::test_helpers::NoOpStore>>,
         )
         .await
         .unwrap();
@@ -1368,13 +1368,13 @@ mod tests {
         };
 
         let (result, _) = process_received_edit(
-            None::<&Arc<crate::mqtt::MqttClient>>,
+            None::<&Arc<crate::test_helpers::NoOpPublisher>>,
             "ws",
             "n1",
             &mut state,
             &remote_msg,
             "me",
-            None::<&Arc<crate::store::CommitStore>>,
+            None::<&Arc<crate::test_helpers::NoOpStore>>,
         )
         .await
         .unwrap();
@@ -1723,7 +1723,7 @@ mod tests {
         let jsonl = r#"{"name":"alice","age":30}
 {"name":"bob","age":25}
 "#;
-        let update_b64 = crate::sync::crdt::yjs::create_yjs_jsonl_update(jsonl, None).unwrap();
+        let update_b64 = crate::yjs::create_yjs_jsonl_update(jsonl, None).unwrap();
         let update_bytes = STANDARD.decode(&update_b64).unwrap();
 
         let doc = Doc::new();
@@ -1765,7 +1765,7 @@ mod tests {
                        {\"id\": 2, \"message\": \"second line\"}\n";
 
         // Create YArray from content
-        let update_b64 = crate::sync::crdt::yjs::create_yjs_jsonl_update(content, None).unwrap();
+        let update_b64 = crate::yjs::create_yjs_jsonl_update(content, None).unwrap();
         let update_bytes = STANDARD.decode(&update_b64).unwrap();
 
         let doc = Doc::new();
@@ -1776,8 +1776,8 @@ mod tests {
         }
 
         // Extract via doc_to_json_array_value (as match_doc_structured_content does)
-        let doc_value = crate::sync::crdt::yjs::doc_to_json_array_value(&doc)
-            .expect("Should extract array value");
+        let doc_value =
+            crate::yjs::doc_to_json_array_value(&doc).expect("Should extract array value");
 
         // Parse as JSONL values (as match_doc_structured_content does)
         let parsed_values: Vec<serde_json::Value> = content
@@ -1805,8 +1805,7 @@ mod tests {
         // Step 1: Workspace creates JSONL with 2 lines
         let initial_content = "{\"id\":1,\"message\":\"first line\"}\n\
                                {\"id\":2,\"message\":\"second line\"}\n";
-        let initial_b64 =
-            crate::sync::crdt::yjs::create_yjs_jsonl_update(initial_content, None).unwrap();
+        let initial_b64 = crate::yjs::create_yjs_jsonl_update(initial_content, None).unwrap();
         let initial_bytes = STANDARD.decode(&initial_b64).unwrap();
 
         // Workspace doc
@@ -1845,8 +1844,7 @@ mod tests {
                            {\"id\":2,\"message\":\"second line\"}\n\
                            {\"id\":3,\"message\":\"third line from sandbox\"}\n";
         let sandbox_update_b64 =
-            crate::sync::crdt::yjs::create_yjs_jsonl_update(new_content, Some(&sandbox_state))
-                .unwrap();
+            crate::yjs::create_yjs_jsonl_update(new_content, Some(&sandbox_state)).unwrap();
         let sandbox_update_bytes = STANDARD.decode(&sandbox_update_b64).unwrap();
 
         // Step 4: Workspace receives sandbox's update

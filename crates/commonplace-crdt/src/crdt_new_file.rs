@@ -7,13 +7,13 @@
 //!
 //! See: docs/plans/2026-01-21-crdt-peer-sync-design.md
 
-use super::crdt_state::{CrdtPeerState, DirectorySyncState};
-use super::yjs::create_yjs_jsonl_update;
-use super::ymap_schema;
-use crate::commit::Commit;
-use crate::mqtt::EditMessage;
-use crate::sync::error::{SyncError, SyncResult};
+use crate::crdt_state::{CrdtPeerState, DirectorySyncState};
+use crate::yjs::create_yjs_jsonl_update;
+use crate::ymap_schema;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use commonplace_types::commit::Commit;
+use commonplace_types::mqtt::EditMessage;
+use commonplace_types::sync::error::{SyncError, SyncResult};
 use commonplace_types::traits::{edits_topic, MqttPublisher};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -416,7 +416,7 @@ pub async fn publish_schema_via_mqtt(
     mqtt_client: &Arc<impl MqttPublisher>,
     workspace: &str,
     schema_state: &mut CrdtPeerState,
-    schema: &crate::fs::FsSchema,
+    schema: &commonplace_types::fs::FsSchema,
     author: &str,
 ) -> SyncResult<String> {
     // Load schema Y.Doc
@@ -574,7 +574,7 @@ pub async fn add_directory_to_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::Entry;
+    use commonplace_types::fs::Entry;
 
     #[test]
     fn test_generate_file_uuid() {
@@ -835,7 +835,7 @@ mod tests {
     /// Test that DirectorySyncState properly tracks file creation.
     #[test]
     fn test_directory_sync_state_tracks_new_file() {
-        use super::super::DirectorySyncState;
+        use crate::crdt_state::DirectorySyncState;
 
         let mut dir_state = DirectorySyncState::new(Uuid::new_v4());
 
@@ -865,7 +865,7 @@ mod tests {
     /// Test that DirectorySyncState properly tracks file deletion.
     #[test]
     fn test_directory_sync_state_tracks_file_deletion() {
-        use super::super::DirectorySyncState;
+        use crate::crdt_state::DirectorySyncState;
 
         let mut dir_state = DirectorySyncState::new(Uuid::new_v4());
 
@@ -931,7 +931,7 @@ mod tests {
         drop(txn);
 
         // Verify the content round-trips via get_doc_text_content
-        let extracted = super::super::crdt_merge::get_doc_text_content_for_test(&doc);
+        let extracted = crate::crdt_merge::get_doc_text_content_for_test(&doc);
         assert!(!extracted.is_empty(), "Should extract JSONL content");
         assert!(extracted.ends_with('\n'), "JSONL should end with newline");
 
@@ -957,7 +957,7 @@ mod tests {
             text.insert(&mut txn, 0, content);
         }
 
-        let extracted = super::super::crdt_merge::get_doc_text_content_for_test(&doc);
+        let extracted = crate::crdt_merge::get_doc_text_content_for_test(&doc);
         assert_eq!(extracted, content);
     }
 }
