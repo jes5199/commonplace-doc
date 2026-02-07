@@ -419,6 +419,184 @@ pub async fn remove_file_from_schema(
     Ok(cid)
 }
 
+/// Publish a full schema via MQTT, replacing the schema Y.Doc contents.
+///
+/// This is the MQTT equivalent of `push_schema_to_server()`. It:
+/// 1. Loads the schema Y.Doc from CRDT state
+/// 2. Applies the full FsSchema to it via YMap operations
+/// 3. Creates and publishes a commit via MQTT
+///
+/// Used by `handle_schema_modified` to push user schema edits via MQTT
+/// instead of HTTP.
+pub async fn publish_schema_via_mqtt(
+    mqtt_client: &Arc<MqttClient>,
+    workspace: &str,
+    schema_state: &mut CrdtPeerState,
+    schema: &crate::fs::FsSchema,
+    author: &str,
+) -> SyncResult<String> {
+    // Load schema Y.Doc
+    let doc = schema_state.to_doc()?;
+
+    // Migrate from JSON text format if needed
+    if ymap_schema::is_json_text_format(&doc) && !ymap_schema::is_ymap_format(&doc) {
+        match ymap_schema::migrate_from_json_text(&doc) {
+            Ok(true) => {
+                info!("Migrated schema from JSON text to YMap format");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!("Failed to migrate schema, will overwrite with YMap: {}", e);
+            }
+        }
+    }
+
+    // Apply full schema to Y.Doc via YMap operations
+    ymap_schema::from_fs_schema(&doc, schema);
+
+    // Get the update bytes (full state)
+    let update_bytes = {
+        let txn = doc.transact();
+        txn.encode_state_as_update_v1(&yrs::StateVector::default())
+    };
+
+    // Create and publish commit
+    let parents = match &schema_state.local_head_cid {
+        Some(cid) => vec![cid.clone()],
+        None => vec![],
+    };
+
+    let update_b64 = STANDARD.encode(&update_bytes);
+    let commit = Commit::new(
+        parents.clone(),
+        update_b64.clone(),
+        author.to_string(),
+        None,
+    );
+    let cid = commit.calculate_cid();
+
+    // Update state
+    schema_state.local_head_cid = Some(cid.clone());
+    schema_state.update_from_doc(&doc);
+
+    // Publish via MQTT
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let edit_msg = EditMessage {
+        update: update_b64,
+        parents,
+        author: author.to_string(),
+        message: Some("Schema update".to_string()),
+        timestamp,
+        req: None,
+    };
+
+    let schema_node_id = schema_state.node_id.to_string();
+    let topic = Topic::edits(workspace, &schema_node_id).to_topic_string();
+    let payload = serde_json::to_vec(&edit_msg)?;
+
+    mqtt_client
+        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
+        .await
+        .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
+
+    info!("Published schema commit {} via MQTT (retained)", cid);
+
+    Ok(cid)
+}
+
+/// Add a directory entry to the schema and publish via MQTT.
+///
+/// This is used by `ensure_parent_directories_exist` when creating new
+/// node-backed subdirectories in CRDT mode, replacing the HTTP POST /docs
+/// + push_schema_to_server pattern.
+pub async fn add_directory_to_schema(
+    mqtt_client: &Arc<MqttClient>,
+    workspace: &str,
+    schema_state: &mut CrdtPeerState,
+    dirname: &str,
+    node_id: &str,
+    author: &str,
+) -> SyncResult<String> {
+    // Load schema Y.Doc
+    let doc = schema_state.to_doc()?;
+
+    // Migrate from JSON text format if needed
+    if ymap_schema::is_json_text_format(&doc) && !ymap_schema::is_ymap_format(&doc) {
+        match ymap_schema::migrate_from_json_text(&doc) {
+            Ok(true) => {
+                info!("Migrated schema from JSON text to YMap format");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!("Failed to migrate schema: {}", e);
+            }
+        }
+    }
+
+    // Add directory using YMap operations
+    ymap_schema::add_directory(&doc, dirname, Some(node_id));
+
+    // Get the update bytes
+    let update_bytes = {
+        let txn = doc.transact();
+        txn.encode_state_as_update_v1(&yrs::StateVector::default())
+    };
+
+    // Create and publish commit
+    let parents = match &schema_state.local_head_cid {
+        Some(cid) => vec![cid.clone()],
+        None => vec![],
+    };
+
+    let update_b64 = STANDARD.encode(&update_bytes);
+    let commit = Commit::new(
+        parents.clone(),
+        update_b64.clone(),
+        author.to_string(),
+        None,
+    );
+    let cid = commit.calculate_cid();
+
+    // Update state
+    schema_state.local_head_cid = Some(cid.clone());
+    schema_state.update_from_doc(&doc);
+
+    // Publish via MQTT
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let edit_msg = EditMessage {
+        update: update_b64,
+        parents,
+        author: author.to_string(),
+        message: Some(format!("Add directory: {}", dirname)),
+        timestamp,
+        req: None,
+    };
+
+    let schema_node_id = schema_state.node_id.to_string();
+    let topic = Topic::edits(workspace, &schema_node_id).to_topic_string();
+    let payload = serde_json::to_vec(&edit_msg)?;
+
+    mqtt_client
+        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
+        .await
+        .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
+
+    info!(
+        "Published schema commit {} for directory '{}' (retained)",
+        cid, dirname
+    );
+
+    Ok(cid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

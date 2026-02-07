@@ -7,6 +7,7 @@ use crate::commit::Commit;
 use crate::fs::{Entry, FsSchema};
 use crate::sync::client::fetch_head;
 use crate::sync::crdt_merge::parse_edit_message;
+use crate::sync::crdt_new_file::publish_schema_via_mqtt;
 use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
 use crate::sync::file_events::find_owning_document;
 use crate::sync::schema_io::{
@@ -2747,7 +2748,8 @@ pub async fn check_server_has_content(client: &Client, server: &str, fs_root_id:
 /// Handle a user edit to a .commonplace.json schema file.
 ///
 /// When the user edits a schema file locally (e.g., to change a node_id for linking),
-/// this function pushes the changes to the server.
+/// this function pushes the changes to the server via MQTT (when CRDT context is
+/// available) or HTTP (fallback).
 ///
 /// # Arguments
 /// * `client` - HTTP client
@@ -2757,6 +2759,8 @@ pub async fn check_server_has_content(client: &Client, server: &str, fs_root_id:
 /// * `schema_path` - Path to the modified .commonplace.json file
 /// * `content` - New content of the schema file
 /// * `author` - The author string for the commit
+/// * `written_schemas` - Recently written schemas for echo detection
+/// * `crdt_context` - Optional CRDT context for MQTT publishing
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_schema_modified(
     client: &Client,
@@ -2767,20 +2771,15 @@ pub async fn handle_schema_modified(
     content: &str,
     author: &str,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
+    crdt_context: Option<&CrdtFileSyncContext>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Check for echo - if we recently wrote to this path, skip pushing
-    // This prevents feedback loops where intermediate writes (e.g., from scan_directory_to_json)
-    // get pushed back to the server and overwrite our correct content.
-    // The key insight: if we wrote to this file recently, we already pushed the correct content.
-    // Any SchemaModified event is likely a stale echo of an intermediate write.
     if let Some(ws) = written_schemas {
         let canonical = schema_path
             .canonicalize()
             .unwrap_or(schema_path.to_path_buf());
         let written = ws.read().await;
         if written.contains_key(&canonical) {
-            // We recently wrote to this path - skip this event entirely
-            // Our write already pushed the correct content to the server
             tracing::debug!(
                 "Skipping schema push for {} - we recently wrote to this file",
                 schema_path.display()
@@ -2789,27 +2788,39 @@ pub async fn handle_schema_modified(
         }
     }
 
-    // Validate the schema content
-    let _schema: FsSchema =
+    // Validate and parse the schema content
+    let schema: FsSchema =
         serde_json::from_str(content).map_err(|e| format!("Invalid schema JSON: {}", e))?;
 
     // Determine which document owns this schema
-    // If schema_path is in base_directory (root schema), push to fs_root_id
-    // If schema_path is in a subdirectory, find the node_id from parent schema
-
     let schema_dir = schema_path
         .parent()
         .ok_or("Schema file has no parent directory")?;
 
-    // Check if this is the root schema
-    if schema_dir == base_directory {
-        info!("Pushing root schema to server (fs_root_id: {})", fs_root_id);
-        push_schema_to_server(client, server, fs_root_id, content, author).await?;
+    let is_root = schema_dir == base_directory;
+
+    if is_root {
+        // Root schema
+        if let Some(ctx) = crdt_context {
+            info!("Pushing root schema via MQTT (fs_root_id: {})", fs_root_id);
+            let mut state = ctx.crdt_state.write().await;
+            publish_schema_via_mqtt(
+                &ctx.mqtt_client,
+                &ctx.workspace,
+                &mut state.schema,
+                &schema,
+                author,
+            )
+            .await
+            .map_err(|e| format!("Failed to publish schema via MQTT: {}", e))?;
+        } else {
+            info!("Pushing root schema via HTTP (fs_root_id: {})", fs_root_id);
+            push_schema_to_server(client, server, fs_root_id, content, author).await?;
+        }
         return Ok(());
     }
 
-    // This is a nested schema - find the owning document
-    // Get the relative path from base_directory to schema_dir
+    // Nested schema - find the owning document's node_id
     let relative_dir = schema_dir.strip_prefix(base_directory).map_err(|_| {
         format!(
             "Schema path {} is not under base directory {}",
@@ -2818,15 +2829,12 @@ pub async fn handle_schema_modified(
         )
     })?;
 
-    // Find the node_id for this directory by reading parent schemas
-    // Start from base_directory and walk down
     let mut current_dir = base_directory.to_path_buf();
     let mut current_node_id = fs_root_id.to_string();
 
     for component in relative_dir.iter() {
         let component_str = component.to_string_lossy();
 
-        // Read the schema at current_dir
         let parent_schema_path = current_dir.join(SCHEMA_FILENAME);
         let parent_schema_content = tokio::fs::read_to_string(&parent_schema_path)
             .await
@@ -2841,7 +2849,6 @@ pub async fn handle_schema_modified(
         let parent_schema: FsSchema = serde_json::from_str(&parent_schema_content)
             .map_err(|e| format!("Invalid parent schema: {}", e))?;
 
-        // Find the entry for this component
         let entry = parent_schema
             .root
             .as_ref()
@@ -2854,7 +2861,6 @@ pub async fn handle_schema_modified(
             })
             .ok_or_else(|| format!("Directory {} not found in parent schema", component_str))?;
 
-        // Get the node_id if this is a node-backed directory
         if let Entry::Dir(dir) = entry {
             if let Some(ref node_id) = dir.node_id {
                 current_node_id = node_id.clone();
@@ -2872,12 +2878,43 @@ pub async fn handle_schema_modified(
         current_dir = current_dir.join(component);
     }
 
-    info!(
-        "Pushing nested schema {} to server (node_id: {})",
-        schema_path.display(),
-        current_node_id
-    );
-    push_schema_to_server(client, server, &current_node_id, content, author).await?;
+    // Push nested schema via MQTT or HTTP
+    if let Some(ctx) = crdt_context {
+        info!(
+            "Pushing nested schema {} via MQTT (node_id: {})",
+            schema_path.display(),
+            current_node_id
+        );
+        // Load or create subdirectory state from cache
+        let subdir_node_uuid = Uuid::parse_str(&current_node_id).map_err(|e| {
+            format!(
+                "Invalid node_id '{}' for nested schema: {}",
+                current_node_id, e
+            )
+        })?;
+        let subdir_state = ctx
+            .subdir_cache
+            .get_or_load(&current_dir, subdir_node_uuid)
+            .await
+            .map_err(|e| format!("Failed to load subdirectory state: {}", e))?;
+        let mut state = subdir_state.write().await;
+        publish_schema_via_mqtt(
+            &ctx.mqtt_client,
+            &ctx.workspace,
+            &mut state.schema,
+            &schema,
+            author,
+        )
+        .await
+        .map_err(|e| format!("Failed to publish nested schema via MQTT: {}", e))?;
+    } else {
+        info!(
+            "Pushing nested schema {} via HTTP (node_id: {})",
+            schema_path.display(),
+            current_node_id
+        );
+        push_schema_to_server(client, server, &current_node_id, content, author).await?;
+    }
 
     Ok(())
 }

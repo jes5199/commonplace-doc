@@ -230,6 +230,14 @@ async fn handle_dir_event(
         }
         DirEvent::SchemaModified(path, content) => {
             info!("User edited schema file: {}", path.display());
+            // Build CrdtFileSyncContext from CrdtEventParams if available
+            let crdt_ctx = crdt_params.map(|p| CrdtFileSyncContext {
+                mqtt_client: p.mqtt_client.clone(),
+                workspace: p.workspace.clone(),
+                crdt_state: p.crdt_state.clone(),
+                subdir_cache: p.subdir_cache.clone(),
+                mqtt_only_config: p.mqtt_only_config,
+            });
             if let Err(e) = handle_schema_modified(
                 client,
                 server,
@@ -239,6 +247,7 @@ async fn handle_dir_event(
                 &content,
                 author,
                 written_schemas,
+                crdt_ctx.as_ref(),
             )
             .await
             {
@@ -340,10 +349,15 @@ async fn handle_file_created_crdt(
     };
 
     // Ensure parent directories exist as node-backed directories
-    // This handles the case where a file is created in a new subdirectory
-    // We must push schema updates via HTTP so other clients learn about new directories.
-    // Without this, new subdirectories created alongside files would never propagate
-    // to other clients, breaking sync for those branches.
+    // When CRDT context is available, uses local UUID gen + MQTT publish.
+    // Otherwise falls back to HTTP for directory creation.
+    let crdt_ctx = Some(CrdtFileSyncContext {
+        mqtt_client: crdt.mqtt_client.clone(),
+        workspace: crdt.workspace.clone(),
+        crdt_state: crdt.crdt_state.clone(),
+        subdir_cache: crdt.subdir_cache.clone(),
+        mqtt_only_config: crdt.mqtt_only_config,
+    });
     if let Err(e) = ensure_parent_directories_exist(
         client,
         server,
@@ -353,7 +367,8 @@ async fn handle_file_created_crdt(
         options,
         author,
         written_schemas,
-        false, // skip_http_schema_push: push schema so other clients see new directories
+        true, // skip_http_schema_push: CRDT context handles schema propagation
+        crdt_ctx.as_ref(),
     )
     .await
     {

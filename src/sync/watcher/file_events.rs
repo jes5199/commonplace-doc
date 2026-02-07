@@ -4,8 +4,10 @@
 //! during directory synchronization.
 
 use crate::fs::{Entry, FsSchema};
+use crate::sync::crdt_new_file::add_directory_to_schema;
 use crate::sync::directory::{scan_directory_to_json, ScanOptions};
 use crate::sync::schema_io::{write_schema_file, SCHEMA_FILENAME};
+use crate::sync::subscriptions::CrdtFileSyncContext;
 use crate::sync::uuid_map::fetch_subdir_node_id;
 use crate::sync::{
     delete_schema_entry, normalize_path, push_schema_to_server, remove_file_state_and_abort,
@@ -146,20 +148,15 @@ pub fn find_owning_document(
 ///
 /// When a file is created in a new subdirectory (e.g., `newdir/file.txt`), we need to:
 /// 1. Check if `newdir` exists in the parent's schema with a node_id
-/// 2. If not, create a document on the server for it
+/// 2. If not, create a document on the server for it (HTTP POST /docs)
 /// 3. Update the parent schema to include the directory with its node_id
 ///
-/// This function walks from the file's directory up to the root, ensuring each
-/// directory has a node_id assigned. Without this, `find_owning_document` would
-/// fail to find the correct owning document for files in new subdirectories.
+/// When `crdt_context` is provided, schema updates are published via MQTT
+/// instead of HTTP push_schema_to_server. Document creation still uses HTTP
+/// to ensure correct content type (Json for schema documents).
 ///
-/// Returns the deepest directory's node_id (the one that will own the file),
-/// or the fs_root_id if the file is in the root directory.
-///
-/// When `skip_http_schema_push` is true, schema updates are written locally
-/// but NOT pushed to the server via HTTP. This is used when CRDT/MQTT sync
-/// is enabled, as the MQTT path handles schema propagation and HTTP pushes
-/// would cause conflicting updates from the server.
+/// When `skip_http_schema_push` is true (and no crdt_context), schema updates are
+/// written locally but NOT pushed to the server via HTTP.
 #[allow(clippy::too_many_arguments)]
 pub async fn ensure_parent_directories_exist(
     client: &Client,
@@ -171,6 +168,7 @@ pub async fn ensure_parent_directories_exist(
     author: &str,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
     skip_http_schema_push: bool,
+    crdt_context: Option<&CrdtFileSyncContext>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(
         "ensure_parent_directories_exist called for: {}",
@@ -200,7 +198,6 @@ pub async fn ensure_parent_directories_exist(
                     if let Some(ref entries) = dir_entry.entries {
                         if let Some(Entry::Dir(subdir)) = entries.get(*dir_name) {
                             if let Some(ref node_id) = subdir.node_id {
-                                // Directory already has a node_id
                                 needs_creation = false;
                                 existing_node_id = Some(node_id.clone());
                                 debug!("Directory '{}' already has node_id {}", dir_name, node_id);
@@ -212,11 +209,7 @@ pub async fn ensure_parent_directories_exist(
         }
 
         if needs_creation {
-            // Before creating a new document, check the server's schema to see if
-            // this directory already exists there. The local schema file may be stale
-            // (e.g., overwritten by an MQTT schema edit with incomplete Y.Doc state),
-            // so we verify with the server to prevent creating duplicate documents
-            // that cause UUID divergence.
+            // Check server for existing directory (prevents duplicate UUIDs when local schema is stale)
             if let Some(server_node_id) =
                 fetch_subdir_node_id(client, server, &current_parent_id, dir_name).await
             {
@@ -235,7 +228,7 @@ pub async fn ensure_parent_directories_exist(
                 dir_name, current_parent_id
             );
 
-            // Create a new document on the server for this directory
+            // Create document on server via HTTP (ensures correct Json content type)
             let create_url = format!("{}/docs", server);
             let create_resp = client
                 .post(&create_url)
@@ -266,10 +259,8 @@ pub async fn ensure_parent_directories_exist(
                 new_node_id, dir_name
             );
 
-            // Update parent schema to include this directory with its node_id
-            // First, scan the parent directory to get the current schema
+            // Update parent schema with the new directory entry
             if let Ok(json) = scan_directory_to_json(&current_dir, options) {
-                // Parse and modify the schema to add node_id
                 let mut schema: serde_json::Value = serde_json::from_str(&json)?;
                 if let Some(entries) = schema
                     .get_mut("root")
@@ -282,12 +273,60 @@ pub async fn ensure_parent_directories_exist(
                 }
 
                 let updated_json = serde_json::to_string(&schema)?;
-
-                // Write locally - propagate errors since schema write failures can cause divergence
                 write_schema_file(&current_dir, &updated_json, written_schemas).await?;
 
-                // Push to server (skip when CRDT/MQTT sync handles schema propagation)
-                if !skip_http_schema_push {
+                // Push schema update via MQTT (when CRDT context available) or HTTP
+                if let Some(ctx) = crdt_context {
+                    let parent_uuid =
+                        uuid::Uuid::parse_str(&current_parent_id).unwrap_or(uuid::Uuid::nil());
+                    let is_root = current_parent_id == fs_root_id;
+                    if is_root {
+                        let mut state = ctx.crdt_state.write().await;
+                        if let Err(e) = add_directory_to_schema(
+                            &ctx.mqtt_client,
+                            &ctx.workspace,
+                            &mut state.schema,
+                            dir_name,
+                            &new_node_id,
+                            author,
+                        )
+                        .await
+                        {
+                            warn!("Failed to publish directory schema via MQTT: {}", e);
+                        }
+                        if let Err(e) = state.save(root_directory).await {
+                            warn!("Failed to save CRDT state after dir creation: {}", e);
+                        }
+                    } else {
+                        match ctx
+                            .subdir_cache
+                            .get_or_load(&current_dir, parent_uuid)
+                            .await
+                        {
+                            Ok(subdir_state) => {
+                                let mut state = subdir_state.write().await;
+                                if let Err(e) = add_directory_to_schema(
+                                    &ctx.mqtt_client,
+                                    &ctx.workspace,
+                                    &mut state.schema,
+                                    dir_name,
+                                    &new_node_id,
+                                    author,
+                                )
+                                .await
+                                {
+                                    warn!("Failed to publish subdirectory schema via MQTT: {}", e);
+                                }
+                                if let Err(e) = state.save(&current_dir).await {
+                                    warn!("Failed to save subdirectory CRDT state: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to load subdirectory state: {}", e);
+                            }
+                        }
+                    }
+                } else if !skip_http_schema_push {
                     push_schema_to_server(
                         client,
                         server,
@@ -299,9 +338,7 @@ pub async fn ensure_parent_directories_exist(
                 }
             }
 
-            // Also initialize the new directory's schema (empty) if it doesn't already exist
-            // We only write an empty schema if there's no existing schema to avoid
-            // overwriting a schema that already has file entries from scan_directory
+            // Initialize the new directory's schema (empty) if it doesn't already exist
             let subdir_path = current_dir.join(dir_name);
             let subdir_schema_path = subdir_path.join(SCHEMA_FILENAME);
             let existing_schema = match std::fs::read_to_string(&subdir_schema_path) {
@@ -316,9 +353,6 @@ pub async fn ensure_parent_directories_exist(
                 }
             };
 
-            // Only write and push schema if no schema exists yet
-            // If a schema exists, it may already have file entries from scan_directory
-            // and will be properly updated and pushed by the later code in handle_file_created
             if existing_schema.is_none() {
                 let empty_schema = serde_json::json!({
                     "version": 1,
@@ -328,12 +362,10 @@ pub async fn ensure_parent_directories_exist(
                     }
                 });
                 let schema_str = serde_json::to_string(&empty_schema)?;
-
-                // Write local schema for the new directory - propagate errors
                 write_schema_file(&subdir_path, &schema_str, written_schemas).await?;
 
-                // Push empty schema to server for the new directory (skip when CRDT/MQTT sync handles this)
-                if !skip_http_schema_push {
+                // Push empty schema to server (HTTP only — CRDT mode will push when file is created)
+                if crdt_context.is_none() && !skip_http_schema_push {
                     push_schema_to_server(client, server, &new_node_id, &schema_str, author)
                         .await?;
                 }
