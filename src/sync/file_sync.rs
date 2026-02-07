@@ -2928,9 +2928,23 @@ pub async fn receive_task_crdt(
             {
                 Ok(Some(head)) => {
                     if let Some(ref server_cid) = head.cid {
-                        let needs_resync = match &current_head_cid {
-                            Some(local_cid) => local_cid != server_cid,
-                            None => true,
+                        // Check if we already know about this CID (e.g., we published it
+                        // via push_local_if_differs before tasks were spawned). If so,
+                        // no resync is needed even if head_cid doesn't match exactly.
+                        let is_known = {
+                            let state_guard = crdt_state.read().await;
+                            state_guard
+                                .get_file(&filename)
+                                .map(|f| f.is_cid_known(server_cid))
+                                .unwrap_or(false)
+                        };
+                        let needs_resync = if is_known {
+                            false
+                        } else {
+                            match &current_head_cid {
+                                Some(local_cid) => local_cid != server_cid,
+                                None => true,
+                            }
                         };
 
                         if needs_resync {

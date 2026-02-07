@@ -1,7 +1,8 @@
 //! UUID map building and path resolution for directory sync.
 //!
 //! This module handles building maps of relative paths to UUIDs by
-//! fetching schemas from the server and traversing node-backed directories.
+//! fetching schemas from the server (or reading local schema files)
+//! and traversing node-backed directories.
 
 use super::schema_io::write_schema_file;
 use crate::fs::{Entry, FsSchema};
@@ -572,5 +573,74 @@ pub async fn wait_for_uuid_map_ready(
         // Wait with exponential backoff
         sleep(Duration::from_millis(delay_ms)).await;
         delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+    }
+}
+
+/// Build a UUID map by reading local `.commonplace.json` schema files from the filesystem.
+///
+/// This is the local equivalent of `build_uuid_map_recursive` — it builds the same
+/// path-to-UUID map but reads schema files from disk instead of fetching via HTTP.
+/// Used after `sync_schema` has already ensured the local schema files are up to date.
+pub fn build_uuid_map_from_local_schemas(
+    directory: &Path,
+    path_prefix: &str,
+    uuid_map: &mut HashMap<String, String>,
+) {
+    let schema_path = directory.join(super::schema_io::SCHEMA_FILENAME);
+    let content = match std::fs::read_to_string(&schema_path) {
+        Ok(c) => c,
+        Err(e) => {
+            debug!("No schema file at {}: {}", schema_path.display(), e);
+            return;
+        }
+    };
+
+    let schema: FsSchema = match serde_json::from_str(&content) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to parse schema at {}: {}", schema_path.display(), e);
+            return;
+        }
+    };
+
+    if let Some(ref root) = schema.root {
+        collect_paths_from_local_schema(root, directory, path_prefix, uuid_map);
+    }
+}
+
+/// Recursively collect file paths and UUIDs from local schema entries.
+///
+/// For node-backed directories, reads the subdirectory's `.commonplace.json` and recurses.
+fn collect_paths_from_local_schema(
+    entry: &Entry,
+    directory: &Path,
+    prefix: &str,
+    uuid_map: &mut HashMap<String, String>,
+) {
+    match entry {
+        Entry::Dir(dir) => {
+            // Node-backed directory: read its local schema and recurse
+            if dir.node_id.is_some() {
+                let subdir_path = directory.join(prefix);
+                build_uuid_map_from_local_schemas(&subdir_path, prefix, uuid_map);
+            }
+            // Walk inline entries (root directory has entries)
+            if let Some(ref entries) = dir.entries {
+                for (name, child) in entries {
+                    let child_path = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", prefix, name)
+                    };
+                    collect_paths_from_local_schema(child, directory, &child_path, uuid_map);
+                }
+            }
+        }
+        Entry::Doc(doc) => {
+            if let Some(ref node_id) = doc.node_id {
+                debug!("Local UUID: {} -> {}", prefix, node_id);
+                uuid_map.insert(prefix.to_string(), node_id.clone());
+            }
+        }
     }
 }

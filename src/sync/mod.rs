@@ -194,10 +194,10 @@ pub use schema::schema_io::{
     SCHEMA_FILENAME,
 };
 pub use schema::uuid_map::{
-    build_uuid_map_and_write_schemas, build_uuid_map_from_doc, build_uuid_map_recursive,
-    collect_node_backed_dir_ids, collect_paths_from_entry, collect_paths_with_node_backed_dirs,
-    fetch_node_id_from_schema, get_all_node_backed_dir_ids, wait_for_uuid_map_ready,
-    UuidMapTimeoutError,
+    build_uuid_map_and_write_schemas, build_uuid_map_from_doc, build_uuid_map_from_local_schemas,
+    build_uuid_map_recursive, collect_node_backed_dir_ids, collect_paths_from_entry,
+    collect_paths_with_node_backed_dirs, fetch_node_id_from_schema, get_all_node_backed_dir_ids,
+    wait_for_uuid_map_ready, UuidMapTimeoutError,
 };
 
 // --- From transport/ ---

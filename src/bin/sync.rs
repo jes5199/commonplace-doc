@@ -15,19 +15,19 @@ use commonplace_doc::sync::subdir_spawn::{
 };
 use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
-    acquire_sync_lock, build_head_url, build_info_url, build_replace_url, build_uuid_map_recursive,
-    check_server_has_content, create_new_file, detect_from_path, directory_mqtt_task,
-    directory_watcher_task, discover_fs_root, ensure_fs_root_exists,
-    ensure_parent_directories_exist, file_watcher_task, find_owning_document, fork_node,
-    handle_file_deleted, handle_file_modified, handle_schema_change, handle_schema_modified,
-    initial_sync, is_binary_content, push_local_if_differs, push_schema_to_server,
-    remove_file_from_schema, resync_crdt_state_via_cyan_with_pending, scan_directory_with_contents,
-    schema_to_json, spawn_command_listener, spawn_file_sync_tasks_crdt, sse_task, sync_schema,
-    sync_single_file, trace_timeline, upload_task, wait_for_file_stability,
-    wait_for_uuid_map_ready, write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent,
-    FileEvent, FileSyncState, InodeKey, InodeTracker, MqttOnlySyncConfig, ReplaceResponse,
-    ScanOptions, SharedLastContent, SubdirStateCache, SyncState, TimelineMilestone,
-    SCHEMA_FILENAME,
+    acquire_sync_lock, build_head_url, build_info_url, build_replace_url,
+    build_uuid_map_from_local_schemas, build_uuid_map_recursive, check_server_has_content,
+    create_new_file, detect_from_path, directory_mqtt_task, directory_watcher_task,
+    discover_fs_root, ensure_fs_root_exists, ensure_parent_directories_exist, file_watcher_task,
+    find_owning_document, fork_node, get_text_content, handle_file_deleted, handle_file_modified,
+    handle_schema_change, handle_schema_modified, initial_sync, is_binary_content,
+    push_local_if_differs, push_schema_to_server, remove_file_from_schema,
+    resync_crdt_state_via_cyan_with_pending, scan_directory_with_contents, schema_to_json,
+    spawn_command_listener, spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file,
+    trace_timeline, upload_task, wait_for_file_stability, wait_for_uuid_map_ready,
+    write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent, FileEvent, FileSyncState,
+    InodeKey, InodeTracker, MqttOnlySyncConfig, ReplaceResponse, ScanOptions, SharedLastContent,
+    SubdirStateCache, SyncState, TimelineMilestone, SCHEMA_FILENAME,
 };
 #[cfg(unix)]
 use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
@@ -2167,82 +2167,51 @@ async fn run_directory_mode(
     )
     .await?;
 
-    // Scan files with contents and push each one
-    let files = scan_directory_with_contents(&directory, &options)
-        .map_err(|e| format!("Scan error: {}", e))?;
+    // Build UUID map from local schema files (no HTTP needed).
+    // sync_schema already ensured the local schemas are up to date.
+    let mut uuid_map = HashMap::new();
+    build_uuid_map_from_local_schemas(&directory, "", &mut uuid_map);
+    let file_count = uuid_map.len();
+    info!("Built UUID map from local schemas: {} files", file_count);
 
-    // Collect expected file paths for UUID map readiness check
-    let expected_paths: Vec<String> = files.iter().map(|f| f.relative_path.clone()).collect();
-
-    // Wait for reconciler to process the schema and create documents.
-    // Uses exponential backoff (100ms, 200ms, 400ms, ...) with 10s timeout.
-    let uuid_map =
-        fetch_uuid_map_with_logging(&client, &server, &fs_root_id, use_paths, &expected_paths)
-            .await;
-
-    // Sync files in parallel with concurrency limit
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_SYNCS));
-    let uuid_map = Arc::new(uuid_map);
-    let file_count = files.len();
-
-    // Create futures for all file syncs - they won't run until polled
-    let mut futures: FuturesUnordered<_> = files
-        .into_iter()
-        .map(|file| {
-            let semaphore = semaphore.clone();
-            let client = client.clone();
-            let server = server.clone();
-            let fs_root_id = fs_root_id.clone();
-            let directory = directory.clone();
-            let file_path = directory.join(&file.relative_path);
-            let uuid_map = uuid_map.clone();
-            let initial_sync_strategy = initial_sync_strategy.clone();
-            let file_states = file_states.clone();
-            let author = author.clone();
-            let shared_state_file = shared_state_file.clone();
-
-            async move {
-                // Acquire permit to limit concurrency
-                let _permit = semaphore.acquire().await.unwrap();
-                let result = sync_single_file(
-                    &client,
-                    &server,
-                    &fs_root_id,
-                    &directory,
-                    &file,
-                    &file_path,
-                    &uuid_map,
-                    &initial_sync_strategy,
-                    &file_states,
-                    use_paths,
-                    &author,
-                    Some(&shared_state_file),
-                )
-                .await
-                .map_err(|e| e.to_string());
-                (file.relative_path.clone(), result)
+    // Populate file_states from UUID map (only for files that exist on disk).
+    // Content sync (push/pull) is handled later by CRDT init + push_local_if_differs.
+    {
+        let mut states = file_states.write().await;
+        for (relative_path, uuid) in &uuid_map {
+            let file_path = directory.join(relative_path);
+            if !file_path.exists() {
+                debug!("Skipping {} — not on disk yet", relative_path);
+                continue;
             }
-        })
-        .collect();
 
-    // Wait for all file syncs to complete
-    let mut failed_count = 0;
-    while let Some((path, result)) = futures.next().await {
-        if let Err(e) = result {
-            warn!("Sync failed for {}: {}", path, e);
-            failed_count += 1;
+            trace_timeline(TimelineMilestone::UuidReady, relative_path, Some(uuid));
+
+            let initial_cid = shared_state_file.read().await.get_file_cid(relative_path);
+            let state = Arc::new(RwLock::new(SyncState::for_directory_file(
+                initial_cid,
+                shared_state_file.clone(),
+                relative_path.clone(),
+            )));
+
+            states.insert(
+                relative_path.clone(),
+                FileSyncState {
+                    relative_path: relative_path.clone(),
+                    identifier: uuid.clone(),
+                    state,
+                    task_handles: Vec::new(),
+                    use_paths,
+                    content_hash: None,
+                    crdt_last_content: None,
+                },
+            );
         }
     }
-    info!(
-        "Initial sync complete: {} files synced ({} failed)",
-        file_count - failed_count,
-        failed_count
-    );
 
     // Create local files for any schema entries that don't exist locally.
     // This handles commonplace-link entries where the linked target exists but the
-    // link file needs to be created locally. We do this AFTER sync_single_file
-    // so that file_states is populated and we correctly identify truly new files.
+    // link file needs to be created locally.
     handle_schema_change(
         &client,
         &server,
@@ -2261,16 +2230,6 @@ async fn run_directory_mode(
         None, // No CRDT context during initial sync
     )
     .await?;
-
-    // Save state file after initial sync to persist CIDs
-    {
-        let sf = shared_state_file.read().await;
-        if let Err(e) = sf.save(&state_file_path).await {
-            warn!("Failed to save state file after initial sync: {}", e);
-        } else {
-            debug!("State file saved with {} tracked files", sf.files.len());
-        }
-    }
 
     // Publish initial-sync-complete event via MQTT
     publish_initial_sync_complete(
@@ -2341,8 +2300,7 @@ async fn run_directory_mode(
             }
         });
 
-        // Extract the uuid_map from Arc for passing to the task
-        let initial_uuid_map: HashMap<String, String> = (*uuid_map).clone();
+        let initial_uuid_map: HashMap<String, String> = uuid_map.clone();
 
         info!(
             "Using MQTT for directory sync subscriptions ({} file UUIDs)",
@@ -2453,6 +2411,9 @@ async fn run_directory_mode(
             // Initialize CRDT state via cyan sync (MQTT) before spawning tasks.
             // This ensures all sync clients share the same Yjs operation history,
             // which is critical for merges to work correctly (especially deletions).
+            // Don't write to disk during init — we push local content afterward,
+            // and write_to_disk=true would overwrite local content with (possibly empty)
+            // server content before we get a chance to push.
             if let Err(e) = resync_crdt_state_via_cyan_with_pending(
                 &mqtt_client,
                 &workspace,
@@ -2463,7 +2424,7 @@ async fn run_directory_mode(
                 &author,
                 Some(&shared_last_content),
                 inode_tracker.as_ref(),
-                true,
+                false,
                 true,
             )
             .await
@@ -2487,10 +2448,64 @@ async fn run_directory_mode(
                     Some(&file_state.identifier),
                 );
             }
+
+            // Push local content if it differs from server (replaces sync_single_file push).
+            // This runs after BOTH success and failure of CRDT init: when cyan sync fails
+            // and we initialize empty, we still need to push local content to create the
+            // first commit on the server.
+            if !pull_only {
+                if let Err(e) = push_local_if_differs(
+                    &mqtt_client,
+                    &workspace,
+                    &file_crdt_state,
+                    &filename,
+                    node_id,
+                    &file_path,
+                    &author,
+                )
+                .await
+                {
+                    warn!("Failed to push local content for {}: {}", relative_path, e);
+                }
+            }
+
+            // Pull case: if local file is empty/default but server has content,
+            // write server content to disk so the file reflects the CRDT state.
+            {
+                let local_content = tokio::fs::read_to_string(&file_path)
+                    .await
+                    .unwrap_or_default();
+                let content_info = detect_from_path(&file_path);
+                if local_content.is_empty()
+                    || commonplace_doc::sync::is_default_content(&local_content, &content_info)
+                {
+                    let crdt_content = {
+                        let state = file_crdt_state.read().await;
+                        state
+                            .get_file(&filename)
+                            .and_then(|fs| get_text_content(fs).ok())
+                    };
+                    if let Some(ref content) = crdt_content {
+                        if !content.is_empty() {
+                            info!(
+                                "Writing CRDT content to {} ({} bytes, pull case)",
+                                file_path.display(),
+                                content.len()
+                            );
+                            if let Err(e) = tokio::fs::write(&file_path, content).await {
+                                warn!(
+                                    "Failed to write CRDT content to {}: {}",
+                                    file_path.display(),
+                                    e
+                                );
+                            } else {
+                                *shared_last_content.write().await = Some(content.clone());
+                            }
+                        }
+                    }
+                }
+            }
             file_state.crdt_last_content = Some(shared_last_content.clone());
-            // Note: file_states is None here because we're in the initial setup phase
-            // iterating through all files - deduplication not needed since we're
-            // creating tasks for files that don't have tasks yet
             // Trace TASK_SPAWN milestone before spawning tasks (directory mode)
             trace_timeline(
                 TimelineMilestone::TaskSpawn,
@@ -2802,134 +2817,55 @@ async fn run_exec_mode(
     )
     .await?;
 
-    // Sync file contents
-    // In sandbox mode, do this in a background task so exec can start sooner
-    // The schema is already synced, so directory structure exists - file content
-    // can sync while the exec is running
-    info!("Syncing file contents...");
-    let files = scan_directory_with_contents(&directory, &options)
-        .map_err(|e| format!("Scan error: {}", e))?;
+    let sync_start = Instant::now();
 
-    // Collect expected file paths for UUID map readiness check
-    let expected_paths: Vec<String> = files.iter().map(|f| f.relative_path.clone()).collect();
+    // Build UUID map from local schema files (no HTTP needed).
+    // sync_schema already ensured the local schemas are up to date.
+    let mut uuid_map = HashMap::new();
+    build_uuid_map_from_local_schemas(&directory, "", &mut uuid_map);
+    let file_count = uuid_map.len();
+    info!("Built UUID map from local schemas: {} files", file_count);
 
-    // Wait for reconciler to process the schema and create documents.
-    // Uses exponential backoff (100ms, 200ms, 400ms, ...) with 10s timeout.
-    let uuid_map =
-        fetch_uuid_map_with_logging(&client, &server, &fs_root_id, use_paths, &expected_paths)
-            .await;
+    // Populate file_states from UUID map (only for files that exist on disk).
+    // Content sync (push/pull) is handled later by CRDT init + push_local_if_differs.
+    {
+        let mut states = file_states.write().await;
+        for (relative_path, uuid) in &uuid_map {
+            let file_path = directory.join(relative_path);
+            if !file_path.exists() {
+                debug!("Skipping {} — not on disk yet", relative_path);
+                continue;
+            }
 
-    // In sandbox mode, use a timeout to not block exec for too long
-    // In non-sandbox mode, sync files synchronously before continuing
-    let file_count = files.len();
-    let sync_timeout = if sandbox {
-        // Give sandbox mode 3 seconds for file sync, then proceed to exec
-        // SSE subscription will handle any files that don't sync in time
-        Some(Duration::from_secs(3))
-    } else {
-        None
-    };
+            trace_timeline(TimelineMilestone::UuidReady, relative_path, Some(uuid));
 
-    // Sync files in parallel with concurrency limit
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_SYNCS));
-    let uuid_map = Arc::new(uuid_map);
+            let initial_cid = shared_state_file.read().await.get_file_cid(relative_path);
+            let state = Arc::new(RwLock::new(SyncState::for_directory_file(
+                initial_cid,
+                shared_state_file.clone(),
+                relative_path.clone(),
+            )));
 
-    // Create futures for all file syncs - they won't run until polled
-    let mut futures: FuturesUnordered<_> = files
-        .into_iter()
-        .map(|file| {
-            let semaphore = semaphore.clone();
-            let client = client.clone();
-            let server = server.clone();
-            let fs_root_id = fs_root_id.clone();
-            let directory = directory.clone();
-            let file_path = directory.join(&file.relative_path);
-            let uuid_map = uuid_map.clone();
-            let initial_sync_strategy = initial_sync_strategy.clone();
-            let file_states = file_states.clone();
-            let author = author.clone();
-            let shared_state_file = shared_state_file.clone();
-
-            async move {
-                // Acquire permit to limit concurrency
-                let _permit = semaphore.acquire().await.unwrap();
-                let result = sync_single_file(
-                    &client,
-                    &server,
-                    &fs_root_id,
-                    &directory,
-                    &file,
-                    &file_path,
-                    &uuid_map,
-                    &initial_sync_strategy,
-                    &file_states,
+            states.insert(
+                relative_path.clone(),
+                FileSyncState {
+                    relative_path: relative_path.clone(),
+                    identifier: uuid.clone(),
+                    state,
+                    task_handles: Vec::new(),
                     use_paths,
-                    &author,
-                    Some(&shared_state_file),
-                )
-                .await
-                .map_err(|e| e.to_string());
-                (file.relative_path.clone(), result)
-            }
-        })
-        .collect();
-
-    let mut synced_count = 0usize;
-    let sync_start = std::time::Instant::now();
-
-    if let Some(timeout_duration) = sync_timeout {
-        // Sandbox mode: sync with timeout
-        loop {
-            let remaining = timeout_duration.saturating_sub(sync_start.elapsed());
-            if remaining.is_zero() {
-                info!(
-                    "Sandbox file sync timeout after {} files ({}ms elapsed), proceeding to exec",
-                    synced_count,
-                    sync_start.elapsed().as_millis()
-                );
-                break;
-            }
-
-            match tokio::time::timeout(remaining, futures.next()).await {
-                Ok(Some((path, result))) => {
-                    if let Err(e) = result {
-                        warn!("Failed to sync file {}: {}", path, e);
-                    }
-                    synced_count += 1;
-                }
-                Ok(None) => break, // All files synced
-                Err(_) => {
-                    info!(
-                        "Sandbox file sync timeout after {} files ({}ms elapsed), proceeding to exec",
-                        synced_count,
-                        sync_start.elapsed().as_millis()
-                    );
-                    break;
-                }
-            }
-        }
-    } else {
-        // Non-sandbox mode: sync all files without timeout
-        while let Some((path, result)) = futures.next().await {
-            if let Err(e) = result {
-                warn!("Failed to sync file {}: {}", path, e);
-            }
-            synced_count += 1;
+                    content_hash: None,
+                    crdt_last_content: None,
+                },
+            );
         }
     }
-
-    info!(
-        "Initial sync complete: {}/{} files synced ({}ms)",
-        synced_count,
-        file_count,
-        sync_start.elapsed().as_millis()
-    );
 
     // Publish initial-sync-complete event via MQTT
     publish_initial_sync_complete(
         &mqtt_client,
         &fs_root_id,
-        synced_count,
+        file_count,
         &initial_sync_strategy,
         sync_start.elapsed().as_millis() as u64,
     )
@@ -2994,8 +2930,7 @@ async fn run_exec_mode(
             }
         });
 
-        // Extract uuid_map for MQTT task
-        let initial_uuid_map: HashMap<String, String> = (*uuid_map).clone();
+        let initial_uuid_map: HashMap<String, String> = uuid_map.clone();
         info!(
             "Using MQTT for exec mode subscriptions ({} file UUIDs)",
             initial_uuid_map.len()
@@ -3101,9 +3036,9 @@ async fn run_exec_mode(
                 .filter(|s| !s.is_empty());
             let shared_last_content: SharedLastContent = Arc::new(RwLock::new(initial_content));
 
-            // Initialize CRDT state via cyan sync (MQTT) before spawning tasks.
-            // This ensures all sync clients share the same Yjs operation history,
-            // which is critical for merges to work correctly (especially deletions).
+            // Don't write to disk during init — we push local content afterward,
+            // and write_to_disk=true would overwrite local content with (possibly empty)
+            // server content before we get a chance to push.
             if let Err(e) = resync_crdt_state_via_cyan_with_pending(
                 &mqtt_client,
                 &workspace,
@@ -3114,7 +3049,7 @@ async fn run_exec_mode(
                 &author,
                 Some(&shared_last_content),
                 inode_tracker.as_ref(),
-                true,
+                false,
                 true,
             )
             .await
@@ -3138,10 +3073,63 @@ async fn run_exec_mode(
                     Some(&file_state.identifier),
                 );
             }
+
+            // Push local content if it differs from server (replaces sync_single_file push).
+            // This runs after BOTH success and failure of CRDT init.
+            if !pull_only {
+                if let Err(e) = push_local_if_differs(
+                    &mqtt_client,
+                    &workspace,
+                    &file_crdt_state,
+                    &filename,
+                    node_id,
+                    &file_path,
+                    &author,
+                )
+                .await
+                {
+                    warn!("Failed to push local content for {}: {}", relative_path, e);
+                }
+            }
+
+            // Pull case: if local file is empty/default but server has content,
+            // write server content to disk so the file reflects the CRDT state.
+            {
+                let local_content = tokio::fs::read_to_string(&file_path)
+                    .await
+                    .unwrap_or_default();
+                let content_info = detect_from_path(&file_path);
+                if local_content.is_empty()
+                    || commonplace_doc::sync::is_default_content(&local_content, &content_info)
+                {
+                    let crdt_content = {
+                        let state = file_crdt_state.read().await;
+                        state
+                            .get_file(&filename)
+                            .and_then(|fs| get_text_content(fs).ok())
+                    };
+                    if let Some(ref content) = crdt_content {
+                        if !content.is_empty() {
+                            info!(
+                                "Writing CRDT content to {} ({} bytes, pull case)",
+                                file_path.display(),
+                                content.len()
+                            );
+                            if let Err(e) = tokio::fs::write(&file_path, content).await {
+                                warn!(
+                                    "Failed to write CRDT content to {}: {}",
+                                    file_path.display(),
+                                    e
+                                );
+                            } else {
+                                *shared_last_content.write().await = Some(content.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
             file_state.crdt_last_content = Some(shared_last_content.clone());
-            // Note: file_states is None here because we're in the initial setup phase
-            // iterating through all files - deduplication not needed since we're
-            // creating tasks for files that don't have tasks yet
             // Trace TASK_SPAWN milestone before spawning tasks
             trace_timeline(
                 TimelineMilestone::TaskSpawn,
