@@ -3,7 +3,6 @@
 //! This module contains transport-related functionality for the sync client:
 //! - HTTP client operations (client.rs)
 //! - URL building utilities (urls.rs)
-//! - SSE (Server-Sent Events) handling (sse.rs)
 //! - Commit ancestry checking (ancestry.rs)
 //! - MQTT subscription tasks (subscriptions.rs)
 //! - MQTT command handling (commands.rs)
@@ -16,7 +15,6 @@ pub mod commands;
 pub mod missing_parent;
 pub mod peer_fallback;
 pub mod shadow;
-pub mod sse;
 pub mod subscriptions;
 pub mod urls;
 
@@ -55,11 +53,6 @@ pub use shadow::{
     write_inbound_with_checks, write_inbound_with_checks_atomic, InboundWriteError,
     InboundWriteResult,
 };
-
-// From sse
-pub use sse::{handle_server_edit, handle_server_edit_with_flock, sse_task, sse_task_with_flock};
-#[cfg(unix)]
-pub use sse::{handle_server_edit_with_tracker, sse_task_with_tracker};
 
 // From subscriptions
 pub use subscriptions::{

@@ -9,31 +9,28 @@ use commonplace_doc::events::recv_broadcast;
 use commonplace_doc::mqtt::{MqttClient, MqttConfig, Topic};
 use commonplace_doc::store::CommitStore;
 use commonplace_doc::sync::crdt_state::DirectorySyncState;
-use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
+#[cfg(unix)]
+use commonplace_doc::sync::spawn_shadow_tasks;
+use commonplace_doc::sync::state_file::compute_content_hash;
 use commonplace_doc::sync::subdir_spawn::{
     spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport,
 };
 use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
-    acquire_sync_lock, build_head_url, build_info_url, build_replace_url,
-    build_uuid_map_from_local_schemas, build_uuid_map_recursive, check_server_has_content,
-    create_new_file, detect_from_path, directory_mqtt_task, directory_watcher_task,
-    discover_fs_root, ensure_fs_root_exists, ensure_parent_directories_exist, file_watcher_task,
-    find_owning_document, fork_node, get_text_content, handle_file_deleted, handle_file_modified,
-    handle_schema_change, handle_schema_modified, initial_sync, is_binary_content,
+    acquire_sync_lock, build_head_url, build_info_url, build_uuid_map_from_local_schemas,
+    check_server_has_content, create_new_file, detect_from_path, directory_mqtt_task,
+    directory_watcher_task, discover_fs_root, ensure_fs_root_exists,
+    ensure_parent_directories_exist, find_owning_document, fork_node, get_text_content,
+    handle_file_deleted, handle_file_modified, handle_schema_change, handle_schema_modified,
     push_local_if_differs, push_schema_to_server, remove_file_from_schema,
-    resync_crdt_state_via_cyan_with_pending, scan_directory_with_contents, schema_to_json,
-    spawn_command_listener, spawn_file_sync_tasks_crdt, sse_task, sync_schema, sync_single_file,
-    trace_timeline, upload_task, wait_for_file_stability, wait_for_uuid_map_ready,
-    write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent, FileEvent, FileSyncState,
-    InodeKey, InodeTracker, MqttOnlySyncConfig, ReplaceResponse, ScanOptions, SharedLastContent,
-    SubdirStateCache, SyncState, TimelineMilestone, SCHEMA_FILENAME,
+    resync_crdt_state_via_cyan_with_pending, schema_to_json, spawn_command_listener,
+    spawn_file_sync_tasks_crdt, sync_schema, trace_timeline, wait_for_file_stability,
+    write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent, FileSyncState, InodeTracker,
+    MqttOnlySyncConfig, ScanOptions, SharedLastContent, SubdirStateCache, SyncState,
+    TimelineMilestone, SCHEMA_FILENAME,
 };
-#[cfg(unix)]
-use commonplace_doc::sync::{spawn_shadow_tasks, sse_task_with_tracker};
 use commonplace_doc::workspace::is_process_running;
 use commonplace_doc::{DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
-use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use rumqttc::QoS;
 use std::collections::{HashMap, HashSet};
@@ -42,16 +39,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use commonplace_doc::sync::WrittenSchemas;
 use tokio::task::JoinHandle;
 
-/// Maximum number of concurrent file syncs during initial sync.
-/// This limits server load while still providing significant speedup.
-const MAX_CONCURRENT_FILE_SYNCS: usize = 10;
 /// Default shadow dir when running with inode tracking enabled.
 const DEFAULT_SHADOW_DIR: &str = "/tmp/commonplace-sync/hardlinks";
 
@@ -978,60 +972,6 @@ async fn handle_file_deleted_crdt(
             }
         }
     }
-}
-
-/// Fetch UUID map from server with logging.
-///
-/// When `use_paths` is true, returns an empty map (paths used directly).
-/// Otherwise, waits for the reconciler to assign UUIDs to all expected paths
-/// using exponential backoff, then returns the UUID map.
-///
-/// # Arguments
-/// * `expected_paths` - List of relative file paths that should have UUIDs.
-///   If empty, falls back to a simple fetch without readiness waiting.
-async fn fetch_uuid_map_with_logging(
-    client: &Client,
-    server: &str,
-    fs_root_id: &str,
-    use_paths: bool,
-    expected_paths: &[String],
-) -> HashMap<String, String> {
-    if use_paths {
-        return HashMap::new();
-    }
-
-    // If we have expected paths, wait for them all to have UUIDs
-    if !expected_paths.is_empty() {
-        match wait_for_uuid_map_ready(client, server, fs_root_id, expected_paths).await {
-            Ok(map) => {
-                for (path, uuid) in &map {
-                    debug!("  UUID map: {} -> {}", path, uuid);
-                    // Trace UUID_READY milestone for each file
-                    trace_timeline(TimelineMilestone::UuidReady, path, Some(uuid));
-                }
-                return map;
-            }
-            Err(e) => {
-                // Log warning but continue with whatever UUIDs we have
-                warn!("{}", e);
-                warn!("Proceeding with partial UUID map - some files may fail to sync");
-                // Fall through to fetch whatever is available
-            }
-        }
-    }
-
-    // Fallback: simple fetch without readiness waiting
-    let map = build_uuid_map_recursive(client, server, fs_root_id).await;
-    info!(
-        "Resolved {} UUIDs from server schema for initial sync",
-        map.len()
-    );
-    for (path, uuid) in &map {
-        debug!("  UUID map: {} -> {}", path, uuid);
-        // Trace UUID_READY milestone for each file
-        trace_timeline(TimelineMilestone::UuidReady, path, Some(uuid));
-    }
-    map
 }
 
 /// Commonplace Sync - Keep a local file or directory in sync with a server document

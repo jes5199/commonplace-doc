@@ -118,7 +118,6 @@ pub use transport::commands;
 pub use transport::missing_parent;
 pub use transport::peer_fallback;
 pub use transport::shadow;
-pub use transport::sse;
 pub use transport::subscriptions;
 pub use transport::urls;
 
@@ -223,11 +222,6 @@ pub use transport::shadow::{
     write_inbound_with_checks, write_inbound_with_checks_atomic, InboundWriteError,
     InboundWriteResult,
 };
-pub use transport::sse::{
-    handle_server_edit, handle_server_edit_with_flock, sse_task, sse_task_with_flock,
-};
-#[cfg(unix)]
-pub use transport::sse::{handle_server_edit_with_tracker, sse_task_with_tracker};
 pub use transport::subscriptions::{
     directory_mqtt_task, spawn_subdir_mqtt_task, subdir_mqtt_task, trace_timeline,
     CrdtFileSyncContext, TimelineMilestone,
@@ -247,9 +241,8 @@ pub use dir_sync::{
 };
 pub use error::{SyncError, SyncResult};
 pub use file_sync::{
-    initial_sync, prepare_content_for_upload, push_local_if_differs,
-    resync_crdt_state_via_cyan_with_pending, spawn_file_sync_tasks_crdt, sync_single_file,
-    upload_task, upload_task_crdt, PreparedContent, PENDING_WRITE_TIMEOUT,
+    prepare_content_for_upload, push_local_if_differs, resync_crdt_state_via_cyan_with_pending,
+    spawn_file_sync_tasks_crdt, upload_task_crdt, PreparedContent, PENDING_WRITE_TIMEOUT,
 };
 pub use types::{
     build_uuid_to_paths_map, remove_file_state_and_abort, CommitData, DirEvent, EditEventData,
