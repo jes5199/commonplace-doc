@@ -20,14 +20,13 @@ use commonplace_doc::sync::{
     acquire_sync_lock, build_head_url, build_info_url, build_uuid_map_from_local_schemas,
     check_server_has_content, create_new_file, detect_from_path, directory_mqtt_task,
     directory_watcher_task, discover_fs_root, ensure_fs_root_exists,
-    ensure_parent_directories_exist, find_owning_document, fork_node, get_text_content,
-    handle_file_deleted, handle_file_modified, handle_schema_change, handle_schema_modified,
-    push_local_if_differs, push_schema_to_server, remove_file_from_schema,
-    resync_crdt_state_via_cyan_with_pending, schema_to_json, spawn_command_listener,
-    spawn_file_sync_tasks_crdt, sync_schema, trace_timeline, wait_for_file_stability,
-    write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent, FileSyncState, InodeTracker,
-    MqttOnlySyncConfig, ScanOptions, SharedLastContent, SubdirStateCache, SyncState,
-    TimelineMilestone, SCHEMA_FILENAME,
+    ensure_parent_directories_exist, find_owning_document, fork_node, handle_file_deleted,
+    handle_file_modified, handle_schema_change, handle_schema_modified, push_local_if_differs,
+    push_schema_to_server, remove_file_from_schema, resync_crdt_state_via_cyan_with_pending,
+    schema_to_json, spawn_command_listener, spawn_file_sync_tasks_crdt, sync_schema,
+    trace_timeline, wait_for_file_stability, write_schema_file, ymap_schema, CrdtFileSyncContext,
+    DirEvent, FileSyncState, InodeTracker, MqttOnlySyncConfig, ScanOptions, SharedLastContent,
+    SubdirStateCache, SyncState, TimelineMilestone, SCHEMA_FILENAME,
 };
 use commonplace_doc::workspace::is_process_running;
 use commonplace_doc::{DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
@@ -2421,9 +2420,15 @@ async fn run_directory_mode(
                 {
                     let crdt_content = {
                         let state = file_crdt_state.read().await;
-                        state
-                            .get_file(&filename)
-                            .and_then(|fs| get_text_content(fs).ok())
+                        state.get_file(&filename).and_then(|fs| {
+                            let doc = fs.to_doc().ok()?;
+                            let c = commonplace_doc::sync::crdt_merge::get_doc_text_content(&doc);
+                            if c.is_empty() {
+                                None
+                            } else {
+                                Some(c)
+                            }
+                        })
                     };
                     if let Some(ref content) = crdt_content {
                         if !content.is_empty() {
@@ -3044,9 +3049,15 @@ async fn run_exec_mode(
                 {
                     let crdt_content = {
                         let state = file_crdt_state.read().await;
-                        state
-                            .get_file(&filename)
-                            .and_then(|fs| get_text_content(fs).ok())
+                        state.get_file(&filename).and_then(|fs| {
+                            let doc = fs.to_doc().ok()?;
+                            let c = commonplace_doc::sync::crdt_merge::get_doc_text_content(&doc);
+                            if c.is_empty() {
+                                None
+                            } else {
+                                Some(c)
+                            }
+                        })
                     };
                     if let Some(ref content) = crdt_content {
                         if !content.is_empty() {

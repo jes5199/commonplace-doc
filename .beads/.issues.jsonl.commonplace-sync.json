@@ -1,13 +1,13 @@
 {
   "server": "http://localhost:3000",
   "node_id": "4e966429-b8fd-4461-9034-8a656510f1e3",
-  "last_synced_cid": "bb18267f9fcebec4a94f7875e02810d227bf8d276a901efd5868792e8ea636ef",
-  "last_synced_at": "2026-02-01T06:05:57.712534372+00:00",
+  "last_synced_cid": "71988167ace096fbb2f2012f190a7bd3104224ce01b38c083f52842d4a77d1b1",
+  "last_synced_at": "2026-02-02T19:08:48.318740680+00:00",
   "files": {
     "issues.jsonl": {
       "hash": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
-      "last_modified": "2026-02-01T06:05:57.712560172+00:00",
-      "last_cid": "bb18267f9fcebec4a94f7875e02810d227bf8d276a901efd5868792e8ea636ef",
+      "last_modified": "2026-02-02T19:08:48.318744520+00:00",
+      "last_cid": "71988167ace096fbb2f2012f190a7bd3104224ce01b38c083f52842d4a77d1b1",
       "inode_key": "fd01-48702"
     }
   },

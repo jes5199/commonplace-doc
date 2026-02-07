@@ -495,6 +495,12 @@ pub async fn upload_task_crdt(
     while let Some(event) = rx.recv().await {
         let FileEvent::Modified(raw_content) = event;
 
+        debug!(
+            "CRDT upload_task: received FileEvent for {} ({} bytes)",
+            file_path.display(),
+            raw_content.len()
+        );
+
         // Detect content type
         let prepared = prepare_content_for_upload(&raw_content, &file_path);
 
@@ -527,9 +533,10 @@ pub async fn upload_task_crdt(
 
         // Skip if content unchanged
         if old_content == new_content {
-            trace!(
-                "[UPLOAD-TRACE] upload_task_crdt SKIPPING unchanged content for {}",
-                file_path.display()
+            debug!(
+                "CRDT upload_task: skipping unchanged content for {} ({} bytes)",
+                file_path.display(),
+                new_content.len()
             );
             continue;
         }
@@ -592,8 +599,8 @@ pub async fn upload_task_crdt(
             // text gets inserted twice (once per client ID), causing content duplication
             // like "{}" becoming "{}{}".
             if file_state.needs_server_init() {
-                debug!(
-                    "CRDT upload_task: skipping publish for {} - CRDT state not yet initialized from server",
+                info!(
+                    "CRDT upload_task: SKIPPING publish for {} - CRDT state not yet initialized from server (yjs_state is None)",
                     file_path.display()
                 );
                 drop(state_guard);
@@ -612,6 +619,10 @@ pub async fn upload_task_crdt(
                     prepared.is_jsonl,
                 ) {
                     Ok(DocContentMatch::MatchesNew) => {
+                        info!(
+                            "CRDT upload_task: Y.Doc already matches new content for {} — skipping publish",
+                            file_path.display()
+                        );
                         drop(state_guard);
                         let mut shared = shared_last_content.write().await;
                         *shared = Some(new_content);
@@ -756,15 +767,8 @@ pub async fn upload_task_crdt(
 
             match publish_result {
                 Ok(result) => {
-                    debug!(
-                        "[SANDBOX-TRACE] upload_task_crdt PUBLISHED file={} uuid={} cid={} update_bytes={}",
-                        file_path.display(),
-                        node_id,
-                        result.cid,
-                        result.update_bytes.len()
-                    );
-                    debug!(
-                        "CRDT upload: published commit {} for {} ({} bytes)",
+                    info!(
+                        "CRDT upload_task: PUBLISHED commit {} for {} ({} bytes)",
                         result.cid,
                         file_path.display(),
                         result.update_bytes.len()
@@ -883,12 +887,21 @@ pub async fn push_local_if_differs(
         return Ok(());
     }
 
-    // Get CRDT content for comparison
+    // Get CRDT content for comparison.
+    // Use get_doc_text_content which handles YText, YArray, AND YMap formats.
+    // Using get_text_content would fail for JSON files (stored as YMap) and always
+    // return empty, causing us to think local differs and push stale content.
     let crdt_content = {
         let state = crdt_state.read().await;
-        state
-            .get_file(filename)
-            .and_then(|fs| crate::sync::crdt::crdt_publish::get_text_content(fs).ok())
+        state.get_file(filename).and_then(|fs| {
+            let doc = fs.to_doc().ok()?;
+            let content = crate::sync::crdt::crdt_merge::get_doc_text_content(&doc);
+            if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            }
+        })
     };
 
     // Normalize for comparison (trim trailing newlines)
@@ -2129,6 +2142,15 @@ pub async fn receive_task_crdt(
         )
         .calculate_cid();
 
+        debug!(
+            "CRDT receive_task: incoming edit for {} — CID={} parents={:?} author={} update_len={}",
+            file_path.display(),
+            received_cid,
+            edit_msg.parents,
+            edit_msg.author,
+            edit_msg.update.len()
+        );
+
         // Get or create the CRDT state for this file
         let mut state_guard = crdt_state.write().await;
         let file_state = state_guard.get_or_create_file(&filename, node_id);
@@ -2138,15 +2160,9 @@ pub async fn receive_task_crdt(
         if let Some(reason) = file_state.should_queue_edits() {
             file_state.queue_pending_edit(msg.payload.clone());
             debug!(
-                "[SANDBOX-TRACE] receive_task_crdt QUEUED file={} uuid={} queue_size={} reason={:?}",
+                "CRDT receive_task: queued edit for {} (CID={} reason={:?} queue_size={})",
                 file_path.display(),
-                node_id,
-                file_state.pending_edits.len(),
-                reason
-            );
-            debug!(
-                "CRDT receive_task: queuing edit for {} (reason: {:?}, queue size: {})",
-                file_path.display(),
+                received_cid,
                 reason,
                 file_state.pending_edits.len()
             );
@@ -2156,7 +2172,8 @@ pub async fn receive_task_crdt(
 
         if file_state.is_cid_known(&received_cid) {
             debug!(
-                "CRDT receive_task: commit already known for {}",
+                "CRDT receive_task: skipping known CID {} for {}",
+                received_cid,
                 file_path.display()
             );
             drop(state_guard);
@@ -2233,24 +2250,17 @@ pub async fn receive_task_crdt(
         .await
         {
             Ok((result, maybe_content)) => {
-                debug!(
-                    "[SANDBOX-TRACE] receive_task_crdt CRDT_MERGE file={} uuid={} result={:?} has_content={}",
-                    file_path.display(),
-                    node_id,
-                    result,
-                    maybe_content.is_some()
-                );
                 use crate::sync::crdt_merge::MergeResult;
                 let commit_id = commit_id_for_write(&result, &received_cid);
 
                 match result {
                     MergeResult::AlreadyKnown => {
                         debug!(
-                            "CRDT receive_task: commit already known for {}",
+                            "CRDT receive_task: already known for {}",
                             file_path.display()
                         );
                     }
-                    MergeResult::FastForward { new_head } => {
+                    MergeResult::FastForward { ref new_head } => {
                         debug!(
                             "CRDT receive_task: fast-forward to {} for {}",
                             new_head,
@@ -2258,11 +2268,12 @@ pub async fn receive_task_crdt(
                         );
                     }
                     MergeResult::Merged {
-                        merge_cid,
-                        remote_cid,
+                        ref merge_cid,
+                        ref remote_cid,
                     } => {
                         debug!(
-                            "CRDT receive_task: merged {} into {} for {}",
+                            "CRDT receive_task: merged {} + {} → {} for {}",
+                            received_cid,
                             remote_cid,
                             merge_cid,
                             file_path.display()
@@ -2270,8 +2281,9 @@ pub async fn receive_task_crdt(
                     }
                     MergeResult::LocalAhead => {
                         debug!(
-                            "CRDT receive_task: local is ahead for {}",
-                            file_path.display()
+                            "CRDT receive_task: local ahead for {} (received CID={})",
+                            file_path.display(),
+                            received_cid,
                         );
                     }
                     MergeResult::NeedsMerge { .. } => {
@@ -2335,6 +2347,37 @@ pub async fn receive_task_crdt(
 
                 // Write content to file if merge produced new content
                 if let Some(content) = maybe_content {
+                    // Guard: if the file has been modified externally (user edit),
+                    // skip the write to preserve the user's changes. The upload_task
+                    // will detect the user's edit and publish it. Without this guard,
+                    // incoming MQTT edits (e.g. from sandbox sync clients) can overwrite
+                    // user edits before upload_task has a chance to detect them.
+                    let skip_write = {
+                        let last = shared_last_content.read().await;
+                        if let Some(ref last_content) = *last {
+                            match tokio::fs::read_to_string(&file_path).await {
+                                Ok(current_file)
+                                    if current_file.trim_end() != last_content.trim_end()
+                                        && current_file.trim_end() != content.trim_end() =>
+                                {
+                                    info!(
+                                        "CRDT receive_task: skipping write to {} — file has external edits ({} bytes on disk vs {} bytes last-known)",
+                                        file_path.display(), current_file.len(), last_content.len()
+                                    );
+                                    true
+                                }
+                                _ => false,
+                            }
+                        } else {
+                            false
+                        }
+                    };
+
+                    if skip_write {
+                        drop(state_guard);
+                        continue;
+                    }
+
                     match write_content_with_rollback_guard(
                         &file_path,
                         &content,
@@ -2352,12 +2395,6 @@ pub async fn receive_task_crdt(
                                 TimelineMilestone::FirstWrite,
                                 &file_path.display().to_string(),
                                 Some(&node_id_str),
-                            );
-                            debug!(
-                                "[SANDBOX-TRACE] receive_task_crdt DISK_WRITE file={} uuid={} content_len={}",
-                                file_path.display(),
-                                node_id,
-                                content.len()
                             );
                             debug!(
                                 "CRDT receive_task: wrote {} bytes to {}",
@@ -2402,9 +2439,13 @@ pub async fn receive_task_crdt(
 ///
 /// This is called periodically to detect when MQTT messages were missed and
 /// the local state has diverged from the server. It handles three cases:
-/// 1. Server ahead: Pull and merge server state
-/// 2. Local ahead: Re-publish local commits
-/// 3. True divergence: Perform CRDT merge
+/// 1. Server ahead: Pull and merge server state (write to disk)
+/// 2. Local ahead: Re-publish local commits that were orphaned on server
+/// 3. True divergence: Perform bidirectional CRDT merge
+///
+/// After pulling server state, any local edits that differ from the server
+/// are pushed back additively (for JSON: adds/updates keys without deleting
+/// server-only keys, achieving a CRDT union of both sides).
 ///
 /// Returns true if divergence was detected and handled, false otherwise.
 #[allow(clippy::too_many_arguments)]
@@ -2419,6 +2460,12 @@ async fn check_and_resolve_divergence(
     shared_last_content: Option<&SharedLastContent>,
     inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
 ) -> bool {
+    // Save local file content BEFORE resync — if we had local edits that were
+    // orphaned on the server (head_advanced: false due to concurrent edits),
+    // the resync will overwrite them with stale server state. We need to push
+    // our edits back afterward.
+    let pre_resync_content = tokio::fs::read_to_string(file_path).await.ok();
+
     // Mark state as needing resync
     {
         let mut state_guard = crdt_state.write().await;
@@ -2427,7 +2474,7 @@ async fn check_and_resolve_divergence(
         }
     }
 
-    // Resync via cyan (MQTT) - the caller already suspects divergence
+    // Resync via cyan (MQTT) - pull server state and write to disk
     match resync_crdt_state_via_cyan_with_pending(
         mqtt_client,
         workspace,
@@ -2448,6 +2495,35 @@ async fn check_and_resolve_divergence(
                 "Divergence check: successfully resynced {} via cyan",
                 file_path.display()
             );
+
+            // After resync, push any local edits that weren't in the server state.
+            // This handles the case where our published commit was orphaned on the
+            // server (head_advanced: false) due to concurrent edits from sandbox
+            // sync clients. The additive push re-publishes with the correct parent
+            // CID so the server accepts it.
+            if let Some(ref pre_content) = pre_resync_content {
+                if let Err(e) = push_local_edits_after_resync(
+                    mqtt_client,
+                    workspace,
+                    crdt_state,
+                    filename,
+                    node_id,
+                    file_path,
+                    pre_content,
+                    author,
+                    shared_last_content,
+                    inode_tracker,
+                )
+                .await
+                {
+                    warn!(
+                        "Divergence check: failed to push local edits for {}: {}",
+                        file_path.display(),
+                        e
+                    );
+                }
+            }
+
             true
         }
         Err(e) => {
@@ -2459,6 +2535,186 @@ async fn check_and_resolve_divergence(
             false
         }
     }
+}
+
+/// After a divergence resync, push any local edits that weren't in the server state.
+///
+/// When a commit is "orphaned" on the server (stored with `head_advanced: false` due to
+/// concurrent edits from other sync clients), the divergence resync pulls stale server
+/// state. This function detects if the pre-resync local content had edits not in the
+/// server state, and pushes them back:
+///
+/// - **JSON**: Uses additive merge (`create_yjs_json_merge`) which adds/updates keys
+///   without deleting server-only keys. This achieves a CRDT union of both sides.
+/// - **JSONL/Text**: Uses structured or text diff update.
+///
+/// For the "server ahead" case (server has newer content), the additive push is
+/// effectively a no-op since all local keys already exist on the server.
+#[allow(clippy::too_many_arguments)]
+async fn push_local_edits_after_resync(
+    mqtt_client: &Arc<MqttClient>,
+    workspace: &str,
+    crdt_state: &Arc<RwLock<DirectorySyncState>>,
+    filename: &str,
+    node_id: Uuid,
+    file_path: &Path,
+    pre_resync_content: &str,
+    author: &str,
+    shared_last_content: Option<&SharedLastContent>,
+    inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
+) -> SyncResult<()> {
+    // Get CRDT content (= server state after resync)
+    // Must use get_doc_text_content which handles YText, YArray, AND YMap formats.
+    // (crdt_publish::get_text_content only handles YText, returning empty for JSON files)
+    let crdt_content = {
+        let state = crdt_state.read().await;
+        state.get_file(filename).and_then(|fs| {
+            fs.to_doc()
+                .ok()
+                .map(|doc| get_doc_text_content(&doc))
+                .filter(|s| !s.is_empty())
+        })
+    };
+
+    // Compare (trimmed) — if they match, no local edits to push
+    let pre_trimmed = pre_resync_content.trim_end();
+    let crdt_trimmed = crdt_content.as_deref().map(|s| s.trim_end()).unwrap_or("");
+
+    if pre_trimmed == crdt_trimmed || pre_trimmed.is_empty() {
+        return Ok(());
+    }
+
+    // Skip if pre-resync content is default/empty
+    let content_info = detect_from_path(file_path);
+    if crate::sync::content_type::is_default_content(pre_resync_content, &content_info) {
+        return Ok(());
+    }
+
+    info!(
+        "Divergence check: local content differs from server for {} — pushing additively ({} local bytes vs {} server bytes)",
+        file_path.display(),
+        pre_resync_content.len(),
+        crdt_content.as_ref().map(|s| s.len()).unwrap_or(0),
+    );
+
+    let is_json = content_info.mime_type == "application/json";
+    let is_jsonl = content_info.mime_type == "application/x-ndjson";
+    let node_id_str = node_id.to_string();
+
+    // Publish the update (hold write lock for publish)
+    {
+        let mut state = crdt_state.write().await;
+        let file_state = state.get_or_create_file(filename, node_id);
+
+        if is_json {
+            // Additive merge: adds/updates keys without deleting server-only keys
+            let base_state = file_state.yjs_state.as_deref();
+            match crate::sync::crdt::yjs::create_yjs_json_merge(pre_resync_content, base_state) {
+                Ok(update_b64) => match crate::sync::crdt::yjs::base64_decode(&update_b64) {
+                    Ok(update_bytes) => {
+                        publish_yjs_update(
+                            mqtt_client,
+                            workspace,
+                            &node_id_str,
+                            file_state,
+                            update_bytes,
+                            author,
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        warn!("Divergence push: failed to decode merge update: {}", e);
+                        return Ok(());
+                    }
+                },
+                Err(e) => {
+                    warn!("Divergence push: failed to create merge update: {}", e);
+                    return Ok(());
+                }
+            }
+        } else if is_jsonl {
+            let ct = crate::content_type::ContentType::Jsonl;
+            let base_state = file_state.yjs_state.as_deref();
+            match crate::sync::crdt::yjs::create_yjs_structured_update(
+                ct,
+                pre_resync_content,
+                base_state,
+            ) {
+                Ok(update_b64) => match crate::sync::crdt::yjs::base64_decode(&update_b64) {
+                    Ok(update_bytes) => {
+                        publish_yjs_update(
+                            mqtt_client,
+                            workspace,
+                            &node_id_str,
+                            file_state,
+                            update_bytes,
+                            author,
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        warn!("Divergence push: failed to decode JSONL update: {}", e);
+                        return Ok(());
+                    }
+                },
+                Err(e) => {
+                    warn!("Divergence push: failed to create JSONL update: {}", e);
+                    return Ok(());
+                }
+            }
+        } else {
+            // Text: use text diff
+            let old = crdt_content.as_deref().unwrap_or("");
+            publish_text_change(
+                mqtt_client,
+                workspace,
+                &node_id_str,
+                file_state,
+                old,
+                pre_resync_content,
+                author,
+            )
+            .await?;
+        }
+    }
+
+    // After publishing, write the merged CRDT content to disk
+    let merged_content = {
+        let state = crdt_state.read().await;
+        state.get_file(filename).and_then(|fs| {
+            fs.to_doc()
+                .ok()
+                .map(|doc| get_doc_text_content(&doc))
+                .filter(|s| !s.is_empty())
+        })
+    };
+
+    if let Some(ref merged) = merged_content {
+        if let Err(e) = write_content_with_tracker(
+            file_path,
+            merged,
+            shared_last_content,
+            inode_tracker,
+            None,
+            "DIVERGENCE-PUSH",
+        )
+        .await
+        {
+            warn!(
+                "Divergence push: failed to write merged content to {}: {}",
+                file_path.display(),
+                e
+            );
+        } else {
+            info!(
+                "Divergence push: wrote merged content to {} ({} bytes)",
+                file_path.display(),
+                merged.len()
+            );
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
