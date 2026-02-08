@@ -381,6 +381,7 @@ dependencies = [
  "chrono",
  "clap",
  "commonplace-crdt",
+ "commonplace-schema",
  "commonplace-types",
  "commonplace-watcher",
  "fs2",
@@ -411,6 +412,22 @@ dependencies = [
  "urlencoding",
  "uuid",
  "yrs",
+]
+
+[[package]]
+name = "commonplace-schema"
+version = "0.1.0"
+dependencies = [
+ "async-recursion",
+ "base64 0.21.7",
+ "commonplace-types",
+ "commonplace-watcher",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

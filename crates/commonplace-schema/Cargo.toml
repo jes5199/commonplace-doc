@@ -1,0 +1,23 @@
+[package]
+name = "commonplace-schema"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "commonplace_schema"
+path = "src/lib.rs"
+
+[dependencies]
+commonplace-types = { path = "../commonplace-types" }
+commonplace-watcher = { path = "../commonplace-watcher" }
+async-recursion = "1.0"
+base64 = "0.21"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1", features = ["fs", "sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.0"
+tokio = { version = "1", features = ["full", "test-util"] }
