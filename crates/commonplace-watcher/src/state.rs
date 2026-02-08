@@ -163,6 +163,10 @@ pub struct InodeState {
     pub last_write: Instant,
     /// Primary file path this inode is associated with.
     pub primary_path: PathBuf,
+    /// Stashed node_id for rename detection.
+    /// When a file is deleted, the deletion handler stashes the node_id here
+    /// so the creation handler can recover it if the delete+create is a rename.
+    pub node_id: Option<String>,
 }
 
 /// Default idle timeout before GC can remove a shadow link (1 hour).
@@ -199,7 +203,13 @@ impl InodeTracker {
     }
 
     /// Track a new inode at a primary path with a given commit.
-    pub fn track(&mut self, key: InodeKey, commit_id: String, primary_path: PathBuf) {
+    pub fn track(
+        &mut self,
+        key: InodeKey,
+        commit_id: String,
+        primary_path: PathBuf,
+        node_id: Option<String>,
+    ) {
         self.states.insert(
             key,
             InodeState {
@@ -208,8 +218,43 @@ impl InodeTracker {
                 shadowed_at: None,
                 last_write: Instant::now(),
                 primary_path,
+                node_id,
             },
         );
+    }
+
+    /// Check if an inode is tracked under a different path (rename detection).
+    /// Returns Some((old_primary_path, stashed_node_id)) if rename detected.
+    pub fn check_rename(
+        &self,
+        key: &InodeKey,
+        new_path: &std::path::Path,
+    ) -> Option<(PathBuf, Option<String>)> {
+        if let Some(state) = self.states.get(key) {
+            if state.primary_path != new_path {
+                return Some((state.primary_path.clone(), state.node_id.clone()));
+            }
+        }
+        None
+    }
+
+    /// Update the primary_path for an inode (after rename).
+    pub fn update_primary_path(&mut self, key: &InodeKey, new_path: PathBuf) {
+        if let Some(state) = self.states.get_mut(key) {
+            state.primary_path = new_path;
+            state.node_id = None; // Clear stashed node_id after rename completes
+        }
+    }
+
+    /// Find InodeKey by primary_path and stash a node_id for rename detection.
+    pub fn stash_node_id_by_path(&mut self, primary_path: &std::path::Path, node_id: String) {
+        if let Some(state) = self
+            .states
+            .values_mut()
+            .find(|s| s.primary_path == primary_path)
+        {
+            state.node_id = Some(node_id);
+        }
     }
 
     /// Move an inode to shadow status.

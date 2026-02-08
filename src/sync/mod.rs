@@ -137,7 +137,7 @@ pub use crdt::crdt_merge::{
 };
 pub use crdt::crdt_new_file::{
     add_directory_to_schema, create_new_file, generate_file_uuid, publish_schema_via_mqtt,
-    remove_file_from_schema, NewFileResult,
+    remove_file_from_schema, rename_file_in_schema, NewFileResult,
 };
 pub use crdt::crdt_publish::{
     apply_received_commit, get_text_content, is_commit_known, publish_text_change,

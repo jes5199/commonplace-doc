@@ -254,6 +254,47 @@ pub fn add_directory(doc: &Doc, dirname: &str, node_id: Option<&str>) {
     }
 }
 
+/// Rename a schema entry, preserving its type and node_id.
+/// Returns the preserved node_id, or None if old entry not found.
+pub fn rename_entry(doc: &Doc, old_name: &str, new_name: &str) -> Option<String> {
+    let mut txn = doc.transact_mut();
+    let entries = get_or_create_entries(&mut txn);
+
+    // Read old entry properties
+    let (entry_type_str, node_id) = match entries.get(&txn, old_name) {
+        Some(yrs::Value::YMap(entry_map)) => {
+            let t = match entry_map.get(&txn, "type") {
+                Some(yrs::Value::Any(Any::String(s))) => s.to_string(),
+                _ => return None,
+            };
+            let n = match entry_map.get(&txn, "node_id") {
+                Some(yrs::Value::Any(Any::String(s))) => s.to_string(),
+                _ => return None,
+            };
+            (t, n)
+        }
+        Some(yrs::Value::Any(Any::Map(map))) => {
+            let t = match map.get("type") {
+                Some(Any::String(s)) => s.to_string(),
+                _ => return None,
+            };
+            let n = match map.get("node_id") {
+                Some(Any::String(s)) => s.to_string(),
+                _ => return None,
+            };
+            (t, n)
+        }
+        _ => return None,
+    };
+
+    entries.remove(&mut txn, old_name);
+    let new_entry = entries.insert(&mut txn, new_name, yrs::MapPrelim::<Any>::new());
+    new_entry.insert(&mut txn, "type", entry_type_str.as_str());
+    new_entry.insert(&mut txn, "node_id", node_id.as_str());
+
+    Some(node_id)
+}
+
 /// Remove an entry from the schema.
 pub fn remove_entry(doc: &Doc, name: &str) {
     let mut txn = doc.transact_mut();
@@ -566,6 +607,44 @@ mod tests {
 
         remove_entry(&doc, "test.txt");
         assert!(get_entry(&doc, "test.txt").is_none());
+    }
+
+    #[test]
+    fn test_rename_entry() {
+        let doc = Doc::new();
+        add_file(&doc, "old.txt", "uuid-123");
+
+        let node_id = rename_entry(&doc, "old.txt", "new.txt");
+        assert_eq!(node_id, Some("uuid-123".to_string()));
+
+        // Old entry should be gone
+        assert!(get_entry(&doc, "old.txt").is_none());
+
+        // New entry should exist with preserved type and node_id
+        let entry = get_entry(&doc, "new.txt").expect("new entry should exist");
+        assert_eq!(entry.entry_type, SchemaEntryType::Doc);
+        assert_eq!(entry.node_id, Some("uuid-123".to_string()));
+    }
+
+    #[test]
+    fn test_rename_entry_nonexistent() {
+        let doc = Doc::new();
+        let result = rename_entry(&doc, "nonexistent.txt", "new.txt");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_rename_directory_entry() {
+        let doc = Doc::new();
+        add_directory(&doc, "old_dir", Some("uuid-456"));
+
+        let node_id = rename_entry(&doc, "old_dir", "new_dir");
+        assert_eq!(node_id, Some("uuid-456".to_string()));
+
+        assert!(get_entry(&doc, "old_dir").is_none());
+        let entry = get_entry(&doc, "new_dir").expect("new entry should exist");
+        assert_eq!(entry.entry_type, SchemaEntryType::Dir);
+        assert_eq!(entry.node_id, Some("uuid-456".to_string()));
     }
 
     #[test]
