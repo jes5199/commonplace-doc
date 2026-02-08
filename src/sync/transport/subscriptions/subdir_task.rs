@@ -699,31 +699,6 @@ pub async fn subdir_mqtt_task(
                                                 for rel_path in paths {
                                                     let file_path = directory.join(rel_path);
 
-                                                    // Update shared_last_content before writing to prevent echo
-                                                    // If we can't update it, log a warning since this may cause
-                                                    // echo loops when the file watcher detects our write
-                                                    {
-                                                        let states = file_states.read().await;
-                                                        if let Some(state) = states.get(rel_path) {
-                                                            if let Some(ref slc) =
-                                                                state.crdt_last_content
-                                                            {
-                                                                let mut shared = slc.write().await;
-                                                                *shared = Some(content.clone());
-                                                            } else {
-                                                                warn!(
-                                                                "Subdir {}: No crdt_last_content for {} - echo suppression may fail",
-                                                                subdir_path, rel_path
-                                                            );
-                                                            }
-                                                        } else {
-                                                            warn!(
-                                                            "Subdir {}: No file state for {} - echo suppression may fail",
-                                                            subdir_path, rel_path
-                                                        );
-                                                        }
-                                                    }
-
                                                     if let Some(parent) = file_path.parent() {
                                                         let _ =
                                                             tokio::fs::create_dir_all(parent).await;

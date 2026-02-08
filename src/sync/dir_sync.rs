@@ -25,8 +25,7 @@ use crate::sync::ymap_schema;
 use crate::sync::{
     ancestry::determine_sync_direction, build_info_url, detect_from_path, is_allowed_extension,
     is_binary_content, looks_like_base64_binary, push_schema_to_server,
-    remove_file_state_and_abort, spawn_file_sync_tasks_crdt, FileSyncState, SharedLastContent,
-    SyncState,
+    remove_file_state_and_abort, spawn_file_sync_tasks_crdt, FileSyncState, SyncState,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::Client;
@@ -956,8 +955,6 @@ pub async fn handle_subdir_new_files(
                         .to_string();
 
                     let local_content = tokio::fs::read_to_string(&file_path).await.ok();
-                    let shared_last_content: SharedLastContent =
-                        Arc::new(RwLock::new(local_content.clone()));
                     let content_hash = compute_content_hash(
                         local_content.as_ref().map(|s| s.as_bytes()).unwrap_or(b""),
                     );
@@ -992,7 +989,7 @@ pub async fn handle_subdir_new_files(
                                 task_handles: Vec::new(),
                                 use_paths,
                                 content_hash: Some(content_hash),
-                                crdt_last_content: Some(shared_last_content.clone()),
+                                crdt_tasks_spawned: true,
                             },
                         );
                     }
@@ -1031,7 +1028,6 @@ pub async fn handle_subdir_new_files(
                         file_path.clone(),
                         subdir_state,
                         filename,
-                        shared_last_content.clone(),
                         pull_only,
                         author.to_string(),
                         ctx.mqtt_only_config,
@@ -1133,14 +1129,14 @@ pub async fn handle_subdir_new_files(
                         task_handles: Vec::new(), // Empty initially, updated after spawn
                         use_paths,
                         content_hash: Some(content_hash.clone()),
-                        crdt_last_content: None, // Updated for CRDT path after spawn
+                        crdt_tasks_spawned: false,
                     },
                 );
             }
 
             // Spawn sync tasks for the new file
             // Use CRDT tasks if context is provided and identifier is a valid UUID
-            let (task_handles, crdt_last_content) = if let Some(ctx) = crdt_context {
+            let task_handles = if let Some(ctx) = crdt_context {
                 // Try to parse identifier as UUID for CRDT sync
                 if let Ok(node_uuid) = Uuid::parse_str(&identifier) {
                     // Initialize CRDT state from server
@@ -1149,15 +1145,6 @@ pub async fn handle_subdir_new_files(
                         .and_then(|n| n.to_str())
                         .unwrap_or(&identifier)
                         .to_string();
-
-                    // Create shared_last_content BEFORE init so we can update it during init
-                    // This prevents the file watcher from detecting init writes as local changes
-                    let initial_content = tokio::fs::read_to_string(&file_path)
-                        .await
-                        .ok()
-                        .filter(|s| !s.is_empty());
-                    let shared_last_content: SharedLastContent =
-                        Arc::new(RwLock::new(initial_content));
 
                     // CRITICAL FIX: Use subdirectory's state from cache, not root's state.
                     // See comment in MQTT fallback path above for full explanation.
@@ -1195,7 +1182,6 @@ pub async fn handle_subdir_new_files(
                         &filename,
                         &file_path,
                         author,
-                        Some(&shared_last_content),
                         inode_tracker.as_ref(),
                         true,
                         true,
@@ -1213,7 +1199,7 @@ pub async fn handle_subdir_new_files(
 
                     // State is already registered, spawn tasks using subdirectory state
                     // Pass None for file_states since we already registered
-                    let handles = spawn_file_sync_tasks_crdt(
+                    spawn_file_sync_tasks_crdt(
                         ctx.mqtt_client.clone(),
                         client.clone(),
                         server.to_string(),
@@ -1222,15 +1208,13 @@ pub async fn handle_subdir_new_files(
                         file_path.clone(),
                         subdir_state,
                         filename,
-                        shared_last_content.clone(),
                         pull_only,
                         author.to_string(),
                         ctx.mqtt_only_config,
                         inode_tracker.clone(),
                         None, // Already registered, no need to check
                         None,
-                    );
-                    (handles, Some(shared_last_content))
+                    )
                 } else {
                     // Non-UUID identifier - CRDT sync requires a valid UUID
                     warn!(
@@ -1248,12 +1232,12 @@ pub async fn handle_subdir_new_files(
                 continue;
             };
 
-            // Update the registered state with task handles and crdt_last_content
+            // Update the registered state with task handles
             {
                 let mut states = file_states.write().await;
                 if let Some(file_state) = states.get_mut(root_relative_path) {
                     file_state.task_handles = task_handles;
-                    file_state.crdt_last_content = crdt_last_content;
+                    file_state.crdt_tasks_spawned = true;
                 }
             }
         } else if has_mqtt_uuid && matches!(fetch_result, Ok(None)) {
@@ -1323,7 +1307,7 @@ pub async fn handle_subdir_new_files(
                         task_handles: Vec::new(),
                         use_paths,
                         content_hash: Some(content_hash.clone()),
-                        crdt_last_content: None,
+                        crdt_tasks_spawned: false,
                     },
                 );
             }
@@ -1336,10 +1320,6 @@ pub async fn handle_subdir_new_files(
                         .and_then(|n| n.to_str())
                         .unwrap_or(&identifier)
                         .to_string();
-
-                    // Create shared_last_content with empty content
-                    let shared_last_content: SharedLastContent =
-                        Arc::new(RwLock::new(Some(String::new())));
 
                     // CRITICAL FIX: Use subdirectory's state from cache, not root's state.
                     // The root crdt_state has a nil UUID (because fs_root_id="workspace" isn't a UUID).
@@ -1381,7 +1361,6 @@ pub async fn handle_subdir_new_files(
                         &filename,
                         &file_path,
                         author,
-                        Some(&shared_last_content),
                         inode_tracker.as_ref(),
                         true,
                         true,
@@ -1409,7 +1388,6 @@ pub async fn handle_subdir_new_files(
                         file_path.clone(),
                         subdir_state,
                         filename,
-                        shared_last_content.clone(),
                         pull_only,
                         author.to_string(),
                         ctx.mqtt_only_config,
@@ -1424,7 +1402,7 @@ pub async fn handle_subdir_new_files(
                         let mut states = file_states.write().await;
                         if let Some(file_state) = states.get_mut(root_relative_path) {
                             file_state.task_handles = handles;
-                            file_state.crdt_last_content = Some(shared_last_content);
+                            file_state.crdt_tasks_spawned = true;
                         }
                     }
                 }
@@ -1888,7 +1866,7 @@ pub async fn handle_schema_change(
 
                 // Spawn sync tasks for the new file (only if requested)
                 // Use CRDT tasks if context is provided and identifier is a valid UUID
-                let (task_handles, crdt_last_content) = if spawn_tasks {
+                let task_handles = if spawn_tasks {
                     if let Some(ctx) = crdt_context {
                         // Try to parse identifier as UUID for CRDT sync
                         if let Ok(node_uuid) = Uuid::parse_str(&identifier) {
@@ -1898,15 +1876,6 @@ pub async fn handle_schema_change(
                                 .and_then(|n| n.to_str())
                                 .unwrap_or(&identifier)
                                 .to_string();
-
-                            // Create shared_last_content BEFORE init so we can update it during init
-                            // This prevents the file watcher from detecting init writes as local changes
-                            let initial_content = tokio::fs::read_to_string(&file_path)
-                                .await
-                                .ok()
-                                .filter(|s| !s.is_empty());
-                            let shared_last_content: SharedLastContent =
-                                Arc::new(RwLock::new(initial_content));
 
                             // CRITICAL FIX: Use the correct directory's state from cache, not root's state.
                             // For files in subdirectories, we need to load the subdirectory's state.
@@ -1954,7 +1923,6 @@ pub async fn handle_schema_change(
                                     &filename,
                                     &file_path,
                                     author,
-                                    Some(&shared_last_content),
                                     inode_tracker.as_ref(),
                                     true,
                                     true,
@@ -1981,7 +1949,6 @@ pub async fn handle_schema_change(
                                 file_path.clone(),
                                 dir_state,
                                 filename,
-                                shared_last_content.clone(),
                                 pull_only,
                                 author.to_string(),
                                 ctx.mqtt_only_config,
@@ -1990,7 +1957,7 @@ pub async fn handle_schema_change(
                                 Some(path),
                             );
                             drop(states_snapshot);
-                            (handles, Some(shared_last_content))
+                            handles
                         } else {
                             // Non-UUID identifier - CRDT sync requires a valid UUID
                             warn!(
@@ -2005,11 +1972,12 @@ pub async fn handle_schema_change(
                         continue;
                     }
                 } else {
-                    (Vec::new(), None)
+                    Vec::new()
                 };
 
                 // Skip if spawn was prevented due to existing tasks
-                if task_handles.is_empty() && crdt_last_content.is_some() {
+                let crdt_spawn_attempted = spawn_tasks;
+                if task_handles.is_empty() && crdt_spawn_attempted {
                     // CRDT spawn was attempted but prevented - skip this file
                     continue;
                 }
@@ -2036,7 +2004,7 @@ pub async fn handle_schema_change(
                         task_handles,
                         use_paths,
                         content_hash: Some(content_hash),
-                        crdt_last_content,
+                        crdt_tasks_spawned: crdt_spawn_attempted,
                     },
                 );
             }
