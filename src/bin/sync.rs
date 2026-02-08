@@ -27,7 +27,7 @@ use commonplace_doc::sync::{
     schema_to_json, spawn_command_listener, spawn_file_sync_tasks_crdt, sync_schema,
     trace_timeline, wait_for_file_stability, write_schema_file, ymap_schema, CrdtFileSyncContext,
     DirEvent, FileSyncState, InodeTracker, InodeTrackerInit, MqttOnlySyncConfig, ScanOptions,
-    SharedLastContent, SubdirStateCache, SyncState, TimelineMilestone, SCHEMA_FILENAME,
+    SubdirStateCache, SyncState, TimelineMilestone, SCHEMA_FILENAME,
 };
 use commonplace_doc::workspace::is_process_running;
 use commonplace_doc::{DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
@@ -585,7 +585,6 @@ async fn handle_file_created_crdt(
 
                 // Spawn CRDT sync tasks for the new file using the cached state Arc
                 let file_path = path.to_path_buf();
-                let shared_last_content = Arc::new(RwLock::new(Some(content.clone())));
                 // Check for existing tasks before spawning (prevents duplicates)
                 let states_snapshot = file_states.read().await;
                 let handles = spawn_file_sync_tasks_crdt(
@@ -597,7 +596,6 @@ async fn handle_file_created_crdt(
                     file_path,
                     subdir_state_arc,
                     owning_doc.relative_path.clone(),
-                    shared_last_content.clone(),
                     false, // pull_only = false for new files
                     author.to_string(),
                     crdt.mqtt_only_config,
@@ -621,7 +619,7 @@ async fn handle_file_created_crdt(
                         task_handles: handles,
                         use_paths: false,
                         content_hash: Some(content_hash),
-                        crdt_last_content: Some(shared_last_content),
+                        crdt_tasks_spawned: true,
                     },
                 );
             }
@@ -670,7 +668,6 @@ async fn handle_file_created_crdt(
 
                 // Spawn CRDT sync tasks for the new file
                 let file_path = path.to_path_buf();
-                let shared_last_content = Arc::new(RwLock::new(Some(content.clone())));
                 // Check for existing tasks before spawning (prevents duplicates)
                 let states_snapshot = file_states.read().await;
                 let handles = spawn_file_sync_tasks_crdt(
@@ -682,7 +679,6 @@ async fn handle_file_created_crdt(
                     file_path,
                     crdt.crdt_state.clone(),
                     filename.clone(),
-                    shared_last_content.clone(),
                     false, // pull_only = false for new files
                     author.to_string(),
                     crdt.mqtt_only_config,
@@ -706,7 +702,7 @@ async fn handle_file_created_crdt(
                         task_handles: handles,
                         use_paths: false,
                         content_hash: Some(content_hash),
-                        crdt_last_content: Some(shared_last_content),
+                        crdt_tasks_spawned: true,
                     },
                 );
             }
@@ -1814,13 +1810,6 @@ async fn run_file_mode(
             .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
     ));
 
-    // Read initial content for echo detection
-    let initial_content = tokio::fs::read_to_string(&file)
-        .await
-        .ok()
-        .filter(|s| !s.is_empty());
-    let shared_last_content: SharedLastContent = Arc::new(RwLock::new(initial_content));
-
     // Start MQTT event loop
     let mqtt_for_loop = mqtt_client.clone();
     tokio::spawn(async move {
@@ -1839,7 +1828,6 @@ async fn run_file_mode(
         &filename,
         &file,
         &author,
-        Some(&shared_last_content),
         None,  // inode_tracker not needed during init
         false, // write_to_disk=false: defer disk write until we compare local vs server
         true,  // process_pending_edits
@@ -1920,9 +1908,6 @@ async fn run_file_mode(
                         file.display(),
                         content_with_newline.len()
                     );
-                    // Update shared_last_content for echo detection
-                    let mut last = shared_last_content.write().await;
-                    *last = Some(content_with_newline);
                 }
             }
         }
@@ -1961,7 +1946,6 @@ async fn run_file_mode(
         file.clone(),
         crdt_state.clone(),
         filename,
-        shared_last_content,
         pull_only,
         author.clone(),
         mqtt_only_config,
@@ -2182,7 +2166,7 @@ async fn run_directory_mode(
                     task_handles: Vec::new(),
                     use_paths,
                     content_hash: None,
-                    crdt_last_content: None,
+                    crdt_tasks_spawned: false,
                 },
             );
         }
@@ -2378,15 +2362,6 @@ async fn run_directory_mode(
                 (crdt_state.clone(), filename)
             };
 
-            // Create shared_last_content BEFORE init so we can update it during init.
-            // This prevents the file watcher from detecting init writes as local changes,
-            // which would cause LocalAhead divergence.
-            let initial_content = tokio::fs::read_to_string(&file_path)
-                .await
-                .ok()
-                .filter(|s| !s.is_empty());
-            let shared_last_content: SharedLastContent = Arc::new(RwLock::new(initial_content));
-
             // Initialize CRDT state via cyan sync (MQTT) before spawning tasks.
             // This ensures all sync clients share the same Yjs operation history,
             // which is critical for merges to work correctly (especially deletions).
@@ -2401,7 +2376,6 @@ async fn run_directory_mode(
                 &filename,
                 &file_path,
                 &author,
-                Some(&shared_last_content),
                 inode_tracker.as_ref(),
                 false,
                 true,
@@ -2483,14 +2457,11 @@ async fn run_directory_mode(
                                     file_path.display(),
                                     e
                                 );
-                            } else {
-                                *shared_last_content.write().await = Some(content.clone());
                             }
                         }
                     }
                 }
             }
-            file_state.crdt_last_content = Some(shared_last_content.clone());
             // Trace TASK_SPAWN milestone before spawning tasks (directory mode)
             trace_timeline(
                 TimelineMilestone::TaskSpawn,
@@ -2506,7 +2477,6 @@ async fn run_directory_mode(
                 file_path,
                 file_crdt_state.clone(),
                 filename,
-                shared_last_content,
                 pull_only,
                 author.clone(),
                 mqtt_only_config,
@@ -2843,7 +2813,7 @@ async fn run_exec_mode(
                     task_handles: Vec::new(),
                     use_paths,
                     content_hash: None,
-                    crdt_last_content: None,
+                    crdt_tasks_spawned: false,
                 },
             );
         }
@@ -3015,15 +2985,6 @@ async fn run_exec_mode(
                 (crdt_state.clone(), filename)
             };
 
-            // Create shared_last_content BEFORE init so we can update it during init.
-            // This prevents the file watcher from detecting init writes as local changes,
-            // which would cause LocalAhead divergence.
-            let initial_content = tokio::fs::read_to_string(&file_path)
-                .await
-                .ok()
-                .filter(|s| !s.is_empty());
-            let shared_last_content: SharedLastContent = Arc::new(RwLock::new(initial_content));
-
             // Don't write to disk during init — we push local content afterward,
             // and write_to_disk=true would overwrite local content with (possibly empty)
             // server content before we get a chance to push.
@@ -3035,7 +2996,6 @@ async fn run_exec_mode(
                 &filename,
                 &file_path,
                 &author,
-                Some(&shared_last_content),
                 inode_tracker.as_ref(),
                 false,
                 true,
@@ -3115,15 +3075,12 @@ async fn run_exec_mode(
                                     file_path.display(),
                                     e
                                 );
-                            } else {
-                                *shared_last_content.write().await = Some(content.clone());
                             }
                         }
                     }
                 }
             }
 
-            file_state.crdt_last_content = Some(shared_last_content.clone());
             // Trace TASK_SPAWN milestone before spawning tasks
             trace_timeline(
                 TimelineMilestone::TaskSpawn,
@@ -3139,7 +3096,6 @@ async fn run_exec_mode(
                 file_path,
                 file_crdt_state.clone(),
                 filename,
-                shared_last_content,
                 pull_only,
                 author.clone(),
                 mqtt_only_config,

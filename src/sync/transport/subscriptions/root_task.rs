@@ -16,7 +16,7 @@ use crate::sync::error::SyncResult;
 #[cfg(unix)]
 use crate::sync::flock::{try_flock_exclusive, FlockResult};
 use crate::sync::subdir_spawn::{spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport};
-use crate::sync::{spawn_file_sync_tasks_crdt, FileSyncState, SharedLastContent};
+use crate::sync::{spawn_file_sync_tasks_crdt, FileSyncState};
 use reqwest::Client;
 use rumqttc::QoS;
 use std::collections::{HashMap, HashSet};
@@ -695,31 +695,6 @@ pub async fn directory_mqtt_task(
                                                 for rel_path in paths {
                                                     let file_path = directory.join(rel_path);
 
-                                                    // Update shared_last_content before writing to prevent echo
-                                                    // If we can't update it, log a warning since this may cause
-                                                    // echo loops when the file watcher detects our write
-                                                    {
-                                                        let states = file_states.read().await;
-                                                        if let Some(state) = states.get(rel_path) {
-                                                            if let Some(ref slc) =
-                                                                state.crdt_last_content
-                                                            {
-                                                                let mut shared = slc.write().await;
-                                                                *shared = Some(content.clone());
-                                                            } else {
-                                                                warn!(
-                                                                "No crdt_last_content for {} - echo suppression may fail",
-                                                                rel_path
-                                                            );
-                                                            }
-                                                        } else {
-                                                            warn!(
-                                                            "No file state for {} - echo suppression may fail",
-                                                            rel_path
-                                                        );
-                                                        }
-                                                    }
-
                                                     if let Some(parent) = file_path.parent() {
                                                         let _ =
                                                             tokio::fs::create_dir_all(parent).await;
@@ -798,7 +773,7 @@ async fn ensure_crdt_tasks_for_files(
         let states = file_states.read().await;
         states
             .iter()
-            .filter(|(_, state)| state.crdt_last_content.is_none() && !state.use_paths)
+            .filter(|(_, state)| !state.crdt_tasks_spawned && !state.use_paths)
             .map(|(path, state)| (path.clone(), state.identifier.clone()))
             .collect()
     };
@@ -822,33 +797,6 @@ async fn ensure_crdt_tasks_for_files(
             .unwrap_or(&relative_path)
             .to_string();
 
-        // Reuse existing shared_last_content from file_states if available.
-        // This preserves content written by the receive task, preventing a race where
-        // respawned tasks start with stale/empty content.
-        let shared_last_content: SharedLastContent = {
-            let states = file_states.read().await;
-            states
-                .get(&relative_path)
-                .and_then(|s| s.crdt_last_content.clone())
-        }
-        .unwrap_or_else(|| {
-            // No existing state — create fresh from file content
-            let initial_content = match std::fs::read_to_string(&file_path) {
-                Ok(s) if !s.is_empty() => Some(s),
-                Ok(_) => None,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => {
-                    error!(
-                        "Failed to read initial content from {}: {}",
-                        file_path.display(),
-                        e
-                    );
-                    None
-                }
-            };
-            Arc::new(RwLock::new(initial_content))
-        });
-
         if let Err(e) = crate::sync::file_sync::resync_crdt_state_via_cyan_with_pending(
             &context.mqtt_client,
             &context.workspace,
@@ -857,7 +805,6 @@ async fn ensure_crdt_tasks_for_files(
             &filename,
             &file_path,
             author,
-            Some(&shared_last_content),
             inode_tracker.as_ref(),
             true,
             true,
@@ -899,7 +846,6 @@ async fn ensure_crdt_tasks_for_files(
             file_path,
             context.crdt_state.clone(),
             filename,
-            shared_last_content.clone(),
             pull_only,
             author.to_string(),
             context.mqtt_only_config,
@@ -911,7 +857,7 @@ async fn ensure_crdt_tasks_for_files(
         let mut states = file_states.write().await;
         if let Some(state) = states.get_mut(&relative_path) {
             state.task_handles = handles;
-            state.crdt_last_content = Some(shared_last_content);
+            state.crdt_tasks_spawned = true;
         }
     }
 

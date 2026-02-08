@@ -33,7 +33,7 @@ pub(super) async fn resync_subscribed_files(
     uuid_to_paths: &crate::sync::UuidToPathsMap,
     directory: &Path,
     _use_paths: bool,
-    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    _file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
     crdt_context: Option<&CrdtFileSyncContext>,
     inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     author: &str,
@@ -75,15 +75,6 @@ pub(super) async fn resync_subscribed_files(
                     }
                 }
 
-                // Look up existing shared_last_content from file_states
-                let relative_path = paths.first().cloned().unwrap_or_else(|| filename.clone());
-                let shared_last_content = {
-                    let states = file_states.read().await;
-                    states
-                        .get(&relative_path)
-                        .and_then(|s| s.crdt_last_content.clone())
-                };
-
                 if let Err(e) = crate::sync::file_sync::resync_crdt_state_via_cyan_with_pending(
                     &ctx.mqtt_client,
                     &ctx.workspace,
@@ -92,7 +83,6 @@ pub(super) async fn resync_subscribed_files(
                     &filename,
                     &file_path,
                     author,
-                    shared_last_content.as_ref(),
                     inode_tracker.as_ref(),
                     true,
                     true,

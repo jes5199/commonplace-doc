@@ -249,6 +249,6 @@ pub use file_sync::{
 pub use types::{
     build_uuid_to_paths_map, remove_file_state_and_abort, CommitData, DirEvent, EditEventData,
     EditRequest, EditResponse, FileEvent, FileSyncState, ForkResponse, HeadResponse,
-    InitialSyncComplete, ReplaceResponse, ReplaceSummary, SharedLastContent, SharedStateFile,
-    UuidToPathsMap, WrittenSchemas,
+    InitialSyncComplete, ReplaceResponse, ReplaceSummary, SharedStateFile, UuidToPathsMap,
+    WrittenSchemas,
 };
