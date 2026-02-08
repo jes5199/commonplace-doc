@@ -170,7 +170,9 @@ pub use watcher::flock::{
 };
 pub use watcher::flock_state;
 pub use watcher::flock_state::FlockSyncState;
-pub use watcher::state::{InodeKey, InodeState, InodeTracker, PendingWrite, SyncState};
+pub use watcher::state::{
+    InodeKey, InodeState, InodeTracker, InodeTrackerInit, PendingWrite, SyncState,
+};
 #[cfg(unix)]
 pub use watcher::watcher::spawn_shadow_tasks;
 pub use watcher::watcher::{

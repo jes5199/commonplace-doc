@@ -25,8 +25,8 @@ use commonplace_doc::sync::{
     push_schema_to_server, remove_file_from_schema, resync_crdt_state_via_cyan_with_pending,
     schema_to_json, spawn_command_listener, spawn_file_sync_tasks_crdt, sync_schema,
     trace_timeline, wait_for_file_stability, write_schema_file, ymap_schema, CrdtFileSyncContext,
-    DirEvent, FileSyncState, InodeTracker, MqttOnlySyncConfig, ScanOptions, SharedLastContent,
-    SubdirStateCache, SyncState, TimelineMilestone, SCHEMA_FILENAME,
+    DirEvent, FileSyncState, InodeTracker, InodeTrackerInit, MqttOnlySyncConfig, ScanOptions,
+    SharedLastContent, SubdirStateCache, SyncState, TimelineMilestone, SCHEMA_FILENAME,
 };
 use commonplace_doc::workspace::is_process_running;
 use commonplace_doc::{DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
