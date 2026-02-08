@@ -61,7 +61,7 @@ fn extract_node_ids_with_prefix(entry: &Entry, prefix: &str) -> HashMap<String, 
             if let Some(ref node_id) = dir.node_id {
                 result.insert(prefix.to_string(), node_id.clone());
             }
-            // Iterate over entries (root-level schemas legitimately have entries)
+            // Iterate over child entries
             if let Some(ref entries) = dir.entries {
                 for (name, child) in entries {
                     let child_path = if prefix.is_empty() {
