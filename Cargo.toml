@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/commonplace-types", "crates/commonplace-crdt"]
+members = [".", "crates/commonplace-types", "crates/commonplace-crdt", "crates/commonplace-watcher"]
 resolver = "2"
 
 [package]
@@ -86,6 +86,7 @@ path = "src/bin/beads_bridge.rs"
 [dependencies]
 commonplace-types = { path = "crates/commonplace-types" }
 commonplace-crdt = { path = "crates/commonplace-crdt" }
+commonplace-watcher = { path = "crates/commonplace-watcher" }
 bytes = "1.5"
 rmcp = { version = "0.12", features = ["server", "transport-io"] }
 axum = { version = "0.7", features = ["ws"] }
