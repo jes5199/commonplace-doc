@@ -61,7 +61,7 @@ fn extract_node_ids_with_prefix(entry: &Entry, prefix: &str) -> HashMap<String, 
             if let Some(ref node_id) = dir.node_id {
                 result.insert(prefix.to_string(), node_id.clone());
             }
-            // For inline entries, recursively extract
+            // Iterate over entries (root-level schemas legitimately have entries)
             if let Some(ref entries) = dir.entries {
                 for (name, child) in entries {
                     let child_path = if prefix.is_empty() {
@@ -81,58 +81,15 @@ fn extract_node_ids_with_prefix(entry: &Entry, prefix: &str) -> HashMap<String, 
 /// Recursively load node_ids from nested .commonplace.json files.
 fn load_nested_node_ids(
     entry: &Entry,
-    current_dir: &Path,
-    prefix: &str,
-    result: &mut HashMap<String, String>,
+    _current_dir: &Path,
+    _prefix: &str,
+    _result: &mut HashMap<String, String>,
 ) {
     if let Entry::Dir(dir) = entry {
         // For node-backed directories, check for nested .commonplace.json
         if dir.node_id.is_some() && dir.entries.is_none() {
             // This is a node-backed directory - don't recurse here as we handle
             // it at the schema level by looking for .commonplace.json in subdirs
-        }
-
-        // For inline directories (shouldn't exist after fix, but handle for compatibility)
-        if let Some(ref entries) = dir.entries {
-            for (name, child) in entries {
-                let child_path = if prefix.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{}/{}", prefix, name)
-                };
-                let child_dir = current_dir.join(name);
-
-                // If this is a node-backed subdirectory, load its nested schema
-                if let Entry::Dir(child_dir_entry) = child {
-                    if child_dir_entry.node_id.is_some() {
-                        let nested_schema_path = child_dir.join(SCHEMA_FILENAME);
-                        if nested_schema_path.exists() {
-                            if let Ok(content) = fs::read_to_string(&nested_schema_path) {
-                                if let Ok(nested_schema) =
-                                    serde_json::from_str::<FsSchema>(&content)
-                                {
-                                    if let Some(ref nested_root) = nested_schema.root {
-                                        result.extend(extract_node_ids_with_prefix(
-                                            nested_root,
-                                            &child_path,
-                                        ));
-                                        // Recursively load from deeper levels
-                                        load_nested_node_ids(
-                                            nested_root,
-                                            &child_dir,
-                                            &child_path,
-                                            result,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Continue recursing into inline entries
-                load_nested_node_ids(child, &child_dir, &child_path, result);
-            }
         }
     }
 }

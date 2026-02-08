@@ -1639,26 +1639,6 @@ async fn push_nested_schemas_recursive(
                     }
                 }
             }
-        } else {
-            // Non-node-backed directory: iterate over inline entries (deprecated but handle for safety)
-            if let Some(ref entries) = dir.entries {
-                for (entry_name, child_entry) in entries {
-                    if let Entry::Dir(ref child_dir) = child_entry {
-                        if child_dir.node_id.is_some() {
-                            let child_path = current_dir.join(entry_name);
-                            pushed_count += push_nested_schemas_recursive(
-                                client,
-                                server,
-                                _base_dir,
-                                child_entry,
-                                &child_path,
-                                author,
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -2743,6 +2723,49 @@ pub async fn check_server_has_content(client: &Client, server: &str, fs_root_id:
         return !head.content.is_empty() && head.content != "{}";
     }
     false
+}
+
+/// Ensure fs-root document exists on the server via MQTT, creating it if necessary.
+///
+/// MQTT equivalent of `ensure_fs_root_exists` - uses get-info and create-document
+/// commands instead of HTTP requests.
+pub async fn ensure_fs_root_exists_mqtt(
+    mqtt_request: &crate::mqtt::MqttRequestClient,
+    fs_root_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let info_resp = mqtt_request.get_info(fs_root_id).await?;
+    if info_resp.error.is_some() {
+        // Document doesn't exist - create it with the specific fs-root ID
+        info!("Creating fs-root document via MQTT: {}", fs_root_id);
+        let create_resp = mqtt_request
+            .create_document("application/json", Some(fs_root_id))
+            .await?;
+        if let Some(err) = create_resp.error {
+            return Err(format!("Failed to create fs-root document: {}", err).into());
+        }
+    }
+    info!("Connected to fs-root document: {}", fs_root_id);
+    Ok(())
+}
+
+/// Check if the server has existing schema content via MQTT.
+///
+/// MQTT equivalent of `check_server_has_content` - uses get-content command
+/// instead of HTTP fetch_head.
+pub async fn check_server_has_content_mqtt(
+    mqtt_request: &crate::mqtt::MqttRequestClient,
+    fs_root_id: &str,
+) -> bool {
+    match mqtt_request.get_content(fs_root_id).await {
+        Ok(resp) => {
+            if let Some(content) = resp.content {
+                !content.is_empty() && content != "{}"
+            } else {
+                false
+            }
+        }
+        Err(_) => false,
+    }
 }
 
 /// Handle a user edit to a .commonplace.json schema file.
