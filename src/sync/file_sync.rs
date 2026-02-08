@@ -2181,8 +2181,7 @@ pub async fn receive_task_crdt(
         let pre_merge_content = file_state
             .to_doc()
             .ok()
-            .map(|doc| get_doc_text_content(&doc))
-            .filter(|s| !s.is_empty());
+            .map(|doc| get_doc_text_content(&doc));
 
         // Process the received edit
         match process_received_edit(
