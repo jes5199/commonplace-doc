@@ -1,22 +1,29 @@
 //! Commands port handler.
 //!
-//! Handles store-level commands like create-document, delete-document, get-content, and get-info.
+//! Handles store-level commands like create-document, delete-document, get-content,
+//! get-info, and fork-document.
 
+use crate::b64;
+use crate::commit::Commit;
 use crate::document::{ContentType, DocumentStore};
 use crate::mqtt::client::MqttClient;
 use crate::mqtt::messages::{
     CreateDocumentRequest, CreateDocumentResponse, DeleteDocumentRequest, DeleteDocumentResponse,
-    GetContentRequest, GetContentResponse, GetInfoRequest, GetInfoResponse,
+    ForkDocumentRequest, ForkDocumentResponse, GetContentRequest, GetContentResponse,
+    GetInfoRequest, GetInfoResponse,
 };
 use crate::mqtt::{encode_json, parse_json, MqttError};
+use crate::replay::CommitReplayer;
+use crate::store::CommitStore;
 use rumqttc::QoS;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Handler for the commands port.
 pub struct CommandsHandler {
     client: Arc<MqttClient>,
     document_store: Arc<DocumentStore>,
+    commit_store: Option<Arc<CommitStore>>,
     workspace: String,
 }
 
@@ -25,11 +32,13 @@ impl CommandsHandler {
     pub fn new(
         client: Arc<MqttClient>,
         document_store: Arc<DocumentStore>,
+        commit_store: Option<Arc<CommitStore>>,
         workspace: String,
     ) -> Self {
         Self {
             client,
             document_store,
+            commit_store,
             workspace,
         }
     }
@@ -56,7 +65,14 @@ impl CommandsHandler {
 
         let response = match ContentType::from_mime(&request.content_type) {
             Some(content_type) => {
-                let uuid = self.document_store.create_document(content_type).await;
+                let uuid = if let Some(ref custom_id) = request.id {
+                    self.document_store
+                        .create_document_with_id(custom_id.clone(), content_type)
+                        .await;
+                    custom_id.clone()
+                } else {
+                    self.document_store.create_document(content_type).await
+                };
                 debug!(
                     "Created document with uuid={} for req={}",
                     uuid, request.req
@@ -169,6 +185,174 @@ impl CommandsHandler {
         };
 
         debug!("Get-info response for req={}", request.req);
+
+        self.publish_response(&response).await
+    }
+
+    /// Handle fork-document command.
+    /// Topic: {workspace}/commands/__system/fork-document
+    pub async fn handle_fork_document(&self, payload: &[u8]) -> Result<(), MqttError> {
+        let request: ForkDocumentRequest = parse_json(payload)?;
+
+        debug!(
+            "Received fork-document command: req={}, source_id={}, at_commit={:?}",
+            request.req, request.source_id, request.at_commit
+        );
+
+        let commit_store = match &self.commit_store {
+            Some(cs) => cs,
+            None => {
+                let response = ForkDocumentResponse {
+                    req: request.req,
+                    id: None,
+                    head: None,
+                    error: Some("Fork requires persistence (--database)".to_string()),
+                };
+                return self.publish_response(&response).await;
+            }
+        };
+
+        // Get source document
+        let source_doc = match self.document_store.get_document(&request.source_id).await {
+            Some(doc) => doc,
+            None => {
+                let response = ForkDocumentResponse {
+                    req: request.req,
+                    id: None,
+                    head: None,
+                    error: Some(format!("Source document '{}' not found", request.source_id)),
+                };
+                return self.publish_response(&response).await;
+            }
+        };
+
+        // Create new document with same content type
+        let new_id = self
+            .document_store
+            .create_document(source_doc.content_type)
+            .await;
+
+        // Get target commit (specified or HEAD)
+        let target_cid = match request.at_commit {
+            Some(cid) => cid,
+            None => match commit_store.get_document_head(&request.source_id).await {
+                Ok(Some(cid)) => cid,
+                Ok(None) => {
+                    let response = ForkDocumentResponse {
+                        req: request.req,
+                        id: None,
+                        head: None,
+                        error: Some(format!("No HEAD commit for source '{}'", request.source_id)),
+                    };
+                    return self.publish_response(&response).await;
+                }
+                Err(e) => {
+                    let response = ForkDocumentResponse {
+                        req: request.req,
+                        id: None,
+                        head: None,
+                        error: Some(format!("Failed to get HEAD: {}", e)),
+                    };
+                    return self.publish_response(&response).await;
+                }
+            },
+        };
+
+        // Replay commits to build state
+        let replayer = CommitReplayer::new(commit_store);
+
+        // Verify commit belongs to source document's history
+        match replayer
+            .verify_commit_in_history(&request.source_id, &target_cid)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                let response = ForkDocumentResponse {
+                    req: request.req,
+                    id: None,
+                    head: None,
+                    error: Some(format!(
+                        "Commit {} not in history of {}",
+                        target_cid, request.source_id
+                    )),
+                };
+                return self.publish_response(&response).await;
+            }
+        }
+
+        let (_content, state_bytes) = match replayer
+            .get_content_and_state_at_commit(
+                &request.source_id,
+                &target_cid,
+                &source_doc.content_type,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                let response = ForkDocumentResponse {
+                    req: request.req,
+                    id: None,
+                    head: None,
+                    error: Some(format!("Failed to replay state: {}", e)),
+                };
+                return self.publish_response(&response).await;
+            }
+        };
+
+        // Apply replayed state to new document
+        if let Err(e) = self
+            .document_store
+            .apply_yjs_update(&new_id, &state_bytes)
+            .await
+        {
+            let response = ForkDocumentResponse {
+                req: request.req,
+                id: None,
+                head: None,
+                error: Some(format!("Failed to apply state: {:?}", e)),
+            };
+            return self.publish_response(&response).await;
+        }
+
+        // Create root commit for forked document
+        let update_b64 = b64::encode(&state_bytes);
+        let commit = Commit::new(
+            vec![],
+            update_b64,
+            "fork".to_string(),
+            Some(format!(
+                "Forked from {} at {}",
+                request.source_id, target_cid
+            )),
+        );
+
+        let response = match commit_store
+            .store_commit_and_set_head(&new_id, &commit)
+            .await
+        {
+            Ok((new_cid, _timestamp)) => {
+                info!(
+                    "Forked document {} -> {} (at commit {})",
+                    request.source_id,
+                    new_id,
+                    &target_cid[..8.min(target_cid.len())]
+                );
+                ForkDocumentResponse {
+                    req: request.req,
+                    id: Some(new_id),
+                    head: Some(new_cid),
+                    error: None,
+                }
+            }
+            Err(e) => ForkDocumentResponse {
+                req: request.req,
+                id: None,
+                head: None,
+                error: Some(format!("Failed to store commit: {}", e)),
+            },
+        };
 
         self.publish_response(&response).await
     }

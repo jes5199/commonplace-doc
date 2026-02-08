@@ -237,9 +237,9 @@ pub use transport::urls::{
 // --- From root-level modules ---
 pub use dir_sync::{
     apply_explicit_deletions, apply_schema_update_to_state, check_server_has_content,
-    decode_schema_from_mqtt_payload, ensure_fs_root_exists, handle_schema_change,
-    handle_schema_change_with_dedup, handle_schema_modified, push_nested_schemas, sync_schema,
-    SchemaUpdateResult,
+    check_server_has_content_mqtt, decode_schema_from_mqtt_payload, ensure_fs_root_exists,
+    ensure_fs_root_exists_mqtt, handle_schema_change, handle_schema_change_with_dedup,
+    handle_schema_modified, push_nested_schemas, sync_schema, SchemaUpdateResult,
 };
 pub use error::{SyncError, SyncResult};
 pub use file_sync::{

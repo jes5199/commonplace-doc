@@ -8,7 +8,10 @@
 //! sync client (CP-8j6c).
 
 use crate::mqtt::client::MqttClient;
-use crate::mqtt::messages::{GetContentRequest, GetContentResponse};
+use crate::mqtt::messages::{
+    CreateDocumentRequest, CreateDocumentResponse, ForkDocumentRequest, ForkDocumentResponse,
+    GetContentRequest, GetContentResponse, GetInfoRequest, GetInfoResponse,
+};
 use crate::mqtt::MqttError;
 use rumqttc::QoS;
 use std::collections::HashMap;
@@ -159,6 +162,181 @@ impl MqttRequestClient {
                     id
                 )))
             }
+        }
+    }
+
+    /// Get document info/metadata by ID.
+    ///
+    /// Publishes a `GetInfoRequest` to `{workspace}/commands/__system/get-info`
+    /// and waits for the matching `GetInfoResponse`.
+    pub async fn get_info(&self, id: &str) -> Result<GetInfoResponse, MqttError> {
+        let req_id = uuid::Uuid::new_v4().to_string();
+
+        let request = GetInfoRequest {
+            req: req_id.clone(),
+            id: id.to_string(),
+        };
+
+        let payload =
+            serde_json::to_vec(&request).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+
+        let rx = self.register_pending_request(req_id.clone()).await;
+
+        let topic = format!("{}/commands/__system/get-info", self.workspace);
+        self.client
+            .publish(&topic, &payload, QoS::AtLeastOnce)
+            .await?;
+
+        match tokio::time::timeout(self.timeout, rx).await {
+            Ok(Ok(response_bytes)) => serde_json::from_slice(&response_bytes)
+                .map_err(|e| MqttError::InvalidMessage(e.to_string())),
+            Ok(Err(_)) => Err(MqttError::InvalidMessage(
+                "Response channel closed unexpectedly".to_string(),
+            )),
+            Err(_) => {
+                self.remove_pending_request(&req_id).await;
+                Err(MqttError::Connection(format!(
+                    "Timeout waiting for get-info response for {}",
+                    id
+                )))
+            }
+        }
+    }
+
+    /// Create a new document.
+    ///
+    /// Publishes a `CreateDocumentRequest` to `{workspace}/commands/__system/create-document`
+    /// and waits for the matching `CreateDocumentResponse`.
+    ///
+    /// If `id` is `Some`, the document will be created with the specified ID.
+    /// Otherwise, a random UUID will be generated.
+    pub async fn create_document(
+        &self,
+        content_type: &str,
+        id: Option<&str>,
+    ) -> Result<CreateDocumentResponse, MqttError> {
+        let req_id = uuid::Uuid::new_v4().to_string();
+
+        let request = CreateDocumentRequest {
+            req: req_id.clone(),
+            content_type: content_type.to_string(),
+            id: id.map(|s| s.to_string()),
+        };
+
+        let payload =
+            serde_json::to_vec(&request).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+
+        let rx = self.register_pending_request(req_id.clone()).await;
+
+        let topic = format!("{}/commands/__system/create-document", self.workspace);
+        self.client
+            .publish(&topic, &payload, QoS::AtLeastOnce)
+            .await?;
+
+        match tokio::time::timeout(self.timeout, rx).await {
+            Ok(Ok(response_bytes)) => serde_json::from_slice(&response_bytes)
+                .map_err(|e| MqttError::InvalidMessage(e.to_string())),
+            Ok(Err(_)) => Err(MqttError::InvalidMessage(
+                "Response channel closed unexpectedly".to_string(),
+            )),
+            Err(_) => {
+                self.remove_pending_request(&req_id).await;
+                Err(MqttError::Connection(
+                    "Timeout waiting for create-document response".to_string(),
+                ))
+            }
+        }
+    }
+
+    /// Fork a document, optionally at a specific commit.
+    ///
+    /// Publishes a `ForkDocumentRequest` to `{workspace}/commands/__system/fork-document`
+    /// and waits for the matching `ForkDocumentResponse`.
+    pub async fn fork_document(
+        &self,
+        source_id: &str,
+        at_commit: Option<&str>,
+    ) -> Result<ForkDocumentResponse, MqttError> {
+        let req_id = uuid::Uuid::new_v4().to_string();
+
+        let request = ForkDocumentRequest {
+            req: req_id.clone(),
+            source_id: source_id.to_string(),
+            at_commit: at_commit.map(|s| s.to_string()),
+        };
+
+        let payload =
+            serde_json::to_vec(&request).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+
+        let rx = self.register_pending_request(req_id.clone()).await;
+
+        let topic = format!("{}/commands/__system/fork-document", self.workspace);
+        self.client
+            .publish(&topic, &payload, QoS::AtLeastOnce)
+            .await?;
+
+        match tokio::time::timeout(self.timeout, rx).await {
+            Ok(Ok(response_bytes)) => serde_json::from_slice(&response_bytes)
+                .map_err(|e| MqttError::InvalidMessage(e.to_string())),
+            Ok(Err(_)) => Err(MqttError::InvalidMessage(
+                "Response channel closed unexpectedly".to_string(),
+            )),
+            Err(_) => {
+                self.remove_pending_request(&req_id).await;
+                Err(MqttError::Connection(format!(
+                    "Timeout waiting for fork-document response for {}",
+                    source_id
+                )))
+            }
+        }
+    }
+
+    /// Discover the fs-root document ID via MQTT retained message.
+    ///
+    /// Subscribes to `{workspace}/_system/fs-root` and reads the retained message
+    /// published by the server at startup. This is the MQTT equivalent of the
+    /// HTTP `GET /fs-root` endpoint.
+    pub async fn discover_fs_root(&self) -> Result<String, MqttError> {
+        let topic = format!("{}/_system/fs-root", self.workspace);
+
+        // Create receiver BEFORE subscribing so we catch the retained message
+        let mut rx = self.client.subscribe_messages();
+        self.client.subscribe(&topic, QoS::AtLeastOnce).await?;
+
+        // Wait for the retained message
+        let result = tokio::time::timeout(self.timeout, async {
+            loop {
+                match rx.recv().await {
+                    Ok(msg) if msg.topic == topic => {
+                        let id = String::from_utf8_lossy(&msg.payload).to_string();
+                        if id.is_empty() {
+                            return Err(MqttError::InvalidMessage(
+                                "Empty fs-root retained message".to_string(),
+                            ));
+                        }
+                        return Ok(id);
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => {
+                        return Err(MqttError::InvalidMessage(
+                            "Message channel closed".to_string(),
+                        ))
+                    }
+                }
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(id)) => {
+                debug!("Discovered fs-root via MQTT: {}", id);
+                Ok(id)
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(MqttError::Connection(
+                "Timeout waiting for fs-root retained message (server may not have --fs-root configured)".to_string(),
+            )),
         }
     }
 

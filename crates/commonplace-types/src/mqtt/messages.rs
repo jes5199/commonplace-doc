@@ -418,6 +418,9 @@ pub struct CreateDocumentRequest {
     pub req: String,
     /// MIME content type (e.g., "text/plain", "application/json")
     pub content_type: String,
+    /// Optional document ID (if not specified, a UUID will be generated)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 /// Response with created document UUID.
@@ -546,6 +549,34 @@ pub struct ReplaceContentResponse {
     /// Summary of changes (present on success)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<ReplaceSummary>,
+    /// Error message (present on failure)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Request to fork a document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkDocumentRequest {
+    /// Request ID for correlation
+    pub req: String,
+    /// Source document ID to fork from
+    pub source_id: String,
+    /// Optional commit ID to fork at (defaults to HEAD)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_commit: Option<String>,
+}
+
+/// Response to fork document request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkDocumentResponse {
+    /// Request ID for correlation
+    pub req: String,
+    /// New document ID (present on success)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// HEAD commit of new document (present on success)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
     /// Error message (present on failure)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -874,6 +905,7 @@ mod tests {
         let req = CreateDocumentRequest {
             req: "r-001".to_string(),
             content_type: "text/plain".to_string(),
+            id: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();

@@ -27,8 +27,8 @@ use thiserror::Error;
 pub use client::{IncomingMessage, MqttClient};
 pub use messages::{
     CommandMessage, CreateDocumentRequest, CreateDocumentResponse, DeleteDocumentRequest,
-    DeleteDocumentResponse, EditMessage, EventMessage, GetContentRequest, GetContentResponse,
-    GetInfoRequest, GetInfoResponse, SyncMessage,
+    DeleteDocumentResponse, EditMessage, EventMessage, ForkDocumentRequest, ForkDocumentResponse,
+    GetContentRequest, GetContentResponse, GetInfoRequest, GetInfoResponse, SyncMessage,
 };
 pub use request::MqttRequestClient;
 pub use topics::{Port, Topic};
@@ -148,6 +148,7 @@ impl MqttService {
         let commands_handler = commands::CommandsHandler::new(
             client.clone(),
             document_store.clone(),
+            commit_store.clone(),
             workspace.clone(),
         );
 
@@ -187,6 +188,12 @@ impl MqttService {
         format!("{}/commands/__system/get-info", self.workspace)
     }
 
+    /// Get the store commands topic for fork-document.
+    /// Uses `__system` prefix to avoid conflicts with document paths.
+    fn fork_document_topic(&self) -> String {
+        format!("{}/commands/__system/fork-document", self.workspace)
+    }
+
     /// Subscribe to store-level commands.
     /// This subscribes to document management command topics.
     pub async fn subscribe_store_commands(&self) -> Result<(), MqttError> {
@@ -213,6 +220,15 @@ impl MqttService {
             .subscribe(&get_info_topic, QoS::AtLeastOnce)
             .await?;
         tracing::debug!("Subscribed to get-info commands: {}", get_info_topic);
+
+        let fork_document_topic = self.fork_document_topic();
+        self.client
+            .subscribe(&fork_document_topic, QoS::AtLeastOnce)
+            .await?;
+        tracing::debug!(
+            "Subscribed to fork-document commands: {}",
+            fork_document_topic
+        );
 
         Ok(())
     }
@@ -385,6 +401,9 @@ impl MqttService {
         }
         if topic_str == self.get_info_topic() {
             return self.commands_handler.handle_get_info(payload).await;
+        }
+        if topic_str == self.fork_document_topic() {
+            return self.commands_handler.handle_fork_document(payload).await;
         }
 
         // Parse the topic

@@ -6,6 +6,7 @@
 
 use clap::Parser;
 use commonplace_doc::events::recv_broadcast;
+use commonplace_doc::mqtt::MqttRequestClient;
 use commonplace_doc::mqtt::{MqttClient, MqttConfig, Topic};
 use commonplace_doc::store::CommitStore;
 use commonplace_doc::sync::crdt_state::DirectorySyncState;
@@ -18,9 +19,9 @@ use commonplace_doc::sync::subdir_spawn::{
 use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
     acquire_sync_lock, build_head_url, build_info_url, build_uuid_map_from_local_schemas,
-    check_server_has_content, create_new_file, detect_from_path, directory_mqtt_task,
-    directory_watcher_task, discover_fs_root, ensure_fs_root_exists,
-    ensure_parent_directories_exist, find_owning_document, fork_node, handle_file_deleted,
+    check_server_has_content_mqtt, create_new_file, detect_from_path, directory_mqtt_task,
+    directory_watcher_task, discover_fs_root, ensure_fs_root_exists_mqtt,
+    ensure_parent_directories_exist, find_owning_document, handle_file_deleted,
     handle_file_modified, handle_schema_change, handle_schema_modified, push_local_if_differs,
     push_schema_to_server, remove_file_from_schema, resync_crdt_state_via_cyan_with_pending,
     schema_to_json, spawn_command_listener, spawn_file_sync_tasks_crdt, sync_schema,
@@ -1486,19 +1487,55 @@ async fn main() -> ExitCode {
             }
         }
     } else if let Some(ref source) = args.fork_from {
-        // Fork from another node
-        info!("Forking from node {}...", source);
-        match fork_node(&client, &args.server, source, args.at_commit.as_deref()).await {
-            Ok(id) => id,
+        // Fork from another node via MQTT
+        info!("Forking from node {} via MQTT...", source);
+        let mqtt_request =
+            match MqttRequestClient::new(mqtt_client.clone(), args.workspace.clone()).await {
+                Ok(req) => req,
+                Err(e) => {
+                    error!("Failed to create MQTT request client: {}", e);
+                    return ExitCode::from(1);
+                }
+            };
+        match mqtt_request
+            .fork_document(source, args.at_commit.as_deref())
+            .await
+        {
+            Ok(resp) => match resp.id {
+                Some(id) => {
+                    info!(
+                        "Forked node {} -> {} (at commit {})",
+                        source,
+                        id,
+                        resp.head.as_deref().unwrap_or("HEAD")
+                    );
+                    id
+                }
+                None => {
+                    error!(
+                        "Fork failed: {}",
+                        resp.error.unwrap_or_else(|| "unknown error".to_string())
+                    );
+                    return ExitCode::from(1);
+                }
+            },
             Err(e) => {
                 error!("Fork failed: {}", e);
                 return ExitCode::from(1);
             }
         }
     } else if args.use_paths {
-        // No node specified - try to discover fs-root from server
-        info!("Discovering fs-root from server...");
-        match discover_fs_root(&client, &args.server).await {
+        // No node specified - discover fs-root via MQTT retained message
+        info!("Discovering fs-root via MQTT...");
+        let mqtt_request =
+            match MqttRequestClient::new(mqtt_client.clone(), args.workspace.clone()).await {
+                Ok(req) => req,
+                Err(e) => {
+                    error!("Failed to create MQTT request client: {}", e);
+                    return ExitCode::from(1);
+                }
+            };
+        match mqtt_request.discover_fs_root().await {
             Ok(id) => {
                 info!("Discovered fs-root: {}", id);
                 id
@@ -2017,11 +2054,14 @@ async fn run_directory_mode(
     #[cfg(not(unix))]
     let inode_tracker: Option<Arc<RwLock<InodeTracker>>> = None;
 
-    // Verify fs-root document exists (or create it)
-    ensure_fs_root_exists(&client, &server, &fs_root_id).await?;
+    // Verify fs-root document exists (or create it) via MQTT
+    let mqtt_request = MqttRequestClient::new(mqtt_client.clone(), workspace.clone())
+        .await
+        .map_err(|e| format!("Failed to create MQTT request client: {}", e))?;
+    ensure_fs_root_exists_mqtt(&mqtt_request, &fs_root_id).await?;
 
-    // Check if server has existing schema
-    let server_has_content = check_server_has_content(&client, &server, &fs_root_id).await;
+    // Check if server has existing schema via MQTT
+    let server_has_content = check_server_has_content_mqtt(&mqtt_request, &fs_root_id).await;
 
     // Load or create state file for persisting per-file CIDs
     let state_file_path =
@@ -2675,11 +2715,14 @@ async fn run_exec_mode(
     #[cfg(not(unix))]
     let inode_tracker: Option<Arc<RwLock<InodeTracker>>> = None;
 
-    // Verify fs-root document exists (or create it)
-    ensure_fs_root_exists(&client, &server, &fs_root_id).await?;
+    // Verify fs-root document exists (or create it) via MQTT
+    let mqtt_request = MqttRequestClient::new(mqtt_client.clone(), workspace.clone())
+        .await
+        .map_err(|e| format!("Failed to create MQTT request client: {}", e))?;
+    ensure_fs_root_exists_mqtt(&mqtt_request, &fs_root_id).await?;
 
-    // Check if server has existing schema
-    let server_has_content = check_server_has_content(&client, &server, &fs_root_id).await;
+    // Check if server has existing schema via MQTT
+    let server_has_content = check_server_has_content_mqtt(&mqtt_request, &fs_root_id).await;
 
     // Load or create state file for persisting per-file CIDs (sandbox mode)
     let state_file_path =
