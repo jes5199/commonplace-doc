@@ -5,21 +5,12 @@
 use crate::sync::SyncState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
-/// Tracks the content we've written to schema files, for echo detection.
-///
-/// When the sync client writes a `.commonplace.json` file (e.g., after receiving
-/// an update from the server), it records the content here. When the watcher
-/// detects a schema file change, it compares against this map to distinguish
-/// our writes from user edits.
-///
-/// Key: Canonical path to the `.commonplace.json` file
-/// Value: Content we last wrote (as normalized JSON string)
-pub type WrittenSchemas = Arc<RwLock<HashMap<PathBuf, String>>>;
+/// Re-export WrittenSchemas from commonplace-watcher crate.
+pub use commonplace_watcher::WrittenSchemas;
 
 /// Shared state file for directory sync mode.
 ///

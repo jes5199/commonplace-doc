@@ -3,10 +3,22 @@
 //! This crate provides file/directory watchers, file locking,
 //! inode tracking, and sync state management.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
 #[cfg(unix)]
 pub mod flock;
 pub mod flock_state;
 pub mod state;
+pub mod watcher;
+
+/// Tracks schema files written by sync, for detecting user edits vs our writes.
+///
+/// Key: Canonical path to the `.commonplace.json` file
+/// Value: Content we last wrote (as normalized JSON string)
+pub type WrittenSchemas = Arc<RwLock<HashMap<PathBuf, String>>>;
 
 // Re-exports
 #[cfg(unix)]

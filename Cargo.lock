@@ -382,6 +382,7 @@ dependencies = [
  "clap",
  "commonplace-crdt",
  "commonplace-types",
+ "commonplace-watcher",
  "fs2",
  "futures",
  "futures-util",
@@ -425,6 +426,21 @@ dependencies = [
  "thiserror 1.0.69",
  "uuid",
  "yrs",
+]
+
+[[package]]
+name = "commonplace-watcher"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "commonplace-types",
+ "libc",
+ "notify",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
