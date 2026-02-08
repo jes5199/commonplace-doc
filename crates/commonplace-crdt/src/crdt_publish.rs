@@ -297,12 +297,13 @@ pub fn get_text_content(state: &CrdtPeerState) -> SyncResult<String> {
 }
 
 /// Get the current text content from a Y.Doc.
+///
+/// Delegates to crdt_merge::get_doc_text_content which handles YText, YArray,
+/// and YMap formats. This is critical for the text fallback path: when a JSON
+/// file's structured update fails, publish_text_change needs to see the actual
+/// YMap content (not empty) to pass precondition checks.
 fn get_doc_text_content(doc: &Doc) -> String {
-    let txn = doc.transact();
-    match txn.get_text("content") {
-        Some(text) => text.get_string(&txn),
-        None => String::new(),
-    }
+    crate::crdt_merge::get_doc_text_content(doc)
 }
 
 /// Compute a minimal text update using the current Y.Doc state as base.
