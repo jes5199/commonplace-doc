@@ -229,14 +229,8 @@ pub enum ScanError {
     Serialization(String),
 }
 
-/// Options for directory scanning.
-#[derive(Debug, Clone, Default)]
-pub struct ScanOptions {
-    /// Include hidden files (starting with '.')
-    pub include_hidden: bool,
-    /// Custom ignore patterns (glob-style)
-    pub ignore_patterns: Vec<String>,
-}
+// Re-export ScanOptions from commonplace-types
+pub use commonplace_types::sync::events::ScanOptions;
 
 /// Result of scanning a file.
 #[derive(Debug, Clone)]

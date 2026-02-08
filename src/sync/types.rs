@@ -101,25 +101,8 @@ pub struct ForkResponse {
     pub head: String,
 }
 
-/// File watcher events
-#[derive(Debug)]
-pub enum FileEvent {
-    /// File was modified. Contains the raw file content captured at notification time.
-    /// Capturing content immediately prevents race conditions where SSE might overwrite
-    /// the file before the upload task reads it.
-    Modified(Vec<u8>),
-}
-
-/// Directory watcher events
-#[derive(Debug)]
-pub enum DirEvent {
-    Created(std::path::PathBuf),
-    Modified(std::path::PathBuf),
-    Deleted(std::path::PathBuf),
-    /// Schema file (.commonplace.json) was modified by user (not by sync client).
-    /// Contains the path to the schema file and the new content.
-    SchemaModified(std::path::PathBuf, String),
-}
+// Re-export event types from commonplace-types
+pub use commonplace_types::sync::events::{DirEvent, FileEvent};
 
 /// Sync state for a single file in directory mode.
 ///
