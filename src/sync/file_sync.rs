@@ -490,12 +490,16 @@ pub async fn upload_task_crdt(
         // Get the old content for diff computation from Y.Doc state.
         // The Y.Doc is always updated before disk writes, so it contains the
         // last-known content for echo suppression.
+        // Must use get_doc_text_content (via to_doc) which handles YText, YArray, AND YMap
+        // formats. get_text_content only handles YText, returning empty for JSON files.
         let old_content = {
             let state_guard = crdt_state.read().await;
             match state_guard.get_file(&filename) {
-                Some(file_state) => {
-                    crate::sync::crdt_publish::get_text_content(file_state).unwrap_or_default()
-                }
+                Some(file_state) => file_state
+                    .to_doc()
+                    .ok()
+                    .map(|doc| get_doc_text_content(&doc))
+                    .unwrap_or_default(),
                 None => String::new(),
             }
         };
@@ -2172,7 +2176,12 @@ pub async fn receive_task_crdt(
 
         // Capture pre-merge Y.Doc content for external edit guard.
         // The Y.Doc content before the merge represents what was last written to disk.
-        let pre_merge_content = crate::sync::crdt_publish::get_text_content(file_state).ok();
+        // Must use get_doc_text_content (via to_doc) which handles YText, YArray, AND YMap
+        // formats. get_text_content only handles YText, returning empty for JSON files.
+        let pre_merge_content = file_state
+            .to_doc()
+            .ok()
+            .map(|doc| get_doc_text_content(&doc));
 
         // Process the received edit
         match process_received_edit(
