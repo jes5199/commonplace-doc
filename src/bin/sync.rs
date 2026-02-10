@@ -845,6 +845,17 @@ async fn handle_file_renamed(
     let owning_doc = find_owning_document(&canonical_directory, fs_root_id, &relative_path);
     let is_subdirectory = owning_doc.document_id != fs_root_id;
 
+    // Compute old relative path within the owning document's directory.
+    // Schema keys use paths relative to the owning document, not basenames.
+    let old_relative_in_owner = if is_subdirectory {
+        match old_path.strip_prefix(&owning_doc.directory) {
+            Ok(rel) => rel.to_string_lossy().to_string().replace('\\', "/"),
+            Err(_) => old_filename.clone(),
+        }
+    } else {
+        old_relative_path.clone()
+    };
+
     // Try atomic rename in schema first (works if old entry still exists).
     // If that fails (old entry already removed by Deleted handler), fall back to
     // adding a new entry with the preserved node_id.
@@ -883,7 +894,7 @@ async fn handle_file_renamed(
                 &crdt.mqtt_client,
                 &crdt.workspace,
                 &mut subdir_state,
-                &old_filename,
+                &old_relative_in_owner,
                 &owning_doc.relative_path,
                 author,
             )
@@ -895,7 +906,7 @@ async fn handle_file_renamed(
                     // Old entry already removed, add new entry with preserved node_id
                     debug!(
                         "Old entry '{}' already removed, adding '{}' with preserved node_id",
-                        old_filename, owning_doc.relative_path
+                        old_relative_in_owner, owning_doc.relative_path
                     );
                     subdir_state
                         .ensure_schema_initialized(&owning_doc.directory)
@@ -945,8 +956,8 @@ async fn handle_file_renamed(
                 &crdt.mqtt_client,
                 &crdt.workspace,
                 &mut state,
-                &old_filename,
-                &new_filename,
+                &old_relative_in_owner,
+                &relative_path,
                 author,
             )
             .await;
@@ -956,7 +967,7 @@ async fn handle_file_renamed(
                 Err(_) => {
                     debug!(
                         "Old entry '{}' already removed, adding '{}' with preserved node_id",
-                        old_filename, new_filename
+                        old_relative_in_owner, relative_path
                     );
                     state.ensure_schema_initialized(directory).await;
                     let doc = match state.schema.to_doc() {
@@ -966,10 +977,10 @@ async fn handle_file_renamed(
                             return;
                         }
                     };
-                    ymap_schema::add_file(&doc, &new_filename, node_id);
+                    ymap_schema::add_file(&doc, &relative_path, node_id);
                     state.schema.update_from_doc(&doc);
                     if let Ok(uuid) = uuid::Uuid::parse_str(node_id) {
-                        state.get_or_create_file(&new_filename, uuid);
+                        state.get_or_create_file(&relative_path, uuid);
                     }
                     true
                 }
@@ -1068,7 +1079,7 @@ async fn handle_file_renamed(
     let file_key = if is_subdirectory {
         owning_doc.relative_path.clone()
     } else {
-        new_filename.clone()
+        relative_path.clone()
     };
 
     let states_snapshot = file_states.read().await;
