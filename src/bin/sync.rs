@@ -868,7 +868,10 @@ async fn handle_file_renamed(
         Err(_) => new_filename.clone(),
     };
 
-    let old_relative_path = match old_path.strip_prefix(directory) {
+    let canonical_old_path = old_path
+        .canonicalize()
+        .unwrap_or_else(|_| old_path.to_path_buf());
+    let old_relative_path = match canonical_old_path.strip_prefix(&canonical_directory) {
         Ok(rel) => rel.to_string_lossy().to_string().replace('\\', "/"),
         Err(_) => old_filename.clone(),
     };

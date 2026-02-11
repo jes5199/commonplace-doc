@@ -167,6 +167,8 @@ pub struct InodeState {
     /// When a file is deleted, the deletion handler stashes the node_id here
     /// so the creation handler can recover it if the delete+create is a rename.
     pub node_id: Option<String>,
+    /// When node_id was stashed (for freshness check in rename detection).
+    pub stashed_at: Option<Instant>,
 }
 
 /// Default idle timeout before GC can remove a shadow link (1 hour).
@@ -174,6 +176,11 @@ pub const SHADOW_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 /// Minimum time a shadow must exist before GC can remove it (5 minutes).
 pub const SHADOW_MIN_LIFETIME: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Maximum age for a stashed node_id to be considered valid for rename detection.
+/// Delete+Create pairs from a rename typically arrive within milliseconds.
+/// After this timeout, the stash is treated as stale (likely inode reuse, not rename).
+pub const RENAME_STASH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Shared tracker for all inodes across the sync client.
 ///
@@ -218,6 +225,7 @@ impl InodeTracker {
                 shadowed_at: None,
                 last_write: Instant::now(),
                 primary_path,
+                stashed_at: node_id.as_ref().map(|_| Instant::now()),
                 node_id,
             },
         );
@@ -225,6 +233,11 @@ impl InodeTracker {
 
     /// Check if an inode is tracked under a different path (rename detection).
     /// Returns Some((old_primary_path, stashed_node_id)) if rename detected.
+    ///
+    /// Stashed node_ids expire after `RENAME_STASH_TIMEOUT` to prevent stale
+    /// inode reuse from being misidentified as a rename. If the stash is expired,
+    /// the entry is treated as having no stashed node_id and the inode state is
+    /// cleaned up on the next mutable access.
     pub fn check_rename(
         &self,
         key: &InodeKey,
@@ -232,7 +245,14 @@ impl InodeTracker {
     ) -> Option<(PathBuf, Option<String>)> {
         if let Some(state) = self.states.get(key) {
             if state.primary_path != new_path {
-                return Some((state.primary_path.clone(), state.node_id.clone()));
+                // Check freshness of stashed node_id
+                let node_id = match (&state.node_id, state.stashed_at) {
+                    (Some(id), Some(stashed_at)) if stashed_at.elapsed() < RENAME_STASH_TIMEOUT => {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                };
+                return Some((state.primary_path.clone(), node_id));
             }
         }
         None
@@ -243,6 +263,7 @@ impl InodeTracker {
         if let Some(state) = self.states.get_mut(key) {
             state.primary_path = new_path;
             state.node_id = None; // Clear stashed node_id after rename completes
+            state.stashed_at = None;
         }
     }
 
@@ -254,6 +275,7 @@ impl InodeTracker {
             .find(|s| s.primary_path == primary_path)
         {
             state.node_id = Some(node_id);
+            state.stashed_at = Some(Instant::now());
         }
     }
 
