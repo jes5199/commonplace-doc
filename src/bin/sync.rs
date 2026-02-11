@@ -18,12 +18,12 @@ use commonplace_doc::sync::subdir_spawn::{
 };
 use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
-    acquire_sync_lock, build_head_url, build_info_url, build_uuid_map_from_local_schemas,
-    check_server_has_content_mqtt, create_new_file, detect_from_path, directory_mqtt_task,
-    directory_watcher_task, discover_fs_root, ensure_fs_root_exists_mqtt,
-    ensure_parent_directories_exist, find_owning_document, handle_file_deleted,
-    handle_file_modified, handle_schema_change, handle_schema_modified, push_local_if_differs,
-    push_schema_to_server, remove_file_from_schema, rename_file_in_schema,
+    acquire_sync_lock, add_file_to_schema, build_head_url, build_info_url,
+    build_uuid_map_from_local_schemas, check_server_has_content_mqtt, create_new_file,
+    detect_from_path, directory_mqtt_task, directory_watcher_task, discover_fs_root,
+    ensure_fs_root_exists_mqtt, ensure_parent_directories_exist, find_owning_document,
+    handle_file_deleted, handle_file_modified, handle_schema_change, handle_schema_modified,
+    push_local_if_differs, push_schema_to_server, remove_file_from_schema, rename_file_in_schema,
     resync_crdt_state_via_cyan_with_pending, schema_to_json, spawn_command_listener,
     spawn_file_sync_tasks_crdt, sync_schema, trace_timeline, wait_for_file_stability,
     write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent, FileSyncState, InodeKey,
@@ -360,19 +360,51 @@ async fn handle_file_created_crdt(
                 let node_id = if let Some(id) = stashed_node_id {
                     Some(id)
                 } else {
-                    // Try reading from schema - old entry may still exist
-                    let old_filename = old_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|s| s.to_string());
-                    if let Some(old_fn) = old_filename {
-                        let state = crdt.crdt_state.read().await;
-                        state
-                            .schema
-                            .to_doc()
-                            .ok()
-                            .and_then(|doc| ymap_schema::get_entry(&doc, &old_fn))
-                            .and_then(|e| e.node_id)
+                    // Try reading from schema - old entry may still exist.
+                    // Use relative path (not basename) and look up in the correct
+                    // schema (root or subdirectory) based on owning document.
+                    let old_rel = old_path
+                        .strip_prefix(&canonical_directory)
+                        .map(|r| r.to_string_lossy().to_string().replace('\\', "/"))
+                        .ok();
+                    if let Some(old_rel) = old_rel {
+                        let old_owning =
+                            find_owning_document(&canonical_directory, fs_root_id, &old_rel);
+                        if old_owning.document_id != fs_root_id {
+                            // Subdirectory-owned file: look up in subdir schema
+                            let subdir_node_id =
+                                uuid::Uuid::parse_str(&old_owning.document_id).ok();
+                            if let Some(subdir_uuid) = subdir_node_id {
+                                if let Ok(subdir_state_arc) = crdt
+                                    .subdir_cache
+                                    .get_or_load(&old_owning.directory, subdir_uuid)
+                                    .await
+                                {
+                                    let subdir_state = subdir_state_arc.read().await;
+                                    subdir_state
+                                        .schema
+                                        .to_doc()
+                                        .ok()
+                                        .and_then(|doc| {
+                                            ymap_schema::get_entry(&doc, &old_owning.relative_path)
+                                        })
+                                        .and_then(|e| e.node_id)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            // Root-owned file: look up in root schema
+                            let state = crdt.crdt_state.read().await;
+                            state
+                                .schema
+                                .to_doc()
+                                .ok()
+                                .and_then(|doc| ymap_schema::get_entry(&doc, &old_rel))
+                                .and_then(|e| e.node_id)
+                        }
                     } else {
                         None
                     }
@@ -904,6 +936,7 @@ async fn handle_file_renamed(
                 Ok(_nid) => true,
                 Err(_) => {
                     // Old entry already removed, add new entry with preserved node_id
+                    // and publish via MQTT so remote peers see the update
                     debug!(
                         "Old entry '{}' already removed, adding '{}' with preserved node_id",
                         old_relative_in_owner, owning_doc.relative_path
@@ -911,20 +944,22 @@ async fn handle_file_renamed(
                     subdir_state
                         .ensure_schema_initialized(&owning_doc.directory)
                         .await;
-                    let doc = match subdir_state.schema.to_doc() {
-                        Ok(d) => d,
+                    match add_file_to_schema(
+                        &crdt.mqtt_client,
+                        &crdt.workspace,
+                        &mut subdir_state,
+                        &owning_doc.relative_path,
+                        node_id,
+                        author,
+                    )
+                    .await
+                    {
+                        Ok(_cid) => true,
                         Err(e) => {
-                            warn!("Failed to load schema doc for rename: {}", e);
-                            return;
+                            warn!("Failed to add file to schema in rename fallback: {}", e);
+                            false
                         }
-                    };
-                    ymap_schema::add_file(&doc, &owning_doc.relative_path, node_id);
-                    subdir_state.schema.update_from_doc(&doc);
-                    // The file state needs a UUID entry
-                    if let Ok(uuid) = uuid::Uuid::parse_str(node_id) {
-                        subdir_state.get_or_create_file(&owning_doc.relative_path, uuid);
                     }
-                    true
                 }
             }
         };
@@ -965,24 +1000,29 @@ async fn handle_file_renamed(
             match rename_result {
                 Ok(_nid) => true,
                 Err(_) => {
+                    // Old entry already removed, add new entry with preserved node_id
+                    // and publish via MQTT so remote peers see the update
                     debug!(
                         "Old entry '{}' already removed, adding '{}' with preserved node_id",
                         old_relative_in_owner, relative_path
                     );
                     state.ensure_schema_initialized(directory).await;
-                    let doc = match state.schema.to_doc() {
-                        Ok(d) => d,
+                    match add_file_to_schema(
+                        &crdt.mqtt_client,
+                        &crdt.workspace,
+                        &mut state,
+                        &relative_path,
+                        node_id,
+                        author,
+                    )
+                    .await
+                    {
+                        Ok(_cid) => true,
                         Err(e) => {
-                            warn!("Failed to load schema doc for rename: {}", e);
-                            return;
+                            warn!("Failed to add file to schema in rename fallback: {}", e);
+                            false
                         }
-                    };
-                    ymap_schema::add_file(&doc, &relative_path, node_id);
-                    state.schema.update_from_doc(&doc);
-                    if let Ok(uuid) = uuid::Uuid::parse_str(node_id) {
-                        state.get_or_create_file(&relative_path, uuid);
                     }
-                    true
                 }
             }
         };
