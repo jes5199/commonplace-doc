@@ -234,10 +234,11 @@ impl InodeTracker {
     /// Check if an inode is tracked under a different path (rename detection).
     /// Returns Some((old_primary_path, stashed_node_id)) if rename detected.
     ///
-    /// Stashed node_ids expire after `RENAME_STASH_TIMEOUT` to prevent stale
-    /// inode reuse from being misidentified as a rename. If the stash is expired,
-    /// the entry is treated as having no stashed node_id and the inode state is
-    /// cleaned up on the next mutable access.
+    /// Rename detection requires two conditions beyond a path mismatch:
+    /// 1. The old primary_path must no longer exist on disk (confirms actual
+    ///    delete+create pair rather than coincidental inode reuse).
+    /// 2. Stashed node_ids expire after `RENAME_STASH_TIMEOUT` to prevent stale
+    ///    inode reuse from being misidentified as a rename.
     pub fn check_rename(
         &self,
         key: &InodeKey,
@@ -245,6 +246,13 @@ impl InodeTracker {
     ) -> Option<(PathBuf, Option<String>)> {
         if let Some(state) = self.states.get(key) {
             if state.primary_path != new_path {
+                // Verify the old path is actually gone — this confirms a real
+                // delete+create pair. If the old file still exists, this is inode
+                // reuse from an unrelated file creation, not a rename.
+                if state.primary_path.exists() {
+                    return None;
+                }
+
                 // Check freshness of stashed node_id
                 let node_id = match (&state.node_id, state.stashed_at) {
                     (Some(id), Some(stashed_at)) if stashed_at.elapsed() < RENAME_STASH_TIMEOUT => {

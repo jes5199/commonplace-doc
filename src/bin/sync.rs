@@ -27,8 +27,8 @@ use commonplace_doc::sync::{
     resync_crdt_state_via_cyan_with_pending, schema_to_json, spawn_command_listener,
     spawn_file_sync_tasks_crdt, sync_schema, trace_timeline, wait_for_file_stability,
     write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent, FileSyncState, InodeKey,
-    InodeTracker, InodeTrackerInit, MqttOnlySyncConfig, ScanOptions, SubdirStateCache, SyncState,
-    TimelineMilestone, SCHEMA_FILENAME,
+    InodeTracker, InodeTrackerInit, MqttOnlySyncConfig, ScanOptions, SubdirStateCache, SyncError,
+    SyncState, TimelineMilestone, SCHEMA_FILENAME,
 };
 use commonplace_doc::workspace::is_process_running;
 use commonplace_doc::{DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
@@ -937,7 +937,7 @@ async fn handle_file_renamed(
 
             match rename_result {
                 Ok(_nid) => true,
-                Err(_) => {
+                Err(SyncError::NotFound(_)) => {
                     // Old entry already removed, add new entry with preserved node_id
                     // and publish via MQTT so remote peers see the update
                     debug!(
@@ -963,6 +963,13 @@ async fn handle_file_renamed(
                             false
                         }
                     }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to rename '{}' -> '{}' in schema: {}",
+                        old_relative_in_owner, owning_doc.relative_path, e
+                    );
+                    false
                 }
             }
         };
@@ -1002,7 +1009,7 @@ async fn handle_file_renamed(
 
             match rename_result {
                 Ok(_nid) => true,
-                Err(_) => {
+                Err(SyncError::NotFound(_)) => {
                     // Old entry already removed, add new entry with preserved node_id
                     // and publish via MQTT so remote peers see the update
                     debug!(
@@ -1026,6 +1033,13 @@ async fn handle_file_renamed(
                             false
                         }
                     }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to rename '{}' -> '{}' in schema: {}",
+                        old_relative_in_owner, relative_path, e
+                    );
+                    false
                 }
             }
         };
