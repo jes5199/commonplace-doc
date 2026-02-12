@@ -276,14 +276,23 @@ impl InodeTracker {
     }
 
     /// Find InodeKey by primary_path and stash a node_id for rename detection.
+    ///
+    /// Prefers the active (non-shadowed) inode entry over shadowed historical
+    /// entries, since the Created event will look up the stash by the live
+    /// inode key.
     pub fn stash_node_id_by_path(&mut self, primary_path: &std::path::Path, node_id: String) {
-        if let Some(state) = self
+        // Find the best matching key: prefer non-shadowed (active) entries
+        let key = self
             .states
-            .values_mut()
-            .find(|s| s.primary_path == primary_path)
-        {
-            state.node_id = Some(node_id);
-            state.stashed_at = Some(Instant::now());
+            .iter()
+            .filter(|(_, s)| s.primary_path == primary_path)
+            .min_by_key(|(_, s)| s.shadow_path.is_some()) // false < true, so non-shadowed wins
+            .map(|(k, _)| *k);
+        if let Some(key) = key {
+            if let Some(state) = self.states.get_mut(&key) {
+                state.node_id = Some(node_id);
+                state.stashed_at = Some(Instant::now());
+            }
         }
     }
 

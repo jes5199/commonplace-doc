@@ -415,7 +415,7 @@ async fn handle_file_created_crdt(
                         "Detected rename to {} (preserving node_id: {})",
                         filename, node_id
                     );
-                    handle_file_renamed(
+                    let rename_ok = handle_file_renamed(
                         path,
                         &old_path,
                         &node_id,
@@ -431,7 +431,14 @@ async fn handle_file_created_crdt(
                         written_schemas,
                     )
                     .await;
-                    return;
+                    if rename_ok {
+                        return;
+                    }
+                    // Rename failed — fall through to normal file creation
+                    warn!(
+                        "Rename handling failed for {}, falling back to create",
+                        filename
+                    );
                 }
             }
         }
@@ -834,7 +841,7 @@ async fn handle_file_renamed(
     client: &Client,
     server: &str,
     _written_schemas: Option<&WrittenSchemas>,
-) {
+) -> bool {
     let new_filename = match new_path.file_name().and_then(|n| n.to_str()) {
         Some(n) => n.to_string(),
         None => {
@@ -842,7 +849,7 @@ async fn handle_file_renamed(
                 "Could not get filename from new path: {}",
                 new_path.display()
             );
-            return;
+            return false;
         }
     };
     let old_filename = match old_path.file_name().and_then(|n| n.to_str()) {
@@ -852,7 +859,7 @@ async fn handle_file_renamed(
                 "Could not get filename from old path: {}",
                 old_path.display()
             );
-            return;
+            return false;
         }
     };
 
@@ -902,7 +909,7 @@ async fn handle_file_renamed(
                     "Invalid subdirectory node_id '{}': {}",
                     owning_doc.document_id, e
                 );
-                return;
+                return false;
             }
         };
 
@@ -918,7 +925,7 @@ async fn handle_file_renamed(
                     owning_doc.directory.display(),
                     e
                 );
-                return;
+                return false;
             }
         };
 
@@ -1065,7 +1072,7 @@ async fn handle_file_renamed(
             "Failed to update schema for rename: {} -> {}",
             old_filename, new_filename
         );
-        return;
+        return false;
     }
 
     // Update InodeTracker primary_path
@@ -1095,7 +1102,7 @@ async fn handle_file_renamed(
         Ok(c) => c,
         Err(e) => {
             warn!("Failed to read renamed file {}: {}", new_path.display(), e);
-            return;
+            return false;
         }
     };
 
@@ -1104,7 +1111,7 @@ async fn handle_file_renamed(
         Ok(u) => u,
         Err(e) => {
             warn!("Invalid node_id UUID '{}': {}", node_id, e);
-            return;
+            return false;
         }
     };
 
@@ -1115,7 +1122,7 @@ async fn handle_file_renamed(
             Ok(id) => id,
             Err(e) => {
                 warn!("Invalid subdir node_id for spawning tasks: {}", e);
-                return;
+                return false;
             }
         };
         match crdt
@@ -1126,7 +1133,7 @@ async fn handle_file_renamed(
             Ok(s) => s,
             Err(e) => {
                 warn!("Failed to load subdir state for spawning tasks: {}", e);
-                return;
+                return false;
             }
         }
     } else {
@@ -1180,6 +1187,7 @@ async fn handle_file_renamed(
         "Rename complete: {} -> {} (node_id: {})",
         old_filename, new_filename, node_id
     );
+    true
 }
 
 /// Handle file deletion via CRDT/MQTT path.
