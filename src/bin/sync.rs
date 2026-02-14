@@ -355,91 +355,105 @@ async fn handle_file_created_crdt(
                 tracker_guard.check_rename(&inode_key, &canonical_path)
             };
             if let Some((old_path, stashed_node_id)) = rename_info {
-                // Rename detected! Get node_id from stash (if Deleted ran first)
-                // or from schema (if Created ran first, schema still has old entry)
-                let node_id = if let Some(id) = stashed_node_id {
-                    Some(id)
+                // Only handle same-directory renames. Cross-directory moves
+                // need special handling (commonplace-mv) because the destination
+                // directory may not be node-backed yet.
+                if old_path.parent() != canonical_path.parent() {
+                    info!(
+                        "Cross-directory move detected ({} -> {}), treating as new file",
+                        old_path.display(),
+                        canonical_path.display()
+                    );
                 } else {
-                    // Try reading from schema - old entry may still exist.
-                    // Use relative path (not basename) and look up in the correct
-                    // schema (root or subdirectory) based on owning document.
-                    let old_rel = old_path
-                        .strip_prefix(&canonical_directory)
-                        .map(|r| r.to_string_lossy().to_string().replace('\\', "/"))
-                        .ok();
-                    if let Some(old_rel) = old_rel {
-                        let old_owning =
-                            find_owning_document(&canonical_directory, fs_root_id, &old_rel);
-                        if old_owning.document_id != fs_root_id {
-                            // Subdirectory-owned file: look up in subdir schema
-                            let subdir_node_id =
-                                uuid::Uuid::parse_str(&old_owning.document_id).ok();
-                            if let Some(subdir_uuid) = subdir_node_id {
-                                if let Ok(subdir_state_arc) = crdt
-                                    .subdir_cache
-                                    .get_or_load(&old_owning.directory, subdir_uuid)
-                                    .await
-                                {
-                                    let subdir_state = subdir_state_arc.read().await;
-                                    subdir_state
-                                        .schema
-                                        .to_doc()
-                                        .ok()
-                                        .and_then(|doc| {
-                                            ymap_schema::get_entry(&doc, &old_owning.relative_path)
-                                        })
-                                        .and_then(|e| e.node_id)
+                    // Rename detected! Get node_id from stash (if Deleted ran first)
+                    // or from schema (if Created ran first, schema still has old entry)
+                    let node_id = if let Some(id) = stashed_node_id {
+                        Some(id)
+                    } else {
+                        // Try reading from schema - old entry may still exist.
+                        // Use relative path (not basename) and look up in the correct
+                        // schema (root or subdirectory) based on owning document.
+                        let old_rel = old_path
+                            .strip_prefix(&canonical_directory)
+                            .map(|r| r.to_string_lossy().to_string().replace('\\', "/"))
+                            .ok();
+                        if let Some(old_rel) = old_rel {
+                            let old_owning =
+                                find_owning_document(&canonical_directory, fs_root_id, &old_rel);
+                            if old_owning.document_id != fs_root_id {
+                                // Subdirectory-owned file: look up in subdir schema
+                                let subdir_node_id =
+                                    uuid::Uuid::parse_str(&old_owning.document_id).ok();
+                                if let Some(subdir_uuid) = subdir_node_id {
+                                    if let Ok(subdir_state_arc) = crdt
+                                        .subdir_cache
+                                        .get_or_load(&old_owning.directory, subdir_uuid)
+                                        .await
+                                    {
+                                        let subdir_state = subdir_state_arc.read().await;
+                                        subdir_state
+                                            .schema
+                                            .to_doc()
+                                            .ok()
+                                            .and_then(|doc| {
+                                                ymap_schema::get_entry(
+                                                    &doc,
+                                                    &old_owning.relative_path,
+                                                )
+                                            })
+                                            .and_then(|e| e.node_id)
+                                    } else {
+                                        None
+                                    }
                                 } else {
                                     None
                                 }
                             } else {
-                                None
+                                // Root-owned file: look up in root schema
+                                let state = crdt.crdt_state.read().await;
+                                state
+                                    .schema
+                                    .to_doc()
+                                    .ok()
+                                    .and_then(|doc| ymap_schema::get_entry(&doc, &old_rel))
+                                    .and_then(|e| e.node_id)
                             }
                         } else {
-                            // Root-owned file: look up in root schema
-                            let state = crdt.crdt_state.read().await;
-                            state
-                                .schema
-                                .to_doc()
-                                .ok()
-                                .and_then(|doc| ymap_schema::get_entry(&doc, &old_rel))
-                                .and_then(|e| e.node_id)
+                            None
                         }
-                    } else {
-                        None
-                    }
-                };
+                    };
 
-                if let Some(node_id) = node_id {
-                    info!(
-                        "Detected rename to {} (preserving node_id: {})",
-                        filename, node_id
-                    );
-                    let rename_ok = handle_file_renamed(
-                        path,
-                        &old_path,
-                        &node_id,
-                        directory,
-                        fs_root_id,
-                        options,
-                        file_states,
-                        author,
-                        crdt,
-                        pull_only,
-                        client,
-                        server,
-                        written_schemas,
-                    )
-                    .await;
-                    if rename_ok {
-                        return;
+                    if let Some(node_id) = node_id {
+                        info!(
+                            "Detected rename to {} (preserving node_id: {})",
+                            filename, node_id
+                        );
+                        let rename_ok = handle_file_renamed(
+                            path,
+                            &old_path,
+                            &node_id,
+                            directory,
+                            fs_root_id,
+                            options,
+                            file_states,
+                            author,
+                            crdt,
+                            pull_only,
+                            client,
+                            server,
+                            written_schemas,
+                        )
+                        .await;
+                        if rename_ok {
+                            return;
+                        }
+                        // Rename failed — fall through to normal file creation
+                        warn!(
+                            "Rename handling failed for {}, falling back to create",
+                            filename
+                        );
                     }
-                    // Rename failed — fall through to normal file creation
-                    warn!(
-                        "Rename handling failed for {}, falling back to create",
-                        filename
-                    );
-                }
+                } // else (same-directory rename)
             }
         }
     }
