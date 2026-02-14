@@ -69,7 +69,7 @@ impl InodeTrackerInit for InodeTracker {
             let primary_path = base_dir.join(relative_path);
 
             // Track this inode
-            self.track(inode_key, cid.clone(), primary_path);
+            self.track(inode_key, cid.clone(), primary_path, None);
         }
     }
 }

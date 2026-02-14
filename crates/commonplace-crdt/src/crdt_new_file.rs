@@ -403,6 +403,199 @@ pub async fn remove_file_from_schema(
     Ok(cid)
 }
 
+/// Rename a file in the schema CRDT and publish the update via MQTT.
+///
+/// This performs an atomic rename in a single Yrs transaction, preserving the
+/// file's node_id. Used for rename detection: when a file is renamed on disk,
+/// we update the schema to reflect the new name without losing the UUID.
+///
+/// Also renames the key in dir_state.files so sync tasks continue tracking it.
+///
+/// Returns the preserved node_id.
+pub async fn rename_file_in_schema(
+    mqtt_client: &Arc<impl MqttPublisher>,
+    workspace: &str,
+    dir_state: &mut DirectorySyncState,
+    old_filename: &str,
+    new_filename: &str,
+    author: &str,
+) -> SyncResult<String> {
+    // Load schema Y.Doc
+    let doc = dir_state.schema.to_doc()?;
+
+    // Migrate from JSON text format if needed
+    if ymap_schema::is_json_text_format(&doc) && !ymap_schema::is_ymap_format(&doc) {
+        match ymap_schema::migrate_from_json_text(&doc) {
+            Ok(true) => {
+                info!("Migrated schema from JSON text to YMap format");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!("Failed to migrate schema: {}", e);
+            }
+        }
+    }
+
+    // Perform atomic rename in schema
+    let node_id = ymap_schema::rename_entry(&doc, old_filename, new_filename).ok_or_else(|| {
+        SyncError::NotFound(format!(
+            "File '{}' not found in schema for rename",
+            old_filename
+        ))
+    })?;
+
+    // Get the update bytes
+    let update_bytes = {
+        let txn = doc.transact();
+        txn.encode_state_as_update_v1(&yrs::StateVector::default())
+    };
+
+    // Create and publish commit
+    let parents = match &dir_state.schema.local_head_cid {
+        Some(cid) => vec![cid.clone()],
+        None => vec![],
+    };
+
+    let update_b64 = STANDARD.encode(&update_bytes);
+    let commit = Commit::new(
+        parents.clone(),
+        update_b64.clone(),
+        author.to_string(),
+        None,
+    );
+    let cid = commit.calculate_cid();
+
+    // Update schema state
+    dir_state.schema.local_head_cid = Some(cid.clone());
+    dir_state.schema.update_from_doc(&doc);
+
+    // Get schema node_id before renaming file state
+    let schema_node_id = dir_state.schema.node_id.to_string();
+
+    // Rename the key in dir_state.files
+    if let Some(file_state) = dir_state.remove_file(old_filename) {
+        dir_state.files.insert(new_filename.to_string(), file_state);
+    }
+
+    // Publish via MQTT
+    let edit_msg = EditMessage {
+        update: update_b64,
+        parents,
+        author: author.to_string(),
+        message: Some(format!("Rename file: {} -> {}", old_filename, new_filename)),
+        timestamp: commit.timestamp,
+        req: None,
+    };
+
+    let topic = edits_topic(workspace, &schema_node_id);
+    let payload = serde_json::to_vec(&edit_msg)?;
+
+    mqtt_client
+        .publish_retained(&topic, &payload)
+        .await
+        .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
+
+    info!(
+        "Published schema commit {} to rename file '{}' -> '{}' (preserved node_id: {}, retained)",
+        cid, old_filename, new_filename, node_id
+    );
+
+    Ok(node_id)
+}
+
+/// Add a file entry to the schema CRDT and publish the update via MQTT.
+///
+/// Used as a fallback in rename handling when the old entry has already been
+/// removed (delete-before-create ordering). This ensures the new entry is
+/// published to remote peers rather than only updated locally.
+///
+/// Returns the commit CID.
+pub async fn add_file_to_schema(
+    mqtt_client: &Arc<impl MqttPublisher>,
+    workspace: &str,
+    dir_state: &mut DirectorySyncState,
+    filename: &str,
+    node_id: &str,
+    author: &str,
+) -> SyncResult<String> {
+    // Load schema Y.Doc
+    let doc = dir_state.schema.to_doc()?;
+
+    // Migrate from JSON text format if needed
+    if ymap_schema::is_json_text_format(&doc) && !ymap_schema::is_ymap_format(&doc) {
+        match ymap_schema::migrate_from_json_text(&doc) {
+            Ok(true) => {
+                info!("Migrated schema from JSON text to YMap format");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!("Failed to migrate schema: {}", e);
+            }
+        }
+    }
+
+    // Add file entry with preserved node_id
+    ymap_schema::add_file(&doc, filename, node_id);
+
+    // Get the update bytes
+    let update_bytes = {
+        let txn = doc.transact();
+        txn.encode_state_as_update_v1(&yrs::StateVector::default())
+    };
+
+    // Create and publish commit
+    let parents = match &dir_state.schema.local_head_cid {
+        Some(cid) => vec![cid.clone()],
+        None => vec![],
+    };
+
+    let update_b64 = STANDARD.encode(&update_bytes);
+    let commit = Commit::new(
+        parents.clone(),
+        update_b64.clone(),
+        author.to_string(),
+        None,
+    );
+    let cid = commit.calculate_cid();
+
+    // Update schema state
+    dir_state.schema.local_head_cid = Some(cid.clone());
+    dir_state.schema.update_from_doc(&doc);
+
+    // Get schema node_id
+    let schema_node_id = dir_state.schema.node_id.to_string();
+
+    // Add file state entry
+    if let Ok(uuid) = uuid::Uuid::parse_str(node_id) {
+        dir_state.get_or_create_file(filename, uuid);
+    }
+
+    // Publish via MQTT
+    let edit_msg = EditMessage {
+        update: update_b64,
+        parents,
+        author: author.to_string(),
+        message: Some(format!("Add file (rename fallback): {}", filename)),
+        timestamp: commit.timestamp,
+        req: None,
+    };
+
+    let topic = edits_topic(workspace, &schema_node_id);
+    let payload = serde_json::to_vec(&edit_msg)?;
+
+    mqtt_client
+        .publish_retained(&topic, &payload)
+        .await
+        .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
+
+    info!(
+        "Published schema commit {} to add file '{}' with node_id {} (rename fallback, retained)",
+        cid, filename, node_id
+    );
+
+    Ok(cid)
+}
+
 /// Publish a full schema via MQTT, replacing the schema Y.Doc contents.
 ///
 /// This is the MQTT equivalent of `push_schema_to_server()`. It:

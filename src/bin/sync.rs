@@ -18,16 +18,17 @@ use commonplace_doc::sync::subdir_spawn::{
 };
 use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
-    acquire_sync_lock, build_head_url, build_info_url, build_uuid_map_from_local_schemas,
-    check_server_has_content_mqtt, create_new_file, detect_from_path, directory_mqtt_task,
-    directory_watcher_task, discover_fs_root, ensure_fs_root_exists_mqtt,
-    ensure_parent_directories_exist, find_owning_document, handle_file_deleted,
-    handle_file_modified, handle_schema_change, handle_schema_modified, push_local_if_differs,
-    push_schema_to_server, remove_file_from_schema, resync_crdt_state_via_cyan_with_pending,
-    schema_to_json, spawn_command_listener, spawn_file_sync_tasks_crdt, sync_schema,
-    trace_timeline, wait_for_file_stability, write_schema_file, ymap_schema, CrdtFileSyncContext,
-    DirEvent, FileSyncState, InodeTracker, InodeTrackerInit, MqttOnlySyncConfig, ScanOptions,
-    SubdirStateCache, SyncState, TimelineMilestone, SCHEMA_FILENAME,
+    acquire_sync_lock, add_file_to_schema, build_head_url, build_info_url,
+    build_uuid_map_from_local_schemas, check_server_has_content_mqtt, create_new_file,
+    detect_from_path, directory_mqtt_task, directory_watcher_task, discover_fs_root,
+    ensure_fs_root_exists_mqtt, ensure_parent_directories_exist, find_owning_document,
+    handle_file_deleted, handle_file_modified, handle_schema_change, handle_schema_modified,
+    push_local_if_differs, push_schema_to_server, remove_file_from_schema, rename_file_in_schema,
+    resync_crdt_state_via_cyan_with_pending, schema_to_json, spawn_command_listener,
+    spawn_file_sync_tasks_crdt, sync_schema, trace_timeline, wait_for_file_stability,
+    write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent, FileSyncState, InodeKey,
+    InodeTracker, InodeTrackerInit, MqttOnlySyncConfig, ScanOptions, SubdirStateCache, SyncError,
+    SyncState, TimelineMilestone, SCHEMA_FILENAME,
 };
 use commonplace_doc::workspace::is_process_running;
 use commonplace_doc::{DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
@@ -341,6 +342,107 @@ async fn handle_file_created_crdt(
             filename.clone()
         }
     };
+
+    // Check for rename via inode tracking (same-directory renames only).
+    // When a file is renamed (mv foo.txt bar.txt), the watcher sees Delete(foo) + Create(bar).
+    // The inode stays the same, so we can detect this by checking if the inode is tracked
+    // under a different path.
+    #[cfg(unix)]
+    if let Some(ref tracker) = crdt.inode_tracker {
+        if let Ok(inode_key) = InodeKey::from_path(&canonical_path) {
+            let rename_info = {
+                let tracker_guard = tracker.read().await;
+                tracker_guard.check_rename(&inode_key, &canonical_path)
+            };
+            if let Some((old_path, stashed_node_id)) = rename_info {
+                // Rename detected! Get node_id from stash (if Deleted ran first)
+                // or from schema (if Created ran first, schema still has old entry)
+                let node_id = if let Some(id) = stashed_node_id {
+                    Some(id)
+                } else {
+                    // Try reading from schema - old entry may still exist.
+                    // Use relative path (not basename) and look up in the correct
+                    // schema (root or subdirectory) based on owning document.
+                    let old_rel = old_path
+                        .strip_prefix(&canonical_directory)
+                        .map(|r| r.to_string_lossy().to_string().replace('\\', "/"))
+                        .ok();
+                    if let Some(old_rel) = old_rel {
+                        let old_owning =
+                            find_owning_document(&canonical_directory, fs_root_id, &old_rel);
+                        if old_owning.document_id != fs_root_id {
+                            // Subdirectory-owned file: look up in subdir schema
+                            let subdir_node_id =
+                                uuid::Uuid::parse_str(&old_owning.document_id).ok();
+                            if let Some(subdir_uuid) = subdir_node_id {
+                                if let Ok(subdir_state_arc) = crdt
+                                    .subdir_cache
+                                    .get_or_load(&old_owning.directory, subdir_uuid)
+                                    .await
+                                {
+                                    let subdir_state = subdir_state_arc.read().await;
+                                    subdir_state
+                                        .schema
+                                        .to_doc()
+                                        .ok()
+                                        .and_then(|doc| {
+                                            ymap_schema::get_entry(&doc, &old_owning.relative_path)
+                                        })
+                                        .and_then(|e| e.node_id)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            // Root-owned file: look up in root schema
+                            let state = crdt.crdt_state.read().await;
+                            state
+                                .schema
+                                .to_doc()
+                                .ok()
+                                .and_then(|doc| ymap_schema::get_entry(&doc, &old_rel))
+                                .and_then(|e| e.node_id)
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(node_id) = node_id {
+                    info!(
+                        "Detected rename to {} (preserving node_id: {})",
+                        filename, node_id
+                    );
+                    let rename_ok = handle_file_renamed(
+                        path,
+                        &old_path,
+                        &node_id,
+                        directory,
+                        fs_root_id,
+                        options,
+                        file_states,
+                        author,
+                        crdt,
+                        pull_only,
+                        client,
+                        server,
+                        written_schemas,
+                    )
+                    .await;
+                    if rename_ok {
+                        return;
+                    }
+                    // Rename failed — fall through to normal file creation
+                    warn!(
+                        "Rename handling failed for {}, falling back to create",
+                        filename
+                    );
+                }
+            }
+        }
+    }
 
     // Ensure parent directories exist as node-backed directories
     // When CRDT context is available, uses local UUID gen + MQTT publish.
@@ -713,6 +815,381 @@ async fn handle_file_created_crdt(
     }
 }
 
+/// Handle the "creation" side of a detected file rename.
+///
+/// When inode tracking detects that a newly-created file has the same inode as
+/// a previously-tracked file at a different path, this is a rename. This function:
+/// 1. Updates the schema to reflect the new filename (preserving node_id)
+/// 2. Updates InodeTracker primary_path
+/// 3. Migrates file_states from old path to new path
+/// 4. Writes updated .commonplace.json
+/// 5. Spawns sync tasks for the file under its new name
+///
+/// Only handles same-directory renames. Cross-directory renames are deferred.
+#[allow(clippy::too_many_arguments)]
+async fn handle_file_renamed(
+    new_path: &std::path::Path,
+    old_path: &std::path::Path,
+    node_id: &str,
+    directory: &std::path::Path,
+    fs_root_id: &str,
+    _options: &ScanOptions,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    author: &str,
+    crdt: &CrdtEventParams,
+    pull_only: bool,
+    client: &Client,
+    server: &str,
+    _written_schemas: Option<&WrittenSchemas>,
+) -> bool {
+    let new_filename = match new_path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            warn!(
+                "Could not get filename from new path: {}",
+                new_path.display()
+            );
+            return false;
+        }
+    };
+    let old_filename = match old_path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            warn!(
+                "Could not get filename from old path: {}",
+                old_path.display()
+            );
+            return false;
+        }
+    };
+
+    let canonical_path = new_path
+        .canonicalize()
+        .unwrap_or_else(|_| new_path.to_path_buf());
+    let canonical_directory = directory
+        .canonicalize()
+        .unwrap_or_else(|_| directory.to_path_buf());
+
+    let relative_path = match canonical_path.strip_prefix(&canonical_directory) {
+        Ok(rel) => rel.to_string_lossy().to_string().replace('\\', "/"),
+        Err(_) => new_filename.clone(),
+    };
+
+    let canonical_old_path = old_path
+        .canonicalize()
+        .unwrap_or_else(|_| old_path.to_path_buf());
+    let old_relative_path = match canonical_old_path.strip_prefix(&canonical_directory) {
+        Ok(rel) => rel.to_string_lossy().to_string().replace('\\', "/"),
+        Err(_) => old_filename.clone(),
+    };
+
+    // Find which document owns this file
+    let owning_doc = find_owning_document(&canonical_directory, fs_root_id, &relative_path);
+    let is_subdirectory = owning_doc.document_id != fs_root_id;
+
+    // Compute old relative path within the owning document's directory.
+    // Schema keys use paths relative to the owning document, not basenames.
+    let old_relative_in_owner = if is_subdirectory {
+        match old_path.strip_prefix(&owning_doc.directory) {
+            Ok(rel) => rel.to_string_lossy().to_string().replace('\\', "/"),
+            Err(_) => old_filename.clone(),
+        }
+    } else {
+        old_relative_path.clone()
+    };
+
+    // Try atomic rename in schema first (works if old entry still exists).
+    // If that fails (old entry already removed by Deleted handler), fall back to
+    // adding a new entry with the preserved node_id.
+    let schema_updated = if is_subdirectory {
+        let subdir_node_id = match uuid::Uuid::parse_str(&owning_doc.document_id) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(
+                    "Invalid subdirectory node_id '{}': {}",
+                    owning_doc.document_id, e
+                );
+                return false;
+            }
+        };
+
+        let subdir_state_arc = match crdt
+            .subdir_cache
+            .get_or_load(&owning_doc.directory, subdir_node_id)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "Failed to load state for subdirectory {}: {}",
+                    owning_doc.directory.display(),
+                    e
+                );
+                return false;
+            }
+        };
+
+        let result = {
+            let mut subdir_state = subdir_state_arc.write().await;
+            // Try rename first
+            let rename_result = rename_file_in_schema(
+                &crdt.mqtt_client,
+                &crdt.workspace,
+                &mut subdir_state,
+                &old_relative_in_owner,
+                &owning_doc.relative_path,
+                author,
+            )
+            .await;
+
+            match rename_result {
+                Ok(_nid) => true,
+                Err(SyncError::NotFound(_)) => {
+                    // Old entry already removed, add new entry with preserved node_id
+                    // and publish via MQTT so remote peers see the update
+                    debug!(
+                        "Old entry '{}' already removed, adding '{}' with preserved node_id",
+                        old_relative_in_owner, owning_doc.relative_path
+                    );
+                    subdir_state
+                        .ensure_schema_initialized(&owning_doc.directory)
+                        .await;
+                    match add_file_to_schema(
+                        &crdt.mqtt_client,
+                        &crdt.workspace,
+                        &mut subdir_state,
+                        &owning_doc.relative_path,
+                        node_id,
+                        author,
+                    )
+                    .await
+                    {
+                        Ok(_cid) => true,
+                        Err(e) => {
+                            warn!("Failed to add file to schema in rename fallback: {}", e);
+                            false
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to rename '{}' -> '{}' in schema: {}",
+                        old_relative_in_owner, owning_doc.relative_path, e
+                    );
+                    false
+                }
+            }
+        };
+
+        // Save state and write .commonplace.json
+        if result {
+            let subdir_state = subdir_state_arc.read().await;
+            if let Err(e) = subdir_state.save(&owning_doc.directory).await {
+                warn!("Failed to save subdirectory state after rename: {}", e);
+            }
+            if let Ok(doc) = subdir_state.schema.to_doc() {
+                let fs_schema = ymap_schema::to_fs_schema(&doc);
+                if let Ok(schema_json) = schema_to_json(&fs_schema) {
+                    if let Err(e) =
+                        write_schema_file(&owning_doc.directory, &schema_json, None).await
+                    {
+                        warn!("Failed to write schema after rename: {}", e);
+                    }
+                }
+            }
+        }
+
+        result
+    } else {
+        // Root directory
+        let result = {
+            let mut state = crdt.crdt_state.write().await;
+            let rename_result = rename_file_in_schema(
+                &crdt.mqtt_client,
+                &crdt.workspace,
+                &mut state,
+                &old_relative_in_owner,
+                &relative_path,
+                author,
+            )
+            .await;
+
+            match rename_result {
+                Ok(_nid) => true,
+                Err(SyncError::NotFound(_)) => {
+                    // Old entry already removed, add new entry with preserved node_id
+                    // and publish via MQTT so remote peers see the update
+                    debug!(
+                        "Old entry '{}' already removed, adding '{}' with preserved node_id",
+                        old_relative_in_owner, relative_path
+                    );
+                    state.ensure_schema_initialized(directory).await;
+                    match add_file_to_schema(
+                        &crdt.mqtt_client,
+                        &crdt.workspace,
+                        &mut state,
+                        &relative_path,
+                        node_id,
+                        author,
+                    )
+                    .await
+                    {
+                        Ok(_cid) => true,
+                        Err(e) => {
+                            warn!("Failed to add file to schema in rename fallback: {}", e);
+                            false
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to rename '{}' -> '{}' in schema: {}",
+                        old_relative_in_owner, relative_path, e
+                    );
+                    false
+                }
+            }
+        };
+
+        // Write .commonplace.json for root directory
+        if result {
+            let state = crdt.crdt_state.read().await;
+            if let Ok(doc) = state.schema.to_doc() {
+                let fs_schema = ymap_schema::to_fs_schema(&doc);
+                if let Ok(schema_json) = schema_to_json(&fs_schema) {
+                    if let Err(e) = write_schema_file(directory, &schema_json, None).await {
+                        warn!("Failed to write schema after rename: {}", e);
+                    }
+                }
+            }
+        }
+
+        result
+    };
+
+    if !schema_updated {
+        warn!(
+            "Failed to update schema for rename: {} -> {}",
+            old_filename, new_filename
+        );
+        return false;
+    }
+
+    // Update InodeTracker primary_path
+    #[cfg(unix)]
+    if let Some(ref tracker) = crdt.inode_tracker {
+        if let Ok(inode_key) = InodeKey::from_path(&canonical_path) {
+            let mut t = tracker.write().await;
+            t.update_primary_path(&inode_key, canonical_path.clone());
+        }
+    }
+
+    // Migrate file_states: remove old entry, keep task handles for abort
+    let old_entry = {
+        let mut states = file_states.write().await;
+        states.remove(&old_relative_path)
+    };
+
+    // Abort old sync tasks (they reference the old filename)
+    if let Some(old_state) = &old_entry {
+        for handle in &old_state.task_handles {
+            handle.abort();
+        }
+    }
+
+    // Read file content for the new entry
+    let content = match tokio::fs::read_to_string(new_path).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to read renamed file {}: {}", new_path.display(), e);
+            return false;
+        }
+    };
+
+    // Parse the preserved node_id as UUID for spawning tasks
+    let file_uuid = match uuid::Uuid::parse_str(node_id) {
+        Ok(u) => u,
+        Err(e) => {
+            warn!("Invalid node_id UUID '{}': {}", node_id, e);
+            return false;
+        }
+    };
+
+    // Spawn new sync tasks for the renamed file
+    let file_path = new_path.to_path_buf();
+    let dir_state_arc = if is_subdirectory {
+        let subdir_node_id = match uuid::Uuid::parse_str(&owning_doc.document_id) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!("Invalid subdir node_id for spawning tasks: {}", e);
+                return false;
+            }
+        };
+        match crdt
+            .subdir_cache
+            .get_or_load(&owning_doc.directory, subdir_node_id)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to load subdir state for spawning tasks: {}", e);
+                return false;
+            }
+        }
+    } else {
+        crdt.crdt_state.clone()
+    };
+
+    let file_key = if is_subdirectory {
+        owning_doc.relative_path.clone()
+    } else {
+        relative_path.clone()
+    };
+
+    let states_snapshot = file_states.read().await;
+    let handles = spawn_file_sync_tasks_crdt(
+        crdt.mqtt_client.clone(),
+        client.clone(),
+        server.to_string(),
+        crdt.workspace.clone(),
+        file_uuid,
+        file_path,
+        dir_state_arc,
+        file_key.clone(),
+        pull_only,
+        author.to_string(),
+        crdt.mqtt_only_config,
+        crdt.inode_tracker.clone(),
+        Some(&*states_snapshot),
+        Some(&relative_path),
+    );
+    drop(states_snapshot);
+
+    // Add to file_states under new path
+    let mut states = file_states.write().await;
+    let state = Arc::new(RwLock::new(SyncState::new()));
+    let content_hash = compute_content_hash(content.as_bytes());
+
+    states.insert(
+        relative_path.clone(),
+        FileSyncState {
+            relative_path,
+            identifier: node_id.to_string(),
+            state,
+            task_handles: handles,
+            use_paths: false,
+            content_hash: Some(content_hash),
+            crdt_tasks_spawned: true,
+        },
+    );
+
+    info!(
+        "Rename complete: {} -> {} (node_id: {})",
+        old_filename, new_filename, node_id
+    );
+    true
+}
+
 /// Handle file deletion via CRDT/MQTT path.
 ///
 /// This function properly handles files in node-backed subdirectories by:
@@ -876,6 +1353,20 @@ async fn handle_file_deleted_crdt(
             }
         }
 
+        // Stash node_id in InodeTracker before removing from schema (for rename detection)
+        #[cfg(unix)]
+        if let Some(ref tracker) = crdt.inode_tracker {
+            let subdir_state = subdir_state_arc.read().await;
+            if let Ok(doc) = subdir_state.schema.to_doc() {
+                if let Some(entry) = ymap_schema::get_entry(&doc, &owning_doc.relative_path) {
+                    if let Some(ref node_id) = entry.node_id {
+                        let mut t = tracker.write().await;
+                        t.stash_node_id_by_path(&canonical_path, node_id.clone());
+                    }
+                }
+            }
+        }
+
         // Remove file from subdirectory schema via CRDT
         let result = {
             let mut subdir_state = subdir_state_arc.write().await;
@@ -943,6 +1434,20 @@ async fn handle_file_deleted_crdt(
         }
     } else {
         // File is in the root directory - use the existing crdt_state
+        // Stash node_id in InodeTracker before removing from schema (for rename detection)
+        #[cfg(unix)]
+        if let Some(ref tracker) = crdt.inode_tracker {
+            let state = crdt.crdt_state.read().await;
+            if let Ok(doc) = state.schema.to_doc() {
+                if let Some(entry) = ymap_schema::get_entry(&doc, &filename) {
+                    if let Some(ref node_id) = entry.node_id {
+                        let mut t = tracker.write().await;
+                        t.stash_node_id_by_path(&canonical_path, node_id.clone());
+                    }
+                }
+            }
+        }
+
         let result = {
             let mut state = crdt.crdt_state.write().await;
             remove_file_from_schema(

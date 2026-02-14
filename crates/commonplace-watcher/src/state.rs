@@ -163,6 +163,12 @@ pub struct InodeState {
     pub last_write: Instant,
     /// Primary file path this inode is associated with.
     pub primary_path: PathBuf,
+    /// Stashed node_id for rename detection.
+    /// When a file is deleted, the deletion handler stashes the node_id here
+    /// so the creation handler can recover it if the delete+create is a rename.
+    pub node_id: Option<String>,
+    /// When node_id was stashed (for freshness check in rename detection).
+    pub stashed_at: Option<Instant>,
 }
 
 /// Default idle timeout before GC can remove a shadow link (1 hour).
@@ -170,6 +176,11 @@ pub const SHADOW_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 /// Minimum time a shadow must exist before GC can remove it (5 minutes).
 pub const SHADOW_MIN_LIFETIME: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Maximum age for a stashed node_id to be considered valid for rename detection.
+/// Delete+Create pairs from a rename typically arrive within milliseconds.
+/// After this timeout, the stash is treated as stale (likely inode reuse, not rename).
+pub const RENAME_STASH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Shared tracker for all inodes across the sync client.
 ///
@@ -199,7 +210,13 @@ impl InodeTracker {
     }
 
     /// Track a new inode at a primary path with a given commit.
-    pub fn track(&mut self, key: InodeKey, commit_id: String, primary_path: PathBuf) {
+    pub fn track(
+        &mut self,
+        key: InodeKey,
+        commit_id: String,
+        primary_path: PathBuf,
+        node_id: Option<String>,
+    ) {
         self.states.insert(
             key,
             InodeState {
@@ -208,8 +225,75 @@ impl InodeTracker {
                 shadowed_at: None,
                 last_write: Instant::now(),
                 primary_path,
+                stashed_at: node_id.as_ref().map(|_| Instant::now()),
+                node_id,
             },
         );
+    }
+
+    /// Check if an inode is tracked under a different path (rename detection).
+    /// Returns Some((old_primary_path, stashed_node_id)) if rename detected.
+    ///
+    /// Rename detection requires two conditions beyond a path mismatch:
+    /// 1. The old primary_path must no longer exist on disk (confirms actual
+    ///    delete+create pair rather than coincidental inode reuse).
+    /// 2. Stashed node_ids expire after `RENAME_STASH_TIMEOUT` to prevent stale
+    ///    inode reuse from being misidentified as a rename.
+    pub fn check_rename(
+        &self,
+        key: &InodeKey,
+        new_path: &std::path::Path,
+    ) -> Option<(PathBuf, Option<String>)> {
+        if let Some(state) = self.states.get(key) {
+            if state.primary_path != new_path {
+                // Verify the old path is actually gone — this confirms a real
+                // delete+create pair. If the old file still exists, this is inode
+                // reuse from an unrelated file creation, not a rename.
+                if state.primary_path.exists() {
+                    return None;
+                }
+
+                // Check freshness of stashed node_id
+                let node_id = match (&state.node_id, state.stashed_at) {
+                    (Some(id), Some(stashed_at)) if stashed_at.elapsed() < RENAME_STASH_TIMEOUT => {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                };
+                return Some((state.primary_path.clone(), node_id));
+            }
+        }
+        None
+    }
+
+    /// Update the primary_path for an inode (after rename).
+    pub fn update_primary_path(&mut self, key: &InodeKey, new_path: PathBuf) {
+        if let Some(state) = self.states.get_mut(key) {
+            state.primary_path = new_path;
+            state.node_id = None; // Clear stashed node_id after rename completes
+            state.stashed_at = None;
+        }
+    }
+
+    /// Find InodeKey by primary_path and stash a node_id for rename detection.
+    ///
+    /// Prefers the active (non-shadowed) inode entry over shadowed historical
+    /// entries, since the Created event will look up the stash by the live
+    /// inode key.
+    pub fn stash_node_id_by_path(&mut self, primary_path: &std::path::Path, node_id: String) {
+        // Find the best matching key: prefer non-shadowed (active) entries
+        let key = self
+            .states
+            .iter()
+            .filter(|(_, s)| s.primary_path == primary_path)
+            .min_by_key(|(_, s)| s.shadow_path.is_some()) // false < true, so non-shadowed wins
+            .map(|(k, _)| *k);
+        if let Some(key) = key {
+            if let Some(state) = self.states.get_mut(&key) {
+                state.node_id = Some(node_id);
+                state.stashed_at = Some(Instant::now());
+            }
+        }
     }
 
     /// Move an inode to shadow status.
