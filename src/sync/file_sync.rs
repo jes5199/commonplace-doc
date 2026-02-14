@@ -982,6 +982,7 @@ pub async fn push_local_if_differs(
 /// initializes state from that snapshot, and can optionally write content and
 /// process queued edits. It is used when MissingHistory is detected so disk
 /// writes only happen after gap fill.
+#[allow(clippy::too_many_arguments)]
 pub async fn resync_crdt_state_via_cyan_with_pending(
     mqtt_client: &Arc<MqttClient>,
     workspace: &str,
@@ -1389,16 +1390,10 @@ async fn write_content_with_rollback_guard(
         content.chars().take(40).collect::<String>()
     );
 
-    let is_rollback = if content.is_empty() && !existing_content.is_empty() {
-        true
-    } else if !content.is_empty()
-        && !existing_content.is_empty()
-        && content.len() < existing_content.len() / 10
-    {
-        true
-    } else {
-        false
-    };
+    let is_rollback = (content.is_empty() && !existing_content.is_empty())
+        || (!content.is_empty()
+            && !existing_content.is_empty()
+            && content.len() < existing_content.len() / 10);
 
     if is_rollback {
         debug!(
@@ -1424,6 +1419,7 @@ async fn write_content_with_rollback_guard(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_pending_edits_with_flock(
     pending_edits: Vec<crate::sync::PendingEdit>,
     mqtt_client: Option<&Arc<MqttClient>>,
@@ -1564,6 +1560,7 @@ async fn process_pending_edits_with_flock(
     deferred.unwrap_or_default()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_pending_edits_with_flock(
     context: &str,
     mqtt_client: Option<&Arc<MqttClient>>,

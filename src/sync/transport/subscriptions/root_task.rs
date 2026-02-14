@@ -759,6 +759,7 @@ pub async fn directory_mqtt_task(
 }
 
 /// Ensure files discovered via schema changes are upgraded to CRDT tasks.
+#[allow(clippy::too_many_arguments)]
 async fn ensure_crdt_tasks_for_files(
     http_client: &Client,
     server: &str,
