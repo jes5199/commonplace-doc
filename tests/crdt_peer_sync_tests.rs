@@ -117,7 +117,9 @@ fn create_test_config(
                     "--initial-sync", "local"
                 ],
                 "restart": {
-                    "policy": "never"
+                    "policy": "on_failure",
+                    "backoff_ms": 2000,
+                    "max_backoff_ms": 10000
                 },
                 "depends_on": ["server"]
             }
