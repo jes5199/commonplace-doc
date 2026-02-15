@@ -12,6 +12,7 @@ pub mod file_events;
 pub mod flock;
 pub mod flock_state;
 pub mod state;
+#[allow(clippy::module_inception)]
 pub mod watcher;
 
 // Re-export from file_events
