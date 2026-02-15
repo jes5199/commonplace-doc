@@ -314,6 +314,11 @@ fn test_sync_client_edit_persisted_by_server_via_mqtt() {
 
     let mut guard = ProcessGuard::new();
 
+    // Redirect orchestrator logs to a file so we can dump them on failure
+    let log_path = temp_dir.path().join("orchestrator.log");
+    let log_file = std::fs::File::create(&log_path).expect("Failed to create log file");
+    let log_stderr = log_file.try_clone().expect("Failed to clone log file");
+
     // Spawn orchestrator (which starts server and sync with MQTT)
     let orchestrator = Command::new(env!("CARGO_BIN_EXE_commonplace-orchestrator"))
         .args([
@@ -322,9 +327,10 @@ fn test_sync_client_edit_persisted_by_server_via_mqtt() {
             "--server",
             &server_url,
         ])
+        .env("RUST_LOG", "info")
         .current_dir(temp_dir.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(log_file)
+        .stderr(log_stderr)
         .spawn()
         .expect("Failed to spawn orchestrator");
 
@@ -351,12 +357,37 @@ fn test_sync_client_edit_persisted_by_server_via_mqtt() {
 
     eprintln!("File UUID: {}", file_uuid);
 
+    // Check what the server knows about this document before waiting
+    let info_url = format!("{}/docs/{}/info", server_url, file_uuid);
+    match client.get(&info_url).send() {
+        Ok(resp) => eprintln!(
+            "Doc info check: status={}, body={:?}",
+            resp.status(),
+            resp.text().unwrap_or_default()
+        ),
+        Err(e) => eprintln!("Doc info check failed: {}", e),
+    }
+
     // THE CRITICAL CHECK: Server should have persisted the initial commit via MQTT
     // The sync client pushes the initial file content to MQTT, server should receive and persist.
     // Use a generous timeout — CI runners can be slow to complete the full
     // orchestrator→sync→MQTT→server pipeline.
-    let cid = wait_for_server_commit(&client, &server_url, file_uuid, Duration::from_secs(60))
-        .expect("Server should have persisted initial commit via MQTT");
+    let commit_result =
+        wait_for_server_commit(&client, &server_url, file_uuid, Duration::from_secs(60));
+
+    if commit_result.is_err() {
+        // Dump orchestrator logs to help diagnose CI failures
+        if let Ok(logs) = std::fs::read_to_string(&log_path) {
+            let last_lines: Vec<&str> = logs.lines().rev().take(80).collect();
+            eprintln!("=== ORCHESTRATOR LOGS (last 80 lines) ===");
+            for line in last_lines.into_iter().rev() {
+                eprintln!("{}", line);
+            }
+            eprintln!("=== END ORCHESTRATOR LOGS ===");
+        }
+    }
+
+    let cid = commit_result.expect("Server should have persisted initial commit via MQTT");
 
     eprintln!("Server has initial commit: {}", cid);
 
