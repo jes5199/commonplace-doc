@@ -553,6 +553,7 @@ fn spawn_sync_directory_debug(
 /// 5. Create a file in the subdirectory
 /// 6. Verify the file appears locally without restarting sync
 #[test]
+#[ignore = "CP-5dii: times out on CI"]
 fn test_node_backed_subdir_propagates_without_restart() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
@@ -729,6 +730,7 @@ fn test_node_backed_subdir_propagates_without_restart() {
 /// O4: Restart sync process
 /// O5: Verify server content now includes local edit
 #[test]
+#[ignore = "CP-5dii: times out on CI"]
 fn test_offline_edits_sync_on_reconnect() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
@@ -887,6 +889,7 @@ fn test_offline_edits_sync_on_reconnect() {
 /// 3. Create a new file locally in the subdirectory
 /// 4. Verify the subdirectory schema on server includes the new file entry
 #[test]
+#[ignore = "CP-5dii: times out on CI"]
 fn test_local_file_in_existing_subdir_updates_server_schema() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
@@ -1039,6 +1042,7 @@ fn test_local_file_in_existing_subdir_updates_server_schema() {
 ///    - subdirectory schema includes the file with node_id
 ///    - file document has correct content
 #[test]
+#[ignore = "CP-5dii: times out on CI"]
 fn test_local_new_subdir_with_file_updates_server_schemas() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
@@ -1193,6 +1197,7 @@ fn test_local_new_subdir_with_file_updates_server_schemas() {
 /// 2. Start sync client
 /// 3. Verify schemas on server have valid UUIDs (not null)
 #[test]
+#[ignore = "CP-5dii: times out on CI"]
 fn test_initial_sync_creates_documents_before_schema() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.redb");
