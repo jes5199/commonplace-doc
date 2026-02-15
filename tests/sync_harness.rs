@@ -366,10 +366,8 @@ mod no_echo_tests {
     /// If content matches what was just written by receive task, upload is skipped.
     #[tokio::test]
     async fn shared_last_content_prevents_echo_upload() {
-        use commonplace_doc::sync::types::SharedLastContent;
-
         // Simulate the shared_last_content mechanism
-        let shared_last_content: SharedLastContent = Arc::new(RwLock::new(None));
+        let shared_last_content: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
         // Scenario: Receive task writes "hello world" to file
         // It updates shared_last_content BEFORE writing
@@ -2922,7 +2920,6 @@ mod receive_pipeline_tests {
     use commonplace_doc::commit::Commit;
     use commonplace_doc::mqtt::EditMessage;
     use commonplace_doc::sync::crdt_state::CrdtPeerState;
-    use commonplace_doc::sync::types::SharedLastContent;
     use commonplace_doc::sync::{process_received_edit, MergeResult};
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -3135,7 +3132,7 @@ mod receive_pipeline_tests {
     /// task can compare and skip the echo.
     #[tokio::test]
     async fn test_receive_updates_shared_last_content() {
-        let shared_last_content: SharedLastContent = Arc::new(RwLock::new(None));
+        let shared_last_content: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
         let mut state = CrdtPeerState::new(Uuid::new_v4());
 
