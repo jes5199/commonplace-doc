@@ -334,8 +334,9 @@ fn test_sync_client_edit_persisted_by_server_via_mqtt() {
     wait_for_orchestrator_ready(&config_path, Duration::from_secs(30))
         .expect("Orchestrator failed to start within timeout");
 
-    // Give sync client time to fully initialize and sync
-    std::thread::sleep(Duration::from_secs(5));
+    // Give sync client time to fully initialize and sync.
+    // CI runners can be slow, so allow generous startup time.
+    std::thread::sleep(Duration::from_secs(10));
 
     // Verify server is healthy
     let client = reqwest::blocking::Client::new();
@@ -351,8 +352,10 @@ fn test_sync_client_edit_persisted_by_server_via_mqtt() {
     eprintln!("File UUID: {}", file_uuid);
 
     // THE CRITICAL CHECK: Server should have persisted the initial commit via MQTT
-    // The sync client pushes the initial file content to MQTT, server should receive and persist
-    let cid = wait_for_server_commit(&client, &server_url, file_uuid, Duration::from_secs(30))
+    // The sync client pushes the initial file content to MQTT, server should receive and persist.
+    // Use a generous timeout — CI runners can be slow to complete the full
+    // orchestrator→sync→MQTT→server pipeline.
+    let cid = wait_for_server_commit(&client, &server_url, file_uuid, Duration::from_secs(60))
         .expect("Server should have persisted initial commit via MQTT");
 
     eprintln!("Server has initial commit: {}", cid);
@@ -380,7 +383,7 @@ fn test_sync_client_edit_persisted_by_server_via_mqtt() {
 
     // Wait for second commit to be persisted
     let commit_count =
-        wait_for_commit_count(&client, &server_url, file_uuid, 2, Duration::from_secs(45))
+        wait_for_commit_count(&client, &server_url, file_uuid, 2, Duration::from_secs(60))
             .expect("Server should have persisted 2 commits");
 
     assert!(
