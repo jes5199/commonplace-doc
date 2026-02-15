@@ -36,7 +36,12 @@ mod tests {
         let tracker = Arc::new(RwLock::new(InodeTracker::new(shadow_dir.clone())));
         {
             let mut t = tracker.write().await;
-            t.track(initial_inode, "commit-123".to_string(), file_path.clone());
+            t.track(
+                initial_inode,
+                "commit-123".to_string(),
+                file_path.clone(),
+                None,
+            );
             eprintln!("Tracker states: {:?}", t.states.keys().collect::<Vec<_>>());
         }
 
@@ -121,7 +126,12 @@ mod tests {
         let tracker = Arc::new(RwLock::new(InodeTracker::new(shadow_dir.clone())));
         {
             let mut t = tracker.write().await;
-            t.track(initial_inode, "commit-123".to_string(), file_path.clone());
+            t.track(
+                initial_inode,
+                "commit-123".to_string(),
+                file_path.clone(),
+                None,
+            );
         }
 
         // Do an atomic write - this replaces the file with a new inode
