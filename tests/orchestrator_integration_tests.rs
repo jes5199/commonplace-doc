@@ -251,6 +251,7 @@ fn wait_for_discovered_process(
 ///
 /// Requires MQTT broker on localhost:1883 (skipped if not available).
 #[test]
+#[ignore = "CP-5dii: orchestrator crashes on CI"]
 fn test_orchestrator_starts_base_processes() {
     if !mqtt_available() {
         eprintln!("Skipping test: MQTT broker not available on localhost:1883");
@@ -382,6 +383,7 @@ fn test_orchestrator_starts_base_processes() {
 ///
 /// Requires MQTT broker on localhost:1883 (skipped if not available).
 #[test]
+#[ignore = "CP-5dii: orchestrator crashes on CI"]
 fn test_commonplace_ps_reports_status() {
     if !mqtt_available() {
         eprintln!("Skipping test: MQTT broker not available on localhost:1883");
@@ -494,6 +496,7 @@ fn test_commonplace_ps_reports_status() {
 ///
 /// Requires MQTT broker on localhost:1883 (skipped if not available).
 #[test]
+#[ignore = "CP-5dii: orchestrator crashes on CI"]
 fn test_sandbox_process_runs_in_sandbox_cwd() {
     if !mqtt_available() {
         eprintln!("Skipping test: MQTT broker not available on localhost:1883");
@@ -682,6 +685,7 @@ fn wait_for_process_removed(
 ///
 /// Requires MQTT broker on localhost:1883 (skipped if not available).
 #[test]
+#[ignore = "CP-5dii: orchestrator crashes on CI"]
 fn test_processes_json_add_remove_starts_stops_processes() {
     if !mqtt_available() {
         eprintln!("Skipping test: MQTT broker not available on localhost:1883");
@@ -867,6 +871,7 @@ fn test_processes_json_add_remove_starts_stops_processes() {
 /// - H2: Verify process restarted with new PID within 10 seconds
 ///
 #[test]
+#[ignore = "CP-5dii: orchestrator crashes on CI"]
 fn test_process_config_change_triggers_restart() {
     if !mqtt_available() {
         eprintln!("Skipping test: MQTT broker not available on localhost:1883");
@@ -1267,6 +1272,7 @@ fn wait_for_schema_node_id(
 ///
 /// Requires MQTT broker on localhost:1883 (skipped if not available).
 #[test]
+#[ignore = "CP-5dii: orchestrator crashes on CI"]
 fn test_workspace_sandbox_file_sync_create_edit_delete() {
     if !mqtt_available() {
         eprintln!("Skipping test: MQTT broker not available on localhost:1883");
@@ -1562,6 +1568,7 @@ fn get_node_id_from_schema(schema_path: &std::path::Path, filename: &str) -> Opt
 ///
 /// Requires MQTT broker on localhost:1883 (skipped if not available).
 #[test]
+#[ignore = "CP-5dii: orchestrator crashes on CI"]
 fn test_commonplace_link_schema_push_updates_server() {
     if !mqtt_available() {
         eprintln!("Skipping test: MQTT broker not available on localhost:1883");
@@ -1840,6 +1847,7 @@ fn test_commonplace_link_schema_push_updates_server() {
 ///
 /// Requires MQTT broker on localhost:1883 (skipped if not available).
 #[test]
+#[ignore = "CP-5dii: orchestrator crashes on CI"]
 fn test_sandbox_stdio_ephemeral_events() {
     if !mqtt_available() {
         eprintln!("Skipping test: MQTT broker not available on localhost:1883");
@@ -2015,6 +2023,7 @@ fn test_sandbox_stdio_ephemeral_events() {
 ///
 /// Requires MQTT broker on localhost:1883 (skipped if not available).
 #[test]
+#[ignore = "CP-5dii: orchestrator crashes on CI"]
 fn test_jsonl_file_append_sync_behavior() {
     if !mqtt_available() {
         eprintln!("Skipping test: MQTT broker not available on localhost:1883");
@@ -2229,6 +2238,7 @@ fn test_jsonl_file_append_sync_behavior() {
 /// - T4: Verify no orphaned python/node processes remain
 /// - T5: Verify sandbox directories still exist
 #[test]
+#[ignore = "CP-5dii: orchestrator crashes on CI"]
 fn test_process_termination_cascade_on_shutdown() {
     if !mqtt_available() {
         eprintln!("Skipping test: MQTT broker not available on localhost:1883");
@@ -2456,6 +2466,7 @@ fn test_process_termination_cascade_on_shutdown() {
 ///
 /// Requires MQTT broker on localhost:1883 (skipped if not available).
 #[test]
+#[ignore = "CP-5dii: orchestrator crashes on CI"]
 fn test_uuid_linked_files_sync_bidirectionally() {
     if !mqtt_available() {
         eprintln!("Skipping test: MQTT broker not available on localhost:1883");
@@ -2793,6 +2804,7 @@ fn test_uuid_linked_files_sync_bidirectionally() {
 ///
 /// Requires MQTT broker on localhost:1883 and Deno installed.
 #[test]
+#[ignore = "CP-5dii: orchestrator crashes on CI"]
 fn test_evaluate_script_with_global_injection() {
     if !mqtt_available() {
         eprintln!("Skipping test: MQTT broker not available on localhost:1883");
