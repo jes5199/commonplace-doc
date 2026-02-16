@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Transport mode for subdir sync tasks.
 #[derive(Clone)]
@@ -71,6 +71,26 @@ pub async fn spawn_subdir_watchers(
     for (subdir_path, subdir_node_id) in node_backed_subdirs {
         if watched.contains(&subdir_node_id) {
             continue;
+        }
+
+        // Materialize newly discovered node-backed subdirectories immediately.
+        // Their own schema document may still be "{}" (no valid FsSchema yet), so
+        // local directory creation cannot rely on subdir schema parsing.
+        if !subdir_path.is_empty() {
+            let local_subdir_path = params.directory.join(&subdir_path);
+            if !local_subdir_path.exists() {
+                if let Err(e) = tokio::fs::create_dir_all(&local_subdir_path).await {
+                    warn!(
+                        "Failed to create local directory for discovered subdir {} ({}): {}",
+                        subdir_path, subdir_node_id, e
+                    );
+                } else {
+                    info!(
+                        "Created local directory for discovered subdir: {} ({})",
+                        subdir_path, subdir_node_id
+                    );
+                }
+            }
         }
 
         watched.insert(subdir_node_id.clone());

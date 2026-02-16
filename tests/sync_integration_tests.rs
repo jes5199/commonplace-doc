@@ -646,11 +646,15 @@ fn test_node_backed_subdir_propagates_without_restart() {
         resp.text().unwrap_or_default()
     );
 
-    // Wait for sync to discover the new subdir via SSE
-    std::thread::sleep(Duration::from_secs(2));
-
     // Verify the subdirectory was created locally
     let subdir_path = sync_dir.join("newsubdir");
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        if subdir_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     assert!(
         subdir_path.exists(),
         "Subdirectory should be created locally: {}",
