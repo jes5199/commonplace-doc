@@ -76,6 +76,43 @@ fn parse_jsonl_values(content: &str) -> Result<Vec<Value>, serde_json::Error> {
     Ok(values)
 }
 
+/// Returns true when `local_json` adds no information compared to `server_json`.
+///
+/// This is used by post-resync divergence handling to avoid re-publishing stale
+/// local content that is already represented in server state.
+fn json_value_is_subset(local_json: &Value, server_json: &Value) -> bool {
+    match (local_json, server_json) {
+        (Value::Object(local_obj), Value::Object(server_obj)) => {
+            local_obj.iter().all(|(k, local_v)| {
+                server_obj
+                    .get(k)
+                    .is_some_and(|server_v| json_value_is_subset(local_v, server_v))
+            })
+        }
+        // Arrays are treated as ordered sequences; require exact match.
+        (Value::Array(local_arr), Value::Array(server_arr)) => local_arr == server_arr,
+        _ => local_json == server_json,
+    }
+}
+
+/// Returns true when local JSONL content is a semantic prefix of server JSONL.
+///
+/// Example: local has lines [A, B], server has [A, B, C].
+fn jsonl_is_semantic_prefix(local_jsonl: &str, server_jsonl: &str) -> bool {
+    let Ok(local_values) = parse_jsonl_values(local_jsonl) else {
+        return false;
+    };
+    let Ok(server_values) = parse_jsonl_values(server_jsonl) else {
+        return false;
+    };
+
+    local_values.len() <= server_values.len()
+        && local_values
+            .iter()
+            .zip(server_values.iter())
+            .all(|(local, server)| local == server)
+}
+
 fn match_doc_structured_content(
     file_state: &CrdtPeerState,
     old_content: &str,
@@ -2502,6 +2539,10 @@ async fn push_local_edits_after_resync(
     author: &str,
     inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
 ) -> SyncResult<()> {
+    let content_info = detect_from_path(file_path);
+    let is_json = content_info.mime_type == "application/json";
+    let is_jsonl = content_info.mime_type == "application/x-ndjson";
+
     // Get CRDT content (= server state after resync)
     // Must use get_doc_text_content which handles YText, YArray, AND YMap formats.
     // (crdt_publish::get_text_content only handles YText, returning empty for JSON files)
@@ -2524,9 +2565,36 @@ async fn push_local_edits_after_resync(
     }
 
     // Skip if pre-resync content is default/empty
-    let content_info = detect_from_path(file_path);
     if crate::sync::content_type::is_default_content(pre_resync_content, &content_info) {
         return Ok(());
+    }
+
+    // If local content is only a stale subset/prefix of server state, do NOT
+    // publish it back during divergence recovery. This prevents reverting newer
+    // server updates (e.g., sandbox JSONL append) with older local content.
+    if let Some(server_content) = crdt_content.as_deref() {
+        if is_jsonl && jsonl_is_semantic_prefix(pre_resync_content, server_content) {
+            debug!(
+                "Divergence check: skipping JSONL push for {} (local is prefix of server)",
+                file_path.display()
+            );
+            return Ok(());
+        }
+
+        if is_json {
+            if let (Ok(local_json), Ok(server_json)) = (
+                serde_json::from_str::<Value>(pre_resync_content),
+                serde_json::from_str::<Value>(server_content),
+            ) {
+                if json_value_is_subset(&local_json, &server_json) {
+                    debug!(
+                        "Divergence check: skipping JSON push for {} (local is subset of server)",
+                        file_path.display()
+                    );
+                    return Ok(());
+                }
+            }
+        }
     }
 
     info!(
@@ -2535,9 +2603,6 @@ async fn push_local_edits_after_resync(
         pre_resync_content.len(),
         crdt_content.as_ref().map(|s| s.len()).unwrap_or(0),
     );
-
-    let is_json = content_info.mime_type == "application/json";
-    let is_jsonl = content_info.mime_type == "application/x-ndjson";
     let node_id_str = node_id.to_string();
 
     // Publish the update (hold write lock for publish)
@@ -2653,11 +2718,9 @@ async fn push_local_edits_after_resync(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::error::SyncError;
-    use reqwest::Client;
     use std::path::Path;
     use tempfile::tempdir;
-    use yrs::{ReadTxn, Transact};
+    use yrs::ReadTxn;
 
     #[test]
     fn test_prepare_content_for_upload_text() {
@@ -2670,6 +2733,67 @@ mod tests {
         assert!(!prepared.is_json);
         assert!(!prepared.is_jsonl);
         assert_eq!(prepared.content, "Hello, world!");
+    }
+
+    #[test]
+    fn test_json_value_is_subset_nested_object() {
+        let local = serde_json::json!({
+            "root": {
+                "entries": {
+                    "a.txt": {"type": "doc"}
+                }
+            }
+        });
+        let server = serde_json::json!({
+            "root": {
+                "entries": {
+                    "a.txt": {"type": "doc", "node_id": "id-a"},
+                    "b.txt": {"type": "doc", "node_id": "id-b"}
+                },
+                "version": 1
+            }
+        });
+
+        assert!(json_value_is_subset(&local, &server));
+    }
+
+    #[test]
+    fn test_json_value_is_subset_false_when_local_has_extra_key() {
+        let local = serde_json::json!({
+            "root": {
+                "entries": {
+                    "missing-on-server.txt": {"type": "doc"}
+                }
+            }
+        });
+        let server = serde_json::json!({
+            "root": {
+                "entries": {}
+            }
+        });
+
+        assert!(!json_value_is_subset(&local, &server));
+    }
+
+    #[test]
+    fn test_jsonl_is_semantic_prefix_true() {
+        let local = "{\"id\":1}\n{\"id\":2}\n";
+        let server = "{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n";
+        assert!(jsonl_is_semantic_prefix(local, server));
+    }
+
+    #[test]
+    fn test_jsonl_is_semantic_prefix_false_on_mismatch() {
+        let local = "{\"id\":1}\n{\"id\":9}\n";
+        let server = "{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n";
+        assert!(!jsonl_is_semantic_prefix(local, server));
+    }
+
+    #[test]
+    fn test_jsonl_is_semantic_prefix_false_on_invalid_jsonl() {
+        let local = "{\"id\":1}\nnot-json\n";
+        let server = "{\"id\":1}\n{\"id\":2}\n";
+        assert!(!jsonl_is_semantic_prefix(local, server));
     }
 
     #[test]

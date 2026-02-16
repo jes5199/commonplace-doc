@@ -228,103 +228,135 @@ impl DocumentStore {
         let content_type = doc.content_type;
         txn.apply_update(update);
 
-        // Detect the actual content type from the Y.Doc structure
-        // This handles the case where documents are created without knowing if they're
-        // file content (YText) or schema content (YMap)
-        let root = txn
-            .root_refs()
-            .find(|(name, _)| *name == Self::TEXT_ROOT_NAME)
-            .map(|(_, value)| value);
+        // Detect all root variants for "content". Yrs can retain multiple types with
+        // the same name if a document was pre-initialized with one type and later
+        // receives updates for another. Prefer structured roots when present.
+        let mut root_map = None;
+        let mut root_array = None;
+        let mut root_text = None;
+        for (name, value) in txn.root_refs() {
+            if name != Self::TEXT_ROOT_NAME {
+                continue;
+            }
+            match value {
+                Value::YMap(map) => {
+                    if root_map.is_none() {
+                        root_map = Some(map);
+                    }
+                }
+                Value::YArray(array) => {
+                    if root_array.is_none() {
+                        root_array = Some(array);
+                    }
+                }
+                Value::YText(text) => {
+                    if root_text.is_none() {
+                        root_text = Some(text);
+                    }
+                }
+                _ => {}
+            }
+        }
 
         doc.content = match content_type {
             ContentType::Text => {
                 // Check if the Y.Doc actually has YMap (schema) instead of YText (file)
-                match root {
-                    Some(Value::YMap(map)) => {
-                        // This is actually a schema document, update content_type and extract as JSON
-                        doc.content_type = ContentType::Json;
-                        let any = map.to_json(&txn);
-                        serde_json::to_string(&any)
-                            .map_err(|e| ApplyError::Serialization(e.to_string()))?
+                if let Some(map) = root_map {
+                    // This is actually a schema document, update content_type and extract as JSON
+                    doc.content_type = ContentType::Json;
+                    json_content_from_map(&txn, &map)?
+                } else if let Some(array) = root_array {
+                    // This is a JSONL document (YArray root), update content type.
+                    doc.content_type = ContentType::Jsonl;
+                    jsonl_content_from_array(&txn, &array)?
+                } else if let Some(text) = root_text {
+                    let text_content = text.get_string(&txn);
+                    if !text_content.is_empty() {
+                        text_content
+                    } else {
+                        // Fallback for mixed-root docs where root_refs selected an empty YText
+                        // but structured content exists under the same root name.
+                        if let Some(array) = txn.get_array(Self::TEXT_ROOT_NAME) {
+                            let array_content = jsonl_content_from_array(&txn, &array)?;
+                            if !array_content.is_empty() {
+                                doc.content_type = ContentType::Jsonl;
+                                array_content
+                            } else if let Some(map) = txn.get_map(Self::TEXT_ROOT_NAME) {
+                                let map_content = json_content_from_map(&txn, &map)?;
+                                if map_content != ContentType::Json.default_content() {
+                                    doc.content_type = ContentType::Json;
+                                    map_content
+                                } else {
+                                    text_content
+                                }
+                            } else {
+                                text_content
+                            }
+                        } else if let Some(map) = txn.get_map(Self::TEXT_ROOT_NAME) {
+                            let map_content = json_content_from_map(&txn, &map)?;
+                            if map_content != ContentType::Json.default_content() {
+                                doc.content_type = ContentType::Json;
+                                map_content
+                            } else {
+                                text_content
+                            }
+                        } else {
+                            text_content
+                        }
                     }
-                    Some(Value::YText(text)) => text.get_string(&txn),
-                    _ => {
-                        // Try to get text directly
-                        let text = txn.get_or_insert_text(Self::TEXT_ROOT_NAME);
-                        text.get_string(&txn)
+                } else {
+                    // Try to get text directly
+                    let text = txn.get_or_insert_text(Self::TEXT_ROOT_NAME);
+                    let text_content = text.get_string(&txn);
+                    if !text_content.is_empty() {
+                        text_content
+                    } else if let Some(array) = txn.get_array(Self::TEXT_ROOT_NAME) {
+                        let array_content = jsonl_content_from_array(&txn, &array)?;
+                        if !array_content.is_empty() {
+                            doc.content_type = ContentType::Jsonl;
+                            array_content
+                        } else {
+                            text_content
+                        }
+                    } else {
+                        text_content
                     }
                 }
             }
             ContentType::Json => {
-                match root {
-                    Some(Value::YMap(map)) => {
-                        let any = map.to_json(&txn);
-                        serde_json::to_string(&any)
-                            .map_err(|e| ApplyError::Serialization(e.to_string()))?
-                    }
-                    Some(Value::YText(text)) => {
-                        // Handle YText in case document was created as JSON but contains text content
-                        // This happens when CRDT edits arrive before the document type is known
-                        // Update content_type to reflect the actual type
-                        doc.content_type = ContentType::Text;
-                        text.get_string(&txn)
-                    }
-                    _ => {
-                        // Try to get text directly in case root_refs doesn't match the expected pattern
-                        let text = txn.get_or_insert_text(Self::TEXT_ROOT_NAME);
-                        let content = text.get_string(&txn);
-                        if !content.is_empty() {
-                            content
-                        } else {
-                            ContentType::Json.default_content()
-                        }
+                if let Some(map) = root_map {
+                    json_content_from_map(&txn, &map)?
+                } else if let Some(text) = root_text {
+                    // Handle YText in case document was created as JSON but contains text content
+                    // This happens when CRDT edits arrive before the document type is known
+                    // Update content_type to reflect the actual type
+                    doc.content_type = ContentType::Text;
+                    text.get_string(&txn)
+                } else {
+                    // Try to get text directly in case root_refs doesn't match the expected pattern
+                    let text = txn.get_or_insert_text(Self::TEXT_ROOT_NAME);
+                    let content = text.get_string(&txn);
+                    if !content.is_empty() {
+                        content
+                    } else {
+                        ContentType::Json.default_content()
                     }
                 }
             }
             ContentType::JsonArray => {
-                let root = txn
-                    .root_refs()
-                    .find(|(name, _)| *name == Self::TEXT_ROOT_NAME)
-                    .map(|(_, value)| value);
-
-                match root {
-                    Some(Value::YArray(array)) => {
-                        let any = array.to_json(&txn);
-                        serde_json::to_string(&any)
-                            .map_err(|e| ApplyError::Serialization(e.to_string()))?
-                    }
-                    _ => ContentType::JsonArray.default_content(),
+                if let Some(array) = root_array.or_else(|| txn.get_array(Self::TEXT_ROOT_NAME)) {
+                    let any = array.to_json(&txn);
+                    serde_json::to_string(&any)
+                        .map_err(|e| ApplyError::Serialization(e.to_string()))?
+                } else {
+                    ContentType::JsonArray.default_content()
                 }
             }
             ContentType::Jsonl => {
-                let root = txn
-                    .root_refs()
-                    .find(|(name, _)| *name == Self::TEXT_ROOT_NAME)
-                    .map(|(_, value)| value);
-
-                match root {
-                    Some(Value::YArray(array)) => {
-                        // Get JSON representation of the array
-                        let any_array = array.to_json(&txn);
-                        let json_value = serde_json::to_value(&any_array)
-                            .map_err(|e| ApplyError::Serialization(e.to_string()))?;
-                        // Convert to JSONL: one JSON object per line
-                        if let serde_json::Value::Array(items) = json_value {
-                            let mut content = items
-                                .iter()
-                                .map(serde_json::to_string)
-                                .collect::<Result<Vec<_>, _>>()
-                                .map(|lines| lines.join("\n"))
-                                .map_err(|e| ApplyError::Serialization(e.to_string()))?;
-                            if !content.is_empty() {
-                                content.push('\n');
-                            }
-                            content
-                        } else {
-                            ContentType::Jsonl.default_content()
-                        }
-                    }
-                    _ => ContentType::Jsonl.default_content(),
+                if let Some(array) = root_array.or_else(|| txn.get_array(Self::TEXT_ROOT_NAME)) {
+                    jsonl_content_from_array(&txn, &array)?
+                } else {
+                    ContentType::Jsonl.default_content()
                 }
             }
             ContentType::Xml => {
@@ -422,6 +454,37 @@ impl DocumentStore {
             inner,
             Self::XML_ROOT_END
         )
+    }
+}
+
+fn json_content_from_map(
+    txn: &yrs::TransactionMut<'_>,
+    map: &yrs::MapRef,
+) -> Result<String, ApplyError> {
+    let any = map.to_json(txn);
+    serde_json::to_string(&any).map_err(|e| ApplyError::Serialization(e.to_string()))
+}
+
+fn jsonl_content_from_array(
+    txn: &yrs::TransactionMut<'_>,
+    array: &yrs::ArrayRef,
+) -> Result<String, ApplyError> {
+    let any_array = array.to_json(txn);
+    let json_value =
+        serde_json::to_value(&any_array).map_err(|e| ApplyError::Serialization(e.to_string()))?;
+    if let serde_json::Value::Array(items) = json_value {
+        let mut content = items
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .map(|lines| lines.join("\n"))
+            .map_err(|e| ApplyError::Serialization(e.to_string()))?;
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        Ok(content)
+    } else {
+        Ok(ContentType::Jsonl.default_content())
     }
 }
 
@@ -623,5 +686,48 @@ mod tests {
         assert_eq!(arr.len(), 5, "should have 5 elements, not be nested");
         assert_eq!(arr[0], 1);
         assert_eq!(arr[4], 5);
+    }
+
+    #[tokio::test]
+    async fn test_apply_yjs_update_text_doc_handles_jsonl_array_root() {
+        // Reproduces UUID-path ingestion where a document is pre-created as Text
+        // and later receives JSONL (YArray) updates.
+        let store = DocumentStore::new();
+        let id = "jsonl-array-root-doc";
+        store
+            .create_document_with_id(id.to_string(), ContentType::Text)
+            .await;
+
+        let expected = "{\"id\":1}\n{\"id\":2}\n";
+        let update_b64 = crate::sync::yjs::create_yjs_jsonl_update(expected, None).unwrap();
+        let update_bytes = crate::sync::yjs::base64_decode(&update_b64).unwrap();
+
+        store.apply_yjs_update(id, &update_bytes).await.unwrap();
+        let doc = store.get_document(id).await.unwrap();
+
+        assert_eq!(doc.content_type, ContentType::Jsonl);
+        assert_eq!(doc.content, expected);
+    }
+
+    #[tokio::test]
+    async fn test_apply_yjs_update_with_captured_cp_1876_state() {
+        // Captured from failing CP-1876 orchestrator run:
+        // /docs/{uuid}/head returned content="", but this state should decode to 3 JSONL lines.
+        let captured_state = "AQIBAAEBB2NvbnRlbnQDiAECA3YCAmlkegAAAAAAAAABB21lc3NhZ2V3CmZpcnN0IGxpbmV2AgdtZXNzYWdldwtzZWNvbmQgbGluZQJpZHoAAAAAAAAAAnYCAmlkegAAAAAAAAADB21lc3NhZ2V3F3RoaXJkIGxpbmUgZnJvbSBzYW5kYm94AQEBAAM=";
+        let update_bytes = crate::sync::yjs::base64_decode(captured_state).unwrap();
+
+        let store = DocumentStore::new();
+        let id = "captured-cp-1876-doc";
+        store
+            .create_document_with_id(id.to_string(), ContentType::Text)
+            .await;
+
+        store.apply_yjs_update(id, &update_bytes).await.unwrap();
+        let doc = store.get_document(id).await.unwrap();
+
+        assert_eq!(doc.content_type, ContentType::Jsonl);
+        assert!(doc.content.contains("first line"));
+        assert!(doc.content.contains("second line"));
+        assert!(doc.content.contains("third line from sandbox"));
     }
 }
