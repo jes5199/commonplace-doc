@@ -25,6 +25,10 @@ pub type PendingRequests = Arc<RwLock<HashMap<String, oneshot::Sender<Vec<u8>>>>
 
 /// Default timeout for MQTT request/response operations.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum attempts for request/response operations when timeout occurs.
+const DEFAULT_MAX_ATTEMPTS: usize = 4;
+/// Base delay before retrying a timed-out request.
+const RETRY_BASE_DELAY_MS: u64 = 200;
 
 /// MQTT request/response client.
 ///
@@ -41,6 +45,12 @@ pub struct MqttRequestClient {
 }
 
 impl MqttRequestClient {
+    fn retry_delay(attempt: usize) -> Duration {
+        // Exponential backoff: 200ms, 400ms, 800ms...
+        let exponent = attempt.saturating_sub(1).min(5) as u32;
+        Duration::from_millis(RETRY_BASE_DELAY_MS * (1u64 << exponent))
+    }
+
     /// Create a new MQTT request client and start the response dispatcher.
     ///
     /// This subscribes to `{workspace}/responses` and spawns a background
@@ -128,41 +138,60 @@ impl MqttRequestClient {
     /// Publishes a `GetContentRequest` to `{workspace}/commands/__system/get-content`
     /// and waits for the matching `GetContentResponse`.
     pub async fn get_content(&self, id: &str) -> Result<GetContentResponse, MqttError> {
-        let req_id = uuid::Uuid::new_v4().to_string();
-
-        let request = GetContentRequest {
-            req: req_id.clone(),
-            id: id.to_string(),
-        };
-
-        let payload =
-            serde_json::to_vec(&request).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
-
-        // Register pending request
-        let rx = self.register_pending_request(req_id.clone()).await;
-
-        // Publish request
         let topic = format!("{}/commands/__system/get-content", self.workspace);
-        self.client
-            .publish(&topic, &payload, QoS::AtLeastOnce)
-            .await?;
+        for attempt in 1..=DEFAULT_MAX_ATTEMPTS {
+            let req_id = uuid::Uuid::new_v4().to_string();
+            let request = GetContentRequest {
+                req: req_id.clone(),
+                id: id.to_string(),
+            };
+            let payload = serde_json::to_vec(&request)
+                .map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
 
-        // Wait for response with timeout
-        match tokio::time::timeout(self.timeout, rx).await {
-            Ok(Ok(response_bytes)) => serde_json::from_slice(&response_bytes)
-                .map_err(|e| MqttError::InvalidMessage(e.to_string())),
-            Ok(Err(_)) => Err(MqttError::InvalidMessage(
-                "Response channel closed unexpectedly".to_string(),
-            )),
-            Err(_) => {
-                // Timeout - clean up pending request
-                self.remove_pending_request(&req_id).await;
-                Err(MqttError::Connection(format!(
-                    "Timeout waiting for get-content response for {}",
-                    id
-                )))
+            // Register pending request
+            let rx = self.register_pending_request(req_id.clone()).await;
+
+            // Publish request
+            self.client
+                .publish(&topic, &payload, QoS::AtLeastOnce)
+                .await?;
+
+            // Wait for response with timeout
+            match tokio::time::timeout(self.timeout, rx).await {
+                Ok(Ok(response_bytes)) => {
+                    return serde_json::from_slice(&response_bytes)
+                        .map_err(|e| MqttError::InvalidMessage(e.to_string()));
+                }
+                Ok(Err(_)) => {
+                    return Err(MqttError::InvalidMessage(
+                        "Response channel closed unexpectedly".to_string(),
+                    ));
+                }
+                Err(_) => {
+                    // Timeout - clean up pending request
+                    self.remove_pending_request(&req_id).await;
+
+                    if attempt == DEFAULT_MAX_ATTEMPTS {
+                        return Err(MqttError::Connection(format!(
+                            "Timeout waiting for get-content response for {} after {} attempts",
+                            id, DEFAULT_MAX_ATTEMPTS
+                        )));
+                    }
+
+                    let delay = Self::retry_delay(attempt);
+                    warn!(
+                        "Timeout waiting for get-content response for {} (attempt {}/{}), retrying in {}ms",
+                        id,
+                        attempt,
+                        DEFAULT_MAX_ATTEMPTS,
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
             }
         }
+
+        unreachable!("retry loop should always return or error");
     }
 
     /// Get document info/metadata by ID.
@@ -170,37 +199,56 @@ impl MqttRequestClient {
     /// Publishes a `GetInfoRequest` to `{workspace}/commands/__system/get-info`
     /// and waits for the matching `GetInfoResponse`.
     pub async fn get_info(&self, id: &str) -> Result<GetInfoResponse, MqttError> {
-        let req_id = uuid::Uuid::new_v4().to_string();
-
-        let request = GetInfoRequest {
-            req: req_id.clone(),
-            id: id.to_string(),
-        };
-
-        let payload =
-            serde_json::to_vec(&request).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
-
-        let rx = self.register_pending_request(req_id.clone()).await;
-
         let topic = format!("{}/commands/__system/get-info", self.workspace);
-        self.client
-            .publish(&topic, &payload, QoS::AtLeastOnce)
-            .await?;
+        for attempt in 1..=DEFAULT_MAX_ATTEMPTS {
+            let req_id = uuid::Uuid::new_v4().to_string();
+            let request = GetInfoRequest {
+                req: req_id.clone(),
+                id: id.to_string(),
+            };
+            let payload = serde_json::to_vec(&request)
+                .map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
 
-        match tokio::time::timeout(self.timeout, rx).await {
-            Ok(Ok(response_bytes)) => serde_json::from_slice(&response_bytes)
-                .map_err(|e| MqttError::InvalidMessage(e.to_string())),
-            Ok(Err(_)) => Err(MqttError::InvalidMessage(
-                "Response channel closed unexpectedly".to_string(),
-            )),
-            Err(_) => {
-                self.remove_pending_request(&req_id).await;
-                Err(MqttError::Connection(format!(
-                    "Timeout waiting for get-info response for {}",
-                    id
-                )))
+            let rx = self.register_pending_request(req_id.clone()).await;
+
+            self.client
+                .publish(&topic, &payload, QoS::AtLeastOnce)
+                .await?;
+
+            match tokio::time::timeout(self.timeout, rx).await {
+                Ok(Ok(response_bytes)) => {
+                    return serde_json::from_slice(&response_bytes)
+                        .map_err(|e| MqttError::InvalidMessage(e.to_string()));
+                }
+                Ok(Err(_)) => {
+                    return Err(MqttError::InvalidMessage(
+                        "Response channel closed unexpectedly".to_string(),
+                    ));
+                }
+                Err(_) => {
+                    self.remove_pending_request(&req_id).await;
+
+                    if attempt == DEFAULT_MAX_ATTEMPTS {
+                        return Err(MqttError::Connection(format!(
+                            "Timeout waiting for get-info response for {} after {} attempts",
+                            id, DEFAULT_MAX_ATTEMPTS
+                        )));
+                    }
+
+                    let delay = Self::retry_delay(attempt);
+                    warn!(
+                        "Timeout waiting for get-info response for {} (attempt {}/{}), retrying in {}ms",
+                        id,
+                        attempt,
+                        DEFAULT_MAX_ATTEMPTS,
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
             }
         }
+
+        unreachable!("retry loop should always return or error");
     }
 
     /// Create a new document.

@@ -2557,6 +2557,14 @@ async fn run_directory_mode(
     #[cfg(not(unix))]
     let inode_tracker: Option<Arc<RwLock<InodeTracker>>> = None;
 
+    // Start MQTT event loop before making any MQTT request/response calls.
+    let mqtt_for_loop = mqtt_client.clone();
+    tokio::spawn(async move {
+        if let Err(e) = mqtt_for_loop.run_event_loop().await {
+            error!("MQTT event loop error: {}", e);
+        }
+    });
+
     // Verify fs-root document exists (or create it) via MQTT
     let mqtt_request = MqttRequestClient::new(mqtt_client.clone(), workspace.clone())
         .await
@@ -2774,14 +2782,6 @@ async fn run_directory_mode(
 
     // Start subscription task for fs-root (skip if push-only)
     let subscription_handle = if !push_only {
-        // Spawn the MQTT event loop in a background task
-        let mqtt_for_loop = mqtt_client.clone();
-        tokio::spawn(async move {
-            if let Err(e) = mqtt_for_loop.run_event_loop().await {
-                error!("MQTT event loop error: {}", e);
-            }
-        });
-
         let initial_uuid_map: HashMap<String, String> = uuid_map.clone();
 
         info!(
@@ -3204,6 +3204,14 @@ async fn run_exec_mode(
     #[cfg(not(unix))]
     let inode_tracker: Option<Arc<RwLock<InodeTracker>>> = None;
 
+    // Start MQTT event loop before making any MQTT request/response calls.
+    let mqtt_for_loop = mqtt_client.clone();
+    tokio::spawn(async move {
+        if let Err(e) = mqtt_for_loop.run_event_loop().await {
+            error!("MQTT event loop error: {}", e);
+        }
+    });
+
     // Verify fs-root document exists (or create it) via MQTT
     let mqtt_request = MqttRequestClient::new(mqtt_client.clone(), workspace.clone())
         .await
@@ -3399,14 +3407,6 @@ async fn run_exec_mode(
 
     // Start subscription task for fs-root (skip if push-only)
     let subscription_handle = if !push_only {
-        // Spawn the MQTT event loop in a background task
-        let mqtt_for_loop = mqtt_client.clone();
-        tokio::spawn(async move {
-            if let Err(e) = mqtt_for_loop.run_event_loop().await {
-                error!("MQTT event loop error: {}", e);
-            }
-        });
-
         let initial_uuid_map: HashMap<String, String> = uuid_map.clone();
         info!(
             "Using MQTT for exec mode subscriptions ({} file UUIDs)",

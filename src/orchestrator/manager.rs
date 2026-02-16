@@ -222,7 +222,7 @@ impl ProcessManager {
                     continue;
                 }
 
-                let should_restart = {
+                let (should_restart, exited) = {
                     let process = match self.processes.get_mut(&name) {
                         Some(p) => p,
                         None => continue,
@@ -241,11 +241,11 @@ impl ProcessManager {
                                 process.handle = None;
 
                                 match process.config.restart.policy {
-                                    RestartMode::Always => true,
-                                    RestartMode::OnFailure => !success,
+                                    RestartMode::Always => (true, true),
+                                    RestartMode::OnFailure => (!success, true),
                                     RestartMode::Never => {
                                         process.state = ProcessState::Stopped;
-                                        false
+                                        (false, true)
                                     }
                                 }
                             }
@@ -258,7 +258,7 @@ impl ProcessManager {
                                         process.consecutive_failures = 0;
                                     }
                                 }
-                                false
+                                (false, false)
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -266,11 +266,11 @@ impl ProcessManager {
                                     name,
                                     e
                                 );
-                                false
+                                (false, false)
                             }
                         }
                     } else {
-                        false
+                        (false, false)
                     }
                 };
 
@@ -297,6 +297,9 @@ impl ProcessManager {
                     if let Err(e) = self.spawn_process(&name).await {
                         tracing::error!("[orchestrator] Failed to restart '{}': {}", name, e);
                     }
+                } else if exited {
+                    // Process exited and will not restart; persist updated state.
+                    self.write_status();
                 }
             }
         }
@@ -310,7 +313,7 @@ impl ProcessManager {
                 continue;
             }
 
-            let should_restart = {
+            let (should_restart, exited) = {
                 let process = match self.processes.get_mut(&name) {
                     Some(p) => p,
                     None => continue,
@@ -329,11 +332,11 @@ impl ProcessManager {
                             process.handle = None;
 
                             match process.config.restart.policy {
-                                RestartMode::Always => true,
-                                RestartMode::OnFailure => !success,
+                                RestartMode::Always => (true, true),
+                                RestartMode::OnFailure => (!success, true),
                                 RestartMode::Never => {
                                     process.state = ProcessState::Stopped;
-                                    false
+                                    (false, true)
                                 }
                             }
                         }
@@ -346,7 +349,7 @@ impl ProcessManager {
                                     process.consecutive_failures = 0;
                                 }
                             }
-                            false
+                            (false, false)
                         }
                         Err(e) => {
                             tracing::error!(
@@ -354,11 +357,11 @@ impl ProcessManager {
                                 name,
                                 e
                             );
-                            false
+                            (false, false)
                         }
                     }
                 } else {
-                    false
+                    (false, false)
                 }
             };
 
@@ -391,6 +394,9 @@ impl ProcessManager {
                 if let Err(e) = self.spawn_process(&name).await {
                     tracing::error!("[orchestrator] Failed to restart '{}': {}", name, e);
                 }
+            } else if exited {
+                // Process exited and will not restart; persist updated state.
+                self.write_status();
             }
         }
     }

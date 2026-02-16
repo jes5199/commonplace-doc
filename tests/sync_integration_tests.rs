@@ -609,7 +609,7 @@ fn test_node_backed_subdir_propagates_without_restart() {
         .send()
         .expect("Failed to get fs-root HEAD");
     let head: serde_json::Value = resp.json().expect("Failed to parse HEAD");
-    let parent_cid = head["cid"].as_str().expect("No cid in HEAD");
+    let parent_cid = head["cid"].as_str();
 
     let schema = serde_json::json!({
         "version": 1,
@@ -624,11 +624,18 @@ fn test_node_backed_subdir_propagates_without_restart() {
         }
     });
 
-    let resp = client
-        .post(format!(
+    // Newly created documents may not have a HEAD yet. Only include parent_cid
+    // when one exists.
+    let replace_url = match parent_cid {
+        Some(cid) => format!(
             "{}/docs/{}/replace?parent_cid={}",
-            server_url, fs_root_id, parent_cid
-        ))
+            server_url, fs_root_id, cid
+        ),
+        None => format!("{}/docs/{}/replace", server_url, fs_root_id),
+    };
+
+    let resp = client
+        .post(replace_url)
         .header("Content-Type", "application/json")
         .body(schema.to_string())
         .send()
