@@ -28,8 +28,8 @@ pub use directory::{
 
 // From schema_io
 pub use schema_io::{
-    fetch_and_validate_schema, write_nested_schemas, write_schema_file, FetchedSchema,
-    SCHEMA_FILENAME,
+    fetch_and_validate_schema, set_sync_schema_mqtt_request_client, write_nested_schemas,
+    write_schema_file, FetchedSchema, SCHEMA_FILENAME,
 };
 
 // From uuid_map

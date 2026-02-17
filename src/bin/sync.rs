@@ -24,10 +24,11 @@ use commonplace_doc::sync::{
     find_owning_document, handle_file_deleted, handle_file_modified, handle_schema_modified,
     push_local_if_differs, push_schema_to_server, remove_file_from_schema,
     remove_file_state_and_abort, rename_file_in_schema, resync_crdt_state_via_cyan_with_pending,
-    schema_to_json, set_sync_http_disabled, spawn_command_listener, spawn_file_sync_tasks_crdt,
-    trace_timeline, wait_for_file_stability, write_schema_file, ymap_schema, CrdtFileSyncContext,
-    DirEvent, FileSyncState, InodeKey, InodeTracker, InodeTrackerInit, MqttOnlySyncConfig,
-    ScanOptions, SubdirStateCache, SyncError, SyncState, TimelineMilestone, SCHEMA_FILENAME,
+    schema_to_json, set_sync_http_disabled, set_sync_schema_mqtt_request_client,
+    spawn_command_listener, spawn_file_sync_tasks_crdt, trace_timeline, wait_for_file_stability,
+    write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent, FileSyncState, InodeKey,
+    InodeTracker, InodeTrackerInit, MqttOnlySyncConfig, ScanOptions, SubdirStateCache, SyncError,
+    SyncState, TimelineMilestone, SCHEMA_FILENAME,
 };
 use commonplace_doc::workspace::is_process_running;
 use commonplace_doc::{DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
@@ -2545,9 +2546,12 @@ async fn run_directory_mode(
     });
 
     // Verify fs-root document exists (or create it) via MQTT
-    let mqtt_request = MqttRequestClient::new(mqtt_client.clone(), workspace.clone())
-        .await
-        .map_err(|e| format!("Failed to create MQTT request client: {}", e))?;
+    let mqtt_request = Arc::new(
+        MqttRequestClient::new(mqtt_client.clone(), workspace.clone())
+            .await
+            .map_err(|e| format!("Failed to create MQTT request client: {}", e))?,
+    );
+    set_sync_schema_mqtt_request_client(Some(mqtt_request.clone()));
     ensure_fs_root_exists_mqtt(&mqtt_request, &fs_root_id).await?;
 
     // Load or create state file for persisting per-file CIDs
@@ -3137,9 +3141,12 @@ async fn run_exec_mode(
     });
 
     // Verify fs-root document exists (or create it) via MQTT
-    let mqtt_request = MqttRequestClient::new(mqtt_client.clone(), workspace.clone())
-        .await
-        .map_err(|e| format!("Failed to create MQTT request client: {}", e))?;
+    let mqtt_request = Arc::new(
+        MqttRequestClient::new(mqtt_client.clone(), workspace.clone())
+            .await
+            .map_err(|e| format!("Failed to create MQTT request client: {}", e))?,
+    );
+    set_sync_schema_mqtt_request_client(Some(mqtt_request.clone()));
     ensure_fs_root_exists_mqtt(&mqtt_request, &fs_root_id).await?;
 
     // Load or create state file for persisting per-file CIDs (sandbox mode)

@@ -191,8 +191,8 @@ pub use schema::directory::{
     ScanError, ScanOptions, ScannedFile,
 };
 pub use schema::schema_io::{
-    fetch_and_validate_schema, write_nested_schemas, write_schema_file, FetchedSchema,
-    SCHEMA_FILENAME,
+    fetch_and_validate_schema, set_sync_schema_mqtt_request_client, write_nested_schemas,
+    write_schema_file, FetchedSchema, SCHEMA_FILENAME,
 };
 pub use schema::uuid_map::{
     build_uuid_map_and_write_schemas, build_uuid_map_from_doc, build_uuid_map_from_local_schemas,
