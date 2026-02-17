@@ -18,14 +18,14 @@ use commonplace_doc::sync::subdir_spawn::{
 };
 use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
-    acquire_sync_lock, add_file_to_schema, build_head_url, build_info_url,
-    build_uuid_map_from_local_schemas, check_server_has_content_mqtt, create_new_file,
-    detect_from_path, directory_mqtt_task, directory_watcher_task, discover_fs_root,
-    ensure_fs_root_exists_mqtt, ensure_parent_directories_exist, find_owning_document,
-    handle_file_deleted, handle_file_modified, handle_schema_change, handle_schema_modified,
-    push_local_if_differs, push_schema_to_server, remove_file_from_schema,
-    remove_file_state_and_abort, rename_file_in_schema, resync_crdt_state_via_cyan_with_pending,
-    schema_to_json, spawn_command_listener, spawn_file_sync_tasks_crdt, sync_schema,
+    acquire_sync_lock, add_file_to_schema, build_head_url, build_uuid_map_from_local_schemas,
+    check_server_has_content_mqtt, create_new_file, detect_from_path, directory_mqtt_task,
+    directory_watcher_task, discover_fs_root, ensure_fs_root_exists_mqtt,
+    ensure_parent_directories_exist, find_owning_document, handle_file_deleted,
+    handle_file_modified, handle_schema_change, handle_schema_modified, push_local_if_differs,
+    push_schema_to_server, remove_file_from_schema, remove_file_state_and_abort,
+    rename_file_in_schema, resync_crdt_state_via_cyan_with_pending, schema_to_json,
+    set_sync_http_disabled, spawn_command_listener, spawn_file_sync_tasks_crdt, sync_schema,
     trace_timeline, wait_for_file_stability, write_schema_file, ymap_schema, CrdtFileSyncContext,
     DirEvent, FileSyncState, InodeKey, InodeTracker, InodeTrackerInit, MqttOnlySyncConfig,
     ScanOptions, SubdirStateCache, SyncError, SyncState, TimelineMilestone, SCHEMA_FILENAME,
@@ -1661,6 +1661,7 @@ struct Args {
 /// Discovers the fs-root first, then traverses the schema hierarchy.
 /// For example, "bartleby" finds schema.root.entries["bartleby"].node_id
 /// For nested paths like "foo/bar", follows intermediate node_ids.
+#[allow(dead_code)]
 async fn resolve_path_to_uuid(
     client: &Client,
     server: &str,
@@ -1679,6 +1680,7 @@ async fn resolve_path_to_uuid(
 /// schema and waits for the reconciler to assign a UUID.
 ///
 /// This is used for single-file sync when the server path doesn't exist yet.
+#[allow(dead_code)]
 async fn resolve_or_create_path(
     client: &Client,
     server: &str,
@@ -1906,6 +1908,11 @@ async fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // Hard-disable HTTP transport for sync runtime.
+    // Any remaining HTTP call paths should fail fast so they can be replaced by MQTT/cyan.
+    set_sync_http_disabled(true);
+    info!("HTTP sync transport disabled (strict MQTT-only runtime)");
+
     // Create HTTP client
     let client = Client::new();
 
@@ -1963,63 +1970,17 @@ async fn main() -> ExitCode {
         if uuid::Uuid::parse_str(node).is_ok() {
             node.clone()
         } else {
-            // Not a UUID - could be "workspace" (fs-root name) or a path
-            // First check if it's a document ID that exists directly
-            let info_url = build_info_url(&args.server, node);
-            match client.get(&info_url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    // Document exists with this ID
-                    info!("Using node ID directly: {}", node);
-                    node.clone()
-                }
-                _ => {
-                    // Try to resolve as a path
-                    info!("Resolving node '{}' as path to UUID...", node);
-                    match resolve_path_to_uuid(&client, &args.server, node).await {
-                        Ok(id) => {
-                            info!("Resolved '{}' -> {}", node, id);
-                            id
-                        }
-                        Err(e) => {
-                            error!("Failed to resolve node '{}': {}", node, e);
-                            return ExitCode::from(1);
-                        }
-                    }
-                }
-            }
+            error!(
+                "Non-UUID --node values are not supported with HTTP disabled. Pass --node <uuid>."
+            );
+            return ExitCode::from(1);
         }
     } else if let Some(ref path) = args.path {
-        // Path provided - resolve to UUID (or create if using single-file mode)
-        info!("Resolving path '{}' to UUID...", path);
-        if let Some(ref file) = args.file {
-            // Single-file mode with --path: create document if it doesn't exist
-            let author = args
-                .name
-                .clone()
-                .unwrap_or_else(|| "sync-client".to_string());
-            match resolve_or_create_path(&client, &args.server, path, file, &author).await {
-                Ok(id) => {
-                    info!("Resolved '{}' -> {}", path, id);
-                    id
-                }
-                Err(e) => {
-                    error!("Failed to resolve/create path '{}': {}", path, e);
-                    return ExitCode::from(1);
-                }
-            }
-        } else {
-            // Directory mode: path must already exist
-            match resolve_path_to_uuid(&client, &args.server, path).await {
-                Ok(id) => {
-                    info!("Resolved '{}' -> {}", path, id);
-                    id
-                }
-                Err(e) => {
-                    error!("Failed to resolve path '{}': {}", path, e);
-                    return ExitCode::from(1);
-                }
-            }
-        }
+        error!(
+            "--path '{}' is currently unavailable with HTTP disabled in sync runtime (path->UUID resolver is still HTTP-based). Pass --node <uuid>.",
+            path
+        );
+        return ExitCode::from(1);
     } else if let Some(ref source) = args.fork_from {
         // Fork from another node via MQTT
         info!("Forking from node {} via MQTT...", source);

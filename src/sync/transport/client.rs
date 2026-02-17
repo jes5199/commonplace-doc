@@ -12,12 +12,44 @@ use crate::sync::{
     ReplaceResponse, SyncState,
 };
 use reqwest::Client;
+use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
+
+/// Global policy toggle used by `commonplace-sync` to hard-disable HTTP paths.
+///
+/// This is process-local and defaults to `false` to avoid impacting non-sync binaries.
+static HTTP_DISABLED_IN_SYNC_RUNTIME: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable HTTP operations used by sync transport helpers.
+///
+/// When enabled, helper functions in this module fail fast with a clear error so
+/// remaining HTTP dependencies are surfaced immediately.
+pub fn set_sync_http_disabled(disabled: bool) {
+    HTTP_DISABLED_IN_SYNC_RUNTIME.store(disabled, Ordering::Relaxed);
+}
+
+fn http_block_message(operation: &str) -> String {
+    format!(
+        "HTTP disabled in sync runtime; blocked operation: {} (use MQTT/cyan equivalent)",
+        operation
+    )
+}
+
+fn ensure_http_allowed(operation: &str) -> Result<(), io::Error> {
+    if HTTP_DISABLED_IN_SYNC_RUNTIME.load(Ordering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            http_block_message(operation),
+        ));
+    }
+    Ok(())
+}
 
 /// Error from fetching HEAD
 #[derive(Debug)]
@@ -54,6 +86,13 @@ pub async fn fetch_head(
     identifier: &str,
     use_paths: bool,
 ) -> Result<Option<HeadResponse>, FetchHeadError> {
+    if let Err(e) = ensure_http_allowed("fetch_head") {
+        return Err(FetchHeadError::Status(
+            reqwest::StatusCode::FORBIDDEN,
+            e.to_string(),
+        ));
+    }
+
     let head_url = build_head_url(server, identifier, use_paths);
     let resp = client
         .get(&head_url)
@@ -82,6 +121,8 @@ pub async fn fork_node(
     source_node: &str,
     at_commit: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    ensure_http_allowed("fork_node")?;
+
     let fork_url = build_fork_url(server, source_node, at_commit);
 
     let resp = client.post(&fork_url).send().await?;
@@ -117,6 +158,8 @@ pub async fn push_schema_to_server(
     schema_json: &str,
     author: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ensure_http_allowed("push_schema_to_server")?;
+
     let edit_url = build_edit_url(server, fs_root_id, false);
 
     // First fetch current server content and state
@@ -205,6 +248,8 @@ pub async fn delete_schema_entry(
     entry_name: &str,
     author: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ensure_http_allowed("delete_schema_entry")?;
+
     let edit_url = build_edit_url(server, fs_root_id, false);
 
     // Fetch current server state
@@ -271,6 +316,8 @@ async fn push_json_content_impl(
     use_paths: bool,
     author: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ensure_http_allowed("push_json_content")?;
+
     let head_url = build_head_url(server, identifier, use_paths);
     let edit_url = build_edit_url(server, identifier, use_paths);
     let mut attempts = 0;
@@ -342,6 +389,8 @@ pub async fn push_jsonl_content(
     use_paths: bool,
     author: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ensure_http_allowed("push_jsonl_content")?;
+
     let head_url = build_head_url(server, identifier, use_paths);
     let edit_url = build_edit_url(server, identifier, use_paths);
     let mut attempts = 0;
@@ -444,6 +493,8 @@ pub async fn push_file_content(
     use_paths: bool,
     author: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ensure_http_allowed("push_file_content")?;
+
     // First check if there's existing content
     if let Ok(Some(head)) = fetch_head(client, server, identifier, use_paths).await {
         if let Some(parent_cid) = head.cid {
@@ -515,6 +566,8 @@ pub async fn resolve_path_to_uuid_http(
     fs_root_id: &str,
     path: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    ensure_http_allowed("resolve_path_to_uuid_http")?;
+
     use serde::Deserialize;
     use std::collections::HashMap;
 
@@ -653,6 +706,13 @@ pub async fn discover_fs_root(
     client: &Client,
     server: &str,
 ) -> Result<String, DiscoverFsRootError> {
+    if let Err(e) = ensure_http_allowed("discover_fs_root") {
+        return Err(DiscoverFsRootError::Status(
+            reqwest::StatusCode::FORBIDDEN,
+            e.to_string(),
+        ));
+    }
+
     let url = format!("{}/fs-root", server);
     let resp = client
         .get(&url)
@@ -828,4 +888,43 @@ pub async fn refresh_from_head(
         head.content.len()
     );
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fetch_head_fails_fast_when_http_disabled() {
+        set_sync_http_disabled(true);
+        let client = Client::new();
+
+        let result = fetch_head(&client, "http://127.0.0.1:1", "any-id", false).await;
+        set_sync_http_disabled(false);
+
+        match result {
+            Err(FetchHeadError::Status(code, body)) => {
+                assert_eq!(code, reqwest::StatusCode::FORBIDDEN);
+                assert!(body.contains("HTTP disabled in sync runtime"));
+            }
+            other => panic!("expected forbidden status error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_fs_root_fails_fast_when_http_disabled() {
+        set_sync_http_disabled(true);
+        let client = Client::new();
+
+        let result = discover_fs_root(&client, "http://127.0.0.1:1").await;
+        set_sync_http_disabled(false);
+
+        match result {
+            Err(DiscoverFsRootError::Status(code, body)) => {
+                assert_eq!(code, reqwest::StatusCode::FORBIDDEN);
+                assert!(body.contains("HTTP disabled in sync runtime"));
+            }
+            other => panic!("expected forbidden status error, got {:?}", other),
+        }
+    }
 }
