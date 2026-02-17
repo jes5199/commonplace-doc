@@ -109,6 +109,7 @@ fn load_nested_node_ids(
 fn load_linked_entries(
     directory: &Path,
     scanned_entries: &HashMap<String, Entry>,
+    options: &ScanOptions,
 ) -> HashMap<String, Entry> {
     let schema_path = directory.join(SCHEMA_FILENAME);
     if !schema_path.exists() {
@@ -146,7 +147,7 @@ fn load_linked_entries(
     // For subdirectory scans, also preserve links whose peer file exists in a different
     // node-backed directory. Without this, cross-directory links can be dropped when
     // the local file for this schema entry is absent (e.g., after state reset).
-    scanned_node_ids.extend(load_workspace_existing_file_node_ids(directory));
+    scanned_node_ids.extend(load_workspace_existing_file_node_ids(directory, options));
 
     // Find linked entries: entries in existing schema that:
     // - Are not in scanned entries (file doesn't exist locally)
@@ -196,7 +197,10 @@ fn find_workspace_root_with_schema(start: &Path) -> std::path::PathBuf {
 /// This provides cross-directory link preservation: if `a/file.txt` exists and
 /// `b/link.txt` shares its node_id but is absent on disk, `b/link.txt` should
 /// still be preserved as a linked schema entry.
-fn load_workspace_existing_file_node_ids(directory: &Path) -> HashSet<String> {
+fn load_workspace_existing_file_node_ids(
+    directory: &Path,
+    options: &ScanOptions,
+) -> HashSet<String> {
     // If parent doesn't have a schema, this is likely already the workspace root.
     // In that case local scanned entries are sufficient.
     let Some(parent) = directory.parent() else {
@@ -212,7 +216,18 @@ fn load_workspace_existing_file_node_ids(directory: &Path) -> HashSet<String> {
 
     let mut node_ids = HashSet::new();
     for (relative_path, node_id) in uuid_map {
-        if workspace_root.join(relative_path).is_file() {
+        // Respect the same scan filters applied to local files.
+        let filename = std::path::Path::new(&relative_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if !options.include_hidden && filename.starts_with('.') {
+            continue;
+        }
+        if !is_allowed_extension(std::path::Path::new(&relative_path)) {
+            continue;
+        }
+        if workspace_root.join(&relative_path).is_file() {
             node_ids.insert(node_id);
         }
     }
@@ -284,7 +299,7 @@ pub fn scan_directory(path: &Path, options: &ScanOptions) -> Result<FsSchema, Sc
     // with files that do exist. This supports commonplace-link functionality.
     if let Entry::Dir(ref mut dir) = root_entry {
         if let Some(ref mut entries) = dir.entries {
-            let linked_entries = load_linked_entries(path, entries);
+            let linked_entries = load_linked_entries(path, entries, options);
             for (name, entry) in linked_entries {
                 entries.insert(name, entry);
             }
