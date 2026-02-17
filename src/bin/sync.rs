@@ -23,12 +23,12 @@ use commonplace_doc::sync::{
     detect_from_path, directory_mqtt_task, directory_watcher_task, discover_fs_root,
     ensure_fs_root_exists_mqtt, ensure_parent_directories_exist, find_owning_document,
     handle_file_deleted, handle_file_modified, handle_schema_change, handle_schema_modified,
-    push_local_if_differs, push_schema_to_server, remove_file_from_schema, rename_file_in_schema,
-    resync_crdt_state_via_cyan_with_pending, schema_to_json, spawn_command_listener,
-    spawn_file_sync_tasks_crdt, sync_schema, trace_timeline, wait_for_file_stability,
-    write_schema_file, ymap_schema, CrdtFileSyncContext, DirEvent, FileSyncState, InodeKey,
-    InodeTracker, InodeTrackerInit, MqttOnlySyncConfig, ScanOptions, SubdirStateCache, SyncError,
-    SyncState, TimelineMilestone, SCHEMA_FILENAME,
+    push_local_if_differs, push_schema_to_server, remove_file_from_schema,
+    remove_file_state_and_abort, rename_file_in_schema, resync_crdt_state_via_cyan_with_pending,
+    schema_to_json, spawn_command_listener, spawn_file_sync_tasks_crdt, sync_schema,
+    trace_timeline, wait_for_file_stability, write_schema_file, ymap_schema, CrdtFileSyncContext,
+    DirEvent, FileSyncState, InodeKey, InodeTracker, InodeTrackerInit, MqttOnlySyncConfig,
+    ScanOptions, SubdirStateCache, SyncError, SyncState, TimelineMilestone, SCHEMA_FILENAME,
 };
 use commonplace_doc::workspace::is_process_running;
 use commonplace_doc::{DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
@@ -208,7 +208,16 @@ async fn handle_dir_event(
         DirEvent::Deleted(path) => {
             // Use CRDT path if available
             if let Some(crdt) = crdt_params {
-                handle_file_deleted_crdt(&path, directory, fs_root_id, options, author, crdt).await;
+                handle_file_deleted_crdt(
+                    &path,
+                    directory,
+                    fs_root_id,
+                    options,
+                    file_states,
+                    author,
+                    crdt,
+                )
+                .await;
             } else {
                 handle_file_deleted(
                     client,
@@ -1215,6 +1224,7 @@ async fn handle_file_deleted_crdt(
     directory: &std::path::Path,
     fs_root_id: &str,
     options: &ScanOptions,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
     author: &str,
     crdt: &CrdtEventParams,
 ) {
@@ -1298,6 +1308,15 @@ async fn handle_file_deleted_crdt(
             filename.clone()
         }
     };
+
+    // Stop sync tasks and clear runtime tracking so recreate events can
+    // re-enter the normal create/publish path for this same relative path.
+    if remove_file_state_and_abort(file_states, &relative_path)
+        .await
+        .is_some()
+    {
+        info!("Stopping sync tasks for deleted file: {}", relative_path);
+    }
 
     // Find which document owns this file (may be a node-backed subdirectory)
     let owning_doc = find_owning_document(&canonical_directory, fs_root_id, &relative_path);
