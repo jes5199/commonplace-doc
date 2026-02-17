@@ -19,13 +19,12 @@ use commonplace_doc::sync::subdir_spawn::{
 use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
     acquire_sync_lock, add_file_to_schema, build_head_url, build_uuid_map_from_local_schemas,
-    check_server_has_content_mqtt, create_new_file, detect_from_path, directory_mqtt_task,
-    directory_watcher_task, discover_fs_root, ensure_fs_root_exists_mqtt,
-    ensure_parent_directories_exist, find_owning_document, handle_file_deleted,
-    handle_file_modified, handle_schema_change, handle_schema_modified, push_local_if_differs,
-    push_schema_to_server, remove_file_from_schema, remove_file_state_and_abort,
-    rename_file_in_schema, resync_crdt_state_via_cyan_with_pending, schema_to_json,
-    set_sync_http_disabled, spawn_command_listener, spawn_file_sync_tasks_crdt, sync_schema,
+    create_new_file, detect_from_path, directory_mqtt_task, directory_watcher_task,
+    discover_fs_root, ensure_fs_root_exists_mqtt, ensure_parent_directories_exist,
+    find_owning_document, handle_file_deleted, handle_file_modified, handle_schema_modified,
+    push_local_if_differs, push_schema_to_server, remove_file_from_schema,
+    remove_file_state_and_abort, rename_file_in_schema, resync_crdt_state_via_cyan_with_pending,
+    schema_to_json, set_sync_http_disabled, spawn_command_listener, spawn_file_sync_tasks_crdt,
     trace_timeline, wait_for_file_stability, write_schema_file, ymap_schema, CrdtFileSyncContext,
     DirEvent, FileSyncState, InodeKey, InodeTracker, InodeTrackerInit, MqttOnlySyncConfig,
     ScanOptions, SubdirStateCache, SyncError, SyncState, TimelineMilestone, SCHEMA_FILENAME,
@@ -2551,9 +2550,6 @@ async fn run_directory_mode(
         .map_err(|e| format!("Failed to create MQTT request client: {}", e))?;
     ensure_fs_root_exists_mqtt(&mqtt_request, &fs_root_id).await?;
 
-    // Check if server has existing schema via MQTT
-    let server_has_content = check_server_has_content_mqtt(&mqtt_request, &fs_root_id).await;
-
     // Load or create state file for persisting per-file CIDs
     let state_file_path =
         commonplace_doc::sync::state_file::SyncStateFile::state_file_path(&directory);
@@ -2598,47 +2594,19 @@ async fn run_directory_mode(
     let written_schemas: commonplace_doc::sync::WrittenSchemas =
         Arc::new(RwLock::new(std::collections::HashMap::new()));
 
-    if initial_sync_strategy == "server" && server_has_content {
-        info!("Pulling server schema first (initial-sync=server)...");
-        // Don't spawn tasks here - the main loop will spawn them for all files
-        handle_schema_change(
-            &client,
-            &server,
-            &fs_root_id,
-            &directory,
-            &file_states,
-            false,
-            use_paths,
-            push_only,
-            pull_only,
-            &author,
-            #[cfg(unix)]
-            inode_tracker.clone(),
-            Some(&written_schemas),
-            Some(&shared_state_file),
-            None, // No CRDT context during initial sync
-        )
-        .await?;
-        info!("Server files pulled to local directory");
+    if initial_sync_strategy != "skip" {
+        warn!(
+            "Ignoring --initial-sync={} during HTTP-off startup; MQTT/cyan bootstrap owns remote reconciliation",
+            initial_sync_strategy
+        );
     }
 
-    // Synchronize schema between local and server.
-    // Capture the CID from initial sync to prevent subscription tasks from
-    // pulling stale server content that predates our push.
-    let (_schema_json, initial_schema_cid) = sync_schema(
-        &client,
-        &server,
-        &fs_root_id,
-        &directory,
-        &options,
-        &initial_sync_strategy,
-        server_has_content,
-        &author,
-    )
-    .await?;
+    // HTTP bootstrap is disabled in strict MQTT runtime.
+    // Schema/state reconciliation is handled by MQTT subscription tasks.
+    let initial_schema_cid: Option<String> = None;
 
-    // Build UUID map from local schema files (no HTTP needed).
-    // sync_schema already ensured the local schemas are up to date.
+    // Build UUID map from local schema files.
+    // Remote reconciliation is deferred to MQTT subscription tasks.
     let mut uuid_map = HashMap::new();
     build_uuid_map_from_local_schemas(&directory, "", &mut uuid_map);
     let file_count = uuid_map.len();
@@ -2678,28 +2646,6 @@ async fn run_directory_mode(
             );
         }
     }
-
-    // Create local files for any schema entries that don't exist locally.
-    // This handles commonplace-link entries where the linked target exists but the
-    // link file needs to be created locally.
-    handle_schema_change(
-        &client,
-        &server,
-        &fs_root_id,
-        &directory,
-        &file_states,
-        false, // Don't spawn tasks - main loop will do that
-        use_paths,
-        push_only,
-        pull_only,
-        &author,
-        #[cfg(unix)]
-        inode_tracker.clone(),
-        Some(&written_schemas),
-        Some(&shared_state_file),
-        None, // No CRDT context during initial sync
-    )
-    .await?;
 
     // Publish initial-sync-complete event via MQTT
     publish_initial_sync_complete(
@@ -3198,9 +3144,6 @@ async fn run_exec_mode(
         .map_err(|e| format!("Failed to create MQTT request client: {}", e))?;
     ensure_fs_root_exists_mqtt(&mqtt_request, &fs_root_id).await?;
 
-    // Check if server has existing schema via MQTT
-    let server_has_content = check_server_has_content_mqtt(&mqtt_request, &fs_root_id).await;
-
     // Load or create state file for persisting per-file CIDs (sandbox mode)
     let state_file_path =
         commonplace_doc::sync::state_file::SyncStateFile::state_file_path(&directory);
@@ -3244,48 +3187,21 @@ async fn run_exec_mode(
     let written_schemas: commonplace_doc::sync::WrittenSchemas =
         Arc::new(RwLock::new(std::collections::HashMap::new()));
 
-    if initial_sync_strategy == "server" && server_has_content {
-        info!("Pulling server schema first (initial-sync=server)...");
-        handle_schema_change(
-            &client,
-            &server,
-            &fs_root_id,
-            &directory,
-            &file_states,
-            false,
-            use_paths,
-            push_only,
-            pull_only,
-            &author,
-            #[cfg(unix)]
-            inode_tracker.clone(),
-            Some(&written_schemas),
-            Some(&shared_state_file),
-            None, // No CRDT context during initial sync
-        )
-        .await?;
-        info!("Server files pulled to local directory");
+    if initial_sync_strategy != "skip" {
+        warn!(
+            "Ignoring --initial-sync={} during HTTP-off startup; MQTT/cyan bootstrap owns remote reconciliation",
+            initial_sync_strategy
+        );
     }
 
-    // Synchronize schema between local and server.
-    // Capture the CID from initial sync to prevent subscription tasks from
-    // pulling stale server content that predates our push.
-    let (_schema_json, initial_schema_cid) = sync_schema(
-        &client,
-        &server,
-        &fs_root_id,
-        &directory,
-        &options,
-        &initial_sync_strategy,
-        server_has_content,
-        &author,
-    )
-    .await?;
+    // HTTP bootstrap is disabled in strict MQTT runtime.
+    // Schema/state reconciliation is handled by MQTT subscription tasks.
+    let initial_schema_cid: Option<String> = None;
 
     let sync_start = Instant::now();
 
-    // Build UUID map from local schema files (no HTTP needed).
-    // sync_schema already ensured the local schemas are up to date.
+    // Build UUID map from local schema files.
+    // Remote reconciliation is deferred to MQTT subscription tasks.
     let mut uuid_map = HashMap::new();
     build_uuid_map_from_local_schemas(&directory, "", &mut uuid_map);
     let file_count = uuid_map.len();
