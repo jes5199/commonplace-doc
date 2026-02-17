@@ -18,11 +18,10 @@ use commonplace_doc::sync::subdir_spawn::{
 };
 use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
-    acquire_sync_lock, add_file_to_schema, build_head_url, build_uuid_map_from_local_schemas,
-    create_new_file, detect_from_path, directory_mqtt_task, directory_watcher_task,
-    discover_fs_root, ensure_fs_root_exists_mqtt, ensure_parent_directories_exist,
-    find_owning_document, handle_file_deleted, handle_file_modified, handle_schema_modified,
-    push_local_if_differs, push_schema_to_server, remove_file_from_schema,
+    acquire_sync_lock, add_file_to_schema, build_uuid_map_from_local_schemas, create_new_file,
+    detect_from_path, directory_mqtt_task, directory_watcher_task, ensure_fs_root_exists_mqtt,
+    ensure_parent_directories_exist, find_owning_document, handle_file_deleted,
+    handle_file_modified, handle_schema_modified, push_local_if_differs, remove_file_from_schema,
     remove_file_state_and_abort, rename_file_in_schema, resync_crdt_state_via_cyan_with_pending,
     schema_to_json, set_sync_http_disabled, set_sync_schema_mqtt_request_client,
     spawn_command_listener, spawn_file_sync_tasks_crdt, trace_timeline, wait_for_file_stability,
@@ -1656,226 +1655,6 @@ struct Args {
     mqtt_only_sync: bool,
 }
 
-/// Resolve a path relative to fs-root to a UUID.
-///
-/// Discovers the fs-root first, then traverses the schema hierarchy.
-/// For example, "bartleby" finds schema.root.entries["bartleby"].node_id
-/// For nested paths like "foo/bar", follows intermediate node_ids.
-#[allow(dead_code)]
-async fn resolve_path_to_uuid(
-    client: &Client,
-    server: &str,
-    path: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    use commonplace_doc::sync::resolve_path_to_uuid_http;
-
-    let fs_root_id = discover_fs_root(client, server).await?;
-    resolve_path_to_uuid_http(client, server, &fs_root_id, path).await
-}
-
-/// Resolve a path to UUID, or create the document if it doesn't exist.
-///
-/// This function first tries to resolve the path normally. If the final segment
-/// doesn't exist (but the parent path does), it creates a new entry in the parent's
-/// schema and waits for the reconciler to assign a UUID.
-///
-/// This is used for single-file sync when the server path doesn't exist yet.
-#[allow(dead_code)]
-async fn resolve_or_create_path(
-    client: &Client,
-    server: &str,
-    path: &str,
-    local_file: &std::path::Path,
-    author: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // First try to resolve normally
-    match resolve_path_to_uuid(client, server, path).await {
-        Ok(id) => return Ok(id),
-        Err(e) => {
-            let err_msg = e.to_string();
-            // Only proceed if it's a "not found" error for the final segment
-            if !err_msg.contains("not found") && !err_msg.contains("no entry") {
-                return Err(e);
-            }
-            info!("Path '{}' not found, will create it", path);
-        }
-    }
-
-    // Split path into parent and filename
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if segments.is_empty() {
-        return Err("Cannot create document at root path".into());
-    }
-
-    let filename = segments.last().unwrap();
-    let parent_segments = &segments[..segments.len() - 1];
-
-    // Get the parent document ID
-    let (parent_id, parent_path) = if parent_segments.is_empty() {
-        // Parent is fs-root
-        let fs_root_id = discover_fs_root(client, server).await?;
-        (fs_root_id, "fs-root".to_string())
-    } else {
-        // Resolve parent path (must exist)
-        let parent_path_str = parent_segments.join("/");
-        let parent_id = resolve_path_to_uuid(client, server, &parent_path_str).await?;
-        (parent_id, parent_path_str)
-    };
-
-    info!(
-        "Creating '{}' in parent '{}' ({})",
-        filename, parent_path, parent_id
-    );
-
-    // Fetch current parent schema
-    let head_url = build_head_url(server, &parent_id, false);
-    let resp = client.get(&head_url).send().await?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Failed to fetch parent schema: HTTP {}", resp.status()).into());
-    }
-
-    #[derive(serde::Deserialize, serde::Serialize, Clone, Default)]
-    struct Schema {
-        #[serde(default)]
-        version: u32,
-        #[serde(default)]
-        root: SchemaRoot,
-    }
-
-    #[derive(serde::Deserialize, serde::Serialize, Clone)]
-    struct SchemaRoot {
-        #[serde(rename = "type")]
-        entry_type: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        entries: Option<std::collections::HashMap<String, SchemaEntry>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        node_id: Option<String>,
-    }
-
-    impl Default for SchemaRoot {
-        fn default() -> Self {
-            Self {
-                entry_type: "dir".to_string(),
-                entries: None,
-                node_id: None,
-            }
-        }
-    }
-
-    #[derive(serde::Deserialize, serde::Serialize, Clone)]
-    struct SchemaEntry {
-        #[serde(rename = "type")]
-        entry_type: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        node_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        content_type: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct HeadResp {
-        content: String,
-    }
-
-    let head: HeadResp = resp.json().await?;
-    // Parse schema, handling empty "{}" case
-    let mut schema: Schema = if head.content.trim() == "{}" {
-        Schema {
-            version: 1,
-            root: SchemaRoot::default(),
-        }
-    } else {
-        serde_json::from_str(&head.content)?
-    };
-
-    // Determine content type from local file
-    let content_info = detect_from_path(local_file);
-    let content_type = content_info.mime_type;
-
-    // Add entry for the new file with None node_id.
-    // Server's reconciler will generate the UUID to ensure all clients get the same one.
-    let entries = schema
-        .root
-        .entries
-        .get_or_insert_with(std::collections::HashMap::new);
-    entries.insert(
-        filename.to_string(),
-        SchemaEntry {
-            entry_type: "doc".to_string(),
-            node_id: None,
-            content_type: Some(content_type.to_string()),
-        },
-    );
-
-    // Push updated schema - this triggers the server-side reconciler
-    // which creates the document and assigns a UUID
-    let schema_json = serde_json::to_string_pretty(&schema)?;
-    push_schema_to_server(client, server, &parent_id, &schema_json, author)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
-
-    // Wait for the reconciler to create the document with exponential backoff
-    // (100ms, 200ms, 400ms, ...) up to 10 seconds total
-    info!("Waiting for server reconciler to create document...");
-    let head_url = build_head_url(server, &parent_id, false);
-
-    const INITIAL_DELAY_MS: u64 = 100;
-    const MAX_DELAY_MS: u64 = 1600;
-    const TIMEOUT_MS: u64 = 10_000;
-
-    let start = std::time::Instant::now();
-    let mut delay_ms = INITIAL_DELAY_MS;
-    let mut attempt = 0;
-
-    loop {
-        attempt += 1;
-        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-
-        // Fetch the updated schema to get the server-assigned UUID
-        let resp = client.get(&head_url).send().await?;
-        if !resp.status().is_success() {
-            return Err(format!("Failed to fetch updated schema: HTTP {}", resp.status()).into());
-        }
-
-        let head: HeadResp = resp.json().await?;
-        let updated_schema: Schema = serde_json::from_str(&head.content)?;
-
-        // Check if the UUID has been assigned
-        if let Some(node_id) = updated_schema
-            .root
-            .entries
-            .as_ref()
-            .and_then(|e| e.get(*filename))
-            .and_then(|entry| entry.node_id.clone())
-        {
-            info!(
-                "Created document: {} -> {} (after {} attempts)",
-                path, node_id, attempt
-            );
-            return Ok(node_id);
-        }
-
-        // Check timeout
-        let elapsed = start.elapsed();
-        if elapsed.as_millis() >= TIMEOUT_MS as u128 {
-            return Err(format!(
-                "Timeout waiting for reconciler to assign UUID for '{}' after {:?}. Check server logs.",
-                filename, elapsed
-            )
-            .into());
-        }
-
-        debug!(
-            "UUID not yet assigned for '{}', attempt {} (waiting {}ms)",
-            filename, attempt, delay_ms
-        );
-
-        // Exponential backoff
-        delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
-    }
-}
-
 #[tokio::main]
 async fn main() -> ExitCode {
     // Initialize tracing
@@ -1963,35 +1742,73 @@ async fn main() -> ExitCode {
         None
     };
 
+    // Initialize MQTT request/response client for startup operations (path resolution, fork).
+    let mqtt_request =
+        match MqttRequestClient::new(mqtt_client.clone(), args.workspace.clone()).await {
+            Ok(req) => req,
+            Err(e) => {
+                error!("Failed to create MQTT request client: {}", e);
+                return ExitCode::from(1);
+            }
+        };
+
     // Determine the node ID to sync with
     // Priority: --node > --path > --fork-from > --use-paths discovery
     let node_id = if let Some(ref node) = args.node {
-        // Check if it's a valid UUID - use directly if so
+        // UUID values are used directly.
         if uuid::Uuid::parse_str(node).is_ok() {
             node.clone()
         } else {
-            error!(
-                "Non-UUID --node values are not supported with HTTP disabled. Pass --node <uuid>."
+            // Non-UUID --node is treated as an fs-root-relative path.
+            info!(
+                "Resolving --node '{}' as fs-root-relative path via MQTT...",
+                node
             );
-            return ExitCode::from(1);
-        }
-    } else if let Some(ref path) = args.path {
-        error!(
-            "--path '{}' is currently unavailable with HTTP disabled in sync runtime (path->UUID resolver is still HTTP-based). Pass --node <uuid>.",
-            path
-        );
-        return ExitCode::from(1);
-    } else if let Some(ref source) = args.fork_from {
-        // Fork from another node via MQTT
-        info!("Forking from node {} via MQTT...", source);
-        let mqtt_request =
-            match MqttRequestClient::new(mqtt_client.clone(), args.workspace.clone()).await {
-                Ok(req) => req,
+            let fs_root_id = match mqtt_request.discover_fs_root().await {
+                Ok(id) => id,
                 Err(e) => {
-                    error!("Failed to create MQTT request client: {}", e);
+                    error!(
+                        "Failed to discover fs-root for --node path resolution: {}",
+                        e
+                    );
+                    error!("Ensure server was started with --fs-root, or pass --node <uuid>");
                     return ExitCode::from(1);
                 }
             };
+            match mqtt_request.resolve_path_to_uuid(&fs_root_id, node).await {
+                Ok(id) => {
+                    info!("Resolved --node path '{}' -> {}", node, id);
+                    id
+                }
+                Err(e) => {
+                    error!("Failed to resolve --node path '{}' via MQTT: {}", node, e);
+                    return ExitCode::from(1);
+                }
+            }
+        }
+    } else if let Some(ref path) = args.path {
+        info!("Resolving --path '{}' via MQTT...", path);
+        let fs_root_id = match mqtt_request.discover_fs_root().await {
+            Ok(id) => id,
+            Err(e) => {
+                error!("Failed to discover fs-root for --path resolution: {}", e);
+                error!("Either specify --node <uuid>, or ensure server was started with --fs-root");
+                return ExitCode::from(1);
+            }
+        };
+        match mqtt_request.resolve_path_to_uuid(&fs_root_id, path).await {
+            Ok(id) => {
+                info!("Resolved --path '{}' -> {}", path, id);
+                id
+            }
+            Err(e) => {
+                error!("Failed to resolve --path '{}' via MQTT: {}", path, e);
+                return ExitCode::from(1);
+            }
+        }
+    } else if let Some(ref source) = args.fork_from {
+        // Fork from another node via MQTT
+        info!("Forking from node {} via MQTT...", source);
         match mqtt_request
             .fork_document(source, args.at_commit.as_deref())
             .await
@@ -2022,14 +1839,6 @@ async fn main() -> ExitCode {
     } else if args.use_paths {
         // No node specified - discover fs-root via MQTT retained message
         info!("Discovering fs-root via MQTT...");
-        let mqtt_request =
-            match MqttRequestClient::new(mqtt_client.clone(), args.workspace.clone()).await {
-                Ok(req) => req,
-                Err(e) => {
-                    error!("Failed to create MQTT request client: {}", e);
-                    return ExitCode::from(1);
-                }
-            };
         match mqtt_request.discover_fs_root().await {
             Ok(id) => {
                 info!("Discovered fs-root: {}", id);

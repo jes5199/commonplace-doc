@@ -3,7 +3,6 @@
 //! This module handles resolving script paths to UUIDs for evaluate processes,
 //! enabling the orchestrator to watch script files and restart processes when they change.
 
-use crate::fs::{Entry, FsSchema};
 use crate::mqtt::MqttRequestClient;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -154,98 +153,17 @@ impl ScriptResolver {
 
 /// Resolve a path to its UUID by walking the schema tree via MQTT.
 ///
-/// This is the MQTT equivalent of `resolve_path_to_uuid_http` in
-/// `src/sync/transport/client.rs`. The algorithm is identical:
-/// walk path segments, fetch schema at each level, extract node_id.
+/// Delegates to `MqttRequestClient::resolve_path_to_uuid` so orchestrator and
+/// sync share identical path-resolution behavior and errors.
 pub async fn resolve_path_to_uuid_mqtt(
     request_client: &MqttRequestClient,
     fs_root_id: &str,
     path: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-    if segments.is_empty() {
-        return Ok(fs_root_id.to_string());
-    }
-
-    let mut current_id = fs_root_id.to_string();
-
-    for (i, segment) in segments.iter().enumerate() {
-        let response = request_client.get_content(&current_id).await.map_err(|e| {
-            format!(
-                "Failed to fetch schema for '{}': {}",
-                segments[..=i].join("/"),
-                e
-            )
-        })?;
-
-        if let Some(error) = response.error {
-            return Err(format!(
-                "Failed to fetch schema for '{}': {}",
-                segments[..=i].join("/"),
-                error
-            )
-            .into());
-        }
-
-        let content = response
-            .content
-            .ok_or_else(|| format!("No content for schema '{}'", segments[..=i].join("/")))?;
-
-        let schema: FsSchema = serde_json::from_str(&content).map_err(|e| {
-            format!(
-                "Failed to parse schema for '{}': {}",
-                segments[..=i].join("/"),
-                e
-            )
-        })?;
-
-        // Find the segment in schema entries
-        let is_last = i == segments.len() - 1;
-        let entry = schema
-            .root
-            .as_ref()
-            .and_then(|root| match root {
-                Entry::Dir(dir) => dir.entries.as_ref(),
-                _ => None,
-            })
-            .and_then(|entries| entries.get(*segment));
-
-        match entry {
-            Some(Entry::Doc(doc)) if is_last => {
-                return doc
-                    .node_id
-                    .clone()
-                    .ok_or_else(|| format!("Entry '{}' has no node_id", segment).into());
-            }
-            Some(Entry::Dir(dir)) => {
-                current_id = dir
-                    .node_id
-                    .clone()
-                    .ok_or_else(|| format!("Directory '{}' has no node_id", segment))?;
-            }
-            Some(Entry::Doc(doc)) if !is_last => {
-                current_id = doc
-                    .node_id
-                    .clone()
-                    .ok_or_else(|| format!("Entry '{}' has no node_id", segment))?;
-            }
-            _ => {
-                return Err(format!(
-                    "Entry '{}' not found in schema at '{}'",
-                    segment,
-                    if i == 0 {
-                        "/".to_string()
-                    } else {
-                        segments[..i].join("/")
-                    }
-                )
-                .into());
-            }
-        }
-    }
-
-    Ok(current_id)
+    request_client
+        .resolve_path_to_uuid(fs_root_id, path)
+        .await
+        .map_err(|e| e.to_string().into())
 }
 
 #[cfg(test)]

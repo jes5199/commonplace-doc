@@ -7,6 +7,7 @@
 //! Extracted from http_gateway/mod.rs for reuse by the orchestrator and
 //! sync client (CP-8j6c).
 
+use crate::fs::{Entry, FsSchema};
 use crate::mqtt::client::MqttClient;
 use crate::mqtt::messages::{
     CreateDocumentRequest, CreateDocumentResponse, ForkDocumentRequest, ForkDocumentResponse,
@@ -386,6 +387,104 @@ impl MqttRequestClient {
                 "Timeout waiting for fs-root retained message (server may not have --fs-root configured)".to_string(),
             )),
         }
+    }
+
+    /// Resolve a path relative to fs-root to a UUID by traversing schema documents via MQTT.
+    ///
+    /// This is the MQTT equivalent of HTTP path traversal:
+    /// 1. Fetch schema content for the current directory node
+    /// 2. Find the next segment entry
+    /// 3. Follow its node_id
+    pub async fn resolve_path_to_uuid(
+        &self,
+        fs_root_id: &str,
+        path: &str,
+    ) -> Result<String, MqttError> {
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.is_empty() {
+            return Ok(fs_root_id.to_string());
+        }
+
+        let mut current_id = fs_root_id.to_string();
+
+        for (i, segment) in segments.iter().enumerate() {
+            let traversed = segments[..=i].join("/");
+            let response = self.get_content(&current_id).await.map_err(|e| {
+                MqttError::Node(format!("Failed to fetch schema for '{}': {}", traversed, e))
+            })?;
+
+            if let Some(error) = response.error {
+                return Err(MqttError::Node(format!(
+                    "Failed to fetch schema for '{}': {}",
+                    traversed, error
+                )));
+            }
+
+            let content = response.content.ok_or_else(|| {
+                MqttError::Node(format!(
+                    "Failed to fetch schema for '{}': empty content",
+                    traversed
+                ))
+            })?;
+
+            let schema: FsSchema = if content.trim() == "{}" {
+                FsSchema {
+                    version: 1,
+                    root: None,
+                }
+            } else {
+                serde_json::from_str(&content).map_err(|e| {
+                    MqttError::InvalidMessage(format!(
+                        "Failed to parse schema for '{}': {}",
+                        traversed, e
+                    ))
+                })?
+            };
+
+            let parent_scope = if i == 0 {
+                "fs-root".to_string()
+            } else {
+                segments[..i].join("/")
+            };
+
+            let entries = schema
+                .root
+                .as_ref()
+                .and_then(|root| match root {
+                    Entry::Dir(dir) => dir.entries.as_ref(),
+                    Entry::Doc(_) => None,
+                })
+                .ok_or_else(|| {
+                    MqttError::Node(format!(
+                        "Path '{}' not found: '{}' has no entries",
+                        path, parent_scope
+                    ))
+                })?;
+
+            let entry = entries.get(*segment).ok_or_else(|| {
+                let mut available: Vec<_> = entries.keys().map(|k| k.as_str()).collect();
+                available.sort_unstable();
+                MqttError::Node(format!(
+                    "Path '{}' not found: no entry '{}' in '{}'. Available: {:?}",
+                    path, segment, parent_scope, available
+                ))
+            })?;
+
+            let node_id = match entry {
+                Entry::Dir(dir) => dir.node_id.as_ref(),
+                Entry::Doc(doc) => doc.node_id.as_ref(),
+            }
+            .ok_or_else(|| {
+                MqttError::Node(format!(
+                    "Path '{}' not found: entry '{}' has no node_id",
+                    path, segment
+                ))
+            })?;
+
+            current_id = node_id.clone();
+        }
+
+        Ok(current_id)
     }
 
     /// Get a reference to the underlying MQTT client.
