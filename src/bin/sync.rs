@@ -2584,13 +2584,11 @@ async fn run_directory_mode(
         }
     }
 
-    // If strategy is "server" and server has content, pull server files first
-    // This creates the temporary file_states that handle_schema_change needs
+    // Initialize per-file sync state map before watcher/subscription task startup.
     let file_states: Arc<RwLock<HashMap<String, FileSyncState>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
-    // Create written_schemas tracker for user schema edit detection
-    // This must be created before any handle_schema_change calls so we can track what we write
+    // Track schema writes emitted by this process to avoid feedback loops.
     let written_schemas: commonplace_doc::sync::WrittenSchemas =
         Arc::new(RwLock::new(std::collections::HashMap::new()));
 
@@ -3178,12 +3176,11 @@ async fn run_exec_mode(
         }
     }
 
-    // If strategy is "server" and server has content, pull server files first
+    // Initialize per-file sync state map before watcher/subscription task startup.
     let file_states: Arc<RwLock<HashMap<String, FileSyncState>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
-    // Create written_schemas tracker for user schema edit detection
-    // This must be created before any handle_schema_change calls so we can track what we write
+    // Track schema writes emitted by this process to avoid feedback loops.
     let written_schemas: commonplace_doc::sync::WrittenSchemas =
         Arc::new(RwLock::new(std::collections::HashMap::new()));
 
