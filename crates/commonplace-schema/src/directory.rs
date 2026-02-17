@@ -2,6 +2,7 @@
 
 use crate::content_type::{detect_from_path, is_allowed_extension, is_binary_content};
 use crate::schema_io::SCHEMA_FILENAME;
+use crate::uuid_map::build_uuid_map_from_local_schemas;
 use commonplace_types::fs::{DirEntry, DocEntry, Entry, FsSchema};
 
 /// Normalize a file path by replacing backslashes with forward slashes.
@@ -9,7 +10,7 @@ fn normalize_path(path: &str) -> String {
     path.replace('\\', "/")
 }
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -132,8 +133,8 @@ fn load_linked_entries(
         _ => return HashMap::new(),
     };
 
-    // Build a set of node_ids that exist in the scanned entries
-    let mut scanned_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Build a set of node_ids that exist in scanned local files.
+    let mut scanned_node_ids: HashSet<String> = HashSet::new();
     for entry in scanned_entries.values() {
         if let Entry::Doc(doc) = entry {
             if let Some(ref node_id) = doc.node_id {
@@ -141,6 +142,11 @@ fn load_linked_entries(
             }
         }
     }
+
+    // For subdirectory scans, also preserve links whose peer file exists in a different
+    // node-backed directory. Without this, cross-directory links can be dropped when
+    // the local file for this schema entry is absent (e.g., after state reset).
+    scanned_node_ids.extend(load_workspace_existing_file_node_ids(directory));
 
     // Find linked entries: entries in existing schema that:
     // - Are not in scanned entries (file doesn't exist locally)
@@ -164,6 +170,54 @@ fn load_linked_entries(
     }
 
     linked
+}
+
+/// Find the highest ancestor that still has a `.commonplace.json` file.
+///
+/// This resolves the workspace root from any node-backed subdirectory.
+fn find_workspace_root_with_schema(start: &Path) -> std::path::PathBuf {
+    let mut workspace_root = start.to_path_buf();
+    let mut current = start.to_path_buf();
+
+    while let Some(parent) = current.parent() {
+        if parent.join(SCHEMA_FILENAME).exists() {
+            workspace_root = parent.to_path_buf();
+            current = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+
+    workspace_root
+}
+
+/// Load node_ids for files that currently exist on disk anywhere in the workspace.
+///
+/// This provides cross-directory link preservation: if `a/file.txt` exists and
+/// `b/link.txt` shares its node_id but is absent on disk, `b/link.txt` should
+/// still be preserved as a linked schema entry.
+fn load_workspace_existing_file_node_ids(directory: &Path) -> HashSet<String> {
+    // If parent doesn't have a schema, this is likely already the workspace root.
+    // In that case local scanned entries are sufficient.
+    let Some(parent) = directory.parent() else {
+        return HashSet::new();
+    };
+    if !parent.join(SCHEMA_FILENAME).exists() {
+        return HashSet::new();
+    }
+
+    let workspace_root = find_workspace_root_with_schema(directory);
+    let mut uuid_map = HashMap::new();
+    build_uuid_map_from_local_schemas(&workspace_root, "", &mut uuid_map);
+
+    let mut node_ids = HashSet::new();
+    for (relative_path, node_id) in uuid_map {
+        if workspace_root.join(relative_path).is_file() {
+            node_ids.insert(node_id);
+        }
+    }
+
+    node_ids
 }
 
 fn json_content_type_from_bytes(bytes: &[u8]) -> Option<&'static str> {
@@ -1438,6 +1492,109 @@ mod tests {
             assert!(
                 !entries.contains_key("orphan.txt"),
                 "Orphan entry (no matching local file) should not be preserved"
+            );
+        } else {
+            panic!("Expected root to be a Dir");
+        }
+    }
+
+    #[test]
+    fn test_scan_preserves_cross_directory_linked_entries() {
+        // Regression for cross-directory commonplace-link persistence.
+        // If target-dir/link.txt is missing locally but shares node_id with
+        // source-dir/source.txt, scan_directory(target-dir) must preserve it.
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join("source-dir")).unwrap();
+        fs::create_dir_all(temp.path().join("target-dir")).unwrap();
+
+        // Existing source file on disk.
+        File::create(temp.path().join("source-dir/source.txt"))
+            .unwrap()
+            .write_all(b"shared content")
+            .unwrap();
+
+        // Root schema with node-backed subdirectories.
+        let root_schema = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "source-dir": {
+                        "type": "dir",
+                        "node_id": "source-dir-node",
+                        "content_type": "application/json"
+                    },
+                    "target-dir": {
+                        "type": "dir",
+                        "node_id": "target-dir-node",
+                        "content_type": "application/json"
+                    }
+                }
+            }
+        }"#;
+        File::create(temp.path().join(".commonplace.json"))
+            .unwrap()
+            .write_all(root_schema.as_bytes())
+            .unwrap();
+
+        // Source schema has the real file.
+        let source_schema = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "source.txt": {
+                        "type": "doc",
+                        "node_id": "shared-cross-dir-uuid",
+                        "content_type": "text/plain"
+                    }
+                }
+            }
+        }"#;
+        File::create(temp.path().join("source-dir/.commonplace.json"))
+            .unwrap()
+            .write_all(source_schema.as_bytes())
+            .unwrap();
+
+        // Target schema contains one missing linked entry and one missing orphan.
+        // link.txt should be preserved (shared UUID exists in source-dir/source.txt).
+        // orphan.txt should be dropped (no existing local file with orphan UUID).
+        let target_schema = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "link.txt": {
+                        "type": "doc",
+                        "node_id": "shared-cross-dir-uuid",
+                        "content_type": "text/plain"
+                    },
+                    "orphan.txt": {
+                        "type": "doc",
+                        "node_id": "orphan-uuid",
+                        "content_type": "text/plain"
+                    }
+                }
+            }
+        }"#;
+        File::create(temp.path().join("target-dir/.commonplace.json"))
+            .unwrap()
+            .write_all(target_schema.as_bytes())
+            .unwrap();
+
+        // Scan only target-dir (the source file lives in another schema directory).
+        let schema =
+            scan_directory(&temp.path().join("target-dir"), &ScanOptions::default()).unwrap();
+
+        if let Some(Entry::Dir(root)) = &schema.root {
+            let entries = root.entries.as_ref().unwrap();
+            assert!(
+                entries.contains_key("link.txt"),
+                "Cross-directory linked entry should be preserved"
+            );
+            assert!(
+                !entries.contains_key("orphan.txt"),
+                "Orphan entry without existing linked peer should not be preserved"
             );
         } else {
             panic!("Expected root to be a Dir");
