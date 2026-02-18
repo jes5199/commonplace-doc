@@ -140,6 +140,7 @@ fn setup_directory_watchers(
 /// Optional CRDT parameters for handling directory events via MQTT instead of HTTP.
 struct CrdtEventParams {
     mqtt_client: Arc<MqttClient>,
+    mqtt_request: Arc<MqttRequestClient>,
     workspace: String,
     crdt_state: Arc<RwLock<DirectorySyncState>>,
     subdir_cache: Arc<SubdirStateCache>,
@@ -236,6 +237,7 @@ async fn handle_dir_event(
             // Build CrdtFileSyncContext from CrdtEventParams if available
             let crdt_ctx = crdt_params.map(|p| CrdtFileSyncContext {
                 mqtt_client: p.mqtt_client.clone(),
+                mqtt_request: p.mqtt_request.clone(),
                 workspace: p.workspace.clone(),
                 crdt_state: p.crdt_state.clone(),
                 subdir_cache: p.subdir_cache.clone(),
@@ -466,11 +468,10 @@ async fn handle_file_created_crdt(
         }
     }
 
-    // Ensure parent directories exist as node-backed directories
-    // When CRDT context is available, uses local UUID gen + MQTT publish.
-    // Otherwise falls back to HTTP for directory creation.
+    // Ensure parent directories exist as node-backed directories via MQTT/CRDT.
     let crdt_ctx = Some(CrdtFileSyncContext {
         mqtt_client: crdt.mqtt_client.clone(),
+        mqtt_request: crdt.mqtt_request.clone(),
         workspace: crdt.workspace.clone(),
         crdt_state: crdt.crdt_state.clone(),
         subdir_cache: crdt.subdir_cache.clone(),
@@ -2511,6 +2512,7 @@ async fn run_directory_mode(
     };
     let crdt_context = Some(CrdtFileSyncContext {
         mqtt_client: mqtt_client.clone(),
+        mqtt_request: mqtt_request.clone(),
         workspace: workspace.clone(),
         crdt_state: crdt_state.clone(),
         subdir_cache: subdir_cache.clone(),
@@ -2785,6 +2787,7 @@ async fn run_directory_mode(
         // Create CRDT params for the event handler
         let crdt_params = CrdtEventParams {
             mqtt_client: mqtt_client.clone(),
+            mqtt_request: mqtt_request.clone(),
             workspace: workspace.clone(),
             crdt_state: crdt_state.clone(),
             subdir_cache: subdir_cache.clone(),
@@ -3108,6 +3111,7 @@ async fn run_exec_mode(
     };
     let crdt_context = Some(CrdtFileSyncContext {
         mqtt_client: mqtt_client.clone(),
+        mqtt_request: mqtt_request.clone(),
         workspace: workspace.clone(),
         crdt_state: crdt_state.clone(),
         subdir_cache: subdir_cache.clone(),
@@ -3376,6 +3380,7 @@ async fn run_exec_mode(
         // Create CRDT params for the event handler
         let crdt_params = CrdtEventParams {
             mqtt_client: mqtt_client.clone(),
+            mqtt_request: mqtt_request.clone(),
             workspace: workspace.clone(),
             crdt_state: crdt_state.clone(),
             subdir_cache: subdir_cache.clone(),

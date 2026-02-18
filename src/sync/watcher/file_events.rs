@@ -4,15 +4,12 @@
 //! during directory synchronization.
 
 use crate::fs::{Entry, FsSchema};
+use crate::mqtt::MqttRequestClient;
 use crate::sync::crdt_new_file::add_directory_to_schema;
 use crate::sync::directory::{scan_directory_to_json, ScanOptions};
 use crate::sync::schema_io::{write_schema_file, SCHEMA_FILENAME};
 use crate::sync::subscriptions::CrdtFileSyncContext;
-use crate::sync::uuid_map::fetch_subdir_node_id;
-use crate::sync::{
-    delete_schema_entry, normalize_path, push_schema_to_server, remove_file_state_and_abort,
-    FileSyncState,
-};
+use crate::sync::{normalize_path, remove_file_state_and_abort, FileSyncState};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -144,30 +141,87 @@ pub fn find_owning_document(
     }
 }
 
+/// Fetch a subdirectory's node_id from a parent schema via MQTT get-content.
+async fn fetch_subdir_node_id_via_mqtt(
+    mqtt_request: &MqttRequestClient,
+    parent_doc_id: &str,
+    subdir_name: &str,
+) -> Option<String> {
+    let response = match mqtt_request.get_content(parent_doc_id).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!(
+                "Failed to fetch parent schema for {} via MQTT: {}",
+                parent_doc_id, e
+            );
+            return None;
+        }
+    };
+
+    if let Some(err) = response.error {
+        warn!(
+            "MQTT get-content returned error for parent {}: {}",
+            parent_doc_id, err
+        );
+        return None;
+    }
+
+    let content = match response.content {
+        Some(c) => c,
+        None => {
+            warn!(
+                "MQTT get-content returned empty content for parent {}",
+                parent_doc_id
+            );
+            return None;
+        }
+    };
+
+    let schema: FsSchema = match serde_json::from_str(&content) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "Failed to parse parent schema {} from MQTT payload: {}",
+                parent_doc_id, e
+            );
+            return None;
+        }
+    };
+
+    if let Some(Entry::Dir(root_dir)) = schema.root.as_ref() {
+        if let Some(entries) = &root_dir.entries {
+            if let Some(Entry::Dir(subdir)) = entries.get(subdir_name) {
+                return subdir.node_id.clone();
+            }
+        }
+    }
+
+    None
+}
+
 /// Ensure all parent directories of a file path exist as node-backed directories.
 ///
 /// When a file is created in a new subdirectory (e.g., `newdir/file.txt`), we need to:
 /// 1. Check if `newdir` exists in the parent's schema with a node_id
-/// 2. If not, create a document on the server for it (HTTP POST /docs)
+/// 2. If not, create a schema document via MQTT create-document
 /// 3. Update the parent schema to include the directory with its node_id
 ///
-/// When `crdt_context` is provided, schema updates are published via MQTT
-/// instead of HTTP push_schema_to_server. Document creation still uses HTTP
-/// to ensure correct content type (Json for schema documents).
+/// In MQTT-only sync runtime, this creates missing directory documents via
+/// MQTT create-document requests and publishes schema updates via CRDT edits.
 ///
-/// When `skip_http_schema_push` is true (and no crdt_context), schema updates are
-/// written locally but NOT pushed to the server via HTTP.
+/// `skip_http_schema_push` is retained for backward compatibility but HTTP
+/// schema pushes are no longer performed from this watcher path.
 #[allow(clippy::too_many_arguments)]
 pub async fn ensure_parent_directories_exist(
-    client: &Client,
-    server: &str,
+    _client: &Client,
+    _server: &str,
     fs_root_id: &str,
     root_directory: &Path,
     relative_file_path: &str,
     options: &ScanOptions,
     author: &str,
     written_schemas: Option<&crate::sync::WrittenSchemas>,
-    skip_http_schema_push: bool,
+    _skip_http_schema_push: bool,
     crdt_context: Option<&CrdtFileSyncContext>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(
@@ -210,49 +264,44 @@ pub async fn ensure_parent_directories_exist(
 
         if needs_creation {
             // Check server for existing directory (prevents duplicate UUIDs when local schema is stale)
-            if let Some(server_node_id) =
-                fetch_subdir_node_id(client, server, &current_parent_id, dir_name).await
-            {
-                info!(
-                    "Directory '{}' already exists on server with node_id {} (local schema was stale)",
-                    dir_name, server_node_id
-                );
-                needs_creation = false;
-                existing_node_id = Some(server_node_id);
+            if let Some(ctx) = crdt_context {
+                if let Some(server_node_id) =
+                    fetch_subdir_node_id_via_mqtt(&ctx.mqtt_request, &current_parent_id, dir_name)
+                        .await
+                {
+                    info!(
+                        "Directory '{}' already exists on server with node_id {} (local schema was stale)",
+                        dir_name, server_node_id
+                    );
+                    needs_creation = false;
+                    existing_node_id = Some(server_node_id);
+                }
             }
         }
 
         if needs_creation {
+            let ctx = crdt_context.ok_or_else(|| {
+                "CRDT context is required for parent directory creation in MQTT-only sync runtime"
+            })?;
             info!(
                 "Creating node-backed directory '{}' (parent: {})",
                 dir_name, current_parent_id
             );
 
-            // Create document on server via HTTP (ensures correct Json content type)
-            let create_url = format!("{}/docs", server);
-            let create_resp = client
-                .post(&create_url)
-                .json(&serde_json::json!({
-                    "content_type": "application/json"
-                }))
-                .send()
-                .await?;
-
-            if !create_resp.status().is_success() {
-                let status = create_resp.status();
-                let body = create_resp.text().await.unwrap_or_default();
-                return Err(format!(
-                    "Failed to create directory document for '{}': {} - {}",
-                    dir_name, status, body
+            let create_resp = ctx
+                .mqtt_request
+                .create_document("application/json", None)
+                .await
+                .map_err(|e| format!("Failed to create directory document via MQTT: {}", e))?;
+            let new_node_id = create_resp.uuid.ok_or_else(|| {
+                format!(
+                    "MQTT create-document returned no uuid for '{}': {}",
+                    dir_name,
+                    create_resp
+                        .error
+                        .unwrap_or_else(|| "unknown error".to_string())
                 )
-                .into());
-            }
-
-            let resp_body: serde_json::Value = create_resp.json().await?;
-            let new_node_id = resp_body["id"]
-                .as_str()
-                .ok_or("No id in document creation response")?
-                .to_string();
+            })?;
 
             info!(
                 "Created document {} for directory '{}'",
@@ -275,66 +324,55 @@ pub async fn ensure_parent_directories_exist(
                 let updated_json = serde_json::to_string(&schema)?;
                 write_schema_file(&current_dir, &updated_json, written_schemas).await?;
 
-                // Push schema update via MQTT (when CRDT context available) or HTTP
-                if let Some(ctx) = crdt_context {
-                    let parent_uuid =
-                        uuid::Uuid::parse_str(&current_parent_id).unwrap_or(uuid::Uuid::nil());
-                    let is_root = current_parent_id == fs_root_id;
-                    if is_root {
-                        let mut state = ctx.crdt_state.write().await;
-                        if let Err(e) = add_directory_to_schema(
-                            &ctx.mqtt_client,
-                            &ctx.workspace,
-                            &mut state.schema,
-                            dir_name,
-                            &new_node_id,
-                            author,
-                        )
-                        .await
-                        {
-                            warn!("Failed to publish directory schema via MQTT: {}", e);
-                        }
-                        if let Err(e) = state.save(root_directory).await {
-                            warn!("Failed to save CRDT state after dir creation: {}", e);
-                        }
-                    } else {
-                        match ctx
-                            .subdir_cache
-                            .get_or_load(&current_dir, parent_uuid)
-                            .await
-                        {
-                            Ok(subdir_state) => {
-                                let mut state = subdir_state.write().await;
-                                if let Err(e) = add_directory_to_schema(
-                                    &ctx.mqtt_client,
-                                    &ctx.workspace,
-                                    &mut state.schema,
-                                    dir_name,
-                                    &new_node_id,
-                                    author,
-                                )
-                                .await
-                                {
-                                    warn!("Failed to publish subdirectory schema via MQTT: {}", e);
-                                }
-                                if let Err(e) = state.save(&current_dir).await {
-                                    warn!("Failed to save subdirectory CRDT state: {}", e);
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to load subdirectory state: {}", e);
-                            }
-                        }
-                    }
-                } else if !skip_http_schema_push {
-                    push_schema_to_server(
-                        client,
-                        server,
-                        &current_parent_id,
-                        &updated_json,
+                // Publish schema update via MQTT CRDT edit.
+                let parent_uuid =
+                    uuid::Uuid::parse_str(&current_parent_id).unwrap_or(uuid::Uuid::nil());
+                let is_root = current_parent_id == fs_root_id;
+                if is_root {
+                    let mut state = ctx.crdt_state.write().await;
+                    if let Err(e) = add_directory_to_schema(
+                        &ctx.mqtt_client,
+                        &ctx.workspace,
+                        &mut state.schema,
+                        dir_name,
+                        &new_node_id,
                         author,
                     )
-                    .await?;
+                    .await
+                    {
+                        warn!("Failed to publish directory schema via MQTT: {}", e);
+                    }
+                    if let Err(e) = state.save(root_directory).await {
+                        warn!("Failed to save CRDT state after dir creation: {}", e);
+                    }
+                } else {
+                    match ctx
+                        .subdir_cache
+                        .get_or_load(&current_dir, parent_uuid)
+                        .await
+                    {
+                        Ok(subdir_state) => {
+                            let mut state = subdir_state.write().await;
+                            if let Err(e) = add_directory_to_schema(
+                                &ctx.mqtt_client,
+                                &ctx.workspace,
+                                &mut state.schema,
+                                dir_name,
+                                &new_node_id,
+                                author,
+                            )
+                            .await
+                            {
+                                warn!("Failed to publish subdirectory schema via MQTT: {}", e);
+                            }
+                            if let Err(e) = state.save(&current_dir).await {
+                                warn!("Failed to save subdirectory CRDT state: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to load subdirectory state: {}", e);
+                        }
+                    }
                 }
             }
 
@@ -363,12 +401,6 @@ pub async fn ensure_parent_directories_exist(
                 });
                 let schema_str = serde_json::to_string(&empty_schema)?;
                 write_schema_file(&subdir_path, &schema_str, written_schemas).await?;
-
-                // Push empty schema to server (HTTP only — CRDT mode will push when file is created)
-                if crdt_context.is_none() && !skip_http_schema_push {
-                    push_schema_to_server(client, server, &new_node_id, &schema_str, author)
-                        .await?;
-                }
             } else {
                 debug!(
                     "Subdirectory '{}' already has schema, skipping initial write/push",
@@ -376,7 +408,7 @@ pub async fn ensure_parent_directories_exist(
                 );
             }
 
-            // Wait briefly for server to process
+            // Wait briefly for peers to observe schema updates.
             sleep(Duration::from_millis(50)).await;
 
             existing_node_id = Some(new_node_id);
@@ -402,13 +434,13 @@ pub async fn ensure_parent_directories_exist(
 /// Modified files are handled by per-file watchers, so this just updates
 /// the schema in case metadata changed.
 pub async fn handle_file_modified(
-    client: &Client,
-    server: &str,
+    _client: &Client,
+    _server: &str,
     fs_root_id: &str,
     directory: &Path,
     path: &Path,
     options: &ScanOptions,
-    author: &str,
+    _author: &str,
 ) {
     debug!("Directory event: file modified: {}", path.display());
 
@@ -429,16 +461,11 @@ pub async fn handle_file_modified(
     // Find which document owns this file path
     let owning_doc = find_owning_document(directory, fs_root_id, &relative_path);
 
-    // Modified files are handled by per-file watchers
-    // Just update schema in case metadata changed
-    // Use the owning document's directory and ID
-    if let Ok(json) = scan_directory_to_json(&owning_doc.directory, options) {
-        if let Err(e) =
-            push_schema_to_server(client, server, &owning_doc.document_id, &json, author).await
-        {
-            warn!("Failed to push updated schema: {}", e);
-        }
-    }
+    let _ = scan_directory_to_json(&owning_doc.directory, options);
+    debug!(
+        "Skipping legacy schema push for modified file '{}' (MQTT-only runtime)",
+        owning_doc.relative_path
+    );
 }
 
 /// Handle a file deletion event in directory sync mode.
@@ -446,14 +473,14 @@ pub async fn handle_file_modified(
 /// Stops sync tasks for the deleted file and updates the schema.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_file_deleted(
-    client: &Client,
-    server: &str,
-    fs_root_id: &str,
+    _client: &Client,
+    _server: &str,
+    _fs_root_id: &str,
     directory: &Path,
     path: &Path,
     _options: &ScanOptions,
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
-    author: &str,
+    _author: &str,
 ) {
     debug!("Directory event: file deleted: {}", path.display());
 
@@ -491,58 +518,8 @@ pub async fn handle_file_deleted(
         info!("Stopping sync tasks for deleted file: {}", relative_path);
     }
 
-    // Delete from schema
-    // For nested paths, check if the immediate subdirectory is node-backed
-    // Node-backed directories have their own document on the server - we need to
-    // delete the file entry from that document, not from the parent schema
-    if relative_path.contains('/') {
-        // Extract first path component (the immediate subdirectory)
-        // Note: split('/').next() always returns Some for non-empty strings,
-        // and we're inside a contains('/') check, but we use unwrap_or for safety
-        let first_component = relative_path.split('/').next().unwrap_or("");
-        let subdir_schema_path = directory.join(first_component).join(SCHEMA_FILENAME);
-
-        if subdir_schema_path.exists() {
-            // Node-backed directory - need to get its node_id and delete from that schema
-            let file_in_subdir = relative_path
-                .strip_prefix(first_component)
-                .and_then(|s| s.strip_prefix('/'))
-                .unwrap_or(&relative_path);
-
-            // Get the subdirectory's node_id from the parent schema
-            if let Some(subdir_node_id) =
-                fetch_subdir_node_id(client, server, fs_root_id, first_component).await
-            {
-                info!(
-                    "Deleting {} from node-backed subdirectory {} (node_id: {})",
-                    file_in_subdir, first_component, subdir_node_id
-                );
-                if let Err(e) =
-                    delete_schema_entry(client, server, &subdir_node_id, file_in_subdir, author)
-                        .await
-                {
-                    warn!(
-                        "Failed to delete schema entry {} from subdirectory {}: {}",
-                        file_in_subdir, first_component, e
-                    );
-                }
-            } else {
-                warn!(
-                    "Could not find node_id for subdirectory {} - skipping deletion of {}",
-                    first_component, file_in_subdir
-                );
-            }
-            return;
-        }
-        // Non-node-backed subdirectory: fall through to delete from this schema
-        debug!(
-            "Deleting {} from parent schema (subdirectory {} is inline)",
-            relative_path, first_component
-        );
-    }
-
-    // Delete from schema (top-level files or files in non-node-backed subdirectories)
-    if let Err(e) = delete_schema_entry(client, server, fs_root_id, &relative_path, author).await {
-        warn!("Failed to delete schema entry {}: {}", relative_path, e);
-    }
+    warn!(
+        "Legacy delete handler invoked for '{}'; schema mutation is CRDT-only in MQTT runtime",
+        relative_path
+    );
 }

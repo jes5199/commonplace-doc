@@ -14,7 +14,7 @@ pub use subdir_task::{spawn_subdir_mqtt_task, subdir_mqtt_task};
 use std::io::Write;
 
 use crate::fs::FsSchema;
-use crate::mqtt::MqttClient;
+use crate::mqtt::{MqttClient, MqttRequestClient};
 use crate::sync::dir_sync::{
     apply_explicit_deletions, create_subdir_nested_directories, handle_subdir_new_files,
 };
@@ -122,6 +122,7 @@ pub fn trace_timeline(milestone: TimelineMilestone, path: &str, uuid: Option<&st
 #[derive(Clone)]
 pub struct CrdtFileSyncContext {
     pub mqtt_client: Arc<MqttClient>,
+    pub mqtt_request: Arc<MqttRequestClient>,
     pub workspace: String,
     pub crdt_state: Arc<RwLock<crate::sync::DirectorySyncState>>,
     pub subdir_cache: Arc<crate::sync::SubdirStateCache>,
