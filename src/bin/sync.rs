@@ -2446,6 +2446,7 @@ async fn run_file_mode(
             node_id_uuid,
             &file,
             &author,
+            None,
         )
         .await
         {
@@ -2968,6 +2969,7 @@ async fn run_directory_mode(
                     node_id,
                     &file_path,
                     &author,
+                    inode_tracker.as_ref(),
                 )
                 .await
                 {
@@ -3583,6 +3585,7 @@ async fn run_exec_mode(
                     node_id,
                     &file_path,
                     &author,
+                    inode_tracker.as_ref(),
                 )
                 .await
                 {

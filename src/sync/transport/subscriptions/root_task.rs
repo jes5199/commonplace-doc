@@ -743,6 +743,11 @@ pub async fn directory_mqtt_task(
                                             drop(state_guard); // Release lock before file I/O
 
                                             if let Some(content) = maybe_content {
+                                                let commit_id =
+                                                    crate::sync::file_sync::commit_id_for_write(
+                                                        &result,
+                                                        &received_cid,
+                                                    );
                                                 // Write to all paths
                                                 for rel_path in paths {
                                                     let file_path = directory.join(rel_path);
@@ -752,7 +757,14 @@ pub async fn directory_mqtt_task(
                                                             tokio::fs::create_dir_all(parent).await;
                                                     }
                                                     if let Err(e) =
-                                                        tokio::fs::write(&file_path, &content).await
+                                                        crate::sync::file_sync::write_content_with_tracker(
+                                                            &file_path,
+                                                            &content,
+                                                            inode_tracker_for_crdt.as_ref(),
+                                                            commit_id.clone(),
+                                                            "CRDT directory mqtt task",
+                                                        )
+                                                        .await
                                                     {
                                                         warn!(
                                                             "Failed to write {}: {}",

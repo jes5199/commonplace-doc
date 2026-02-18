@@ -792,6 +792,12 @@ pub async fn upload_task_crdt(
 
                     // Save the state to persist CID tracking
                     drop(state_guard);
+                    refresh_inode_tracker_commit_for_path(
+                        &file_path,
+                        &result.cid,
+                        inode_tracker.as_ref(),
+                    )
+                    .await;
                     let state_guard = crdt_state.read().await;
                     if let Err(e) = state_guard
                         .save(file_path.parent().unwrap_or(&file_path))
@@ -875,6 +881,7 @@ pub async fn push_local_if_differs(
     node_id: Uuid,
     file_path: &Path,
     author: &str,
+    inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
 ) -> SyncResult<()> {
     let local_content = match tokio::fs::read_to_string(file_path).await {
         Ok(s) => s,
@@ -934,8 +941,7 @@ pub async fn push_local_if_differs(
 
     let mut state = crdt_state.write().await;
     let file_state = state.get_or_create_file(filename, node_id);
-
-    if is_json || is_jsonl {
+    let published_cid = if is_json || is_jsonl {
         // Structured content: create Yjs update and publish
         let content_type = if is_jsonl {
             crate::content_type::ContentType::Jsonl
@@ -950,7 +956,7 @@ pub async fn push_local_if_differs(
         ) {
             Ok(update_b64) => match crate::sync::crdt::yjs::base64_decode(&update_b64) {
                 Ok(update_bytes) => {
-                    publish_yjs_update(
+                    let result = publish_yjs_update(
                         mqtt_client,
                         workspace,
                         &node_id_str,
@@ -959,12 +965,13 @@ pub async fn push_local_if_differs(
                         author,
                     )
                     .await?;
+                    Some(result.cid)
                 }
                 Err(e) => {
                     warn!("Failed to decode structured update: {}", e);
                     // Fall back to text change
                     let old = crdt_content.as_deref().unwrap_or("");
-                    publish_text_change(
+                    let result = publish_text_change(
                         mqtt_client,
                         workspace,
                         &node_id_str,
@@ -974,6 +981,7 @@ pub async fn push_local_if_differs(
                         author,
                     )
                     .await?;
+                    Some(result.cid)
                 }
             },
             Err(e) => {
@@ -983,7 +991,7 @@ pub async fn push_local_if_differs(
                     e
                 );
                 let old = crdt_content.as_deref().unwrap_or("");
-                publish_text_change(
+                let result = publish_text_change(
                     mqtt_client,
                     workspace,
                     &node_id_str,
@@ -993,12 +1001,13 @@ pub async fn push_local_if_differs(
                     author,
                 )
                 .await?;
+                Some(result.cid)
             }
         }
     } else {
         // Text: compute diff and publish
         let old = crdt_content.as_deref().unwrap_or("");
-        publish_text_change(
+        let result = publish_text_change(
             mqtt_client,
             workspace,
             &node_id_str,
@@ -1008,6 +1017,12 @@ pub async fn push_local_if_differs(
             author,
         )
         .await?;
+        Some(result.cid)
+    };
+
+    drop(state);
+    if let Some(cid) = published_cid {
+        refresh_inode_tracker_commit_for_path(file_path, &cid, inode_tracker).await;
     }
 
     Ok(())
@@ -1347,7 +1362,7 @@ enum WriteDecision {
     Failed,
 }
 
-fn commit_id_for_write(
+pub(crate) fn commit_id_for_write(
     result: &crate::sync::crdt_merge::MergeResult,
     received_cid: &str,
 ) -> Option<String> {
@@ -1359,7 +1374,64 @@ fn commit_id_for_write(
     }
 }
 
-async fn write_content_with_tracker(
+#[cfg(unix)]
+pub(crate) async fn refresh_inode_tracker_commit_for_path(
+    file_path: &Path,
+    commit_id: &str,
+    inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
+) {
+    let Some(tracker) = inode_tracker else {
+        return;
+    };
+
+    let inode_key = match crate::sync::InodeKey::from_path(file_path) {
+        Ok(key) => key,
+        Err(e) => {
+            debug!(
+                "Skipping inode tracker refresh for {} (failed to stat inode: {})",
+                file_path.display(),
+                e
+            );
+            return;
+        }
+    };
+
+    let mut tracker_guard = tracker.write().await;
+    if tracker_guard.get(&inode_key).is_some() {
+        tracker_guard.update_commit(&inode_key, commit_id.to_string());
+        debug!(
+            "Refreshed inode tracker commit for {} ({:x}-{:x} -> {})",
+            file_path.display(),
+            inode_key.dev,
+            inode_key.ino,
+            commit_id
+        );
+    } else {
+        tracker_guard.track(
+            inode_key,
+            commit_id.to_string(),
+            file_path.to_path_buf(),
+            None,
+        );
+        debug!(
+            "Tracked inode after local publish for {} ({:x}-{:x} -> {})",
+            file_path.display(),
+            inode_key.dev,
+            inode_key.ino,
+            commit_id
+        );
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn refresh_inode_tracker_commit_for_path(
+    _file_path: &Path,
+    _commit_id: &str,
+    _inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
+) {
+}
+
+pub(crate) async fn write_content_with_tracker(
     file_path: &Path,
     content: &str,
     inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
@@ -2606,7 +2678,7 @@ async fn push_local_edits_after_resync(
     let node_id_str = node_id.to_string();
 
     // Publish the update (hold write lock for publish)
-    {
+    let published_cid = {
         let mut state = crdt_state.write().await;
         let file_state = state.get_or_create_file(filename, node_id);
 
@@ -2616,7 +2688,7 @@ async fn push_local_edits_after_resync(
             match crate::sync::crdt::yjs::create_yjs_json_merge(pre_resync_content, base_state) {
                 Ok(update_b64) => match crate::sync::crdt::yjs::base64_decode(&update_b64) {
                     Ok(update_bytes) => {
-                        publish_yjs_update(
+                        let result = publish_yjs_update(
                             mqtt_client,
                             workspace,
                             &node_id_str,
@@ -2625,6 +2697,7 @@ async fn push_local_edits_after_resync(
                             author,
                         )
                         .await?;
+                        Some(result.cid)
                     }
                     Err(e) => {
                         warn!("Divergence push: failed to decode merge update: {}", e);
@@ -2646,7 +2719,7 @@ async fn push_local_edits_after_resync(
             ) {
                 Ok(update_b64) => match crate::sync::crdt::yjs::base64_decode(&update_b64) {
                     Ok(update_bytes) => {
-                        publish_yjs_update(
+                        let result = publish_yjs_update(
                             mqtt_client,
                             workspace,
                             &node_id_str,
@@ -2655,6 +2728,7 @@ async fn push_local_edits_after_resync(
                             author,
                         )
                         .await?;
+                        Some(result.cid)
                     }
                     Err(e) => {
                         warn!("Divergence push: failed to decode JSONL update: {}", e);
@@ -2669,7 +2743,7 @@ async fn push_local_edits_after_resync(
         } else {
             // Text: use text diff
             let old = crdt_content.as_deref().unwrap_or("");
-            publish_text_change(
+            let result = publish_text_change(
                 mqtt_client,
                 workspace,
                 &node_id_str,
@@ -2679,7 +2753,12 @@ async fn push_local_edits_after_resync(
                 author,
             )
             .await?;
+            Some(result.cid)
         }
+    };
+
+    if let Some(cid) = published_cid.as_deref() {
+        refresh_inode_tracker_commit_for_path(file_path, cid, inode_tracker).await;
     }
 
     // After publishing, write the merged CRDT content to disk
@@ -2694,9 +2773,14 @@ async fn push_local_edits_after_resync(
     };
 
     if let Some(ref merged) = merged_content {
-        if let Err(e) =
-            write_content_with_tracker(file_path, merged, inode_tracker, None, "DIVERGENCE-PUSH")
-                .await
+        if let Err(e) = write_content_with_tracker(
+            file_path,
+            merged,
+            inode_tracker,
+            published_cid.clone(),
+            "DIVERGENCE-PUSH",
+        )
+        .await
         {
             warn!(
                 "Divergence push: failed to write merged content to {}: {}",
@@ -2874,6 +2958,51 @@ mod tests {
         assert!(!prepared.is_json);
         assert!(!prepared.is_jsonl);
         assert_eq!(prepared.content, "# Heading\n\nParagraph text.");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_refresh_inode_tracker_commit_updates_existing_inode() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("tracked.txt");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        let inode = crate::sync::InodeKey::from_path(&file_path).unwrap();
+        let tracker = Arc::new(RwLock::new(crate::sync::InodeTracker::new(
+            dir.path().join("shadow"),
+        )));
+        {
+            let mut guard = tracker.write().await;
+            guard.track(inode, "cid-old".to_string(), file_path.clone(), None);
+        }
+
+        refresh_inode_tracker_commit_for_path(&file_path, "cid-new", Some(&tracker)).await;
+
+        let guard = tracker.read().await;
+        let tracked = guard.get(&inode).expect("inode should remain tracked");
+        assert_eq!(tracked.commit_id, "cid-new");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_refresh_inode_tracker_commit_tracks_inode_if_missing() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("fresh.txt");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        let inode = crate::sync::InodeKey::from_path(&file_path).unwrap();
+        let tracker = Arc::new(RwLock::new(crate::sync::InodeTracker::new(
+            dir.path().join("shadow"),
+        )));
+
+        refresh_inode_tracker_commit_for_path(&file_path, "cid-new", Some(&tracker)).await;
+
+        let guard = tracker.read().await;
+        let tracked = guard
+            .get(&inode)
+            .expect("inode should be tracked after refresh");
+        assert_eq!(tracked.commit_id, "cid-new");
+        assert_eq!(tracked.primary_path, file_path);
     }
 
     // Tests for EchoDetectionResult
