@@ -467,6 +467,19 @@ pub const PENDING_EDIT_FLUSH_INTERVAL_SECS: u64 = 5;
 
 static WARNED_NO_INODE_TRACKER: AtomicBool = AtomicBool::new(false);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentAttributionSource {
+    TrackedInode,
+    ActivePathFallback,
+    LocalHeadFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParentAttribution {
+    parent_commit: Option<String>,
+    source: ParentAttributionSource,
+}
+
 /// Handle refresh logic after an upload attempt.
 ///
 /// This helper encapsulates the common pattern of refreshing from HEAD after upload,
@@ -609,20 +622,28 @@ pub async fn upload_task_crdt(
         );
 
         let mut resync_attempted = false;
-        let parent_override =
-            best_effort_parent_commit_from_tracker(&file_path, inode_tracker.as_ref()).await;
+        let parent_attribution =
+            determine_parent_attribution_for_upload(&file_path, inode_tracker.as_ref()).await;
+        debug!(
+            "CRDT upload_task: parent attribution for {} source={:?} parent={:?}",
+            file_path.display(),
+            parent_attribution.source,
+            parent_attribution.parent_commit
+        );
 
         loop {
             // Get or create the CRDT state for this file
             let mut state_guard = crdt_state.write().await;
             let file_state = state_guard.get_or_create_file(&filename, node_id);
-            if let (Some(parent), Some(local_head)) =
-                (parent_override.as_ref(), file_state.local_head_cid.as_ref())
-            {
+            if let (Some(parent), Some(local_head)) = (
+                parent_attribution.parent_commit.as_ref(),
+                file_state.local_head_cid.as_ref(),
+            ) {
                 if parent != local_head {
                     debug!(
-                        "CRDT upload_task: overriding parent for {} (tracker={} local_head={})",
+                        "CRDT upload_task: overriding parent for {} (source={:?}, tracker={} local_head={})",
                         file_path.display(),
+                        parent_attribution.source,
                         parent,
                         local_head
                     );
@@ -756,7 +777,7 @@ pub async fn upload_task_crdt(
                                 file_state,
                                 update_bytes,
                                 &author,
-                                parent_override.as_deref(),
+                                parent_attribution.parent_commit.as_deref(),
                             )
                             .await
                         }
@@ -781,7 +802,7 @@ pub async fn upload_task_crdt(
                             &old_content,
                             &new_content,
                             &author,
-                            parent_override.as_deref(),
+                            parent_attribution.parent_commit.as_deref(),
                         )
                         .await
                     }
@@ -796,7 +817,7 @@ pub async fn upload_task_crdt(
                     &old_content,
                     &new_content,
                     &author,
-                    parent_override.as_deref(),
+                    parent_attribution.parent_commit.as_deref(),
                 )
                 .await
             };
@@ -1395,34 +1416,56 @@ pub(crate) fn commit_id_for_write(
 }
 
 #[cfg(unix)]
-async fn best_effort_parent_commit_from_tracker(
+async fn determine_parent_attribution_for_upload(
     file_path: &Path,
     inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
-) -> Option<String> {
-    let tracker = inode_tracker?;
+) -> ParentAttribution {
+    let Some(tracker) = inode_tracker else {
+        return ParentAttribution {
+            parent_commit: None,
+            source: ParentAttributionSource::LocalHeadFallback,
+        };
+    };
     let tracker_guard = tracker.read().await;
 
     if let Ok(inode_key) = crate::sync::InodeKey::from_path(file_path) {
         if let Some(state) = tracker_guard.get(&inode_key) {
-            return Some(state.commit_id.clone());
+            return ParentAttribution {
+                parent_commit: Some(state.commit_id.clone()),
+                source: ParentAttributionSource::TrackedInode,
+            };
         }
     }
 
     // Fallback for external atomic writers: if path now points to an untracked inode,
     // use the current active tracker entry for this path as best-effort base attribution.
-    tracker_guard
+    if let Some(commit_id) = tracker_guard
         .states
         .values()
         .find(|state| state.primary_path == file_path && state.shadow_path.is_none())
         .map(|state| state.commit_id.clone())
+    {
+        return ParentAttribution {
+            parent_commit: Some(commit_id),
+            source: ParentAttributionSource::ActivePathFallback,
+        };
+    }
+
+    ParentAttribution {
+        parent_commit: None,
+        source: ParentAttributionSource::LocalHeadFallback,
+    }
 }
 
 #[cfg(not(unix))]
-async fn best_effort_parent_commit_from_tracker(
+async fn determine_parent_attribution_for_upload(
     _file_path: &Path,
     _inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
-) -> Option<String> {
-    None
+) -> ParentAttribution {
+    ParentAttribution {
+        parent_commit: None,
+        source: ParentAttributionSource::LocalHeadFallback,
+    }
 }
 
 #[cfg(unix)]
@@ -3058,7 +3101,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_best_effort_parent_commit_from_tracker_uses_tracked_inode() {
+    async fn test_determine_parent_attribution_uses_tracked_inode() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("tracked.txt");
         std::fs::write(&file_path, "hello").unwrap();
@@ -3072,13 +3115,14 @@ mod tests {
             guard.track(inode, "cid-tracked".to_string(), file_path.clone(), None);
         }
 
-        let parent = best_effort_parent_commit_from_tracker(&file_path, Some(&tracker)).await;
-        assert_eq!(parent.as_deref(), Some("cid-tracked"));
+        let attribution = determine_parent_attribution_for_upload(&file_path, Some(&tracker)).await;
+        assert_eq!(attribution.parent_commit.as_deref(), Some("cid-tracked"));
+        assert_eq!(attribution.source, ParentAttributionSource::TrackedInode);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_best_effort_parent_commit_from_tracker_falls_back_to_active_path_entry() {
+    async fn test_determine_parent_attribution_falls_back_to_active_path_entry() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("note.txt");
         std::fs::write(&file_path, "old").unwrap();
@@ -3101,8 +3145,27 @@ mod tests {
         let new_inode = crate::sync::InodeKey::from_path(&file_path).unwrap();
         assert_ne!(old_inode, new_inode, "setup should replace inode");
 
-        let parent = best_effort_parent_commit_from_tracker(&file_path, Some(&tracker)).await;
-        assert_eq!(parent.as_deref(), Some("cid-before"));
+        let attribution = determine_parent_attribution_for_upload(&file_path, Some(&tracker)).await;
+        assert_eq!(attribution.parent_commit.as_deref(), Some("cid-before"));
+        assert_eq!(
+            attribution.source,
+            ParentAttributionSource::ActivePathFallback
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_determine_parent_attribution_without_tracker_uses_local_head_fallback() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("note.txt");
+        std::fs::write(&file_path, "content").unwrap();
+
+        let attribution = determine_parent_attribution_for_upload(&file_path, None).await;
+        assert_eq!(attribution.parent_commit, None);
+        assert_eq!(
+            attribution.source,
+            ParentAttributionSource::LocalHeadFallback
+        );
     }
 
     // Tests for EchoDetectionResult
