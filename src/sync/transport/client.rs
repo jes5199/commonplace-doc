@@ -34,6 +34,11 @@ pub fn set_sync_http_disabled(disabled: bool) {
     HTTP_DISABLED_IN_SYNC_RUNTIME.store(disabled, Ordering::Relaxed);
 }
 
+/// Returns whether HTTP sync helpers are disabled for this process.
+pub fn is_sync_http_disabled() -> bool {
+    HTTP_DISABLED_IN_SYNC_RUNTIME.load(Ordering::Relaxed)
+}
+
 fn http_block_message(operation: &str) -> String {
     format!(
         "HTTP disabled in sync runtime; blocked operation: {} (use MQTT/cyan equivalent)",

@@ -202,7 +202,10 @@ pub use schema::uuid_map::{
 };
 
 // --- From transport/ ---
-pub use transport::ancestry::{determine_sync_direction, is_ancestor, SyncDirection};
+pub use transport::ancestry::{
+    determine_sync_direction, is_ancestor, set_sync_ancestry_mqtt_context, SyncAncestryMqttContext,
+    SyncDirection,
+};
 pub use transport::client::{
     delete_schema_entry, discover_fs_root, fetch_head, fork_node, push_content_by_type,
     push_file_content, push_json_content, push_jsonl_content, push_schema_to_server,

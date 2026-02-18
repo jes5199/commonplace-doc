@@ -21,7 +21,10 @@ pub mod urls;
 // Re-export public items from submodules
 
 // From ancestry
-pub use ancestry::{all_are_ancestors, determine_sync_direction, is_ancestor, SyncDirection};
+pub use ancestry::{
+    all_are_ancestors, determine_sync_direction, is_ancestor, set_sync_ancestry_mqtt_context,
+    SyncAncestryMqttContext, SyncDirection,
+};
 
 // From client
 pub use client::{

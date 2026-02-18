@@ -59,6 +59,12 @@ pub async fn directory_mqtt_task(
     initial_uuid_map: HashMap<String, String>,
     crdt_context: Option<CrdtFileSyncContext>,
 ) {
+    // Ensure ancestry checks in this process use MQTT/cyan instead of HTTP.
+    crate::sync::set_sync_ancestry_mqtt_context(Some(crate::sync::SyncAncestryMqttContext::new(
+        mqtt_client.clone(),
+        workspace.clone(),
+    )));
+
     // CRITICAL: Create the broadcast receiver BEFORE any MQTT subscriptions.
     // This ensures we receive retained messages that the broker sends immediately
     // after we subscribe. If we create the receiver after subscribing, retained

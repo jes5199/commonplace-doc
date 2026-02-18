@@ -100,6 +100,12 @@ pub async fn subdir_mqtt_task(
     watched_subdirs: Arc<RwLock<HashSet<String>>>,
     crdt_context: Option<CrdtFileSyncContext>,
 ) {
+    // Ensure ancestry checks in this process use MQTT/cyan instead of HTTP.
+    crate::sync::set_sync_ancestry_mqtt_context(Some(crate::sync::SyncAncestryMqttContext::new(
+        mqtt_client.clone(),
+        workspace.clone(),
+    )));
+
     // Subscribe to edits for the subdirectory document (schema changes)
     let edits_topic = Topic::edits(&workspace, &subdir_node_id);
     let schema_topic_str = edits_topic.to_topic_string();
