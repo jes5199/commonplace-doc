@@ -604,6 +604,79 @@ fn assert_head_content_does_not_contain(
     }
 }
 
+fn wait_for_file_content_contains(path: &std::path::Path, expected: &str, timeout: Duration) {
+    let start = std::time::Instant::now();
+    let mut last_content = "<unavailable>".to_string();
+
+    loop {
+        if start.elapsed() >= timeout {
+            panic!(
+                "Timed out waiting for '{}' in {}. Last content: {}",
+                expected,
+                path.display(),
+                last_content
+            );
+        }
+
+        if path.exists() {
+            match std::fs::read_to_string(path) {
+                Ok(content) => {
+                    if content.contains(expected) {
+                        return;
+                    }
+                    last_content = content;
+                }
+                Err(e) => {
+                    last_content = format!("<read error: {}>", e);
+                }
+            }
+        } else {
+            last_content = "<missing>".to_string();
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn flood_invalid_edit_messages(mqtt_broker: &str, workspace: &str, doc_id: &str, count: usize) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("Failed to build tokio runtime for lag flood");
+
+    rt.block_on(async {
+        let config = commonplace_doc::mqtt::MqttConfig {
+            broker_url: mqtt_broker.to_string(),
+            client_id: format!("lag-flood-{}", uuid::Uuid::new_v4()),
+            workspace: workspace.to_string(),
+            ..Default::default()
+        };
+
+        let client = std::sync::Arc::new(
+            commonplace_doc::mqtt::MqttClient::connect(config)
+                .await
+                .expect("Failed to connect lag flood MQTT client"),
+        );
+        let event_loop_client = client.clone();
+        let event_loop_handle = tokio::spawn(async move {
+            let _ = event_loop_client.run_event_loop().await;
+        });
+
+        let topic = commonplace_doc::mqtt::Topic::edits(workspace, doc_id).to_topic_string();
+        for idx in 0..count {
+            let payload = format!("{{\"kind\":\"lag-flood\",\"idx\":{}}}", idx);
+            client
+                .publish(&topic, payload.as_bytes(), rumqttc::QoS::AtMostOnce)
+                .await
+                .expect("Failed to publish lag flood payload");
+        }
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        event_loop_handle.abort();
+    });
+}
+
 /// Spawn sync client with stderr inherited for debugging
 #[allow(dead_code)]
 fn spawn_sync_directory_debug(
@@ -1091,6 +1164,187 @@ fn test_node_backed_subdir_propagates_without_restart() {
         "File content should match. Got: {}",
         local_content
     );
+}
+
+/// CP-spbw: Ensure subdir lag recovery converges linked files without a fresh edit.
+///
+/// Scenario:
+/// 1. Set up fs-root -> node-backed subdir with two linked paths sharing one UUID
+/// 2. Start sync and verify both local linked files contain initial content
+/// 3. Pause sync process (SIGSTOP)
+/// 4. Publish one real server edit, then flood file topic with invalid MQTT payloads
+///    to force broadcast lag and drop the real edit from the in-process channel
+/// 5. Resume sync (SIGCONT) and verify lag recovery converges both linked paths
+///    to server content without publishing any additional real edit
+#[test]
+fn test_subdir_lag_recovery_converges_linked_paths_without_new_edit() {
+    #[cfg(not(unix))]
+    {
+        eprintln!("Skipping lag recovery test on non-unix (requires SIGSTOP/SIGCONT)");
+        return;
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+    let workspace = "workspace";
+    let initial_content = "subdir-lag-initial";
+    let recovered_content = "subdir-lag-recovered";
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    // Create fs-root, subdir schema document, and linked file document.
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse fs-root response");
+    let fs_root_id = body["id"].as_str().expect("No fs-root id in response");
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create subdir document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse subdir response");
+    let subdir_id = body["id"].as_str().expect("No subdir id in response");
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create linked file document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse linked file response");
+    let file_id = body["id"].as_str().expect("No file id in response");
+
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(initial_content)
+        .send()
+        .expect("Failed to write initial linked file content");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write initial linked file content: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    let subdir_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "linked-a.txt": { "type": "doc", "node_id": file_id },
+                "linked-b.txt": { "type": "doc", "node_id": file_id }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, subdir_id))
+        .header("Content-Type", "application/json")
+        .body(subdir_schema.to_string())
+        .send()
+        .expect("Failed to write subdir schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write subdir schema: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    let fs_root_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "linked": { "type": "dir", "node_id": subdir_id }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(fs_root_schema.to_string())
+        .send()
+        .expect("Failed to write fs-root schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write fs-root schema: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    // Start sync and wait until both linked paths are materialized.
+    let sync = spawn_sync_directory_with_initial_sync(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir,
+        fs_root_id,
+        "server",
+    );
+    let sync_pid = sync.id() as i32;
+    guard.add(sync);
+
+    let linked_a = sync_dir.join("linked").join("linked-a.txt");
+    let linked_b = sync_dir.join("linked").join("linked-b.txt");
+    wait_for_file_content_contains(&linked_a, initial_content, Duration::from_secs(10));
+    wait_for_file_content_contains(&linked_b, initial_content, Duration::from_secs(10));
+
+    // Pause sync process so edits accumulate, then publish one real edit.
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(sync_pid, libc::SIGSTOP);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let resp = client
+        .get(format!("{}/docs/{}/head", server_url, file_id))
+        .send()
+        .expect("Failed to fetch file head before recovery edit");
+    let head: serde_json::Value = resp
+        .json()
+        .expect("Failed to parse file head before recovery edit");
+    let parent_cid = head["cid"]
+        .as_str()
+        .expect("Missing parent cid for recovery edit");
+
+    let resp = client
+        .post(format!(
+            "{}/docs/{}/replace?parent_cid={}",
+            server_url, file_id, parent_cid
+        ))
+        .header("Content-Type", "text/plain")
+        .body(recovered_content)
+        .send()
+        .expect("Failed to write recovery content to server");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write recovery content: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    // Flood with invalid MQTT payloads to force lag and drop earlier in-process messages.
+    flood_invalid_edit_messages(&mqtt_broker, workspace, file_id, 3000);
+
+    // Resume sync. No additional real edits are published after this point.
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(sync_pid, libc::SIGCONT);
+    }
+
+    // Recovery should converge both linked paths to server content.
+    wait_for_file_content_contains(&linked_a, recovered_content, Duration::from_secs(20));
+    wait_for_file_content_contains(&linked_b, recovered_content, Duration::from_secs(20));
 }
 
 /// CP-k51z: Test that offline edits sync on reconnect.
