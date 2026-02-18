@@ -28,9 +28,8 @@ pub use ancestry::{
 
 // From client
 pub use client::{
-    delete_schema_entry, discover_fs_root, fetch_head, fork_node, push_content_by_type,
-    push_file_content, push_json_content, push_jsonl_content, push_schema_to_server,
-    refresh_from_head, resolve_path_to_uuid_http, DiscoverFsRootError, FetchHeadError,
+    delete_schema_entry, discover_fs_root, fetch_head, fork_node, push_schema_to_server,
+    resolve_path_to_uuid_http, DiscoverFsRootError, FetchHeadError,
 };
 
 // From commands
