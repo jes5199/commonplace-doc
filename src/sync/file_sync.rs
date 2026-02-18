@@ -8,7 +8,10 @@ use crate::mqtt::{IncomingMessage, MqttClient, Topic};
 #[cfg(unix)]
 use crate::sync::atomic_write_with_shadow;
 use crate::sync::crdt_merge::{get_doc_text_content, parse_edit_message, process_received_edit};
-use crate::sync::crdt_publish::{publish_text_change, publish_yjs_update};
+use crate::sync::crdt_publish::{
+    publish_text_change, publish_text_change_with_parent, publish_yjs_update,
+    publish_yjs_update_with_parent,
+};
 use crate::sync::crdt_state::{CrdtPeerState, DirectorySyncState};
 #[cfg(unix)]
 use crate::sync::flock::{try_flock_exclusive, FlockResult};
@@ -606,11 +609,25 @@ pub async fn upload_task_crdt(
         );
 
         let mut resync_attempted = false;
+        let parent_override =
+            best_effort_parent_commit_from_tracker(&file_path, inode_tracker.as_ref()).await;
 
         loop {
             // Get or create the CRDT state for this file
             let mut state_guard = crdt_state.write().await;
             let file_state = state_guard.get_or_create_file(&filename, node_id);
+            if let (Some(parent), Some(local_head)) =
+                (parent_override.as_ref(), file_state.local_head_cid.as_ref())
+            {
+                if parent != local_head {
+                    debug!(
+                        "CRDT upload_task: overriding parent for {} (tracker={} local_head={})",
+                        file_path.display(),
+                        parent,
+                        local_head
+                    );
+                }
+            }
 
             // Skip publishing if CRDT state hasn't been initialized from server yet.
             // Publishing from an empty Y.Doc creates Yjs insert operations with a new
@@ -732,13 +749,14 @@ pub async fn upload_task_crdt(
                 ) {
                     Ok(update_b64) => match crate::sync::crdt::yjs::base64_decode(&update_b64) {
                         Ok(update_bytes) => {
-                            publish_yjs_update(
+                            publish_yjs_update_with_parent(
                                 &mqtt_client,
                                 &workspace,
                                 &node_id.to_string(),
                                 file_state,
                                 update_bytes,
                                 &author,
+                                parent_override.as_deref(),
                             )
                             .await
                         }
@@ -755,7 +773,7 @@ pub async fn upload_task_crdt(
                             file_path.display(),
                             e
                         );
-                        publish_text_change(
+                        publish_text_change_with_parent(
                             &mqtt_client,
                             &workspace,
                             &node_id.to_string(),
@@ -763,13 +781,14 @@ pub async fn upload_task_crdt(
                             &old_content,
                             &new_content,
                             &author,
+                            parent_override.as_deref(),
                         )
                         .await
                     }
                 }
             } else {
                 // Text files: use efficient character-level diffs
-                publish_text_change(
+                publish_text_change_with_parent(
                     &mqtt_client,
                     &workspace,
                     &node_id.to_string(),
@@ -777,6 +796,7 @@ pub async fn upload_task_crdt(
                     &old_content,
                     &new_content,
                     &author,
+                    parent_override.as_deref(),
                 )
                 .await
             };
@@ -1372,6 +1392,37 @@ pub(crate) fn commit_id_for_write(
         crate::sync::crdt_merge::MergeResult::LocalAhead => Some(received_cid.to_string()),
         _ => None,
     }
+}
+
+#[cfg(unix)]
+async fn best_effort_parent_commit_from_tracker(
+    file_path: &Path,
+    inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
+) -> Option<String> {
+    let tracker = inode_tracker?;
+    let tracker_guard = tracker.read().await;
+
+    if let Ok(inode_key) = crate::sync::InodeKey::from_path(file_path) {
+        if let Some(state) = tracker_guard.get(&inode_key) {
+            return Some(state.commit_id.clone());
+        }
+    }
+
+    // Fallback for external atomic writers: if path now points to an untracked inode,
+    // use the current active tracker entry for this path as best-effort base attribution.
+    tracker_guard
+        .states
+        .values()
+        .find(|state| state.primary_path == file_path && state.shadow_path.is_none())
+        .map(|state| state.commit_id.clone())
+}
+
+#[cfg(not(unix))]
+async fn best_effort_parent_commit_from_tracker(
+    _file_path: &Path,
+    _inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
+) -> Option<String> {
+    None
 }
 
 #[cfg(unix)]
@@ -3003,6 +3054,55 @@ mod tests {
             .expect("inode should be tracked after refresh");
         assert_eq!(tracked.commit_id, "cid-new");
         assert_eq!(tracked.primary_path, file_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_best_effort_parent_commit_from_tracker_uses_tracked_inode() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("tracked.txt");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        let inode = crate::sync::InodeKey::from_path(&file_path).unwrap();
+        let tracker = Arc::new(RwLock::new(crate::sync::InodeTracker::new(
+            dir.path().join("shadow"),
+        )));
+        {
+            let mut guard = tracker.write().await;
+            guard.track(inode, "cid-tracked".to_string(), file_path.clone(), None);
+        }
+
+        let parent = best_effort_parent_commit_from_tracker(&file_path, Some(&tracker)).await;
+        assert_eq!(parent.as_deref(), Some("cid-tracked"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_best_effort_parent_commit_from_tracker_falls_back_to_active_path_entry() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("note.txt");
+        std::fs::write(&file_path, "old").unwrap();
+
+        let old_inode = crate::sync::InodeKey::from_path(&file_path).unwrap();
+        let tracker = Arc::new(RwLock::new(crate::sync::InodeTracker::new(
+            dir.path().join("shadow"),
+        )));
+        {
+            let mut guard = tracker.write().await;
+            guard.track(old_inode, "cid-before".to_string(), file_path.clone(), None);
+        }
+
+        // Simulate an external atomic writer that replaces the file inode without
+        // going through tracker-aware write paths.
+        let tmp_path = dir.path().join("note.tmp");
+        std::fs::write(&tmp_path, "new").unwrap();
+        std::fs::rename(&tmp_path, &file_path).unwrap();
+
+        let new_inode = crate::sync::InodeKey::from_path(&file_path).unwrap();
+        assert_ne!(old_inode, new_inode, "setup should replace inode");
+
+        let parent = best_effort_parent_commit_from_tracker(&file_path, Some(&tracker)).await;
+        assert_eq!(parent.as_deref(), Some("cid-before"));
     }
 
     // Tests for EchoDetectionResult
