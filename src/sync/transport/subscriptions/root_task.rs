@@ -27,6 +27,43 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+async fn apply_crdt_content_to_paths(
+    directory: &Path,
+    paths: &[String],
+    content: &str,
+    result: &crate::sync::crdt_merge::MergeResult,
+    received_cid: &str,
+    inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
+) {
+    let commit_id = crate::sync::file_sync::commit_id_for_write(result, received_cid);
+
+    for rel_path in paths {
+        let file_path = directory.join(rel_path);
+
+        if let Some(parent) = file_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        if let Err(e) = crate::sync::file_sync::write_content_with_tracker(
+            &file_path,
+            content,
+            inode_tracker,
+            commit_id.clone(),
+            "CRDT directory mqtt task",
+        )
+        .await
+        {
+            warn!("Failed to write {}: {}", rel_path, e);
+        } else {
+            debug!(
+                "CRDT edit applied to {} ({} bytes, {:?})",
+                rel_path,
+                content.len(),
+                result
+            );
+        }
+    }
+}
+
 async fn load_root_schema_from_state(
     ctx: &CrdtFileSyncContext,
 ) -> Option<(crate::fs::FsSchema, String, Option<String>)> {
@@ -743,42 +780,15 @@ pub async fn directory_mqtt_task(
                                             drop(state_guard); // Release lock before file I/O
 
                                             if let Some(content) = maybe_content {
-                                                let commit_id =
-                                                    crate::sync::file_sync::commit_id_for_write(
-                                                        &result,
-                                                        &received_cid,
-                                                    );
-                                                // Write to all paths
-                                                for rel_path in paths {
-                                                    let file_path = directory.join(rel_path);
-
-                                                    if let Some(parent) = file_path.parent() {
-                                                        let _ =
-                                                            tokio::fs::create_dir_all(parent).await;
-                                                    }
-                                                    if let Err(e) =
-                                                        crate::sync::file_sync::write_content_with_tracker(
-                                                            &file_path,
-                                                            &content,
-                                                            inode_tracker_for_crdt.as_ref(),
-                                                            commit_id.clone(),
-                                                            "CRDT directory mqtt task",
-                                                        )
-                                                        .await
-                                                    {
-                                                        warn!(
-                                                            "Failed to write {}: {}",
-                                                            rel_path, e
-                                                        );
-                                                    } else {
-                                                        debug!(
-                                                        "CRDT edit applied to {} ({} bytes, {:?})",
-                                                        rel_path,
-                                                        content.len(),
-                                                        result
-                                                    );
-                                                    }
-                                                }
+                                                apply_crdt_content_to_paths(
+                                                    &directory,
+                                                    &paths,
+                                                    &content,
+                                                    &result,
+                                                    &received_cid,
+                                                    inode_tracker_for_crdt.as_ref(),
+                                                )
+                                                .await;
                                                 true // Handled via CRDT
                                             } else {
                                                 debug!(
@@ -1014,5 +1024,80 @@ async fn sync_uuid_subscriptions(
             to_remove.len(),
             subscribed_uuids.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::crdt_merge::MergeResult;
+    #[cfg(unix)]
+    use crate::sync::{InodeKey, InodeTracker};
+    use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_crdt_content_to_paths_uses_tracker_atomic_write_and_commit_id() {
+        let dir = tempdir().unwrap();
+        let rel_path = "nested/note.txt".to_string();
+        let file_path = dir.path().join(&rel_path);
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "old content").unwrap();
+
+        let old_inode = InodeKey::from_path(&file_path).unwrap();
+        let tracker = Arc::new(RwLock::new(InodeTracker::new(dir.path().join(".shadow"))));
+        {
+            let mut guard = tracker.write().await;
+            guard.track(old_inode, "cid-before".to_string(), file_path.clone(), None);
+        }
+
+        let paths = vec![rel_path];
+        let result = MergeResult::FastForward {
+            new_head: "cid-after".to_string(),
+        };
+        apply_crdt_content_to_paths(
+            dir.path(),
+            &paths,
+            "new content",
+            &result,
+            "received-cid-ignored-for-fast-forward",
+            Some(&tracker),
+        )
+        .await;
+
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "new content");
+
+        let new_inode = InodeKey::from_path(&file_path).unwrap();
+        assert_ne!(
+            old_inode, new_inode,
+            "tracker-aware write should replace inode atomically"
+        );
+
+        let guard = tracker.read().await;
+        let new_state = guard
+            .get(&new_inode)
+            .expect("new inode should be tracked after write");
+        assert_eq!(new_state.commit_id, "cid-after");
+    }
+
+    #[tokio::test]
+    async fn test_apply_crdt_content_to_paths_without_tracker_writes_content() {
+        let dir = tempdir().unwrap();
+        let rel_path = "deep/path/note.txt".to_string();
+        let file_path = dir.path().join(&rel_path);
+
+        let paths = vec![rel_path];
+        let result = MergeResult::LocalAhead;
+        apply_crdt_content_to_paths(
+            dir.path(),
+            &paths,
+            "hello",
+            &result,
+            "cid-local-ahead",
+            None,
+        )
+        .await;
+
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "hello");
     }
 }
