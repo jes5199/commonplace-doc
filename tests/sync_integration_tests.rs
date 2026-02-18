@@ -517,6 +517,93 @@ fn spawn_sync_directory(
         .expect("Failed to spawn sync client")
 }
 
+/// Helper to spawn sync client in directory mode with an explicit initial-sync strategy
+fn spawn_sync_directory_with_initial_sync(
+    server_url: &str,
+    mqtt_broker: &str,
+    directory: &std::path::Path,
+    node_id: &str,
+    initial_sync: &str,
+) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_commonplace-sync"))
+        .args([
+            "--server",
+            server_url,
+            "--mqtt-broker",
+            mqtt_broker,
+            "--node",
+            node_id,
+            "--directory",
+            directory.to_str().unwrap(),
+            "--initial-sync",
+            initial_sync,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn sync client")
+}
+
+fn fetch_head_content(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    doc_id: &str,
+) -> String {
+    let resp = client
+        .get(format!("{}/docs/{}/head", server_url, doc_id))
+        .send()
+        .expect("Failed to fetch head");
+    let head: serde_json::Value = resp.json().expect("Failed to parse HEAD");
+    head["content"]
+        .as_str()
+        .expect("HEAD response missing content")
+        .to_string()
+}
+
+fn wait_for_head_content_contains(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    doc_id: &str,
+    expected: &str,
+    timeout: Duration,
+) -> String {
+    let start = std::time::Instant::now();
+    loop {
+        let content = fetch_head_content(client, server_url, doc_id);
+        if content.contains(expected) {
+            return content;
+        }
+        if start.elapsed() >= timeout {
+            panic!(
+                "Timed out waiting for '{}' in head content for {}. Last content: {}",
+                expected, doc_id, content
+            );
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+fn assert_head_content_does_not_contain(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    doc_id: &str,
+    forbidden: &str,
+    window: Duration,
+) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < window {
+        let content = fetch_head_content(client, server_url, doc_id);
+        assert!(
+            !content.contains(forbidden),
+            "Found forbidden content '{}' in head for {}: {}",
+            forbidden,
+            doc_id,
+            content
+        );
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
 /// Spawn sync client with stderr inherited for debugging
 #[allow(dead_code)]
 fn spawn_sync_directory_debug(
@@ -541,6 +628,280 @@ fn spawn_sync_directory_debug(
         .stderr(Stdio::inherit())
         .spawn()
         .expect("Failed to spawn sync client")
+}
+
+#[test]
+fn test_initial_sync_local_overwrites_server_on_conflict() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+    let server_content = "SERVER_BASELINE_ONLY";
+    let local_content = "LOCAL_OVERRIDE_ONLY";
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    // Create fs-root and a server-side file entry.
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let fs_root_id = body["id"].as_str().expect("No id in response").to_string();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create file document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let file_id = body["id"].as_str().expect("No id in response").to_string();
+
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(server_content)
+        .send()
+        .expect("Failed to write server file content");
+    assert!(resp.status().is_success());
+
+    let schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "notes.txt": {
+                    "type": "doc",
+                    "node_id": file_id
+                }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(schema.to_string())
+        .send()
+        .expect("Failed to write fs-root schema");
+    assert!(resp.status().is_success());
+
+    // Seed conflicting local state.
+    std::fs::write(sync_dir.join("notes.txt"), local_content).expect("Failed to write local file");
+    std::fs::write(sync_dir.join(".commonplace.json"), schema.to_string())
+        .expect("Failed to write local schema");
+
+    guard.add(spawn_sync_directory_with_initial_sync(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir,
+        &fs_root_id,
+        "local",
+    ));
+
+    let final_content = wait_for_head_content_contains(
+        &client,
+        &server_url,
+        &file_id,
+        local_content,
+        Duration::from_secs(10),
+    );
+    assert!(
+        final_content.contains(local_content),
+        "Expected local content on server, got: {}",
+        final_content
+    );
+}
+
+#[test]
+fn test_initial_sync_server_does_not_overwrite_server_on_conflict() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+    let server_content = "SERVER_BASELINE_ONLY";
+    let local_content = "LOCAL_OVERRIDE_ONLY";
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let fs_root_id = body["id"].as_str().expect("No id in response").to_string();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create file document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let file_id = body["id"].as_str().expect("No id in response").to_string();
+
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(server_content)
+        .send()
+        .expect("Failed to write server file content");
+    assert!(resp.status().is_success());
+
+    let schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "notes.txt": {
+                    "type": "doc",
+                    "node_id": file_id
+                }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(schema.to_string())
+        .send()
+        .expect("Failed to write fs-root schema");
+    assert!(resp.status().is_success());
+
+    std::fs::write(sync_dir.join("notes.txt"), local_content).expect("Failed to write local file");
+    std::fs::write(sync_dir.join(".commonplace.json"), schema.to_string())
+        .expect("Failed to write local schema");
+
+    guard.add(spawn_sync_directory_with_initial_sync(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir,
+        &fs_root_id,
+        "server",
+    ));
+
+    assert_head_content_does_not_contain(
+        &client,
+        &server_url,
+        &file_id,
+        local_content,
+        Duration::from_secs(4),
+    );
+    let final_content = fetch_head_content(&client, &server_url, &file_id);
+    assert!(
+        final_content.contains(server_content),
+        "Expected server content to be preserved, got: {}",
+        final_content
+    );
+}
+
+#[test]
+fn test_initial_sync_skip_does_not_overwrite_server_on_conflict() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+    let server_content = "SERVER_BASELINE_ONLY";
+    let local_content = "LOCAL_OVERRIDE_ONLY";
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let fs_root_id = body["id"].as_str().expect("No id in response").to_string();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create file document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let file_id = body["id"].as_str().expect("No id in response").to_string();
+
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(server_content)
+        .send()
+        .expect("Failed to write server file content");
+    assert!(resp.status().is_success());
+
+    let schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "notes.txt": {
+                    "type": "doc",
+                    "node_id": file_id
+                }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(schema.to_string())
+        .send()
+        .expect("Failed to write fs-root schema");
+    assert!(resp.status().is_success());
+
+    std::fs::write(sync_dir.join("notes.txt"), local_content).expect("Failed to write local file");
+    std::fs::write(sync_dir.join(".commonplace.json"), schema.to_string())
+        .expect("Failed to write local schema");
+
+    guard.add(spawn_sync_directory_with_initial_sync(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir,
+        &fs_root_id,
+        "skip",
+    ));
+
+    assert_head_content_does_not_contain(
+        &client,
+        &server_url,
+        &file_id,
+        local_content,
+        Duration::from_secs(4),
+    );
+    let final_content = fetch_head_content(&client, &server_url, &file_id);
+    assert!(
+        final_content.contains(server_content),
+        "Expected server content to be preserved, got: {}",
+        final_content
+    );
 }
 
 /// CP-q52x: Test that newly created node-backed subdirectories propagate without restart.

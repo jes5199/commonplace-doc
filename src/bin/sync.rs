@@ -18,7 +18,8 @@ use commonplace_doc::sync::subdir_spawn::{
 };
 use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
-    acquire_sync_lock, add_file_to_schema, build_uuid_map_from_local_schemas, create_new_file,
+    acquire_sync_lock, add_file_to_schema, build_uuid_map_and_write_schemas,
+    build_uuid_map_from_local_schemas, check_server_has_content_mqtt, create_new_file,
     detect_from_path, directory_mqtt_task, directory_watcher_task, ensure_fs_root_exists_mqtt,
     ensure_parent_directories_exist, find_owning_document, handle_file_deleted,
     handle_file_modified, handle_schema_modified, push_local_if_differs, remove_file_from_schema,
@@ -136,6 +137,270 @@ fn setup_directory_watchers(
         watcher_handle,
         watched_subdirs: Arc::new(RwLock::new(HashSet::new())),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupSyncPlan {
+    BootstrapLocal,
+    LocalAuthoritative,
+    ServerAuthoritative,
+    BootstrapServer,
+    SkipExisting,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StartupSyncDecision {
+    plan: StartupSyncPlan,
+    use_server_schema: bool,
+    push_local_schemas: bool,
+    include_missing_file_states: bool,
+    push_local_content: bool,
+    materialize_server_content: bool,
+}
+
+fn decide_startup_sync(
+    initial_sync_strategy: &str,
+    server_has_content: bool,
+    local_schema_exists: bool,
+    push_only: bool,
+    pull_only: bool,
+) -> StartupSyncDecision {
+    let mut decision = if !server_has_content {
+        StartupSyncDecision {
+            plan: StartupSyncPlan::BootstrapLocal,
+            use_server_schema: false,
+            push_local_schemas: true,
+            include_missing_file_states: false,
+            push_local_content: true,
+            materialize_server_content: false,
+        }
+    } else {
+        match initial_sync_strategy {
+            "local" => StartupSyncDecision {
+                plan: StartupSyncPlan::LocalAuthoritative,
+                use_server_schema: false,
+                push_local_schemas: true,
+                include_missing_file_states: false,
+                push_local_content: true,
+                materialize_server_content: false,
+            },
+            "server" => StartupSyncDecision {
+                plan: StartupSyncPlan::ServerAuthoritative,
+                use_server_schema: true,
+                push_local_schemas: false,
+                include_missing_file_states: true,
+                push_local_content: false,
+                materialize_server_content: true,
+            },
+            "skip" if local_schema_exists => StartupSyncDecision {
+                plan: StartupSyncPlan::SkipExisting,
+                use_server_schema: false,
+                push_local_schemas: false,
+                include_missing_file_states: false,
+                push_local_content: false,
+                materialize_server_content: false,
+            },
+            "skip" => StartupSyncDecision {
+                plan: StartupSyncPlan::BootstrapServer,
+                use_server_schema: true,
+                push_local_schemas: false,
+                include_missing_file_states: true,
+                push_local_content: false,
+                materialize_server_content: true,
+            },
+            _ => StartupSyncDecision {
+                plan: StartupSyncPlan::SkipExisting,
+                use_server_schema: false,
+                push_local_schemas: false,
+                include_missing_file_states: false,
+                push_local_content: false,
+                materialize_server_content: false,
+            },
+        }
+    };
+
+    if pull_only {
+        decision.push_local_schemas = false;
+        decision.push_local_content = false;
+    }
+
+    if push_only {
+        decision.use_server_schema = false;
+        decision.include_missing_file_states = false;
+        decision.materialize_server_content = false;
+    }
+
+    decision
+}
+
+fn collect_local_schema_paths(directory: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut stack = vec![directory.to_path_buf()];
+
+    while let Some(current) = stack.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(e) => e,
+            Err(e) => {
+                debug!(
+                    "Skipping unreadable directory while collecting schemas ({}): {}",
+                    current.display(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(e) => {
+                    debug!("Skipping unreadable entry {}: {}", path.display(), e);
+                    continue;
+                }
+            };
+
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+
+            if file_type.is_file()
+                && path.file_name().and_then(|n| n.to_str()) == Some(SCHEMA_FILENAME)
+            {
+                paths.push(path);
+            }
+        }
+    }
+
+    paths.sort_by_key(|p| {
+        p.strip_prefix(directory)
+            .map(|rel| rel.components().count())
+            .unwrap_or(usize::MAX)
+    });
+    paths
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn push_local_schemas_via_mqtt(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    directory: &Path,
+    author: &str,
+    written_schemas: &WrittenSchemas,
+    crdt_context: &CrdtFileSyncContext,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let schema_paths = collect_local_schema_paths(directory);
+    if schema_paths.is_empty() {
+        info!(
+            "No local schema files found under {}; skipping local schema publish",
+            directory.display()
+        );
+        return Ok(0);
+    }
+
+    let mut published = 0usize;
+    for schema_path in schema_paths {
+        let content = tokio::fs::read_to_string(&schema_path).await.map_err(|e| {
+            format!(
+                "Failed to read local schema {}: {}",
+                schema_path.display(),
+                e
+            )
+        })?;
+
+        handle_schema_modified(
+            client,
+            server,
+            fs_root_id,
+            directory,
+            &schema_path,
+            &content,
+            author,
+            Some(written_schemas),
+            Some(crdt_context),
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "Failed to publish local schema {} via MQTT: {}",
+                schema_path.display(),
+                e
+            )
+        })?;
+
+        published += 1;
+    }
+
+    Ok(published)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_startup_uuid_map(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    directory: &Path,
+    author: &str,
+    local_schema_exists: bool,
+    decision: StartupSyncDecision,
+    written_schemas: &WrittenSchemas,
+    crdt_context: &CrdtFileSyncContext,
+) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
+    if decision.push_local_schemas {
+        let published = push_local_schemas_via_mqtt(
+            client,
+            server,
+            fs_root_id,
+            directory,
+            author,
+            written_schemas,
+            crdt_context,
+        )
+        .await?;
+        info!(
+            "Published {} local schema file(s) for startup plan {:?}",
+            published, decision.plan
+        );
+    }
+
+    let mut uuid_map = HashMap::new();
+
+    if decision.use_server_schema {
+        let (server_uuid_map, all_succeeded) = build_uuid_map_and_write_schemas(
+            client,
+            server,
+            fs_root_id,
+            directory,
+            Some(written_schemas),
+        )
+        .await;
+
+        if !all_succeeded {
+            warn!(
+                "Startup schema fetch had partial failures (plan {:?}); UUID map may be incomplete",
+                decision.plan
+            );
+        }
+
+        if server_uuid_map.is_empty() && local_schema_exists {
+            warn!("Server-derived UUID map is empty; falling back to local schemas for startup");
+            build_uuid_map_from_local_schemas(directory, "", &mut uuid_map);
+        } else {
+            uuid_map = server_uuid_map;
+        }
+    } else {
+        build_uuid_map_from_local_schemas(directory, "", &mut uuid_map);
+    }
+
+    info!(
+        "Startup plan {:?} prepared UUID map with {} entries",
+        decision.plan,
+        uuid_map.len()
+    );
+
+    Ok(uuid_map)
 }
 
 /// Optional CRDT parameters for handling directory events via MQTT instead of HTTP.
@@ -2370,6 +2635,8 @@ async fn run_directory_mode(
     );
     set_sync_schema_mqtt_request_client(Some(mqtt_request.clone()));
     ensure_fs_root_exists_mqtt(&mqtt_request, &fs_root_id).await?;
+    let server_has_content = check_server_has_content_mqtt(&mqtt_request, &fs_root_id).await;
+    let local_schema_exists = directory.join(SCHEMA_FILENAME).exists();
 
     // Load or create state file for persisting per-file CIDs
     let state_file_path =
@@ -2413,32 +2680,91 @@ async fn run_directory_mode(
     let written_schemas: commonplace_doc::sync::WrittenSchemas =
         Arc::new(RwLock::new(std::collections::HashMap::new()));
 
-    if initial_sync_strategy != "skip" {
+    // Load/create CRDT state early so startup schema reconciliation can use MQTT context.
+    // Note: If fs_root_id is not a UUID (e.g., "workspace"), use a nil UUID for the schema.
+    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id).unwrap_or_else(|_| {
         warn!(
-            "Ignoring --initial-sync={} during HTTP-off startup; MQTT/cyan bootstrap owns remote reconciliation",
-            initial_sync_strategy
+            "fs_root_id '{}' is not a UUID, using nil UUID for CRDT schema state",
+            fs_root_id
         );
+        uuid::Uuid::nil()
+    });
+    let crdt_state = Arc::new(RwLock::new(
+        DirectorySyncState::load_or_create(&directory, schema_node_id)
+            .await
+            .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
+    ));
+    let subdir_cache = Arc::new(SubdirStateCache::new());
+    let mqtt_only_config = if mqtt_only_sync {
+        MqttOnlySyncConfig::mqtt_only()
+    } else {
+        MqttOnlySyncConfig::with_http_fallback()
+    };
+    let crdt_context = CrdtFileSyncContext {
+        mqtt_client: mqtt_client.clone(),
+        mqtt_request: mqtt_request.clone(),
+        workspace: workspace.clone(),
+        crdt_state: crdt_state.clone(),
+        subdir_cache: subdir_cache.clone(),
+        mqtt_only_config,
+    };
+
+    let decision = decide_startup_sync(
+        &initial_sync_strategy,
+        server_has_content,
+        local_schema_exists,
+        push_only,
+        pull_only,
+    );
+    info!(
+        "Startup sync plan {:?} (strategy={}, server_has_content={}, local_schema_exists={}, push_only={}, pull_only={})",
+        decision.plan,
+        initial_sync_strategy,
+        server_has_content,
+        local_schema_exists,
+        push_only,
+        pull_only
+    );
+
+    let uuid_map = prepare_startup_uuid_map(
+        &client,
+        &server,
+        &fs_root_id,
+        &directory,
+        &author,
+        local_schema_exists,
+        decision,
+        &written_schemas,
+        &crdt_context,
+    )
+    .await?;
+    let file_count = uuid_map.len();
+
+    // Reconcile sync state UUIDs with schema to detect and fix drift after startup prep.
+    {
+        let mut state = crdt_state.write().await;
+        if let Err(e) = state.reconcile_with_schema(&directory).await {
+            warn!("Failed to reconcile UUIDs with schema: {}", e);
+        }
     }
 
-    // HTTP bootstrap is disabled in strict MQTT runtime.
-    // Schema/state reconciliation is handled by MQTT subscription tasks.
-    let initial_schema_cid: Option<String> = None;
+    let initial_schema_cid = {
+        let state = crdt_state.read().await;
+        state
+            .schema
+            .local_head_cid
+            .clone()
+            .or_else(|| state.schema.head_cid.clone())
+    };
 
-    // Build UUID map from local schema files.
-    // Remote reconciliation is deferred to MQTT subscription tasks.
-    let mut uuid_map = HashMap::new();
-    build_uuid_map_from_local_schemas(&directory, "", &mut uuid_map);
-    let file_count = uuid_map.len();
-    info!("Built UUID map from local schemas: {} files", file_count);
-
-    // Populate file_states from UUID map (only for files that exist on disk).
-    // Content sync (push/pull) is handled later by CRDT init + push_local_if_differs.
+    // Populate file_states from UUID map.
+    // Server-authoritative startup includes missing files so they can be materialized.
     {
         let mut states = file_states.write().await;
         for (relative_path, uuid) in &uuid_map {
             let file_path = directory.join(relative_path);
-            if !file_path.exists() {
-                debug!("Skipping {} — not on disk yet", relative_path);
+            if !file_path.exists() && !decision.include_missing_file_states {
+                debug!("Skipping {} — not on disk for startup plan", relative_path);
                 continue;
             }
 
@@ -2488,44 +2814,6 @@ async fn run_directory_mode(
         written_schemas.clone(),
     );
 
-    // Load/create CRDT state early so subscription tasks can use it.
-    // Note: If fs_root_id is not a UUID (e.g., "workspace"), use a nil UUID for the schema.
-    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id).unwrap_or_else(|_| {
-        warn!(
-            "fs_root_id '{}' is not a UUID, using nil UUID for CRDT schema state",
-            fs_root_id
-        );
-        uuid::Uuid::nil()
-    });
-    let crdt_state = Arc::new(RwLock::new(
-        DirectorySyncState::load_or_create(&directory, schema_node_id)
-            .await
-            .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
-    ));
-
-    // Reconcile sync state UUIDs with schema to detect and fix drift
-    {
-        let mut state = crdt_state.write().await;
-        if let Err(e) = state.reconcile_with_schema(&directory).await {
-            warn!("Failed to reconcile UUIDs with schema: {}", e);
-        }
-    }
-
-    let subdir_cache = Arc::new(SubdirStateCache::new());
-    let mqtt_only_config = if mqtt_only_sync {
-        MqttOnlySyncConfig::mqtt_only()
-    } else {
-        MqttOnlySyncConfig::with_http_fallback()
-    };
-    let crdt_context = Some(CrdtFileSyncContext {
-        mqtt_client: mqtt_client.clone(),
-        mqtt_request: mqtt_request.clone(),
-        workspace: workspace.clone(),
-        crdt_state: crdt_state.clone(),
-        subdir_cache: subdir_cache.clone(),
-        mqtt_only_config,
-    });
-
     // Start subscription task for fs-root (skip if push-only)
     let subscription_handle = if !push_only {
         let initial_uuid_map: HashMap<String, String> = uuid_map.clone();
@@ -2553,7 +2841,7 @@ async fn run_directory_mode(
             initial_schema_cid.clone(),
             Some(shared_state_file.clone()),
             initial_uuid_map,
-            crdt_context.clone(),
+            Some(crdt_context.clone()),
         )))
     } else {
         info!("Push-only mode: skipping subscription");
@@ -2577,7 +2865,7 @@ async fn run_directory_mode(
             #[cfg(unix)]
             inode_tracker: inode_tracker.clone(),
             watched_subdirs: watched_subdirs.clone(),
-            crdt_context: crdt_context.clone(),
+            crdt_context: Some(crdt_context.clone()),
         };
         let transport = SubdirTransport::Mqtt {
             client: mqtt_client.clone(),
@@ -2671,7 +2959,7 @@ async fn run_directory_mode(
             // This runs after BOTH success and failure of CRDT init: when cyan sync fails
             // and we initialize empty, we still need to push local content to create the
             // first commit on the server.
-            if !pull_only {
+            if decision.push_local_content {
                 if let Err(e) = push_local_if_differs(
                     &mqtt_client,
                     &workspace,
@@ -2689,7 +2977,7 @@ async fn run_directory_mode(
 
             // Pull case: if local file is empty/default but server has content,
             // write server content to disk so the file reflects the CRDT state.
-            {
+            if decision.materialize_server_content {
                 let local_content = tokio::fs::read_to_string(&file_path)
                     .await
                     .unwrap_or_default();
@@ -2967,6 +3255,8 @@ async fn run_exec_mode(
     );
     set_sync_schema_mqtt_request_client(Some(mqtt_request.clone()));
     ensure_fs_root_exists_mqtt(&mqtt_request, &fs_root_id).await?;
+    let server_has_content = check_server_has_content_mqtt(&mqtt_request, &fs_root_id).await;
+    let local_schema_exists = directory.join(SCHEMA_FILENAME).exists();
 
     // Load or create state file for persisting per-file CIDs (sandbox mode)
     let state_file_path =
@@ -3010,34 +3300,93 @@ async fn run_exec_mode(
     let written_schemas: commonplace_doc::sync::WrittenSchemas =
         Arc::new(RwLock::new(std::collections::HashMap::new()));
 
-    if initial_sync_strategy != "skip" {
-        warn!(
-            "Ignoring --initial-sync={} during HTTP-off startup; MQTT/cyan bootstrap owns remote reconciliation",
-            initial_sync_strategy
-        );
-    }
-
-    // HTTP bootstrap is disabled in strict MQTT runtime.
-    // Schema/state reconciliation is handled by MQTT subscription tasks.
-    let initial_schema_cid: Option<String> = None;
-
     let sync_start = Instant::now();
 
-    // Build UUID map from local schema files.
-    // Remote reconciliation is deferred to MQTT subscription tasks.
-    let mut uuid_map = HashMap::new();
-    build_uuid_map_from_local_schemas(&directory, "", &mut uuid_map);
-    let file_count = uuid_map.len();
-    info!("Built UUID map from local schemas: {} files", file_count);
+    // Load/create CRDT state early so startup schema reconciliation can use MQTT context.
+    // Note: If fs_root_id is not a UUID (e.g., "workspace"), use a nil UUID for the schema.
+    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id).unwrap_or_else(|_| {
+        warn!(
+            "fs_root_id '{}' is not a UUID, using nil UUID for CRDT schema state",
+            fs_root_id
+        );
+        uuid::Uuid::nil()
+    });
+    let crdt_state = Arc::new(RwLock::new(
+        DirectorySyncState::load_or_create(&directory, schema_node_id)
+            .await
+            .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
+    ));
+    let subdir_cache = Arc::new(SubdirStateCache::new());
+    let mqtt_only_config = if mqtt_only_sync {
+        MqttOnlySyncConfig::mqtt_only()
+    } else {
+        MqttOnlySyncConfig::with_http_fallback()
+    };
+    let crdt_context = CrdtFileSyncContext {
+        mqtt_client: mqtt_client.clone(),
+        mqtt_request: mqtt_request.clone(),
+        workspace: workspace.clone(),
+        crdt_state: crdt_state.clone(),
+        subdir_cache: subdir_cache.clone(),
+        mqtt_only_config,
+    };
 
-    // Populate file_states from UUID map (only for files that exist on disk).
-    // Content sync (push/pull) is handled later by CRDT init + push_local_if_differs.
+    let decision = decide_startup_sync(
+        &initial_sync_strategy,
+        server_has_content,
+        local_schema_exists,
+        push_only,
+        pull_only,
+    );
+    info!(
+        "Startup sync plan {:?} (strategy={}, server_has_content={}, local_schema_exists={}, push_only={}, pull_only={})",
+        decision.plan,
+        initial_sync_strategy,
+        server_has_content,
+        local_schema_exists,
+        push_only,
+        pull_only
+    );
+
+    let uuid_map = prepare_startup_uuid_map(
+        &client,
+        &server,
+        &fs_root_id,
+        &directory,
+        &author,
+        local_schema_exists,
+        decision,
+        &written_schemas,
+        &crdt_context,
+    )
+    .await?;
+    let file_count = uuid_map.len();
+
+    // Reconcile sync state UUIDs with schema to detect and fix drift after startup prep.
+    {
+        let mut state = crdt_state.write().await;
+        if let Err(e) = state.reconcile_with_schema(&directory).await {
+            warn!("Failed to reconcile UUIDs with schema: {}", e);
+        }
+    }
+
+    let initial_schema_cid = {
+        let state = crdt_state.read().await;
+        state
+            .schema
+            .local_head_cid
+            .clone()
+            .or_else(|| state.schema.head_cid.clone())
+    };
+
+    // Populate file_states from UUID map.
+    // Server-authoritative startup includes missing files so they can be materialized.
     {
         let mut states = file_states.write().await;
         for (relative_path, uuid) in &uuid_map {
             let file_path = directory.join(relative_path);
-            if !file_path.exists() {
-                debug!("Skipping {} — not on disk yet", relative_path);
+            if !file_path.exists() && !decision.include_missing_file_states {
+                debug!("Skipping {} — not on disk for startup plan", relative_path);
                 continue;
             }
 
@@ -3087,44 +3436,6 @@ async fn run_exec_mode(
         written_schemas.clone(),
     );
 
-    // Load/create CRDT state early so subscription tasks can use it.
-    // Note: If fs_root_id is not a UUID (e.g., "workspace"), use a nil UUID for the schema.
-    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id).unwrap_or_else(|_| {
-        warn!(
-            "fs_root_id '{}' is not a UUID, using nil UUID for CRDT schema state",
-            fs_root_id
-        );
-        uuid::Uuid::nil()
-    });
-    let crdt_state = Arc::new(RwLock::new(
-        DirectorySyncState::load_or_create(&directory, schema_node_id)
-            .await
-            .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
-    ));
-
-    // Reconcile sync state UUIDs with schema to detect and fix drift
-    {
-        let mut state = crdt_state.write().await;
-        if let Err(e) = state.reconcile_with_schema(&directory).await {
-            warn!("Failed to reconcile UUIDs with schema: {}", e);
-        }
-    }
-
-    let subdir_cache = Arc::new(SubdirStateCache::new());
-    let mqtt_only_config = if mqtt_only_sync {
-        MqttOnlySyncConfig::mqtt_only()
-    } else {
-        MqttOnlySyncConfig::with_http_fallback()
-    };
-    let crdt_context = Some(CrdtFileSyncContext {
-        mqtt_client: mqtt_client.clone(),
-        mqtt_request: mqtt_request.clone(),
-        workspace: workspace.clone(),
-        crdt_state: crdt_state.clone(),
-        subdir_cache: subdir_cache.clone(),
-        mqtt_only_config,
-    });
-
     // Start subscription task for fs-root (skip if push-only)
     let subscription_handle = if !push_only {
         let initial_uuid_map: HashMap<String, String> = uuid_map.clone();
@@ -3151,7 +3462,7 @@ async fn run_exec_mode(
             initial_schema_cid.clone(),
             Some(shared_state_file.clone()),
             initial_uuid_map,
-            crdt_context.clone(),
+            Some(crdt_context.clone()),
         )))
     } else {
         info!("Push-only mode: skipping subscription");
@@ -3174,7 +3485,7 @@ async fn run_exec_mode(
             #[cfg(unix)]
             inode_tracker: inode_tracker.clone(),
             watched_subdirs: watched_subdirs.clone(),
-            crdt_context: crdt_context.clone(),
+            crdt_context: Some(crdt_context.clone()),
         };
         let transport = SubdirTransport::Mqtt {
             client: mqtt_client.clone(),
@@ -3263,7 +3574,7 @@ async fn run_exec_mode(
 
             // Push local content if it differs from server (replaces sync_single_file push).
             // This runs after BOTH success and failure of CRDT init.
-            if !pull_only {
+            if decision.push_local_content {
                 if let Err(e) = push_local_if_differs(
                     &mqtt_client,
                     &workspace,
@@ -3281,7 +3592,7 @@ async fn run_exec_mode(
 
             // Pull case: if local file is empty/default but server has content,
             // write server content to disk so the file reflects the CRDT state.
-            {
+            if decision.materialize_server_content {
                 let local_content = tokio::fs::read_to_string(&file_path)
                     .await
                     .unwrap_or_default();
