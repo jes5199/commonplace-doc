@@ -13,18 +13,11 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-/// Resync all subscribed file UUIDs from server after broadcast lag.
+/// Resync all subscribed file UUIDs after broadcast lag.
 ///
 /// When the broadcast channel lags, we may have missed edit messages for files.
-/// This function fetches the current HEAD state from server for all subscribed
-/// file UUIDs and applies any changes to local files.
-///
-/// For CRDT-managed files, it re-initializes the CRDT state from server.
-/// For non-CRDT files, it fetches and writes the content directly.
-///
-/// **DEPRECATED in MQTT-only mode**: This function uses HTTP which can race with MQTT.
-/// When `mqtt_only_config.mqtt_only` is true, this logs a deprecation warning.
-/// In the future, resync should rely on MQTT retained messages.
+/// For CRDT-managed files, it re-initializes the CRDT state via cyan sync.
+/// For non-CRDT files, recovery currently relies on retained MQTT messages.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn resync_subscribed_files(
     _http_client: &Client,

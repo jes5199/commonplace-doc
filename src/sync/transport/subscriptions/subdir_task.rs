@@ -6,7 +6,9 @@
 use super::recovery::{
     resync_subdir_schema_from_server, resync_subscribed_files, sync_schema_via_cyan,
 };
-use super::{collect_new_subdirs, handle_subdir_edit, CrdtFileSyncContext};
+use super::{
+    collect_new_subdirs, handle_subdir_edit, is_http_recovery_disabled, CrdtFileSyncContext,
+};
 use crate::events::{recv_broadcast_with_lag, BroadcastRecvResult};
 use crate::mqtt::{MqttClient, Topic};
 use crate::sync::dir_sync::{apply_schema_update_to_state, decode_schema_from_mqtt_payload};
@@ -14,11 +16,60 @@ use crate::sync::FileSyncState;
 use reqwest::Client;
 use rumqttc::QoS;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+async fn load_subdir_schema_from_cache(
+    ctx: &CrdtFileSyncContext,
+    subdir_full_path: &Path,
+    subdir_node_id: &str,
+) -> Option<(crate::fs::FsSchema, String)> {
+    let subdir_uuid = Uuid::parse_str(subdir_node_id).ok()?;
+    let subdir_state = match ctx
+        .subdir_cache
+        .get_or_load(subdir_full_path, subdir_uuid)
+        .await
+    {
+        Ok(state) => state,
+        Err(e) => {
+            warn!(
+                "Failed to load subdir state cache for {}: {}",
+                subdir_full_path.display(),
+                e
+            );
+            return None;
+        }
+    };
+
+    let state_guard = subdir_state.read().await;
+    let doc = match state_guard.schema.to_doc() {
+        Ok(doc) => doc,
+        Err(e) => {
+            warn!(
+                "Failed to convert subdir schema state to doc for {}: {}",
+                subdir_full_path.display(),
+                e
+            );
+            return None;
+        }
+    };
+
+    let schema = crate::sync::ymap_schema::to_fs_schema(&doc);
+    match crate::sync::schema_to_json(&schema) {
+        Ok(schema_json) => Some((schema, schema_json)),
+        Err(e) => {
+            warn!(
+                "Failed to serialize cached subdir schema for {}: {}",
+                subdir_full_path.display(),
+                e
+            );
+            None
+        }
+    }
+}
 
 /// Helper to spawn MQTT tasks for subdirectories.
 /// This is separate from subdir_mqtt_task to avoid recursive type issues with tokio::spawn.
@@ -113,6 +164,12 @@ pub async fn subdir_mqtt_task(
     let inode_tracker_for_crdt = inode_tracker.clone();
     #[cfg(not(unix))]
     let inode_tracker_for_crdt = None;
+    let http_recovery_disabled = is_http_recovery_disabled(
+        crdt_context
+            .as_ref()
+            .map(|ctx| ctx.mqtt_only_config.mqtt_only)
+            .unwrap_or(false),
+    );
 
     // CRITICAL: Create the broadcast receiver BEFORE subscribing.
     // This ensures we receive retained messages.
@@ -249,37 +306,86 @@ pub async fn subdir_mqtt_task(
                 missed_count,
                 next_message,
             } => {
-                // For subdir watchers, resync by triggering a schema refresh and resyncing files
                 debug!(
                     "MQTT subdir {} receiver lagged by {} messages, triggering resync",
                     subdir_path, missed_count
                 );
-                // Force a schema refresh by calling handle_subdir_edit
-                // Resync fetches from HTTP (no MQTT payload available)
                 let subdir_full_path = directory.join(&subdir_path);
-                handle_subdir_edit(
-                    &http_client,
-                    &server,
-                    &subdir_node_id,
-                    &subdir_path,
-                    &subdir_full_path,
-                    &directory,
-                    &file_states,
-                    use_paths,
-                    push_only,
-                    pull_only,
-                    shared_state_file.as_ref(),
-                    &author,
-                    #[cfg(unix)]
-                    inode_tracker.clone(),
-                    "MQTT-resync",
-                    crdt_context.as_ref(),
-                    None, // No MQTT schema during resync, fetch from HTTP
-                    std::collections::HashSet::new(), // No CRDT deletions during HTTP resync
-                )
-                .await;
 
-                // Also resync subscribed files to recover missed edits
+                if let Some(ref ctx) = crdt_context {
+                    // Resync subdirectory schema CRDT state to recover missed schema updates.
+                    // Without this, the local subdirectory Y.Doc can drift from server state.
+                    resync_subdir_schema_from_server(
+                        &subdir_node_id,
+                        &subdir_path,
+                        ctx,
+                        &directory,
+                    )
+                    .await;
+
+                    let recovered_schema =
+                        load_subdir_schema_from_cache(ctx, &subdir_full_path, &subdir_node_id)
+                            .await;
+                    if recovered_schema.is_none() {
+                        warn!(
+                            "Subdir {}: schema lag recovery completed but no schema snapshot is available",
+                            subdir_path
+                        );
+                    }
+
+                    handle_subdir_edit(
+                        &http_client,
+                        &server,
+                        &subdir_node_id,
+                        &subdir_path,
+                        &subdir_full_path,
+                        &directory,
+                        &file_states,
+                        use_paths,
+                        push_only,
+                        pull_only,
+                        shared_state_file.as_ref(),
+                        &author,
+                        #[cfg(unix)]
+                        inode_tracker.clone(),
+                        "MQTT-resync",
+                        crdt_context.as_ref(),
+                        recovered_schema,
+                        std::collections::HashSet::new(),
+                    )
+                    .await;
+                } else if http_recovery_disabled {
+                    warn!(
+                        "Subdir {}: lag recovery skipped (no CRDT context and HTTP recovery disabled)",
+                        subdir_path
+                    );
+                } else {
+                    // Legacy path for non-MQTT runtime contexts.
+                    handle_subdir_edit(
+                        &http_client,
+                        &server,
+                        &subdir_node_id,
+                        &subdir_path,
+                        &subdir_full_path,
+                        &directory,
+                        &file_states,
+                        use_paths,
+                        push_only,
+                        pull_only,
+                        shared_state_file.as_ref(),
+                        &author,
+                        #[cfg(unix)]
+                        inode_tracker.clone(),
+                        "MQTT-resync",
+                        crdt_context.as_ref(),
+                        None,
+                        std::collections::HashSet::new(),
+                    )
+                    .await;
+                }
+
+                // Retain existing file-level resync hook; in subdir mode this currently
+                // acts as a lightweight retained-message recovery pass.
                 resync_subscribed_files(
                     &http_client,
                     &server,
@@ -288,23 +394,11 @@ pub async fn subdir_mqtt_task(
                     &directory,
                     use_paths,
                     &file_states,
-                    None, // No CRDT context for subdirs currently
+                    None,
                     inode_tracker_for_crdt.clone(),
                     &author,
                 )
                 .await;
-
-                // Resync subdirectory schema CRDT state to recover missed schema updates.
-                // Without this, the local subdirectory Y.Doc can drift from server state.
-                if let Some(ref ctx) = crdt_context {
-                    resync_subdir_schema_from_server(
-                        &subdir_node_id,
-                        &subdir_path,
-                        ctx,
-                        &directory,
-                    )
-                    .await;
-                }
 
                 match next_message {
                     Some(m) => m,
@@ -356,13 +450,13 @@ pub async fn subdir_mqtt_task(
             // IMPORTANT: We must use the subdirectory's cached state, NOT the root
             // crdt_state. Using the root state would corrupt it by merging subdir
             // schema edits into the root document.
-            let mqtt_schema = if let Some(ref ctx) = crdt_context {
+            let mut mqtt_schema = if let Some(ref ctx) = crdt_context {
                 // Parse subdir_node_id as UUID for cache lookup
                 let subdir_uuid = match Uuid::parse_str(&subdir_node_id) {
                     Ok(id) => id,
                     Err(e) => {
                         warn!(
-                            "Failed to parse subdir_node_id {} as UUID: {}, falling back to HTTP",
+                            "Failed to parse subdir_node_id {} as UUID: {}",
                             subdir_node_id, e
                         );
                         // Fall through to None result
@@ -408,18 +502,12 @@ pub async fn subdir_mqtt_task(
                                     );
                                 }
                             } else {
-                                debug!(
-                                    "Failed to apply schema update for subdir={}, will fetch from HTTP",
-                                    subdir_path
-                                );
+                                debug!("Failed to apply schema update for subdir={}", subdir_path);
                             }
                             result.map(|r| (r.schema, r.schema_json, r.deleted_entries))
                         }
                         Err(e) => {
-                            warn!(
-                                "Failed to load subdir state for {}: {}, falling back to HTTP",
-                                subdir_path, e
-                            );
+                            warn!("Failed to load subdir state for {}: {}", subdir_path, e);
                             None
                         }
                     }
@@ -469,9 +557,6 @@ pub async fn subdir_mqtt_task(
                                 subdir_path, e
                             );
                             // Fall through to stateless decode.
-                            // WARNING: decode_schema_from_mqtt_payload cannot handle DELETE
-                            // operations correctly because it uses a fresh Y.Doc. Deletions
-                            // will be ignored and must be handled via HTTP fallback.
                             decode_schema_from_mqtt_payload(&msg.payload)
                                 .map(|(s, j)| (s, j, std::collections::HashSet::new()))
                         }
@@ -481,27 +566,54 @@ pub async fn subdir_mqtt_task(
                         "Failed to parse subdir_node_id {} as UUID, using stateless decode (DELETE operations may fail - see CP-hwg2)",
                         subdir_node_id
                     );
-                    // WARNING: decode_schema_from_mqtt_payload cannot handle DELETE
-                    // operations correctly because it uses a fresh Y.Doc. Deletions
-                    // will be ignored and must be handled via HTTP fallback.
                     decode_schema_from_mqtt_payload(&msg.payload)
                         .map(|(s, j)| (s, j, std::collections::HashSet::new()))
                 };
 
                 if result.is_none() {
                     debug!(
-                        "Failed to decode schema from MQTT payload for subdir={}, will fetch from HTTP",
+                        "Failed to decode schema from MQTT payload for subdir={}",
                         subdir_path
                     );
                 }
                 result
             };
 
+            if mqtt_schema.is_none() {
+                if let Some(ref ctx) = crdt_context {
+                    warn!(
+                        "Subdir {}: schema update decode failed, triggering cyan resync",
+                        subdir_path
+                    );
+                    resync_subdir_schema_from_server(
+                        &subdir_node_id,
+                        &subdir_path,
+                        ctx,
+                        &directory,
+                    )
+                    .await;
+                    mqtt_schema =
+                        load_subdir_schema_from_cache(ctx, &subdir_full_path, &subdir_node_id)
+                            .await
+                            .map(|(schema, schema_json)| {
+                                (schema, schema_json, std::collections::HashSet::new())
+                            });
+                }
+            }
+
             // Extract deleted_entries from schema result (CP-seha)
             let (mqtt_schema, crdt_deleted_entries) = match mqtt_schema {
                 Some((s, j, deleted)) => (Some((s, j)), deleted),
                 None => (None, std::collections::HashSet::new()),
             };
+
+            if mqtt_schema.is_none() && http_recovery_disabled {
+                warn!(
+                    "Subdir {}: skipping schema edit handling (no schema snapshot and HTTP recovery disabled)",
+                    subdir_path
+                );
+                continue;
+            }
 
             // Use shared helper for edit handling
             handle_subdir_edit(
@@ -532,7 +644,7 @@ pub async fn subdir_mqtt_task(
             // The HTTP-based sync_subdir_uuid_subscriptions can race with the server's
             // reconciler, causing UUIDs to be overwritten and subscriptions lost.
             // See CP-1ual for details on this race condition.
-            if crdt_context.is_none() {
+            if crdt_context.is_none() && !http_recovery_disabled {
                 sync_subdir_uuid_subscriptions(
                     &http_client,
                     &server,
@@ -547,6 +659,11 @@ pub async fn subdir_mqtt_task(
                     &file_states,
                 )
                 .await;
+            } else if crdt_context.is_none() {
+                warn!(
+                    "Subdir {}: skipping HTTP subscription sync (HTTP recovery disabled)",
+                    subdir_path
+                );
             }
 
             // Check for newly discovered nested node-backed subdirs and spawn MQTT tasks

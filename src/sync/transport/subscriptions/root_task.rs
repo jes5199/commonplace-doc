@@ -4,7 +4,7 @@
 //! for schema changes and all file UUIDs for content changes.
 
 use super::recovery::{resync_schema_from_server, resync_subscribed_files, sync_schema_via_cyan};
-use super::{trace_log, CrdtFileSyncContext};
+use super::{is_http_recovery_disabled, trace_log, CrdtFileSyncContext};
 use crate::commit::Commit;
 use crate::events::{recv_broadcast_with_lag, BroadcastRecvResult};
 use crate::mqtt::{MqttClient, Topic};
@@ -74,6 +74,12 @@ pub async fn directory_mqtt_task(
     let inode_tracker_for_crdt = inode_tracker.clone();
     #[cfg(not(unix))]
     let inode_tracker_for_crdt = None;
+    let http_recovery_disabled = is_http_recovery_disabled(
+        crdt_context
+            .as_ref()
+            .map(|ctx| ctx.mqtt_only_config.mqtt_only)
+            .unwrap_or(false),
+    );
 
     // Subscribe to edits for the fs-root document (schema changes)
     let fs_root_topic = Topic::edits(&workspace, &fs_root_id).to_topic_string();
@@ -159,23 +165,18 @@ pub async fn directory_mqtt_task(
 
                 if initialized {
                     debug!("Schema CRDT initialized via cyan sync for {}", fs_root_id);
-                } else if ctx.mqtt_only_config.mqtt_only {
-                    warn!(
-                        "Cyan sync failed for {} and HTTP bootstrap is disabled (MQTT-only)",
-                        fs_root_id
-                    );
                 } else {
                     warn!(
-                        "Cyan sync failed for {} — falling back to HTTP bootstrap",
+                        "Cyan sync failed for {} — no HTTP bootstrap fallback in MQTT runtime",
                         fs_root_id
                     );
                 }
             }
 
             // Bootstrap files from the schema (whether initialized via cyan or already present)
-            if ctx.mqtt_only_config.mqtt_only {
+            if http_recovery_disabled {
                 warn!(
-                    "Skipping HTTP file bootstrap for {} (MQTT-only mode)",
+                    "Skipping HTTP file bootstrap for {} (HTTP recovery disabled)",
                     fs_root_id
                 );
             } else if let Err(e) = handle_subdir_new_files(
@@ -350,9 +351,9 @@ pub async fn directory_mqtt_task(
                             // Handle new files using MQTT schema
                             let schema_tuple = (schema.clone(), schema_json.clone());
                             if !push_only {
-                                if ctx.mqtt_only_config.mqtt_only {
+                                if http_recovery_disabled {
                                     warn!(
-                                        "MQTT: Skipping new file sync for {} (MQTT-only mode, HTTP disabled)",
+                                        "MQTT: Skipping new file sync for {} (HTTP recovery disabled)",
                                         fs_root_id
                                     );
                                 } else if let Err(e) = handle_subdir_new_files(
@@ -446,86 +447,63 @@ pub async fn directory_mqtt_task(
                     }
                 } else {
                     trace_log(
-                        "MQTT: Failed to decode schema from CRDT state, falling back to HTTP",
+                        "MQTT: Failed to decode schema from CRDT state; triggering cyan resync",
                     );
-                    debug!("MQTT: Failed to decode schema from CRDT state, falling back to HTTP");
-                    if ctx.mqtt_only_config.mqtt_only {
-                        warn!(
-                            "MQTT: Schema decode failed for {} but HTTP fallback is disabled (MQTT-only)",
-                            fs_root_id
-                        );
-                    } else {
-                        // Fall through to HTTP-based processing
-                        if let Err(e) = handle_schema_change_with_dedup(
-                            &http_client,
-                            &server,
-                            &fs_root_id,
-                            &directory,
-                            &file_states,
-                            true,
-                            use_paths,
-                            &mut last_schema_hash,
-                            &mut last_schema_cid,
-                            push_only,
-                            pull_only,
-                            &author,
-                            #[cfg(unix)]
-                            inode_tracker.clone(),
-                            written_schemas.as_ref(),
-                            shared_state_file.as_ref(),
-                            crdt_context.as_ref(),
-                        )
-                        .await
-                        {
-                            warn!("MQTT: Failed to handle schema change: {}", e);
-                        }
-                    }
+                    debug!("MQTT: Failed to decode schema from CRDT state; triggering cyan resync");
+                    resync_schema_from_server(&fs_root_id, ctx).await;
                 }
             } else {
-                // No CRDT context - use HTTP-based processing (legacy mode)
-                match handle_schema_change_with_dedup(
-                    &http_client,
-                    &server,
-                    &fs_root_id,
-                    &directory,
-                    &file_states,
-                    true, // spawn_tasks: true for runtime schema changes
-                    use_paths,
-                    &mut last_schema_hash,
-                    &mut last_schema_cid,
-                    push_only,
-                    pull_only,
-                    &author,
-                    #[cfg(unix)]
-                    inode_tracker.clone(),
-                    written_schemas.as_ref(),
-                    shared_state_file.as_ref(),
-                    crdt_context.as_ref(),
-                )
-                .await
-                {
-                    Ok(true) => {
-                        debug!("MQTT: Schema change processed successfully (HTTP mode)");
-                        // Update UUID subscriptions in legacy mode
-                        sync_uuid_subscriptions(
-                            &http_client,
-                            &server,
-                            &fs_root_id,
-                            &mqtt_client,
-                            &workspace,
-                            &mut subscribed_uuids,
-                            &mut uuid_to_paths,
-                            &directory,
-                            use_paths,
-                            &file_states,
-                        )
-                        .await;
-                    }
-                    Ok(false) => {
-                        debug!("MQTT: Schema unchanged, skipped processing (HTTP mode)");
-                    }
-                    Err(e) => {
-                        warn!("MQTT: Failed to handle schema change: {}", e);
+                if http_recovery_disabled {
+                    warn!(
+                        "MQTT: Received schema change for {} but no CRDT context is available and HTTP recovery is disabled",
+                        fs_root_id
+                    );
+                } else {
+                    // No CRDT context - use HTTP-based processing (legacy mode)
+                    match handle_schema_change_with_dedup(
+                        &http_client,
+                        &server,
+                        &fs_root_id,
+                        &directory,
+                        &file_states,
+                        true, // spawn_tasks: true for runtime schema changes
+                        use_paths,
+                        &mut last_schema_hash,
+                        &mut last_schema_cid,
+                        push_only,
+                        pull_only,
+                        &author,
+                        #[cfg(unix)]
+                        inode_tracker.clone(),
+                        written_schemas.as_ref(),
+                        shared_state_file.as_ref(),
+                        crdt_context.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            debug!("MQTT: Schema change processed successfully (HTTP mode)");
+                            // Update UUID subscriptions in legacy mode
+                            sync_uuid_subscriptions(
+                                &http_client,
+                                &server,
+                                &fs_root_id,
+                                &mqtt_client,
+                                &workspace,
+                                &mut subscribed_uuids,
+                                &mut uuid_to_paths,
+                                &directory,
+                                use_paths,
+                                &file_states,
+                            )
+                            .await;
+                        }
+                        Ok(false) => {
+                            debug!("MQTT: Schema unchanged, skipped processing (HTTP mode)");
+                        }
+                        Err(e) => {
+                            warn!("MQTT: Failed to handle schema change: {}", e);
+                        }
                     }
                 }
             }
