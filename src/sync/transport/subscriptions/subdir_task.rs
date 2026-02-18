@@ -593,6 +593,7 @@ pub async fn subdir_mqtt_task(
                 result
             };
 
+            let mut schema_recovered_from_cyan = false;
             if mqtt_schema.is_none() {
                 if let Some(ref ctx) = crdt_context {
                     warn!(
@@ -610,6 +611,7 @@ pub async fn subdir_mqtt_task(
                         load_subdir_schema_from_cache(ctx, &subdir_full_path, &subdir_node_id)
                             .await
                             .map(|(schema, schema_json)| {
+                                schema_recovered_from_cyan = true;
                                 (schema, schema_json, std::collections::HashSet::new())
                             });
                 }
@@ -620,6 +622,8 @@ pub async fn subdir_mqtt_task(
                 Some((s, j, deleted)) => (Some((s, j)), deleted),
                 None => (None, std::collections::HashSet::new()),
             };
+            let has_explicit_deletions = !crdt_deleted_entries.is_empty();
+            let schema_snapshot_for_subscriptions = mqtt_schema.clone();
 
             if mqtt_schema.is_none() && http_recovery_disabled {
                 warn!(
@@ -652,13 +656,19 @@ pub async fn subdir_mqtt_task(
             )
             .await;
 
-            // Schema changed - update UUID subscriptions for this subdirectory
-            // IMPORTANT: Skip sync_subdir_uuid_subscriptions when CRDT context is present.
-            // In CRDT mode, each file's receive_task_crdt handles its own subscription.
-            // The HTTP-based sync_subdir_uuid_subscriptions can race with the server's
-            // reconciler, causing UUIDs to be overwritten and subscriptions lost.
-            // See CP-1ual for details on this race condition.
-            if crdt_context.is_none() && !http_recovery_disabled {
+            // Schema changed - update UUID subscriptions for this subdirectory.
+            // In CRDT mode, use the in-memory schema snapshot to avoid HTTP races.
+            if let Some((schema, _schema_json)) = schema_snapshot_for_subscriptions.as_ref() {
+                sync_subdir_uuid_subscriptions_from_snapshot(
+                    schema,
+                    &subdir_path,
+                    &mqtt_client,
+                    &workspace,
+                    &mut subscribed_uuids,
+                    &mut uuid_to_paths,
+                )
+                .await;
+            } else if crdt_context.is_none() && !http_recovery_disabled {
                 sync_subdir_uuid_subscriptions(
                     &http_client,
                     &server,
@@ -678,6 +688,30 @@ pub async fn subdir_mqtt_task(
                     "Subdir {}: skipping HTTP subscription sync (HTTP recovery disabled)",
                     subdir_path
                 );
+            }
+
+            if schema_recovered_from_cyan && !push_only {
+                if let Some(ref ctx) = crdt_context {
+                    if !has_explicit_deletions {
+                        debug!(
+                            "Subdir {}: cyan snapshot recovery has no explicit deletions; skipping deletion sweep",
+                            subdir_path
+                        );
+                    }
+                    // Materialize content for all subscribed files immediately after
+                    // decode-failure recovery so convergence does not wait for new edits.
+                    resync_subdir_subscribed_files(
+                        &subscribed_uuids,
+                        &uuid_to_paths,
+                        &directory,
+                        &subdir_path,
+                        &subdir_node_id,
+                        ctx,
+                        inode_tracker_for_crdt.clone(),
+                        &author,
+                    )
+                    .await;
+                }
             }
 
             // Check for newly discovered nested node-backed subdirs and spawn MQTT tasks
@@ -921,6 +955,94 @@ pub async fn subdir_mqtt_task(
     }
 
     info!("MQTT message channel closed for subdir {}", subdir_path);
+}
+
+fn build_prefixed_uuid_map_from_schema_snapshot(
+    schema: &crate::fs::FsSchema,
+    subdir_path: &str,
+) -> HashMap<String, String> {
+    let mut schema_paths: Vec<(String, Option<String>)> = Vec::new();
+    if let Some(ref root) = schema.root {
+        crate::sync::collect_paths_from_entry(root, "", &mut schema_paths);
+    }
+
+    schema_paths
+        .into_iter()
+        .filter_map(|(path, node_id)| node_id.map(|id| (path, id)))
+        .map(|(path, uuid)| {
+            let full_path = if subdir_path.is_empty() {
+                path
+            } else {
+                format!("{}/{}", subdir_path, path)
+            };
+            (full_path, uuid)
+        })
+        .collect()
+}
+
+async fn sync_subdir_uuid_subscriptions_from_snapshot(
+    schema: &crate::fs::FsSchema,
+    subdir_path: &str,
+    mqtt_client: &Arc<MqttClient>,
+    workspace: &str,
+    subscribed_uuids: &mut HashSet<String>,
+    uuid_to_paths: &mut crate::sync::UuidToPathsMap,
+) {
+    let prefixed_uuid_map = build_prefixed_uuid_map_from_schema_snapshot(schema, subdir_path);
+
+    let new_uuid_to_paths = crate::sync::build_uuid_to_paths_map(&prefixed_uuid_map);
+    let new_uuids: HashSet<String> = new_uuid_to_paths.keys().cloned().collect();
+
+    let to_add: Vec<String> = new_uuids.difference(subscribed_uuids).cloned().collect();
+    let to_remove: Vec<String> = subscribed_uuids.difference(&new_uuids).cloned().collect();
+
+    for uuid in &to_add {
+        let topic = Topic::edits(workspace, uuid).to_topic_string();
+        if let Err(e) = mqtt_client.subscribe(&topic, QoS::AtLeastOnce).await {
+            warn!(
+                "Subdir {}: Failed to subscribe to snapshot UUID {}: {}",
+                subdir_path, uuid, e
+            );
+        } else {
+            subscribed_uuids.insert(uuid.clone());
+            debug!(
+                "Subdir {}: Subscribed to snapshot UUID: {}",
+                subdir_path, uuid
+            );
+        }
+    }
+
+    for uuid in &to_remove {
+        let topic = Topic::edits(workspace, uuid).to_topic_string();
+        if let Err(e) = mqtt_client.unsubscribe(&topic).await {
+            warn!(
+                "Subdir {}: Failed to unsubscribe snapshot UUID {}: {}",
+                subdir_path, uuid, e
+            );
+        } else {
+            subscribed_uuids.remove(uuid);
+            debug!(
+                "Subdir {}: Unsubscribed snapshot UUID: {}",
+                subdir_path, uuid
+            );
+        }
+    }
+
+    *uuid_to_paths = new_uuid_to_paths;
+
+    if !to_add.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    if !to_add.is_empty() || !to_remove.is_empty() {
+        info!(
+            "Subdir {}: Snapshot UUID subscriptions updated: +{} -{} (total: {})",
+            subdir_path,
+            to_add.len(),
+            to_remove.len(),
+            subscribed_uuids.len()
+        );
+    }
 }
 
 /// Sync UUID subscriptions for a subdirectory after its schema changes.

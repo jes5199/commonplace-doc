@@ -1347,6 +1347,239 @@ fn test_subdir_lag_recovery_converges_linked_paths_without_new_edit() {
     wait_for_file_content_contains(&linked_b, recovered_content, Duration::from_secs(20));
 }
 
+/// CP-kk3w: decode-failure fallback should reconcile root files immediately.
+///
+/// Scenario:
+/// 1. Sync a root-level file from schema
+/// 2. Delete it locally to create drift
+/// 3. Publish an invalid root schema edit payload (forces decode failure)
+/// 4. Verify cyan fallback applies recovered snapshot and re-materializes file content
+#[test]
+fn test_root_decode_failure_recovers_missing_file_from_snapshot() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+    let workspace = "workspace";
+    let file_content = "root decode recovery content";
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root");
+    let body: serde_json::Value = resp
+        .json()
+        .expect("Failed to parse fs-root create response");
+    let fs_root_id = body["id"].as_str().expect("Missing fs-root id");
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create file doc");
+    let body: serde_json::Value = resp.json().expect("Failed to parse file create response");
+    let file_id = body["id"].as_str().expect("Missing file id");
+
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(file_content)
+        .send()
+        .expect("Failed to write file content");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write file content: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    let schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "root-file.txt": { "type": "doc", "node_id": file_id }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(schema.to_string())
+        .send()
+        .expect("Failed to write root schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write root schema: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    guard.add(spawn_sync_directory_with_initial_sync(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir,
+        fs_root_id,
+        "server",
+    ));
+
+    let root_file = sync_dir.join("root-file.txt");
+    wait_for_file_content_contains(&root_file, file_content, Duration::from_secs(10));
+
+    std::fs::remove_file(&root_file).expect("Failed to remove local root file");
+    assert!(!root_file.exists(), "Root file should be deleted locally");
+
+    // Trigger decode failure in root schema handler.
+    flood_invalid_edit_messages(&mqtt_broker, workspace, fs_root_id, 20);
+
+    // Recovery should converge immediately from cyan snapshot.
+    wait_for_file_content_contains(&root_file, file_content, Duration::from_secs(20));
+}
+
+/// CP-kk3w: decode-failure fallback should reconcile subdir files immediately.
+///
+/// Scenario:
+/// 1. Sync a node-backed subdir file from schema
+/// 2. Delete it locally to create drift
+/// 3. Publish an invalid subdir schema edit payload (forces decode failure)
+/// 4. Verify cyan fallback applies recovered snapshot and re-materializes file content
+#[test]
+fn test_subdir_decode_failure_recovers_missing_file_from_snapshot() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+    let workspace = "workspace";
+    let file_content = "subdir decode recovery content";
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root");
+    let body: serde_json::Value = resp
+        .json()
+        .expect("Failed to parse fs-root create response");
+    let fs_root_id = body["id"].as_str().expect("Missing fs-root id");
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create subdir doc");
+    let body: serde_json::Value = resp.json().expect("Failed to parse subdir create response");
+    let subdir_id = body["id"].as_str().expect("Missing subdir id");
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create subdir file doc");
+    let body: serde_json::Value = resp
+        .json()
+        .expect("Failed to parse subdir file create response");
+    let file_id = body["id"].as_str().expect("Missing file id");
+
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(file_content)
+        .send()
+        .expect("Failed to write subdir file content");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write subdir file content: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    let subdir_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "nested-file.txt": { "type": "doc", "node_id": file_id }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, subdir_id))
+        .header("Content-Type", "application/json")
+        .body(subdir_schema.to_string())
+        .send()
+        .expect("Failed to write subdir schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write subdir schema: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    let fs_root_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "subdir": { "type": "dir", "node_id": subdir_id }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(fs_root_schema.to_string())
+        .send()
+        .expect("Failed to write fs-root schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write fs-root schema: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    guard.add(spawn_sync_directory_with_initial_sync(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir,
+        fs_root_id,
+        "server",
+    ));
+
+    let nested_file = sync_dir.join("subdir").join("nested-file.txt");
+    wait_for_file_content_contains(&nested_file, file_content, Duration::from_secs(10));
+
+    std::fs::remove_file(&nested_file).expect("Failed to remove local subdir file");
+    assert!(
+        !nested_file.exists(),
+        "Subdir file should be deleted locally"
+    );
+
+    // Trigger decode failure in subdir schema handler.
+    flood_invalid_edit_messages(&mqtt_broker, workspace, subdir_id, 20);
+
+    // Recovery should converge immediately from cyan snapshot.
+    wait_for_file_content_contains(&nested_file, file_content, Duration::from_secs(20));
+}
+
 /// CP-k51z: Test that offline edits sync on reconnect.
 ///
 /// Scenario (acceptance criteria O1-O5):

@@ -27,6 +27,33 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+async fn load_root_schema_from_state(
+    ctx: &CrdtFileSyncContext,
+) -> Option<(crate::fs::FsSchema, String, Option<String>)> {
+    let state = ctx.crdt_state.read().await;
+    let doc = match state.schema.to_doc() {
+        Ok(doc) => doc,
+        Err(e) => {
+            warn!("Failed to convert root schema state to doc: {}", e);
+            return None;
+        }
+    };
+
+    let schema = crate::sync::ymap_schema::to_fs_schema(&doc);
+    let schema_json = match crate::sync::schema_to_json(&schema) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "Failed to serialize root schema snapshot after cyan resync: {}",
+                e
+            );
+            return None;
+        }
+    };
+
+    Some((schema, schema_json, state.schema.head_cid.clone()))
+}
+
 /// MQTT task for directory-level events (watching fs-root via MQTT).
 ///
 /// This task subscribes to:
@@ -281,29 +308,47 @@ pub async fn directory_mqtt_task(
             //
             // When CRDT context is NOT available, fall back to HTTP-based processing.
             if let Some(ref ctx) = crdt_context {
-                // Apply MQTT delta to persistent CRDT state
-                let mut state = ctx.crdt_state.write().await;
-                let mqtt_schema_result =
-                    apply_schema_update_to_state(&mut state.schema, &msg.payload);
-                // Extract the updated CID before releasing the lock (for ancestry tracking)
-                let updated_cid = state.schema.head_cid.clone();
+                // Apply MQTT delta to persistent CRDT state.
+                let mut schema_recovered_from_cyan = false;
+                let mut updated_cid: Option<String> = None;
+                let mut root_deleted_entries = std::collections::HashSet::new();
 
-                // Extract fields from SchemaUpdateResult (CP-seha)
-                let (mqtt_schema, root_deleted_entries) = match mqtt_schema_result {
-                    Some(r) => (Some((r.schema, r.schema_json)), r.deleted_entries),
-                    None => (None, std::collections::HashSet::new()),
+                let mut mqtt_schema = {
+                    let mut state = ctx.crdt_state.write().await;
+                    let schema_result =
+                        apply_schema_update_to_state(&mut state.schema, &msg.payload)
+                            .map(|r| (r.schema, r.schema_json, r.deleted_entries));
+
+                    if let Some((_, _, deleted_entries)) = &schema_result {
+                        updated_cid = state.schema.head_cid.clone();
+                        root_deleted_entries = deleted_entries.clone();
+
+                        if let Err(e) = state.save(&directory).await {
+                            warn!("Failed to save root CRDT state: {}", e);
+                        } else {
+                            debug!(
+                                "[SANDBOX-TRACE] Persisted schema CRDT state for root directory"
+                            );
+                        }
+                    }
+
+                    schema_result.map(|(schema, schema_json, _)| (schema, schema_json))
                 };
 
-                // Persist the updated CRDT state to disk so it survives restarts
-                if mqtt_schema.is_some() {
-                    if let Err(e) = state.save(&directory).await {
-                        warn!("Failed to save root CRDT state: {}", e);
-                    } else {
-                        debug!("[SANDBOX-TRACE] Persisted schema CRDT state for root directory");
-                    }
+                if mqtt_schema.is_none() {
+                    trace_log(
+                        "MQTT: Failed to decode schema from CRDT state; triggering cyan resync",
+                    );
+                    debug!("MQTT: Failed to decode schema from CRDT state; triggering cyan resync");
+                    resync_schema_from_server(&fs_root_id, ctx).await;
+                    mqtt_schema = load_root_schema_from_state(ctx).await.map(
+                        |(schema, schema_json, recovered_cid)| {
+                            schema_recovered_from_cyan = true;
+                            updated_cid = recovered_cid;
+                            (schema, schema_json)
+                        },
+                    );
                 }
-
-                drop(state); // Release lock before doing I/O
 
                 if let Some((ref schema, ref schema_json)) = mqtt_schema {
                     let entry_count = if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
@@ -336,7 +381,9 @@ pub async fn directory_mqtt_task(
                             crate::sync::state_file::compute_content_hash(schema_json.as_bytes());
                         let is_duplicate = last_schema_hash.as_ref() == Some(&current_hash);
 
-                        if !is_duplicate {
+                        // Full snapshot recovery after decode failure still needs reconciliation
+                        // even if schema hash is unchanged.
+                        if !is_duplicate || schema_recovered_from_cyan {
                             // Write the schema to disk
                             if let Err(e) = crate::sync::write_schema_file(
                                 &directory,
@@ -401,6 +448,10 @@ pub async fn directory_mqtt_task(
                                     &root_deleted_entries,
                                 )
                                 .await;
+                            } else if schema_recovered_from_cyan {
+                                debug!(
+                                    "MQTT: Root schema recovered from cyan snapshot with no explicit deletions; skipping deletion sweep"
+                                );
                             }
 
                             // Ensure CRDT tasks exist for all files
@@ -441,16 +492,33 @@ pub async fn directory_mqtt_task(
                             if updated_cid.is_some() {
                                 last_schema_cid = updated_cid.clone();
                             }
+
+                            if schema_recovered_from_cyan && !push_only {
+                                // Materialize current file state immediately from the recovered
+                                // snapshot so convergence does not wait for a later edit.
+                                resync_subscribed_files(
+                                    &http_client,
+                                    &server,
+                                    &subscribed_uuids,
+                                    &uuid_to_paths,
+                                    &directory,
+                                    use_paths,
+                                    &file_states,
+                                    crdt_context.as_ref(),
+                                    inode_tracker_for_crdt.clone(),
+                                    &author,
+                                )
+                                .await;
+                            }
                         } else {
                             debug!("MQTT: Schema unchanged (same hash), skipped processing");
                         }
                     }
-                } else {
-                    trace_log(
-                        "MQTT: Failed to decode schema from CRDT state; triggering cyan resync",
+                } else if schema_recovered_from_cyan {
+                    warn!(
+                        "MQTT: Cyan resync completed for {}, but no schema snapshot could be loaded",
+                        fs_root_id
                     );
-                    debug!("MQTT: Failed to decode schema from CRDT state; triggering cyan resync");
-                    resync_schema_from_server(&fs_root_id, ctx).await;
                 }
             } else {
                 if http_recovery_disabled {
