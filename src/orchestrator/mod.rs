@@ -23,4 +23,7 @@ pub use process_discovery::{DiscoveryError, DiscoveryResult, ProcessDiscoverySer
 pub use schema_visitor::{visit_entries, SchemaVisitor, VisitorError};
 pub use script_resolver::{ResolverError, ScriptResolver, ScriptWatchMap};
 pub use spawn::{spawn_managed_process, spawn_managed_process_with_logging, SpawnResult};
-pub use status::{get_process_cwd, OrchestratorStatus, ProcessStatus, LEGACY_STATUS_FILE_PATH};
+pub use status::{
+    find_active_status_file, get_process_cwd, prune_stale_status_files, OrchestratorStatus,
+    ProcessStatus, LEGACY_STATUS_FILE_PATH,
+};

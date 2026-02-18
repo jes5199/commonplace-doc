@@ -7,10 +7,11 @@
 
 use clap::Parser;
 use commonplace_doc::cli::SignalArgs;
-use commonplace_doc::orchestrator::{OrchestratorConfig, OrchestratorStatus};
+use commonplace_doc::orchestrator::{
+    find_active_status_file, OrchestratorConfig, OrchestratorStatus,
+};
 use commonplace_doc::workspace::is_process_running;
 use serde::Serialize;
-use std::path::PathBuf;
 
 #[derive(Serialize)]
 struct SignalResult {
@@ -18,23 +19,6 @@ struct SignalResult {
     pid: u32,
     signal: String,
     document_path: Option<String>,
-}
-
-/// Find any orchestrator status file in /tmp.
-/// Returns the first valid status file found, or None if none exist.
-fn find_status_file() -> Option<PathBuf> {
-    let temp_dir = std::env::temp_dir();
-    if let Ok(entries) = std::fs::read_dir(&temp_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("commonplace-orchestrator-") && name.ends_with(".status.json") {
-                    return Some(path);
-                }
-            }
-        }
-    }
-    None
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -48,8 +32,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let status = match OrchestratorStatus::read(&status_file_path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Try to find any status file in /tmp
-            if let Some(found_path) = find_status_file() {
+            // Try to find any ACTIVE status file in /tmp
+            if let Some(found_path) = find_active_status_file() {
                 match OrchestratorStatus::read(&found_path) {
                     Ok(s) => s,
                     Err(e) => {
