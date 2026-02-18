@@ -90,6 +90,7 @@ pub async fn publish_text_change(
 /// When `parent_override` is present, it is used as the commit parent instead of
 /// `state.local_head_cid`. This enables higher-fidelity ancestry attribution when
 /// callers have stronger provenance (for example, inode-tracker-based base commits).
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_text_change_with_parent(
     mqtt_client: &Arc<impl MqttPublisher>,
     workspace: &str,

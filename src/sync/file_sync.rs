@@ -914,6 +914,7 @@ pub async fn upload_task_crdt(
 /// - Local-first scenarios where the file has non-default content
 ///
 /// Skips push if local content is empty or default content for its type.
+#[allow(clippy::too_many_arguments)]
 pub async fn push_local_if_differs(
     mqtt_client: &Arc<MqttClient>,
     workspace: &str,

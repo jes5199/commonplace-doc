@@ -15,6 +15,25 @@ Sync honors flock. Delays incoming writes until local edits are included in inco
 
 **Never overwrite a file with content that doesn't include all local edits made to that file.**
 
+## Parent Attribution Confidence
+
+When sync publishes a local change, it chooses a parent commit using the strongest
+provenance available:
+
+1. `TrackedInode` (strongest): current inode is tracked and has a commit ID.
+2. `ActivePathFallback` (medium): current inode is untracked, but tracker has an
+   active entry for the same primary path (common after external atomic replace).
+3. `LocalHeadFallback` (weakest): no tracker provenance; use CRDT local head.
+
+The runtime logs this attribution source during upload for debugging.
+
+### Hard Limit (Non-Cooperating Atomic Writers)
+
+For arbitrary external processes that do read-modify-write with atomic rename and
+no protocol/lock integration, exact read-base provenance is not uniquely recoverable
+from filesystem events alone. Sync therefore uses best-effort attribution and relies
+on CRDT merge semantics for safety.
+
 ## Sync State Per Path
 
 ```rust

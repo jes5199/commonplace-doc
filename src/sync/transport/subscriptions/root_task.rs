@@ -782,7 +782,7 @@ pub async fn directory_mqtt_task(
                                             if let Some(content) = maybe_content {
                                                 apply_crdt_content_to_paths(
                                                     &directory,
-                                                    &paths,
+                                                    paths,
                                                     &content,
                                                     &result,
                                                     &received_cid,
