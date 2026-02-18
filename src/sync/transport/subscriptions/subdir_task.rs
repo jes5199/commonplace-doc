@@ -4,7 +4,8 @@
 //! for schema changes and all file UUIDs for content changes.
 
 use super::recovery::{
-    resync_subdir_schema_from_server, resync_subscribed_files, sync_schema_via_cyan,
+    resync_subdir_schema_from_server, resync_subdir_subscribed_files, resync_subscribed_files,
+    sync_schema_via_cyan,
 };
 use super::{
     collect_new_subdirs, handle_subdir_edit, is_http_recovery_disabled, CrdtFileSyncContext,
@@ -384,21 +385,34 @@ pub async fn subdir_mqtt_task(
                     .await;
                 }
 
-                // Retain existing file-level resync hook; in subdir mode this currently
-                // acts as a lightweight retained-message recovery pass.
-                resync_subscribed_files(
-                    &http_client,
-                    &server,
-                    &subscribed_uuids,
-                    &uuid_to_paths,
-                    &directory,
-                    use_paths,
-                    &file_states,
-                    None,
-                    inode_tracker_for_crdt.clone(),
-                    &author,
-                )
-                .await;
+                if let Some(ref ctx) = crdt_context {
+                    resync_subdir_subscribed_files(
+                        &subscribed_uuids,
+                        &uuid_to_paths,
+                        &directory,
+                        &subdir_path,
+                        &subdir_node_id,
+                        ctx,
+                        inode_tracker_for_crdt.clone(),
+                        &author,
+                    )
+                    .await;
+                } else {
+                    // Legacy retained-message recovery path when CRDT context is unavailable.
+                    resync_subscribed_files(
+                        &http_client,
+                        &server,
+                        &subscribed_uuids,
+                        &uuid_to_paths,
+                        &directory,
+                        use_paths,
+                        &file_states,
+                        None,
+                        inode_tracker_for_crdt.clone(),
+                        &author,
+                    )
+                    .await;
+                }
 
                 match next_message {
                     Some(m) => m,

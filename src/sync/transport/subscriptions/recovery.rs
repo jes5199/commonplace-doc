@@ -13,6 +13,28 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+fn subdir_relative_path(full_path: &str, subdir_path: &str) -> Option<String> {
+    if subdir_path.is_empty() {
+        return Some(full_path.to_string());
+    }
+
+    let prefix = format!("{}/", subdir_path.trim_end_matches('/'));
+    if let Some(rest) = full_path.strip_prefix(&prefix) {
+        if !rest.is_empty() {
+            return Some(rest.to_string());
+        }
+    }
+
+    if full_path == subdir_path {
+        return None;
+    }
+
+    std::path::Path::new(full_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+}
+
 /// Resync all subscribed file UUIDs after broadcast lag.
 ///
 /// When the broadcast channel lags, we may have missed edit messages for files.
@@ -104,6 +126,149 @@ pub(super) async fn resync_subscribed_files(
     }
 
     debug!("Resync completed for subscribed file UUIDs");
+}
+
+/// Resync subscribed file UUIDs for a subdirectory watcher after broadcast lag.
+///
+/// Uses the subdirectory CRDT state cache to reinitialize each subscribed file via cyan
+/// and then writes recovered content to all linked local paths for that UUID.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn resync_subdir_subscribed_files(
+    subscribed_uuids: &HashSet<String>,
+    uuid_to_paths: &crate::sync::UuidToPathsMap,
+    directory: &Path,
+    subdir_path: &str,
+    subdir_node_id: &str,
+    crdt_context: &CrdtFileSyncContext,
+    inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
+    author: &str,
+) {
+    let subdir_uuid = match Uuid::parse_str(subdir_node_id) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(
+                "Subdir file resync: invalid subdir node id {}: {}",
+                subdir_node_id, e
+            );
+            return;
+        }
+    };
+
+    let subdir_full_path = directory.join(subdir_path);
+    let subdir_state = match crdt_context
+        .subdir_cache
+        .get_or_load(&subdir_full_path, subdir_uuid)
+        .await
+    {
+        Ok(state) => state,
+        Err(e) => {
+            warn!(
+                "Subdir file resync: failed to load subdir state for {}: {}",
+                subdir_path, e
+            );
+            return;
+        }
+    };
+
+    debug!(
+        "Resyncing {} subscribed file UUIDs for subdir {}",
+        subscribed_uuids.len(),
+        subdir_path
+    );
+
+    for uuid in subscribed_uuids {
+        let node_id = match Uuid::parse_str(uuid) {
+            Ok(id) => id,
+            Err(_) => {
+                debug!("Subdir file resync: skipping non-UUID {}", uuid);
+                continue;
+            }
+        };
+
+        let paths = match uuid_to_paths.get(uuid) {
+            Some(p) if !p.is_empty() => p,
+            _ => continue,
+        };
+
+        let first_path = match paths.first() {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let filename = match subdir_relative_path(first_path, subdir_path) {
+            Some(name) => name,
+            None => continue,
+        };
+
+        let primary_file_path = directory.join(first_path);
+
+        {
+            let mut state_guard = subdir_state.write().await;
+            if let Some(file_state) = state_guard.get_file_mut(&filename) {
+                file_state.mark_needs_resync();
+            }
+        }
+
+        if let Err(e) = crate::sync::file_sync::resync_crdt_state_via_cyan_with_pending(
+            &crdt_context.mqtt_client,
+            &crdt_context.workspace,
+            node_id,
+            &subdir_state,
+            &filename,
+            &primary_file_path,
+            author,
+            inode_tracker.as_ref(),
+            false,
+            true,
+        )
+        .await
+        {
+            warn!(
+                "Subdir file resync: failed to reinitialize {} ({}): {}",
+                filename, uuid, e
+            );
+            let mut state_guard = subdir_state.write().await;
+            let fs = state_guard.get_or_create_file(&filename, node_id);
+            fs.initialize_empty();
+            continue;
+        }
+
+        let content = {
+            let state_guard = subdir_state.read().await;
+            state_guard.get_file(&filename).and_then(|fs| {
+                let doc = fs.to_doc().ok()?;
+                Some(crate::sync::crdt_merge::get_doc_text_content(&doc))
+            })
+        };
+
+        let Some(content) = content else {
+            continue;
+        };
+
+        for rel_path in paths {
+            let file_path = directory.join(rel_path);
+            if let Some(parent) = file_path.parent() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    warn!(
+                        "Subdir file resync: failed creating parent {}: {}",
+                        parent.display(),
+                        e
+                    );
+                    continue;
+                }
+            }
+
+            if let Err(e) = tokio::fs::write(&file_path, &content).await {
+                warn!(
+                    "Subdir file resync: failed writing {}: {}",
+                    file_path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    debug!("Subdir file resync completed for {}", subdir_path);
 }
 
 /// Resync schema CRDT state from server after broadcast lag.
@@ -510,4 +675,37 @@ pub(super) async fn sync_schema_via_cyan(
     );
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::subdir_relative_path;
+
+    #[test]
+    fn subdir_relative_path_strips_prefix() {
+        assert_eq!(
+            subdir_relative_path("alpha/file.txt", "alpha").as_deref(),
+            Some("file.txt")
+        );
+        assert_eq!(
+            subdir_relative_path("alpha/nested/file.txt", "alpha").as_deref(),
+            Some("nested/file.txt")
+        );
+    }
+
+    #[test]
+    fn subdir_relative_path_fallbacks_to_basename_when_mismatch() {
+        assert_eq!(
+            subdir_relative_path("other/path/file.txt", "alpha").as_deref(),
+            Some("file.txt")
+        );
+    }
+
+    #[test]
+    fn subdir_relative_path_handles_empty_subdir() {
+        assert_eq!(
+            subdir_relative_path("root.txt", "").as_deref(),
+            Some("root.txt")
+        );
+    }
 }
