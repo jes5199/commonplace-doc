@@ -599,10 +599,19 @@ async fn handle_file_created_crdt(
         return;
     }
 
-    // Calculate relative path from root directory
-    // Canonicalize both paths to ensure prefix stripping works correctly
-    // when path is absolute and directory is relative (from --directory arg)
-    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Calculate relative path from root directory.
+    // Normalize to an absolute path first so strip_prefix works even when
+    // directory input is relative.
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let canonical_path = absolute_path
+        .canonicalize()
+        .unwrap_or_else(|_| absolute_path.clone());
     let canonical_directory = directory
         .canonicalize()
         .unwrap_or_else(|_| directory.to_path_buf());
@@ -1555,10 +1564,19 @@ async fn handle_file_deleted_crdt(
         return;
     }
 
-    // Calculate relative path from root directory
-    // Canonicalize both paths to ensure prefix stripping works correctly
-    // when path is absolute and directory is relative (from --directory arg)
-    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Calculate relative path from root directory.
+    // For deletions, the path may no longer exist, so canonicalize() can fail.
+    // Normalize to an absolute path first, then strip the canonical directory prefix.
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let canonical_path = absolute_path
+        .canonicalize()
+        .unwrap_or_else(|_| absolute_path.clone());
     let canonical_directory = directory
         .canonicalize()
         .unwrap_or_else(|_| directory.to_path_buf());

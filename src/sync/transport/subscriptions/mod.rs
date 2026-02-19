@@ -214,10 +214,12 @@ pub async fn handle_subdir_edit(
         );
     }
 
-    // Then, sync NEW files from server (disabled in strict MQTT runtime).
-    if http_recovery_disabled {
+    // Then, sync NEW files.
+    // In strict MQTT runtime we still run this when CRDT context is available,
+    // because it can materialize new files using MQTT schema/UUID data without HTTP.
+    if http_recovery_disabled && crdt_context.is_none() {
         warn!(
-            "{}: Skipping new file sync for {} (HTTP recovery disabled)",
+            "{}: Skipping new file sync for {} (HTTP recovery disabled, no CRDT context)",
             log_prefix, subdir_path
         );
     } else {

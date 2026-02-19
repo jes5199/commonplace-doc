@@ -340,13 +340,20 @@ pub async fn remove_file_from_schema(
         )));
     }
 
+    // Capture pre-change state vector so we publish a delta update.
+    // Full-state updates can fail to convey deletions to peers.
+    let before_sv = {
+        let txn = doc.transact();
+        txn.state_vector()
+    };
+
     // Remove file using YMap operations (provides proper CRDT merge semantics)
     ymap_schema::remove_entry(&doc, filename);
 
-    // Get the update bytes
+    // Get a delta update (post-change relative to pre-change state).
     let update_bytes = {
         let txn = doc.transact();
-        txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        txn.encode_state_as_update_v1(&before_sv)
     };
 
     // Create and publish commit
@@ -436,6 +443,12 @@ pub async fn rename_file_in_schema(
         }
     }
 
+    // Capture pre-change state vector so rename publishes as a true delta.
+    let before_sv = {
+        let txn = doc.transact();
+        txn.state_vector()
+    };
+
     // Perform atomic rename in schema
     let node_id = ymap_schema::rename_entry(&doc, old_filename, new_filename).ok_or_else(|| {
         SyncError::NotFound(format!(
@@ -447,7 +460,7 @@ pub async fn rename_file_in_schema(
     // Get the update bytes
     let update_bytes = {
         let txn = doc.transact();
-        txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        txn.encode_state_as_update_v1(&before_sv)
     };
 
     // Create and publish commit
@@ -768,6 +781,32 @@ pub async fn add_directory_to_schema(
 mod tests {
     use super::*;
     use commonplace_types::fs::Entry;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct CapturePublisher {
+        payload: Mutex<Option<Vec<u8>>>,
+    }
+
+    impl MqttPublisher for CapturePublisher {
+        async fn publish_retained(&self, _topic: &str, payload: &[u8]) -> Result<(), String> {
+            *self
+                .payload
+                .lock()
+                .expect("capture publisher lock poisoned") = Some(payload.to_vec());
+            Ok(())
+        }
+    }
+
+    impl CapturePublisher {
+        fn take_payload(&self) -> Vec<u8> {
+            self.payload
+                .lock()
+                .expect("capture publisher lock poisoned")
+                .clone()
+                .expect("expected captured payload")
+        }
+    }
 
     #[test]
     fn test_generate_file_uuid() {
@@ -961,6 +1000,57 @@ mod tests {
         assert!(
             ymap_schema::get_entry(&doc_a, "deleteme.txt").is_none(),
             "File should be deleted in Client A's schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_file_from_schema_payload_deletes_entry_on_peer_doc() {
+        use yrs::updates::decoder::Decode;
+        use yrs::Update;
+
+        let schema_node = Uuid::new_v4();
+        let mqtt = Arc::new(CapturePublisher::default());
+
+        let mut writer_state = DirectorySyncState::new(schema_node);
+        let mut peer_state = DirectorySyncState::new(schema_node);
+
+        // Seed both states with the same starting schema containing delete-me.txt.
+        let seeded_doc = writer_state.schema.to_doc().expect("writer schema doc");
+        ymap_schema::add_file(&seeded_doc, "delete-me.txt", "file-uuid-1");
+        writer_state.schema.update_from_doc(&seeded_doc);
+        peer_state.schema.update_from_doc(&seeded_doc);
+
+        // Set a synthetic local head so the emitted edit uses a parent.
+        writer_state.schema.local_head_cid = Some("parent-cid".to_string());
+
+        remove_file_from_schema(
+            &mqtt,
+            "test-workspace",
+            &mut writer_state,
+            "delete-me.txt",
+            "tester",
+        )
+        .await
+        .expect("remove_file_from_schema should publish");
+
+        // Apply published edit payload to a peer doc and ensure deletion takes effect.
+        let payload = mqtt.take_payload();
+        let edit: EditMessage = serde_json::from_slice(&payload)
+            .expect("published payload should decode as EditMessage");
+        let update_bytes = STANDARD
+            .decode(&edit.update)
+            .expect("edit update should decode from base64");
+
+        let peer_doc = peer_state.schema.to_doc().expect("peer schema doc");
+        {
+            let mut txn = peer_doc.transact_mut();
+            let update = Update::decode_v1(&update_bytes).expect("valid yrs update");
+            txn.apply_update(update);
+        }
+
+        assert!(
+            ymap_schema::get_entry(&peer_doc, "delete-me.txt").is_none(),
+            "Peer doc should remove delete-me.txt after applying published schema edit"
         );
     }
 
