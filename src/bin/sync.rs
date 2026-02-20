@@ -51,6 +51,26 @@ use tokio::task::JoinHandle;
 /// Default shadow dir when running with inode tracking enabled.
 const DEFAULT_SHADOW_DIR: &str = "/tmp/commonplace-sync/hardlinks";
 
+fn append_sandbox_trace(msg: &str) {
+    if std::env::var_os("COMMONPLACE_TRACE_WATCHER_CREATE").is_none() {
+        return;
+    }
+
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/sandbox-trace.log")
+    {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let _ = writeln!(file, "[{} pid={}] {}", timestamp, pid, msg);
+    }
+}
+
 fn resolve_shadow_dir(shadow_dir: &str, base_dir: &Path) -> String {
     if shadow_dir.is_empty() {
         return String::new();
@@ -404,6 +424,7 @@ async fn prepare_startup_uuid_map(
 }
 
 /// Optional CRDT parameters for handling directory events via MQTT instead of HTTP.
+#[derive(Clone)]
 struct CrdtEventParams {
     mqtt_client: Arc<MqttClient>,
     mqtt_request: Arc<MqttRequestClient>,
@@ -436,6 +457,11 @@ async fn handle_dir_event(
 ) {
     match event {
         DirEvent::Created(path) => {
+            append_sandbox_trace(&format!(
+                "DIR_EVENT created path={} has_crdt_params={}",
+                path.display(),
+                crdt_params.is_some()
+            ));
             if let Some(crdt) = crdt_params {
                 handle_file_created_crdt(
                     client,
@@ -500,6 +526,11 @@ async fn handle_dir_event(
         }
         DirEvent::SchemaModified(path, content) => {
             info!("User edited schema file: {}", path.display());
+            append_sandbox_trace(&format!(
+                "DIR_EVENT schema_modified path={} content_len={}",
+                path.display(),
+                content.len()
+            ));
             // Build CrdtFileSyncContext from CrdtEventParams if available
             let crdt_ctx = crdt_params.map(|p| CrdtFileSyncContext {
                 mqtt_client: p.mqtt_client.clone(),
@@ -523,6 +554,16 @@ async fn handle_dir_event(
             .await
             {
                 warn!("Failed to push schema change: {}", e);
+                append_sandbox_trace(&format!(
+                    "DIR_EVENT schema_modified_err path={} err={}",
+                    path.display(),
+                    e
+                ));
+            } else {
+                append_sandbox_trace(&format!(
+                    "DIR_EVENT schema_modified_ok path={}",
+                    path.display()
+                ));
             }
         }
     }
@@ -549,6 +590,13 @@ async fn handle_file_created_crdt(
     pull_only: bool,
     written_schemas: Option<&WrittenSchemas>,
 ) {
+    append_sandbox_trace(&format!(
+        "CREATE_HANDLER start path={} directory={} fs_root_id={}",
+        path.display(),
+        directory.display(),
+        fs_root_id
+    ));
+
     // Skip directories - they will be created via ensure_parent_directories_exist
     // when a file inside them is created
     if path.is_dir() {
@@ -556,6 +604,7 @@ async fn handle_file_created_crdt(
             "Skipping directory in handle_file_created_crdt: {}",
             path.display()
         );
+        append_sandbox_trace(&format!("CREATE_HANDLER skip_dir path={}", path.display()));
         return;
     }
     // Get filename from path
@@ -563,6 +612,10 @@ async fn handle_file_created_crdt(
         Some(n) => n.to_string(),
         None => {
             warn!("Could not get filename from path: {}", path.display());
+            append_sandbox_trace(&format!(
+                "CREATE_HANDLER no_filename path={}",
+                path.display()
+            ));
             return;
         }
     };
@@ -584,18 +637,24 @@ async fn handle_file_created_crdt(
     });
     if should_ignore {
         debug!("Ignoring new file (matches ignore pattern): {}", filename);
+        append_sandbox_trace(&format!(
+            "CREATE_HANDLER ignore_pattern filename={}",
+            filename
+        ));
         return;
     }
 
     // Skip hidden files unless configured
     if !options.include_hidden && filename.starts_with('.') {
         debug!("Ignoring hidden file: {}", filename);
+        append_sandbox_trace(&format!("CREATE_HANDLER hidden_skip filename={}", filename));
         return;
     }
 
     // Skip if pull-only mode
     if pull_only {
         debug!("Skipping file creation in pull-only mode: {}", filename);
+        append_sandbox_trace(&format!("CREATE_HANDLER pull_only filename={}", filename));
         return;
     }
 
@@ -627,6 +686,12 @@ async fn handle_file_created_crdt(
             filename.clone()
         }
     };
+    append_sandbox_trace(&format!(
+        "CREATE_HANDLER resolved relative_path={} canonical_path={} canonical_directory={}",
+        relative_path,
+        canonical_path.display(),
+        canonical_directory.display()
+    ));
 
     // Check for rename via inode tracking (same-directory renames only).
     // When a file is renamed (mv foo.txt bar.txt), the watcher sees Delete(foo) + Create(bar).
@@ -770,7 +835,16 @@ async fn handle_file_created_crdt(
             "Failed to ensure parent directories for {}: {}",
             relative_path, e
         );
+        append_sandbox_trace(&format!(
+            "CREATE_HANDLER ensure_parents_err relative_path={} err={}",
+            relative_path, e
+        ));
         // Continue anyway - find_owning_document may still work if some directories exist
+    } else {
+        append_sandbox_trace(&format!(
+            "CREATE_HANDLER ensure_parents_ok relative_path={}",
+            relative_path
+        ));
     }
 
     // Find which document owns this file (may be a node-backed subdirectory)
@@ -779,6 +853,13 @@ async fn handle_file_created_crdt(
         "CRDT file created: {} owned by document {} (relative: {})",
         relative_path, owning_doc.document_id, owning_doc.relative_path
     );
+    append_sandbox_trace(&format!(
+        "CREATE_HANDLER owning_doc relative_path={} document_id={} owning_relative={} owning_dir={}",
+        relative_path,
+        owning_doc.document_id,
+        owning_doc.relative_path,
+        owning_doc.directory.display()
+    ));
 
     // Check if file is already being tracked - don't create duplicate UUIDs.
     {
@@ -788,6 +869,10 @@ async fn handle_file_created_crdt(
                 "File '{}' already in file_states, skipping create_new_file",
                 relative_path
             );
+            append_sandbox_trace(&format!(
+                "CREATE_HANDLER already_tracked relative_path={}",
+                relative_path
+            ));
             return;
         }
     }
@@ -802,6 +887,11 @@ async fn handle_file_created_crdt(
             path.display(),
             e
         );
+        append_sandbox_trace(&format!(
+            "CREATE_HANDLER stability_err path={} err={}",
+            path.display(),
+            e
+        ));
         return;
     }
 
@@ -810,15 +900,29 @@ async fn handle_file_created_crdt(
         Ok(c) => c,
         Err(e) => {
             warn!("Failed to read new file {}: {}", path.display(), e);
+            append_sandbox_trace(&format!(
+                "CREATE_HANDLER read_err path={} err={}",
+                path.display(),
+                e
+            ));
             return;
         }
     };
+    append_sandbox_trace(&format!(
+        "CREATE_HANDLER read_ok relative_path={} content_len={}",
+        relative_path,
+        content.len()
+    ));
 
     // Determine which DirectorySyncState to use
     // If the file is in a subdirectory, we need to load that subdirectory's state
     let is_subdirectory = owning_doc.document_id != fs_root_id;
 
     if is_subdirectory {
+        append_sandbox_trace(&format!(
+            "CREATE_HANDLER subdir_branch relative_path={} subdir_doc_id={} owning_relative={}",
+            relative_path, owning_doc.document_id, owning_doc.relative_path
+        ));
         // Load or create state for the subdirectory from cache
         let subdir_node_id = match uuid::Uuid::parse_str(&owning_doc.document_id) {
             Ok(id) => id,
@@ -827,6 +931,10 @@ async fn handle_file_created_crdt(
                     "Invalid subdirectory node_id '{}': {}",
                     owning_doc.document_id, e
                 );
+                append_sandbox_trace(&format!(
+                    "CREATE_HANDLER invalid_subdir_uuid document_id={} err={}",
+                    owning_doc.document_id, e
+                ));
                 return;
             }
         };
@@ -843,6 +951,11 @@ async fn handle_file_created_crdt(
                     owning_doc.directory.display(),
                     e
                 );
+                append_sandbox_trace(&format!(
+                    "CREATE_HANDLER subdir_state_load_err dir={} err={}",
+                    owning_doc.directory.display(),
+                    e
+                ));
                 return;
             }
         };
@@ -855,11 +968,19 @@ async fn handle_file_created_crdt(
                     "File '{}' already in subdirectory CRDT state, skipping",
                     owning_doc.relative_path
                 );
+                append_sandbox_trace(&format!(
+                    "CREATE_HANDLER already_in_subdir_state owning_relative={}",
+                    owning_doc.relative_path
+                ));
                 return;
             }
         }
 
         // Create file via CRDT using subdirectory state
+        append_sandbox_trace(&format!(
+            "CREATE_HANDLER create_new_file subdir owning_relative={} subdir_doc_id={}",
+            owning_doc.relative_path, owning_doc.document_id
+        ));
         let result = {
             let mut subdir_state = subdir_state_arc.write().await;
             // Ensure schema Y.Doc has existing entries before adding new file.
@@ -882,6 +1003,10 @@ async fn handle_file_created_crdt(
 
         match result {
             Ok(new_file) => {
+                append_sandbox_trace(&format!(
+                    "CREATE_HANDLER create_new_file_ok subdir owning_relative={} uuid={}",
+                    owning_doc.relative_path, new_file.uuid
+                ));
                 info!(
                     "Created file '{}' via CRDT in subdir {}: uuid={}, schema_cid={}, file_cid={}",
                     owning_doc.relative_path,
@@ -1024,6 +1149,10 @@ async fn handle_file_created_crdt(
                 );
             }
             Err(e) => {
+                append_sandbox_trace(&format!(
+                    "CREATE_HANDLER create_new_file_err subdir owning_relative={} err={}",
+                    owning_doc.relative_path, e
+                ));
                 warn!(
                     "Failed to create file '{}' via CRDT in subdir: {}",
                     owning_doc.relative_path, e
@@ -1031,6 +1160,10 @@ async fn handle_file_created_crdt(
             }
         }
     } else {
+        append_sandbox_trace(&format!(
+            "CREATE_HANDLER root_branch relative_path={} filename={}",
+            relative_path, filename
+        ));
         // File is in the root directory - use the existing crdt_state
         // Check if already tracked in root CRDT state
         {
@@ -1040,11 +1173,19 @@ async fn handle_file_created_crdt(
                     "File '{}' already in root CRDT state, skipping create_new_file",
                     filename
                 );
+                append_sandbox_trace(&format!(
+                    "CREATE_HANDLER already_in_root_state filename={}",
+                    filename
+                ));
                 return;
             }
         }
 
         // Create file via CRDT using root state
+        append_sandbox_trace(&format!(
+            "CREATE_HANDLER create_new_file root filename={}",
+            filename
+        ));
         let result = {
             let mut state = crdt.crdt_state.write().await;
             state.ensure_schema_initialized(directory).await;
@@ -1061,6 +1202,10 @@ async fn handle_file_created_crdt(
 
         match result {
             Ok(new_file) => {
+                append_sandbox_trace(&format!(
+                    "CREATE_HANDLER create_new_file_ok root filename={} uuid={}",
+                    filename, new_file.uuid
+                ));
                 info!(
                     "Created file '{}' via CRDT: uuid={}, schema_cid={}, file_cid={}",
                     filename, new_file.uuid, new_file.schema_cid, new_file.file_cid
@@ -1107,6 +1252,10 @@ async fn handle_file_created_crdt(
                 );
             }
             Err(e) => {
+                append_sandbox_trace(&format!(
+                    "CREATE_HANDLER create_new_file_err root filename={} err={}",
+                    filename, e
+                ));
                 warn!("Failed to create file '{}' via CRDT: {}", filename, e);
             }
         }
@@ -3111,20 +3260,38 @@ async fn run_directory_mode(
         };
         async move {
             while let Some(event) = dir_rx.recv().await {
-                handle_dir_event(
-                    &client,
-                    &server,
-                    &fs_root_id,
-                    &directory,
-                    &options,
-                    &file_states,
-                    pull_only,
-                    &author,
-                    Some(&written_schemas),
-                    Some(&crdt_params),
-                    event,
-                )
+                let client_for_event = client.clone();
+                let server_for_event = server.clone();
+                let fs_root_for_event = fs_root_id.clone();
+                let directory_for_event = directory.clone();
+                let options_for_event = options.clone();
+                let file_states_for_event = file_states.clone();
+                let author_for_event = author.clone();
+                let written_schemas_for_event = written_schemas.clone();
+                let crdt_params_for_event = crdt_params.clone();
+
+                let join_result = tokio::spawn(async move {
+                    handle_dir_event(
+                        &client_for_event,
+                        &server_for_event,
+                        &fs_root_for_event,
+                        &directory_for_event,
+                        &options_for_event,
+                        &file_states_for_event,
+                        pull_only,
+                        &author_for_event,
+                        Some(&written_schemas_for_event),
+                        Some(&crdt_params_for_event),
+                        event,
+                    )
+                    .await;
+                })
                 .await;
+
+                if let Err(e) = join_result {
+                    error!("Directory event handler task failed: {}", e);
+                    append_sandbox_trace(&format!("DIR_EVENT handler join error: {}", e));
+                }
             }
         }
     });
@@ -3729,20 +3896,41 @@ async fn run_exec_mode(
         async move {
             while let Some(event) = dir_rx.recv().await {
                 debug!("RECEIVED DIR EVENT (exec mode): {:?}", event);
-                handle_dir_event(
-                    &client,
-                    &server,
-                    &fs_root_id,
-                    &directory,
-                    &options,
-                    &file_states,
-                    pull_only,
-                    &author,
-                    Some(&written_schemas),
-                    Some(&crdt_params),
-                    event,
-                )
+                let client_for_event = client.clone();
+                let server_for_event = server.clone();
+                let fs_root_for_event = fs_root_id.clone();
+                let directory_for_event = directory.clone();
+                let options_for_event = options.clone();
+                let file_states_for_event = file_states.clone();
+                let author_for_event = author.clone();
+                let written_schemas_for_event = written_schemas.clone();
+                let crdt_params_for_event = crdt_params.clone();
+
+                let join_result = tokio::spawn(async move {
+                    handle_dir_event(
+                        &client_for_event,
+                        &server_for_event,
+                        &fs_root_for_event,
+                        &directory_for_event,
+                        &options_for_event,
+                        &file_states_for_event,
+                        pull_only,
+                        &author_for_event,
+                        Some(&written_schemas_for_event),
+                        Some(&crdt_params_for_event),
+                        event,
+                    )
+                    .await;
+                })
                 .await;
+
+                if let Err(e) = join_result {
+                    error!("Directory event handler task failed (exec mode): {}", e);
+                    append_sandbox_trace(&format!(
+                        "DIR_EVENT handler join error (exec mode): {}",
+                        e
+                    ));
+                }
             }
         }
     });
