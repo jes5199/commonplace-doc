@@ -9,9 +9,9 @@ use tempfile::TempDir;
 /// Helper to spawn mosquitto MQTT broker on a given port
 fn spawn_mqtt_broker(port: u16) -> Child {
     let child = Command::new("mosquitto")
-        .args(["-p", &port.to_string(), "-v"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .args(["-p", &port.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("Failed to spawn mosquitto");
 
@@ -2531,6 +2531,164 @@ fn test_mqtt_only_watcher_delete_in_root_propagates_to_server_and_peer() {
     );
 
     wait_for_path_missing(&file_b, Duration::from_secs(20));
+}
+
+/// CP-ntgh: subdir watcher delete events must propagate in MQTT-only runtime.
+///
+/// Scenario:
+/// 1. Server starts with fs-root -> node-backed subdirectory -> file entry
+/// 2. Two sync clients run with COMMONPLACE_MQTT_ONLY_SYNC=true
+/// 3. Client A deletes the subdir file locally
+/// 4. Verify subdir schema entry is removed and client B file is deleted
+#[test]
+fn test_mqtt_only_watcher_delete_in_subdir_propagates_to_server_and_peer() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir_a = temp_dir.path().join("workspace-a");
+    let sync_dir_b = temp_dir.path().join("workspace-b");
+    std::fs::create_dir_all(&sync_dir_a).unwrap();
+    std::fs::create_dir_all(&sync_dir_b).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse fs-root response");
+    let fs_root_id = body["id"].as_str().expect("Missing fs-root id").to_string();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create subdir document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse subdir response");
+    let subdir_id = body["id"].as_str().expect("Missing subdir id").to_string();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create file document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse file response");
+    let file_id = body["id"].as_str().expect("Missing file id").to_string();
+
+    let initial_content = "subdir delete propagation baseline content";
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(initial_content)
+        .send()
+        .expect("Failed to write file content");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write file content: {}",
+        resp.status()
+    );
+
+    let subdir_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "delete-me.txt": {
+                    "type": "doc",
+                    "node_id": file_id
+                }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, subdir_id))
+        .header("Content-Type", "application/json")
+        .body(subdir_schema.to_string())
+        .send()
+        .expect("Failed to write subdir schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write subdir schema: {}",
+        resp.status()
+    );
+
+    let root_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "shared": {
+                    "type": "dir",
+                    "node_id": subdir_id
+                }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(root_schema.to_string())
+        .send()
+        .expect("Failed to write fs-root schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write fs-root schema: {}",
+        resp.status()
+    );
+
+    guard.add(spawn_sync_directory_mqtt_only(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir_a,
+        &fs_root_id,
+    ));
+    guard.add(spawn_sync_directory_mqtt_only(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir_b,
+        &fs_root_id,
+    ));
+
+    let subdir_a = sync_dir_a.join("shared");
+    let subdir_b = sync_dir_b.join("shared");
+    wait_for_path_exists(&subdir_a, Duration::from_secs(20));
+    wait_for_path_exists(&subdir_b, Duration::from_secs(20));
+
+    let file_a = subdir_a.join("delete-me.txt");
+    let file_b = subdir_b.join("delete-me.txt");
+    wait_for_file_content_contains(&file_a, "baseline content", Duration::from_secs(20));
+    wait_for_file_content_contains(&file_b, "baseline content", Duration::from_secs(20));
+    std::thread::sleep(Duration::from_secs(2));
+
+    std::fs::remove_file(&file_a).expect("Failed to delete local subdir file on writer checkout");
+    wait_for_path_missing(&file_a, Duration::from_secs(5));
+
+    let updated_subdir_schema = wait_for_schema_entry_absence(
+        &client,
+        &server_url,
+        &subdir_id,
+        "delete-me.txt",
+        Duration::from_secs(25),
+    );
+    let entries = updated_subdir_schema["root"]["entries"]
+        .as_object()
+        .expect("Updated subdir schema missing entries object");
+    assert!(
+        !entries.contains_key("delete-me.txt"),
+        "Subdir schema should not contain delete-me.txt after watcher deletion"
+    );
+
+    wait_for_path_missing(&file_b, Duration::from_secs(25));
 }
 
 /// CP-rwaw: Test that initial sync assigns UUIDs directly (not via reconciler).
