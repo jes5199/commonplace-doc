@@ -767,9 +767,17 @@ pub async fn directory_watcher_task(
                 }
             } => {
                 debounce_timer = None;
-                for (_path, event) in pending_events.drain() {
+                for (path, event) in pending_events.drain() {
                     append_sandbox_trace(&format!("WATCHER emit event={:?}", event));
                     if tx.send(event).await.is_err() {
+                        warn!(
+                            "Directory watcher event channel closed while sending event for {}; exiting watcher task",
+                            path.display()
+                        );
+                        append_sandbox_trace(&format!(
+                            "WATCHER send_failed path={} reason=channel_closed",
+                            path.display()
+                        ));
                         return;
                     }
                 }
@@ -935,6 +943,7 @@ pub async fn shadow_watcher_task(shadow_dir: PathBuf, tx: mpsc::Sender<ShadowWri
                         content.len()
                     );
 
+                    let shadow_path_display = path.display().to_string();
                     let event = ShadowWriteEvent {
                         inode_key,
                         shadow_path: path,
@@ -942,6 +951,14 @@ pub async fn shadow_watcher_task(shadow_dir: PathBuf, tx: mpsc::Sender<ShadowWri
                     };
 
                     if tx.send(event).await.is_err() {
+                        warn!(
+                            "Shadow watcher event channel closed while sending {}; exiting watcher task",
+                            shadow_path_display
+                        );
+                        append_sandbox_trace(&format!(
+                            "SHADOW_WATCHER send_failed path={} reason=channel_closed",
+                            shadow_path_display
+                        ));
                         return;
                     }
                 }

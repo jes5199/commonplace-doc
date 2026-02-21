@@ -35,10 +35,11 @@ use commonplace_doc::workspace::is_process_running;
 use commonplace_doc::{DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
 use reqwest::Client;
 use rumqttc::QoS;
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
@@ -69,6 +70,61 @@ fn append_sandbox_trace(msg: &str) {
         let pid = std::process::id();
         let _ = writeln!(file, "[{} pid={}] {}", timestamp, pid, msg);
     }
+}
+
+fn panic_payload_to_string(payload: &(dyn Any + Send + 'static)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "<non-string panic payload>".to_string()
+}
+
+fn log_dir_event_join_error(context: &str, join_error: tokio::task::JoinError) {
+    if join_error.is_panic() {
+        let panic_payload = panic_payload_to_string(join_error.into_panic().as_ref());
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        error!(
+            "{} panicked: payload={} backtrace={}",
+            context, panic_payload, backtrace
+        );
+        append_sandbox_trace(&format!(
+            "{} panic payload={} backtrace={}",
+            context, panic_payload, backtrace
+        ));
+        return;
+    }
+
+    error!("{} failed: {}", context, join_error);
+    append_sandbox_trace(&format!("{} failed: {}", context, join_error));
+}
+
+fn install_panic_trace_hook() {
+    static PANIC_HOOK_ONCE: Once = Once::new();
+    PANIC_HOOK_ONCE.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            let payload = panic_payload_to_string(panic_info.payload());
+            let location = panic_info
+                .location()
+                .map(|loc| format!("{}:{}", loc.file(), loc.line()))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let backtrace = std::backtrace::Backtrace::force_capture();
+
+            error!(
+                "Unhandled panic captured: payload={} location={} backtrace={}",
+                payload, location, backtrace
+            );
+            append_sandbox_trace(&format!(
+                "UNHANDLED_PANIC payload={} location={} backtrace={}",
+                payload, location, backtrace
+            ));
+
+            default_hook(panic_info);
+        }));
+    });
 }
 
 fn resolve_shadow_dir(shadow_dir: &str, base_dir: &Path) -> String {
@@ -123,6 +179,8 @@ async fn publish_initial_sync_complete(
 struct WatcherSetup {
     /// Receiver for directory events from the watcher task.
     dir_rx: mpsc::Receiver<DirEvent>,
+    /// Sender for synthetic directory events injected by sync startup reconciliation.
+    dir_tx: mpsc::Sender<DirEvent>,
     /// Handle to the watcher task (None if pull-only mode).
     watcher_handle: Option<JoinHandle<()>>,
     /// Tracks which subdirectories have subscription tasks.
@@ -143,7 +201,7 @@ fn setup_directory_watchers(
     let watcher_handle = if !pull_only {
         Some(tokio::spawn(directory_watcher_task(
             directory,
-            dir_tx,
+            dir_tx.clone(),
             options,
             Some(written_schemas),
         )))
@@ -154,8 +212,154 @@ fn setup_directory_watchers(
 
     WatcherSetup {
         dir_rx,
+        dir_tx,
         watcher_handle,
         watched_subdirs: Arc::new(RwLock::new(HashSet::new())),
+    }
+}
+
+fn is_startup_temp_file(name: &str) -> bool {
+    if name.starts_with("tmp") && name.len() >= 6 {
+        let suffix = &name[3..];
+        if suffix.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return true;
+        }
+    }
+
+    if name.ends_with(".tmp")
+        || name.ends_with(".temp")
+        || name.ends_with(".swp")
+        || name.ends_with(".swx")
+        || name.ends_with("~")
+    {
+        return true;
+    }
+
+    if name.starts_with('.') && name.ends_with(".swp") {
+        return true;
+    }
+
+    if name.starts_with('#') && name.ends_with('#') {
+        return true;
+    }
+
+    false
+}
+
+fn normalize_relative_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn collect_untracked_startup_files(
+    root: &Path,
+    current: &Path,
+    options: &ScanOptions,
+    tracked_relative_paths: &HashSet<String>,
+    out: &mut Vec<PathBuf>,
+) {
+    let entries = match std::fs::read_dir(current) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = match entry.file_name().to_str() {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+
+        if !options.include_hidden && file_name.starts_with('.') {
+            continue;
+        }
+
+        if file_name == SCHEMA_FILENAME || is_startup_temp_file(&file_name) {
+            continue;
+        }
+
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if file_type.is_dir() {
+            collect_untracked_startup_files(root, &path, options, tracked_relative_paths, out);
+            continue;
+        }
+
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let relative = match path.strip_prefix(root) {
+            Ok(rel) => normalize_relative_path(rel),
+            Err(_) => continue,
+        };
+
+        if tracked_relative_paths.contains(&relative) {
+            continue;
+        }
+
+        out.push(path);
+    }
+}
+
+async fn enqueue_startup_untracked_created_events(
+    directory: &Path,
+    options: &ScanOptions,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    dir_tx: &mpsc::Sender<DirEvent>,
+) {
+    let tracked_relative_paths: HashSet<String> = {
+        let states = file_states.read().await;
+        states.keys().cloned().collect()
+    };
+
+    let mut untracked_files = Vec::new();
+    collect_untracked_startup_files(
+        directory,
+        directory,
+        options,
+        &tracked_relative_paths,
+        &mut untracked_files,
+    );
+
+    if untracked_files.is_empty() {
+        return;
+    }
+
+    untracked_files.sort();
+    info!(
+        "Startup reconciliation found {} untracked local file(s); queueing synthetic create events",
+        untracked_files.len()
+    );
+    append_sandbox_trace(&format!(
+        "STARTUP_RECONCILE untracked_count={} directory={}",
+        untracked_files.len(),
+        directory.display()
+    ));
+
+    for path in untracked_files {
+        if let Err(e) = dir_tx.send(DirEvent::Created(path.clone())).await {
+            warn!(
+                "Startup reconciliation could not enqueue {}; directory event channel closed: {}",
+                path.display(),
+                e
+            );
+            append_sandbox_trace(&format!(
+                "STARTUP_RECONCILE channel_closed path={}",
+                path.display()
+            ));
+            break;
+        }
+        append_sandbox_trace(&format!(
+            "STARTUP_RECONCILE queued_created path={}",
+            path.display()
+        ));
     }
 }
 
@@ -2098,6 +2302,7 @@ async fn main() -> ExitCode {
                 .add_directive(tracing::Level::INFO.into()),
         )
         .init();
+    install_panic_trace_hook();
 
     let args = Args::parse();
 
@@ -2973,6 +3178,7 @@ async fn run_directory_mode(
     // Start directory watcher and create shared state
     let WatcherSetup {
         mut dir_rx,
+        dir_tx,
         watcher_handle,
         watched_subdirs,
     } = setup_directory_watchers(
@@ -3289,12 +3495,16 @@ async fn run_directory_mode(
                 .await;
 
                 if let Err(e) = join_result {
-                    error!("Directory event handler task failed: {}", e);
-                    append_sandbox_trace(&format!("DIR_EVENT handler join error: {}", e));
+                    log_dir_event_join_error("DIR_EVENT handler", e);
                 }
             }
+            warn!("DIR_EVENT receiver closed (directory mode); exiting dir-event loop");
+            append_sandbox_trace("DIR_EVENT receiver_closed mode=directory");
         }
     });
+    if !pull_only {
+        enqueue_startup_untracked_created_events(&directory, &options, &file_states, &dir_tx).await;
+    }
 
     // Wait for Ctrl+C
     tokio::signal::ctrl_c().await?;
@@ -3614,6 +3824,7 @@ async fn run_exec_mode(
     // Start directory watcher and create shared state
     let WatcherSetup {
         mut dir_rx,
+        dir_tx,
         watcher_handle,
         watched_subdirs,
     } = setup_directory_watchers(
@@ -3925,15 +4136,16 @@ async fn run_exec_mode(
                 .await;
 
                 if let Err(e) = join_result {
-                    error!("Directory event handler task failed (exec mode): {}", e);
-                    append_sandbox_trace(&format!(
-                        "DIR_EVENT handler join error (exec mode): {}",
-                        e
-                    ));
+                    log_dir_event_join_error("DIR_EVENT handler (exec mode)", e);
                 }
             }
+            warn!("DIR_EVENT receiver closed (exec mode); exiting dir-event loop");
+            append_sandbox_trace("DIR_EVENT receiver_closed mode=exec");
         }
     });
+    if !pull_only {
+        enqueue_startup_untracked_created_events(&directory, &options, &file_states, &dir_tx).await;
+    }
 
     // Wait for CRDT readiness before starting exec (in sandbox mode)
     // This ensures all file sync tasks are ready to capture writes from the exec process
