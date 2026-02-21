@@ -806,6 +806,72 @@ fn wait_for_schema_entry_presence(
     }
 }
 
+fn wait_for_local_schema_entry_presence(
+    schema_path: &std::path::Path,
+    entry_name: &str,
+    timeout: Duration,
+) -> serde_json::Value {
+    let start = std::time::Instant::now();
+    let mut last_content = "<unavailable>".to_string();
+
+    loop {
+        let content = match std::fs::read_to_string(schema_path) {
+            Ok(content) => content,
+            Err(e) => {
+                if start.elapsed() >= timeout {
+                    panic!(
+                        "Timed out waiting for local schema entry '{}' in {}. Last error: {}",
+                        entry_name,
+                        schema_path.display(),
+                        e
+                    );
+                }
+                last_content = format!("<{}>", e);
+                std::thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+        };
+
+        let schema: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(schema) => schema,
+            Err(e) => {
+                if start.elapsed() >= timeout {
+                    panic!(
+                        "Timed out waiting for local schema entry '{}' in {}. Invalid schema: {} ({})",
+                        entry_name,
+                        schema_path.display(),
+                        e,
+                        content
+                    );
+                }
+                last_content = content;
+                std::thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+        };
+
+        let has_entry = schema["root"]["entries"]
+            .as_object()
+            .map(|entries| entries.contains_key(entry_name))
+            .unwrap_or(false);
+        if has_entry {
+            return schema;
+        }
+
+        if start.elapsed() >= timeout {
+            panic!(
+                "Timed out waiting for local schema entry '{}' in {}. Last schema: {}",
+                entry_name,
+                schema_path.display(),
+                last_content
+            );
+        }
+
+        last_content = content;
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
 fn wait_for_schema_entry_absence(
     client: &reqwest::blocking::Client,
     server_url: &str,
@@ -2411,6 +2477,132 @@ fn test_mqtt_only_watcher_create_in_subdir_propagates_to_server_and_peer() {
 
     let peer_file = subdir_b.join("created-via-watcher.txt");
     wait_for_file_content_contains(&peer_file, "mqtt-only runtime", Duration::from_secs(40));
+}
+
+/// CP-6vn8: root watcher create must update local schema alongside server schema.
+///
+/// Scenario:
+/// 1. Server starts with empty fs-root schema
+/// 2. Sync client runs with COMMONPLACE_MQTT_ONLY_SYNC=true
+/// 3. Client A creates a new root file locally
+/// 4. Verify server schema and local .commonplace.json both update
+#[test]
+fn test_mqtt_only_watcher_create_in_root_updates_local_schema_and_server() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir_a = temp_dir.path().join("workspace-a");
+    let sync_dir_b = temp_dir.path().join("workspace-b");
+    std::fs::create_dir_all(&sync_dir_a).unwrap();
+    std::fs::create_dir_all(&sync_dir_b).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse fs-root response");
+    let fs_root_id = body["id"].as_str().expect("Missing fs-root id").to_string();
+
+    let empty_root_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {}
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(empty_root_schema.to_string())
+        .send()
+        .expect("Failed to initialize root schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to initialize root schema: {}",
+        resp.status()
+    );
+
+    guard.add(spawn_sync_directory_mqtt_only(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir_a,
+        &fs_root_id,
+    ));
+    // Keep a second checkout running to exercise the same runtime shape as peer scenarios.
+    guard.add(spawn_sync_directory_mqtt_only(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir_b,
+        &fs_root_id,
+    ));
+
+    wait_for_path_exists(
+        &sync_dir_a.join(".commonplace.json"),
+        Duration::from_secs(30),
+    );
+    wait_for_path_exists(
+        &sync_dir_b.join(".commonplace.json"),
+        Duration::from_secs(30),
+    );
+
+    let filename = "created-root-via-watcher.txt";
+    let local_new_file = sync_dir_a.join(filename);
+    let content = "root watcher create should update local schema";
+    std::fs::write(&local_new_file, content).expect("Failed to create root watcher file");
+
+    let server_schema = wait_for_schema_entry_presence(
+        &client,
+        &server_url,
+        &fs_root_id,
+        filename,
+        Duration::from_secs(40),
+    );
+    let server_entries = server_schema["root"]["entries"]
+        .as_object()
+        .expect("Server root schema missing entries object");
+    let server_entry = server_entries
+        .get(filename)
+        .expect("Server root schema missing created file entry");
+    let server_file_node_id = server_entry["node_id"]
+        .as_str()
+        .expect("Server created file entry missing node_id");
+
+    let local_schema = wait_for_local_schema_entry_presence(
+        &sync_dir_a.join(".commonplace.json"),
+        filename,
+        Duration::from_secs(40),
+    );
+    let local_entries = local_schema["root"]["entries"]
+        .as_object()
+        .expect("Local root schema missing entries object");
+    let local_entry = local_entries
+        .get(filename)
+        .expect("Local root schema missing created file entry");
+    let local_file_node_id = local_entry["node_id"]
+        .as_str()
+        .expect("Local created file entry missing node_id");
+    assert_eq!(
+        local_file_node_id, server_file_node_id,
+        "Local schema node_id should match server schema node_id"
+    );
+
+    wait_for_head_content_contains(
+        &client,
+        &server_url,
+        server_file_node_id,
+        "root watcher create",
+        Duration::from_secs(40),
+    );
 }
 
 /// CP-1skm: root watcher delete events must propagate in MQTT-only runtime.
