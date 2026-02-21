@@ -52,8 +52,12 @@ use tokio::task::JoinHandle;
 /// Default shadow dir when running with inode tracking enabled.
 const DEFAULT_SHADOW_DIR: &str = "/tmp/commonplace-sync/hardlinks";
 
+fn watcher_create_trace_enabled() -> bool {
+    std::env::var_os("COMMONPLACE_TRACE_WATCHER_CREATE").is_some()
+}
+
 fn append_sandbox_trace(msg: &str) {
-    if std::env::var_os("COMMONPLACE_TRACE_WATCHER_CREATE").is_none() {
+    if !watcher_create_trace_enabled() {
         return;
     }
 
@@ -85,15 +89,20 @@ fn panic_payload_to_string(payload: &(dyn Any + Send + 'static)) -> String {
 fn log_dir_event_join_error(context: &str, join_error: tokio::task::JoinError) {
     if join_error.is_panic() {
         let panic_payload = panic_payload_to_string(join_error.into_panic().as_ref());
-        let backtrace = std::backtrace::Backtrace::force_capture();
-        error!(
-            "{} panicked: payload={} backtrace={}",
-            context, panic_payload, backtrace
-        );
-        append_sandbox_trace(&format!(
-            "{} panic payload={} backtrace={}",
-            context, panic_payload, backtrace
-        ));
+        if watcher_create_trace_enabled() {
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            error!(
+                "{} panicked: payload={} backtrace={}",
+                context, panic_payload, backtrace
+            );
+            append_sandbox_trace(&format!(
+                "{} panic payload={} backtrace={}",
+                context, panic_payload, backtrace
+            ));
+        } else {
+            error!("{} panicked: payload={}", context, panic_payload);
+            append_sandbox_trace(&format!("{} panic payload={}", context, panic_payload));
+        }
         return;
     }
 
@@ -2302,7 +2311,9 @@ async fn main() -> ExitCode {
                 .add_directive(tracing::Level::INFO.into()),
         )
         .init();
-    install_panic_trace_hook();
+    if watcher_create_trace_enabled() {
+        install_panic_trace_hook();
+    }
 
     let args = Args::parse();
 
