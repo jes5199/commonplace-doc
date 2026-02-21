@@ -240,9 +240,10 @@ fn resolve_schema_path(
 
         match entry {
             Entry::Dir(dir) => {
-                if dir.entries.is_none() && dir.node_id.is_some() {
-                    // This is a node-backed directory!
-                    // Check if it has its own .commonplace.json
+                if dir.entries.is_none() {
+                    // Node-backed directories normally have entries=None with a node_id.
+                    // If node_id is missing but a nested schema exists, still treat it as a
+                    // schema boundary so linking can proceed against local state.
                     current_dir_path = current_dir_path.join(dir_name);
                     let subdir_schema_path = current_dir_path.join(SCHEMA_FILENAME);
 
@@ -265,18 +266,26 @@ fn resolve_schema_path(
                             _ => return Err("Subdir root is not a directory".into()),
                         };
                         continue;
-                    } else {
+                    }
+
+                    if dir.node_id.is_some() {
                         return Err(format!(
                             "Node-backed directory {} has no {} file",
                             dir_name, SCHEMA_FILENAME
                         )
                         .into());
                     }
-                } else {
-                    // Regular directory with inline entries
-                    current_dir_path = current_dir_path.join(dir_name);
-                    current_entries = dir.entries.as_ref();
+
+                    return Err(format!(
+                        "Directory {} has no entries and no {} file",
+                        dir_name, SCHEMA_FILENAME
+                    )
+                    .into());
                 }
+
+                // Regular directory with inline entries
+                current_dir_path = current_dir_path.join(dir_name);
+                current_entries = dir.entries.as_ref();
             }
             _ => return Err(format!("{} is not a directory", dir_name).into()),
         }
@@ -403,4 +412,64 @@ fn set_entry_node_id(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    #[test]
+    fn resolve_schema_path_uses_subdir_schema_when_entries_null_even_without_node_id() {
+        let temp = TempDir::new().expect("create temp dir");
+        let workspace_root = temp.path();
+        let subdir = workspace_root.join("bartleby");
+        std::fs::create_dir_all(&subdir).expect("create subdir");
+
+        let root_schema = json!({
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "bartleby": {
+                        "type": "dir",
+                        "entries": null,
+                        "node_id": null,
+                        "content_type": "application/json"
+                    }
+                },
+                "node_id": null,
+                "content_type": null
+            }
+        });
+        std::fs::write(
+            workspace_root.join(SCHEMA_FILENAME),
+            serde_json::to_string_pretty(&root_schema).expect("serialize root schema"),
+        )
+        .expect("write root schema");
+
+        let subdir_schema = json!({
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {},
+                "node_id": null,
+                "content_type": null
+            }
+        });
+        std::fs::write(
+            subdir.join(SCHEMA_FILENAME),
+            serde_json::to_string_pretty(&subdir_schema).expect("serialize subdir schema"),
+        )
+        .expect("write subdir schema");
+
+        let resolved =
+            resolve_schema_path(workspace_root, &["bartleby".to_string()], "shared-b.txt")
+                .expect("resolve schema path");
+
+        assert_eq!(resolved.schema_path, subdir.join(SCHEMA_FILENAME));
+        assert!(resolved.dirs_within_schema.is_empty());
+        assert_eq!(resolved.filename, "shared-b.txt");
+    }
 }
