@@ -9,9 +9,9 @@ use tempfile::TempDir;
 /// Helper to spawn mosquitto MQTT broker on a given port
 fn spawn_mqtt_broker(port: u16) -> Child {
     let child = Command::new("mosquitto")
-        .args(["-p", &port.to_string(), "-v"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .args(["-p", &port.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("Failed to spawn mosquitto");
 
@@ -517,6 +517,395 @@ fn spawn_sync_directory(
         .expect("Failed to spawn sync client")
 }
 
+/// Helper to spawn sync client in directory mode with an explicit initial-sync strategy
+fn spawn_sync_directory_with_initial_sync(
+    server_url: &str,
+    mqtt_broker: &str,
+    directory: &std::path::Path,
+    node_id: &str,
+    initial_sync: &str,
+) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_commonplace-sync"))
+        .args([
+            "--server",
+            server_url,
+            "--mqtt-broker",
+            mqtt_broker,
+            "--node",
+            node_id,
+            "--directory",
+            directory.to_str().unwrap(),
+            "--initial-sync",
+            initial_sync,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn sync client")
+}
+
+/// Helper to spawn sync client in directory mode with MQTT-only runtime enforced.
+fn spawn_sync_directory_mqtt_only_with_initial_sync(
+    server_url: &str,
+    mqtt_broker: &str,
+    directory: &std::path::Path,
+    node_id: &str,
+    initial_sync: &str,
+) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_commonplace-sync"))
+        .args([
+            "--server",
+            server_url,
+            "--mqtt-broker",
+            mqtt_broker,
+            "--node",
+            node_id,
+            "--directory",
+            directory.to_str().unwrap(),
+            "--initial-sync",
+            initial_sync,
+        ])
+        .env("COMMONPLACE_MQTT_ONLY_SYNC", "true")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn sync client")
+}
+
+fn spawn_sync_directory_mqtt_only(
+    server_url: &str,
+    mqtt_broker: &str,
+    directory: &std::path::Path,
+    node_id: &str,
+) -> Child {
+    spawn_sync_directory_mqtt_only_with_initial_sync(
+        server_url,
+        mqtt_broker,
+        directory,
+        node_id,
+        "server",
+    )
+}
+
+fn fetch_head_content(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    doc_id: &str,
+) -> String {
+    try_fetch_head_content(client, server_url, doc_id)
+        .unwrap_or_else(|e| panic!("Failed to fetch head content for {}: {}", doc_id, e))
+}
+
+fn try_fetch_head_content(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    doc_id: &str,
+) -> Result<String, String> {
+    let resp = client
+        .get(format!("{}/docs/{}/head", server_url, doc_id))
+        .send()
+        .map_err(|e| format!("request failed: {}", e))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .map_err(|e| format!("failed reading response body: {}", e))?;
+    if !status.is_success() {
+        return Err(format!("status {}: {}", status, body));
+    }
+    let head: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("invalid HEAD JSON: {} ({})", e, body))?;
+    head["content"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("HEAD response missing content: {}", body))
+}
+
+fn wait_for_head_content_contains(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    doc_id: &str,
+    expected: &str,
+    timeout: Duration,
+) -> String {
+    let start = std::time::Instant::now();
+    loop {
+        let last_content = match try_fetch_head_content(client, server_url, doc_id) {
+            Ok(content) => {
+                if content.contains(expected) {
+                    return content;
+                }
+                content
+            }
+            Err(e) => {
+                format!("<{}>", e)
+            }
+        };
+
+        if start.elapsed() >= timeout {
+            panic!(
+                "Timed out waiting for '{}' in head content for {}. Last content: {}",
+                expected, doc_id, last_content
+            );
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+fn assert_head_content_does_not_contain(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    doc_id: &str,
+    forbidden: &str,
+    window: Duration,
+) {
+    let start = std::time::Instant::now();
+    let mut last_error: Option<String> = None;
+    while start.elapsed() < window {
+        match try_fetch_head_content(client, server_url, doc_id) {
+            Ok(content) => {
+                assert!(
+                    !content.contains(forbidden),
+                    "Found forbidden content '{}' in head for {}: {}",
+                    forbidden,
+                    doc_id,
+                    content
+                );
+                last_error = None;
+            }
+            Err(e) => {
+                last_error = Some(e);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    if let Some(err) = last_error {
+        panic!(
+            "HEAD checks for {} ended with repeated fetch/parse errors: {}",
+            doc_id, err
+        );
+    }
+}
+
+fn wait_for_file_content_contains(path: &std::path::Path, expected: &str, timeout: Duration) {
+    let start = std::time::Instant::now();
+    let mut last_content = "<unavailable>".to_string();
+
+    loop {
+        if start.elapsed() >= timeout {
+            panic!(
+                "Timed out waiting for '{}' in {}. Last content: {}",
+                expected,
+                path.display(),
+                last_content
+            );
+        }
+
+        if path.exists() {
+            match std::fs::read_to_string(path) {
+                Ok(content) => {
+                    if content.contains(expected) {
+                        return;
+                    }
+                    last_content = content;
+                }
+                Err(e) => {
+                    last_content = format!("<read error: {}>", e);
+                }
+            }
+        } else {
+            last_content = "<missing>".to_string();
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_path_exists(path: &std::path::Path, timeout: Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("Timed out waiting for path to exist: {}", path.display());
+}
+
+fn wait_for_path_missing(path: &std::path::Path, timeout: Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if !path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "Timed out waiting for path to be removed: {}",
+        path.display()
+    );
+}
+
+fn wait_for_schema_entry_presence(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    doc_id: &str,
+    entry_name: &str,
+    timeout: Duration,
+) -> serde_json::Value {
+    let start = std::time::Instant::now();
+    let mut last_content = "<unavailable>".to_string();
+
+    loop {
+        let content = match try_fetch_head_content(client, server_url, doc_id) {
+            Ok(content) => content,
+            Err(e) => {
+                if start.elapsed() >= timeout {
+                    panic!(
+                        "Timed out waiting for schema entry '{}' in {}. Last error: {}",
+                        entry_name, doc_id, e
+                    );
+                }
+                last_content = format!("<{}>", e);
+                std::thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+        };
+        let schema: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(schema) => schema,
+            Err(e) => {
+                if start.elapsed() >= timeout {
+                    panic!(
+                        "Timed out waiting for schema entry '{}' in {}. Invalid schema: {} ({})",
+                        entry_name, doc_id, e, content
+                    );
+                }
+                last_content = content;
+                std::thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+        };
+
+        let has_entry = schema["root"]["entries"]
+            .as_object()
+            .map(|entries| entries.contains_key(entry_name))
+            .unwrap_or(false);
+
+        if has_entry {
+            return schema;
+        }
+
+        if start.elapsed() >= timeout {
+            panic!(
+                "Timed out waiting for schema entry '{}' in {}. Last schema: {}",
+                entry_name, doc_id, last_content
+            );
+        }
+
+        last_content = content;
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+fn wait_for_schema_entry_absence(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    doc_id: &str,
+    entry_name: &str,
+    timeout: Duration,
+) -> serde_json::Value {
+    let start = std::time::Instant::now();
+    let mut last_content = "<unavailable>".to_string();
+
+    loop {
+        let content = match try_fetch_head_content(client, server_url, doc_id) {
+            Ok(content) => content,
+            Err(e) => {
+                if start.elapsed() >= timeout {
+                    panic!(
+                        "Timed out waiting for schema entry '{}' to be removed from {}. Last error: {}",
+                        entry_name, doc_id, e
+                    );
+                }
+                last_content = format!("<{}>", e);
+                std::thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+        };
+        let schema: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(schema) => schema,
+            Err(e) => {
+                if start.elapsed() >= timeout {
+                    panic!(
+                        "Timed out waiting for schema entry '{}' removal in {}. Invalid schema: {} ({})",
+                        entry_name, doc_id, e, content
+                    );
+                }
+                last_content = content;
+                std::thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+        };
+
+        let has_entry = schema["root"]["entries"]
+            .as_object()
+            .map(|entries| entries.contains_key(entry_name))
+            .unwrap_or(false);
+
+        if !has_entry {
+            return schema;
+        }
+
+        if start.elapsed() >= timeout {
+            panic!(
+                "Timed out waiting for schema entry '{}' to be removed from {}. Last schema: {}",
+                entry_name, doc_id, last_content
+            );
+        }
+
+        last_content = content;
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+fn flood_invalid_edit_messages(mqtt_broker: &str, workspace: &str, doc_id: &str, count: usize) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("Failed to build tokio runtime for lag flood");
+
+    rt.block_on(async {
+        let config = commonplace_doc::mqtt::MqttConfig {
+            broker_url: mqtt_broker.to_string(),
+            client_id: format!("lag-flood-{}", uuid::Uuid::new_v4()),
+            workspace: workspace.to_string(),
+            ..Default::default()
+        };
+
+        let client = std::sync::Arc::new(
+            commonplace_doc::mqtt::MqttClient::connect(config)
+                .await
+                .expect("Failed to connect lag flood MQTT client"),
+        );
+        let event_loop_client = client.clone();
+        let event_loop_handle = tokio::spawn(async move {
+            let _ = event_loop_client.run_event_loop().await;
+        });
+
+        let topic = commonplace_doc::mqtt::Topic::edits(workspace, doc_id).to_topic_string();
+        for idx in 0..count {
+            let payload = format!("{{\"kind\":\"lag-flood\",\"idx\":{}}}", idx);
+            client
+                .publish(&topic, payload.as_bytes(), rumqttc::QoS::AtMostOnce)
+                .await
+                .expect("Failed to publish lag flood payload");
+        }
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        event_loop_handle.abort();
+    });
+}
+
 /// Spawn sync client with stderr inherited for debugging
 #[allow(dead_code)]
 fn spawn_sync_directory_debug(
@@ -541,6 +930,280 @@ fn spawn_sync_directory_debug(
         .stderr(Stdio::inherit())
         .spawn()
         .expect("Failed to spawn sync client")
+}
+
+#[test]
+fn test_initial_sync_local_overwrites_server_on_conflict() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+    let server_content = "SERVER_BASELINE_ONLY";
+    let local_content = "LOCAL_OVERRIDE_ONLY";
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    // Create fs-root and a server-side file entry.
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let fs_root_id = body["id"].as_str().expect("No id in response").to_string();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create file document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let file_id = body["id"].as_str().expect("No id in response").to_string();
+
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(server_content)
+        .send()
+        .expect("Failed to write server file content");
+    assert!(resp.status().is_success());
+
+    let schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "notes.txt": {
+                    "type": "doc",
+                    "node_id": file_id
+                }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(schema.to_string())
+        .send()
+        .expect("Failed to write fs-root schema");
+    assert!(resp.status().is_success());
+
+    // Seed conflicting local state.
+    std::fs::write(sync_dir.join("notes.txt"), local_content).expect("Failed to write local file");
+    std::fs::write(sync_dir.join(".commonplace.json"), schema.to_string())
+        .expect("Failed to write local schema");
+
+    guard.add(spawn_sync_directory_with_initial_sync(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir,
+        &fs_root_id,
+        "local",
+    ));
+
+    let final_content = wait_for_head_content_contains(
+        &client,
+        &server_url,
+        &file_id,
+        local_content,
+        Duration::from_secs(10),
+    );
+    assert!(
+        final_content.contains(local_content),
+        "Expected local content on server, got: {}",
+        final_content
+    );
+}
+
+#[test]
+fn test_initial_sync_server_does_not_overwrite_server_on_conflict() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+    let server_content = "SERVER_BASELINE_ONLY";
+    let local_content = "LOCAL_OVERRIDE_ONLY";
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let fs_root_id = body["id"].as_str().expect("No id in response").to_string();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create file document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let file_id = body["id"].as_str().expect("No id in response").to_string();
+
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(server_content)
+        .send()
+        .expect("Failed to write server file content");
+    assert!(resp.status().is_success());
+
+    let schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "notes.txt": {
+                    "type": "doc",
+                    "node_id": file_id
+                }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(schema.to_string())
+        .send()
+        .expect("Failed to write fs-root schema");
+    assert!(resp.status().is_success());
+
+    std::fs::write(sync_dir.join("notes.txt"), local_content).expect("Failed to write local file");
+    std::fs::write(sync_dir.join(".commonplace.json"), schema.to_string())
+        .expect("Failed to write local schema");
+
+    guard.add(spawn_sync_directory_with_initial_sync(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir,
+        &fs_root_id,
+        "server",
+    ));
+
+    assert_head_content_does_not_contain(
+        &client,
+        &server_url,
+        &file_id,
+        local_content,
+        Duration::from_secs(4),
+    );
+    let final_content = fetch_head_content(&client, &server_url, &file_id);
+    assert!(
+        final_content.contains(server_content),
+        "Expected server content to be preserved, got: {}",
+        final_content
+    );
+}
+
+#[test]
+fn test_initial_sync_skip_does_not_overwrite_server_on_conflict() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+    let server_content = "SERVER_BASELINE_ONLY";
+    let local_content = "LOCAL_OVERRIDE_ONLY";
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let fs_root_id = body["id"].as_str().expect("No id in response").to_string();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create file document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse response");
+    let file_id = body["id"].as_str().expect("No id in response").to_string();
+
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(server_content)
+        .send()
+        .expect("Failed to write server file content");
+    assert!(resp.status().is_success());
+
+    let schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "notes.txt": {
+                    "type": "doc",
+                    "node_id": file_id
+                }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(schema.to_string())
+        .send()
+        .expect("Failed to write fs-root schema");
+    assert!(resp.status().is_success());
+
+    std::fs::write(sync_dir.join("notes.txt"), local_content).expect("Failed to write local file");
+    std::fs::write(sync_dir.join(".commonplace.json"), schema.to_string())
+        .expect("Failed to write local schema");
+
+    guard.add(spawn_sync_directory_with_initial_sync(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir,
+        &fs_root_id,
+        "skip",
+    ));
+
+    assert_head_content_does_not_contain(
+        &client,
+        &server_url,
+        &file_id,
+        local_content,
+        Duration::from_secs(4),
+    );
+    let final_content = fetch_head_content(&client, &server_url, &file_id);
+    assert!(
+        final_content.contains(server_content),
+        "Expected server content to be preserved, got: {}",
+        final_content
+    );
 }
 
 /// CP-q52x: Test that newly created node-backed subdirectories propagate without restart.
@@ -730,6 +1393,420 @@ fn test_node_backed_subdir_propagates_without_restart() {
         "File content should match. Got: {}",
         local_content
     );
+}
+
+/// CP-spbw: Ensure subdir lag recovery converges linked files without a fresh edit.
+///
+/// Scenario:
+/// 1. Set up fs-root -> node-backed subdir with two linked paths sharing one UUID
+/// 2. Start sync and verify both local linked files contain initial content
+/// 3. Pause sync process (SIGSTOP)
+/// 4. Publish one real server edit, then flood file topic with invalid MQTT payloads
+///    to force broadcast lag and drop the real edit from the in-process channel
+/// 5. Resume sync (SIGCONT) and verify lag recovery converges both linked paths
+///    to server content without publishing any additional real edit
+#[test]
+fn test_subdir_lag_recovery_converges_linked_paths_without_new_edit() {
+    #[cfg(not(unix))]
+    {
+        eprintln!("Skipping lag recovery test on non-unix (requires SIGSTOP/SIGCONT)");
+        return;
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+    let workspace = "workspace";
+    let initial_content = "subdir-lag-initial";
+    let recovered_content = "subdir-lag-recovered";
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    // Create fs-root, subdir schema document, and linked file document.
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse fs-root response");
+    let fs_root_id = body["id"].as_str().expect("No fs-root id in response");
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create subdir document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse subdir response");
+    let subdir_id = body["id"].as_str().expect("No subdir id in response");
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create linked file document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse linked file response");
+    let file_id = body["id"].as_str().expect("No file id in response");
+
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(initial_content)
+        .send()
+        .expect("Failed to write initial linked file content");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write initial linked file content: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    let subdir_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "linked-a.txt": { "type": "doc", "node_id": file_id },
+                "linked-b.txt": { "type": "doc", "node_id": file_id }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, subdir_id))
+        .header("Content-Type", "application/json")
+        .body(subdir_schema.to_string())
+        .send()
+        .expect("Failed to write subdir schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write subdir schema: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    let fs_root_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "linked": { "type": "dir", "node_id": subdir_id }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(fs_root_schema.to_string())
+        .send()
+        .expect("Failed to write fs-root schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write fs-root schema: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    // Start sync and wait until both linked paths are materialized.
+    let sync = spawn_sync_directory_with_initial_sync(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir,
+        fs_root_id,
+        "server",
+    );
+    let sync_pid = sync.id() as i32;
+    guard.add(sync);
+
+    let linked_a = sync_dir.join("linked").join("linked-a.txt");
+    let linked_b = sync_dir.join("linked").join("linked-b.txt");
+    wait_for_file_content_contains(&linked_a, initial_content, Duration::from_secs(10));
+    wait_for_file_content_contains(&linked_b, initial_content, Duration::from_secs(10));
+
+    // Pause sync process so edits accumulate, then publish one real edit.
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(sync_pid, libc::SIGSTOP);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let resp = client
+        .get(format!("{}/docs/{}/head", server_url, file_id))
+        .send()
+        .expect("Failed to fetch file head before recovery edit");
+    let head: serde_json::Value = resp
+        .json()
+        .expect("Failed to parse file head before recovery edit");
+    let parent_cid = head["cid"]
+        .as_str()
+        .expect("Missing parent cid for recovery edit");
+
+    let resp = client
+        .post(format!(
+            "{}/docs/{}/replace?parent_cid={}",
+            server_url, file_id, parent_cid
+        ))
+        .header("Content-Type", "text/plain")
+        .body(recovered_content)
+        .send()
+        .expect("Failed to write recovery content to server");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write recovery content: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    // Flood with invalid MQTT payloads to force lag and drop earlier in-process messages.
+    flood_invalid_edit_messages(&mqtt_broker, workspace, file_id, 3000);
+
+    // Resume sync. No additional real edits are published after this point.
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(sync_pid, libc::SIGCONT);
+    }
+
+    // Recovery should converge both linked paths to server content.
+    wait_for_file_content_contains(&linked_a, recovered_content, Duration::from_secs(20));
+    wait_for_file_content_contains(&linked_b, recovered_content, Duration::from_secs(20));
+}
+
+/// CP-kk3w: decode-failure fallback should reconcile root files immediately.
+///
+/// Scenario:
+/// 1. Sync a root-level file from schema
+/// 2. Delete it locally to create drift
+/// 3. Publish an invalid root schema edit payload (forces decode failure)
+/// 4. Verify cyan fallback applies recovered snapshot and re-materializes file content
+#[test]
+fn test_root_decode_failure_recovers_missing_file_from_snapshot() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+    let workspace = "workspace";
+    let file_content = "root decode recovery content";
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root");
+    let body: serde_json::Value = resp
+        .json()
+        .expect("Failed to parse fs-root create response");
+    let fs_root_id = body["id"].as_str().expect("Missing fs-root id");
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create file doc");
+    let body: serde_json::Value = resp.json().expect("Failed to parse file create response");
+    let file_id = body["id"].as_str().expect("Missing file id");
+
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(file_content)
+        .send()
+        .expect("Failed to write file content");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write file content: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    let schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "root-file.txt": { "type": "doc", "node_id": file_id }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(schema.to_string())
+        .send()
+        .expect("Failed to write root schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write root schema: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    guard.add(spawn_sync_directory_with_initial_sync(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir,
+        fs_root_id,
+        "server",
+    ));
+
+    let root_file = sync_dir.join("root-file.txt");
+    wait_for_file_content_contains(&root_file, file_content, Duration::from_secs(10));
+
+    std::fs::remove_file(&root_file).expect("Failed to remove local root file");
+    assert!(!root_file.exists(), "Root file should be deleted locally");
+
+    // Trigger decode failure in root schema handler.
+    flood_invalid_edit_messages(&mqtt_broker, workspace, fs_root_id, 20);
+
+    // Recovery should converge immediately from cyan snapshot.
+    wait_for_file_content_contains(&root_file, file_content, Duration::from_secs(20));
+}
+
+/// CP-kk3w: decode-failure fallback should reconcile subdir files immediately.
+///
+/// Scenario:
+/// 1. Sync a node-backed subdir file from schema
+/// 2. Delete it locally to create drift
+/// 3. Publish an invalid subdir schema edit payload (forces decode failure)
+/// 4. Verify cyan fallback applies recovered snapshot and re-materializes file content
+#[test]
+fn test_subdir_decode_failure_recovers_missing_file_from_snapshot() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+    let workspace = "workspace";
+    let file_content = "subdir decode recovery content";
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root");
+    let body: serde_json::Value = resp
+        .json()
+        .expect("Failed to parse fs-root create response");
+    let fs_root_id = body["id"].as_str().expect("Missing fs-root id");
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create subdir doc");
+    let body: serde_json::Value = resp.json().expect("Failed to parse subdir create response");
+    let subdir_id = body["id"].as_str().expect("Missing subdir id");
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create subdir file doc");
+    let body: serde_json::Value = resp
+        .json()
+        .expect("Failed to parse subdir file create response");
+    let file_id = body["id"].as_str().expect("Missing file id");
+
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(file_content)
+        .send()
+        .expect("Failed to write subdir file content");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write subdir file content: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    let subdir_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "nested-file.txt": { "type": "doc", "node_id": file_id }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, subdir_id))
+        .header("Content-Type", "application/json")
+        .body(subdir_schema.to_string())
+        .send()
+        .expect("Failed to write subdir schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write subdir schema: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    let fs_root_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "subdir": { "type": "dir", "node_id": subdir_id }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(fs_root_schema.to_string())
+        .send()
+        .expect("Failed to write fs-root schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write fs-root schema: {}",
+        resp.text().unwrap_or_default()
+    );
+
+    guard.add(spawn_sync_directory_with_initial_sync(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir,
+        fs_root_id,
+        "server",
+    ));
+
+    let nested_file = sync_dir.join("subdir").join("nested-file.txt");
+    wait_for_file_content_contains(&nested_file, file_content, Duration::from_secs(10));
+
+    std::fs::remove_file(&nested_file).expect("Failed to remove local subdir file");
+    assert!(
+        !nested_file.exists(),
+        "Subdir file should be deleted locally"
+    );
+
+    // Trigger decode failure in subdir schema handler.
+    flood_invalid_edit_messages(&mqtt_broker, workspace, subdir_id, 20);
+
+    // Recovery should converge immediately from cyan snapshot.
+    wait_for_file_content_contains(&nested_file, file_content, Duration::from_secs(20));
 }
 
 /// CP-k51z: Test that offline edits sync on reconnect.
@@ -1194,6 +2271,424 @@ fn test_local_new_subdir_with_file_updates_server_schemas() {
         "File content should match local. Got: {}",
         file_content
     );
+}
+
+/// CP-1skm: watcher create events must propagate in MQTT-only runtime.
+///
+/// Scenario:
+/// 1. Server starts with fs-root -> node-backed subdirectory
+/// 2. Two sync clients run with COMMONPLACE_MQTT_ONLY_SYNC=true
+/// 3. Client A creates a file inside the subdirectory
+/// 4. Verify subdir schema/file on server and client B checkout update
+#[test]
+fn test_mqtt_only_watcher_create_in_subdir_propagates_to_server_and_peer() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir_a = temp_dir.path().join("workspace-a");
+    let sync_dir_b = temp_dir.path().join("workspace-b");
+    std::fs::create_dir_all(&sync_dir_a).unwrap();
+    std::fs::create_dir_all(&sync_dir_b).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    // Create fs-root and a node-backed subdirectory document.
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse fs-root response");
+    let fs_root_id = body["id"].as_str().expect("Missing fs-root id").to_string();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create subdir document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse subdir response");
+    let subdir_id = body["id"].as_str().expect("Missing subdir id").to_string();
+
+    let empty_subdir_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {}
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, subdir_id))
+        .header("Content-Type", "application/json")
+        .body(empty_subdir_schema.to_string())
+        .send()
+        .expect("Failed to initialize subdir schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to initialize subdir schema: {}",
+        resp.status()
+    );
+
+    let root_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "shared": {
+                    "type": "dir",
+                    "node_id": subdir_id
+                }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(root_schema.to_string())
+        .send()
+        .expect("Failed to write fs-root schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write fs-root schema: {}",
+        resp.status()
+    );
+
+    guard.add(spawn_sync_directory_mqtt_only(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir_a,
+        &fs_root_id,
+    ));
+    guard.add(spawn_sync_directory_mqtt_only(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir_b,
+        &fs_root_id,
+    ));
+
+    let subdir_a = sync_dir_a.join("shared");
+    let subdir_b = sync_dir_b.join("shared");
+    wait_for_path_exists(&subdir_a, Duration::from_secs(30));
+    wait_for_path_exists(&subdir_b, Duration::from_secs(30));
+
+    let local_new_file = subdir_a.join("created-via-watcher.txt");
+    let content = "created from watcher path in mqtt-only runtime";
+    std::fs::write(&local_new_file, content).expect("Failed to create local watcher file");
+
+    let subdir_schema = wait_for_schema_entry_presence(
+        &client,
+        &server_url,
+        &subdir_id,
+        "created-via-watcher.txt",
+        Duration::from_secs(40),
+    );
+
+    let entries = subdir_schema["root"]["entries"]
+        .as_object()
+        .expect("Subdir schema missing entries object");
+    let file_entry = entries
+        .get("created-via-watcher.txt")
+        .expect("Subdir schema missing created file entry");
+    let file_node_id = file_entry["node_id"]
+        .as_str()
+        .expect("Created file entry missing node_id");
+
+    wait_for_head_content_contains(
+        &client,
+        &server_url,
+        file_node_id,
+        "mqtt-only runtime",
+        Duration::from_secs(40),
+    );
+
+    let peer_file = subdir_b.join("created-via-watcher.txt");
+    wait_for_file_content_contains(&peer_file, "mqtt-only runtime", Duration::from_secs(40));
+}
+
+/// CP-1skm: root watcher delete events must propagate in MQTT-only runtime.
+///
+/// Scenario:
+/// 1. Server starts with fs-root -> root file entry
+/// 2. Two sync clients run with COMMONPLACE_MQTT_ONLY_SYNC=true
+/// 3. Client A deletes the file locally
+/// 4. Verify fs-root schema entry is removed and client B file is deleted
+#[test]
+fn test_mqtt_only_watcher_delete_in_root_propagates_to_server_and_peer() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir_a = temp_dir.path().join("workspace-a");
+    let sync_dir_b = temp_dir.path().join("workspace-b");
+    std::fs::create_dir_all(&sync_dir_a).unwrap();
+    std::fs::create_dir_all(&sync_dir_b).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse fs-root response");
+    let fs_root_id = body["id"].as_str().expect("Missing fs-root id").to_string();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create file document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse file response");
+    let file_id = body["id"].as_str().expect("Missing file id").to_string();
+
+    let initial_content = "delete propagation baseline content";
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(initial_content)
+        .send()
+        .expect("Failed to write file content");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write file content: {}",
+        resp.status()
+    );
+
+    let root_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "delete-me.txt": {
+                    "type": "doc",
+                    "node_id": file_id
+                }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(root_schema.to_string())
+        .send()
+        .expect("Failed to write fs-root schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write fs-root schema: {}",
+        resp.status()
+    );
+
+    guard.add(spawn_sync_directory_mqtt_only(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir_a,
+        &fs_root_id,
+    ));
+    guard.add(spawn_sync_directory_mqtt_only(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir_b,
+        &fs_root_id,
+    ));
+
+    let file_a = sync_dir_a.join("delete-me.txt");
+    let file_b = sync_dir_b.join("delete-me.txt");
+    wait_for_file_content_contains(&file_a, "baseline content", Duration::from_secs(20));
+    wait_for_file_content_contains(&file_b, "baseline content", Duration::from_secs(20));
+    std::thread::sleep(Duration::from_secs(2));
+
+    std::fs::remove_file(&file_a).expect("Failed to delete local file on writer checkout");
+    wait_for_path_missing(&file_a, Duration::from_secs(5));
+
+    let updated_root_schema = wait_for_schema_entry_absence(
+        &client,
+        &server_url,
+        &fs_root_id,
+        "delete-me.txt",
+        Duration::from_secs(20),
+    );
+    let entries = updated_root_schema["root"]["entries"]
+        .as_object()
+        .expect("Updated fs-root schema missing entries object");
+    assert!(
+        !entries.contains_key("delete-me.txt"),
+        "fs-root schema should not contain delete-me.txt after watcher deletion"
+    );
+
+    wait_for_path_missing(&file_b, Duration::from_secs(20));
+}
+
+/// CP-ntgh: subdir watcher delete events must propagate in MQTT-only runtime.
+///
+/// Scenario:
+/// 1. Server starts with fs-root -> node-backed subdirectory -> file entry
+/// 2. Two sync clients run with COMMONPLACE_MQTT_ONLY_SYNC=true
+/// 3. Client A deletes the subdir file locally
+/// 4. Verify subdir schema entry is removed and client B file is deleted
+#[test]
+fn test_mqtt_only_watcher_delete_in_subdir_propagates_to_server_and_peer() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir_a = temp_dir.path().join("workspace-a");
+    let sync_dir_b = temp_dir.path().join("workspace-b");
+    std::fs::create_dir_all(&sync_dir_a).unwrap();
+    std::fs::create_dir_all(&sync_dir_b).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse fs-root response");
+    let fs_root_id = body["id"].as_str().expect("Missing fs-root id").to_string();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create subdir document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse subdir response");
+    let subdir_id = body["id"].as_str().expect("Missing subdir id").to_string();
+
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "text/plain")
+        .send()
+        .expect("Failed to create file document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse file response");
+    let file_id = body["id"].as_str().expect("Missing file id").to_string();
+
+    let initial_content = "subdir delete propagation baseline content";
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, file_id))
+        .header("Content-Type", "text/plain")
+        .body(initial_content)
+        .send()
+        .expect("Failed to write file content");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write file content: {}",
+        resp.status()
+    );
+
+    let subdir_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "delete-me.txt": {
+                    "type": "doc",
+                    "node_id": file_id
+                }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, subdir_id))
+        .header("Content-Type", "application/json")
+        .body(subdir_schema.to_string())
+        .send()
+        .expect("Failed to write subdir schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write subdir schema: {}",
+        resp.status()
+    );
+
+    let root_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "shared": {
+                    "type": "dir",
+                    "node_id": subdir_id
+                }
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(root_schema.to_string())
+        .send()
+        .expect("Failed to write fs-root schema");
+    assert!(
+        resp.status().is_success(),
+        "Failed to write fs-root schema: {}",
+        resp.status()
+    );
+
+    guard.add(spawn_sync_directory_mqtt_only(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir_a,
+        &fs_root_id,
+    ));
+    guard.add(spawn_sync_directory_mqtt_only(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir_b,
+        &fs_root_id,
+    ));
+
+    let subdir_a = sync_dir_a.join("shared");
+    let subdir_b = sync_dir_b.join("shared");
+    wait_for_path_exists(&subdir_a, Duration::from_secs(20));
+    wait_for_path_exists(&subdir_b, Duration::from_secs(20));
+
+    let file_a = subdir_a.join("delete-me.txt");
+    let file_b = subdir_b.join("delete-me.txt");
+    wait_for_file_content_contains(&file_a, "baseline content", Duration::from_secs(20));
+    wait_for_file_content_contains(&file_b, "baseline content", Duration::from_secs(20));
+    std::thread::sleep(Duration::from_secs(2));
+
+    std::fs::remove_file(&file_a).expect("Failed to delete local subdir file on writer checkout");
+    wait_for_path_missing(&file_a, Duration::from_secs(5));
+
+    let updated_subdir_schema = wait_for_schema_entry_absence(
+        &client,
+        &server_url,
+        &subdir_id,
+        "delete-me.txt",
+        Duration::from_secs(25),
+    );
+    let entries = updated_subdir_schema["root"]["entries"]
+        .as_object()
+        .expect("Updated subdir schema missing entries object");
+    assert!(
+        !entries.contains_key("delete-me.txt"),
+        "Subdir schema should not contain delete-me.txt after watcher deletion"
+    );
+
+    wait_for_path_missing(&file_b, Duration::from_secs(25));
 }
 
 /// CP-rwaw: Test that initial sync assigns UUIDs directly (not via reconciler).

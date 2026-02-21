@@ -18,26 +18,28 @@ use commonplace_doc::sync::subdir_spawn::{
 };
 use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
-    acquire_sync_lock, add_file_to_schema, build_head_url, build_info_url,
+    acquire_sync_lock, add_file_to_schema, build_uuid_map_and_write_schemas,
     build_uuid_map_from_local_schemas, check_server_has_content_mqtt, create_new_file,
-    detect_from_path, directory_mqtt_task, directory_watcher_task, discover_fs_root,
-    ensure_fs_root_exists_mqtt, ensure_parent_directories_exist, find_owning_document,
-    handle_file_deleted, handle_file_modified, handle_schema_change, handle_schema_modified,
-    push_local_if_differs, push_schema_to_server, remove_file_from_schema,
+    detect_from_path, directory_mqtt_task, directory_watcher_task, ensure_fs_root_exists_mqtt,
+    ensure_parent_directories_exist, find_owning_document, handle_file_deleted,
+    handle_file_modified, handle_schema_modified, push_local_if_differs, remove_file_from_schema,
     remove_file_state_and_abort, rename_file_in_schema, resync_crdt_state_via_cyan_with_pending,
-    schema_to_json, spawn_command_listener, spawn_file_sync_tasks_crdt, sync_schema,
+    schema_to_json, set_sync_ancestry_mqtt_context, set_sync_http_disabled,
+    set_sync_schema_mqtt_request_client, spawn_command_listener, spawn_file_sync_tasks_crdt,
     trace_timeline, wait_for_file_stability, write_schema_file, ymap_schema, CrdtFileSyncContext,
     DirEvent, FileSyncState, InodeKey, InodeTracker, InodeTrackerInit, MqttOnlySyncConfig,
-    ScanOptions, SubdirStateCache, SyncError, SyncState, TimelineMilestone, SCHEMA_FILENAME,
+    ScanOptions, SubdirStateCache, SyncAncestryMqttContext, SyncError, SyncState,
+    TimelineMilestone, SCHEMA_FILENAME,
 };
 use commonplace_doc::workspace::is_process_running;
 use commonplace_doc::{DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
 use reqwest::Client;
 use rumqttc::QoS;
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
@@ -49,6 +51,90 @@ use tokio::task::JoinHandle;
 
 /// Default shadow dir when running with inode tracking enabled.
 const DEFAULT_SHADOW_DIR: &str = "/tmp/commonplace-sync/hardlinks";
+
+fn watcher_create_trace_enabled() -> bool {
+    std::env::var_os("COMMONPLACE_TRACE_WATCHER_CREATE").is_some()
+}
+
+fn append_sandbox_trace(msg: &str) {
+    if !watcher_create_trace_enabled() {
+        return;
+    }
+
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/sandbox-trace.log")
+    {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let _ = writeln!(file, "[{} pid={}] {}", timestamp, pid, msg);
+    }
+}
+
+fn panic_payload_to_string(payload: &(dyn Any + Send + 'static)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "<non-string panic payload>".to_string()
+}
+
+fn log_dir_event_join_error(context: &str, join_error: tokio::task::JoinError) {
+    if join_error.is_panic() {
+        let panic_payload = panic_payload_to_string(join_error.into_panic().as_ref());
+        if watcher_create_trace_enabled() {
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            error!(
+                "{} panicked: payload={} backtrace={}",
+                context, panic_payload, backtrace
+            );
+            append_sandbox_trace(&format!(
+                "{} panic payload={} backtrace={}",
+                context, panic_payload, backtrace
+            ));
+        } else {
+            error!("{} panicked: payload={}", context, panic_payload);
+            append_sandbox_trace(&format!("{} panic payload={}", context, panic_payload));
+        }
+        return;
+    }
+
+    error!("{} failed: {}", context, join_error);
+    append_sandbox_trace(&format!("{} failed: {}", context, join_error));
+}
+
+fn install_panic_trace_hook() {
+    static PANIC_HOOK_ONCE: Once = Once::new();
+    PANIC_HOOK_ONCE.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            let payload = panic_payload_to_string(panic_info.payload());
+            let location = panic_info
+                .location()
+                .map(|loc| format!("{}:{}", loc.file(), loc.line()))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let backtrace = std::backtrace::Backtrace::force_capture();
+
+            error!(
+                "Unhandled panic captured: payload={} location={} backtrace={}",
+                payload, location, backtrace
+            );
+            append_sandbox_trace(&format!(
+                "UNHANDLED_PANIC payload={} location={} backtrace={}",
+                payload, location, backtrace
+            ));
+
+            default_hook(panic_info);
+        }));
+    });
+}
 
 fn resolve_shadow_dir(shadow_dir: &str, base_dir: &Path) -> String {
     if shadow_dir.is_empty() {
@@ -102,6 +188,8 @@ async fn publish_initial_sync_complete(
 struct WatcherSetup {
     /// Receiver for directory events from the watcher task.
     dir_rx: mpsc::Receiver<DirEvent>,
+    /// Sender for synthetic directory events injected by sync startup reconciliation.
+    dir_tx: mpsc::Sender<DirEvent>,
     /// Handle to the watcher task (None if pull-only mode).
     watcher_handle: Option<JoinHandle<()>>,
     /// Tracks which subdirectories have subscription tasks.
@@ -122,7 +210,7 @@ fn setup_directory_watchers(
     let watcher_handle = if !pull_only {
         Some(tokio::spawn(directory_watcher_task(
             directory,
-            dir_tx,
+            dir_tx.clone(),
             options,
             Some(written_schemas),
         )))
@@ -133,14 +221,426 @@ fn setup_directory_watchers(
 
     WatcherSetup {
         dir_rx,
+        dir_tx,
         watcher_handle,
         watched_subdirs: Arc::new(RwLock::new(HashSet::new())),
     }
 }
 
+fn is_startup_temp_file(name: &str) -> bool {
+    if name.starts_with("tmp") && name.len() >= 6 {
+        let suffix = &name[3..];
+        if suffix.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return true;
+        }
+    }
+
+    if name.ends_with(".tmp")
+        || name.ends_with(".temp")
+        || name.ends_with(".swp")
+        || name.ends_with(".swx")
+        || name.ends_with("~")
+    {
+        return true;
+    }
+
+    if name.starts_with('.') && name.ends_with(".swp") {
+        return true;
+    }
+
+    if name.starts_with('#') && name.ends_with('#') {
+        return true;
+    }
+
+    false
+}
+
+fn normalize_relative_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn collect_untracked_startup_files(
+    root: &Path,
+    current: &Path,
+    options: &ScanOptions,
+    tracked_relative_paths: &HashSet<String>,
+    out: &mut Vec<PathBuf>,
+) {
+    let entries = match std::fs::read_dir(current) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = match entry.file_name().to_str() {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+
+        if !options.include_hidden && file_name.starts_with('.') {
+            continue;
+        }
+
+        if file_name == SCHEMA_FILENAME || is_startup_temp_file(&file_name) {
+            continue;
+        }
+
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if file_type.is_dir() {
+            collect_untracked_startup_files(root, &path, options, tracked_relative_paths, out);
+            continue;
+        }
+
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let relative = match path.strip_prefix(root) {
+            Ok(rel) => normalize_relative_path(rel),
+            Err(_) => continue,
+        };
+
+        if tracked_relative_paths.contains(&relative) {
+            continue;
+        }
+
+        out.push(path);
+    }
+}
+
+async fn enqueue_startup_untracked_created_events(
+    directory: &Path,
+    options: &ScanOptions,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    dir_tx: &mpsc::Sender<DirEvent>,
+) {
+    let tracked_relative_paths: HashSet<String> = {
+        let states = file_states.read().await;
+        states.keys().cloned().collect()
+    };
+
+    let mut untracked_files = Vec::new();
+    collect_untracked_startup_files(
+        directory,
+        directory,
+        options,
+        &tracked_relative_paths,
+        &mut untracked_files,
+    );
+
+    if untracked_files.is_empty() {
+        return;
+    }
+
+    untracked_files.sort();
+    info!(
+        "Startup reconciliation found {} untracked local file(s); queueing synthetic create events",
+        untracked_files.len()
+    );
+    append_sandbox_trace(&format!(
+        "STARTUP_RECONCILE untracked_count={} directory={}",
+        untracked_files.len(),
+        directory.display()
+    ));
+
+    for path in untracked_files {
+        if let Err(e) = dir_tx.send(DirEvent::Created(path.clone())).await {
+            warn!(
+                "Startup reconciliation could not enqueue {}; directory event channel closed: {}",
+                path.display(),
+                e
+            );
+            append_sandbox_trace(&format!(
+                "STARTUP_RECONCILE channel_closed path={}",
+                path.display()
+            ));
+            break;
+        }
+        append_sandbox_trace(&format!(
+            "STARTUP_RECONCILE queued_created path={}",
+            path.display()
+        ));
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupSyncPlan {
+    BootstrapLocal,
+    LocalAuthoritative,
+    ServerAuthoritative,
+    BootstrapServer,
+    SkipExisting,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StartupSyncDecision {
+    plan: StartupSyncPlan,
+    use_server_schema: bool,
+    push_local_schemas: bool,
+    include_missing_file_states: bool,
+    push_local_content: bool,
+    materialize_server_content: bool,
+}
+
+fn decide_startup_sync(
+    initial_sync_strategy: &str,
+    server_has_content: bool,
+    local_schema_exists: bool,
+    push_only: bool,
+    pull_only: bool,
+) -> StartupSyncDecision {
+    let mut decision = if !server_has_content {
+        StartupSyncDecision {
+            plan: StartupSyncPlan::BootstrapLocal,
+            use_server_schema: false,
+            push_local_schemas: true,
+            include_missing_file_states: false,
+            push_local_content: true,
+            materialize_server_content: false,
+        }
+    } else {
+        match initial_sync_strategy {
+            "local" => StartupSyncDecision {
+                plan: StartupSyncPlan::LocalAuthoritative,
+                use_server_schema: false,
+                push_local_schemas: true,
+                include_missing_file_states: false,
+                push_local_content: true,
+                materialize_server_content: false,
+            },
+            "server" => StartupSyncDecision {
+                plan: StartupSyncPlan::ServerAuthoritative,
+                use_server_schema: true,
+                push_local_schemas: false,
+                include_missing_file_states: true,
+                push_local_content: false,
+                materialize_server_content: true,
+            },
+            "skip" if local_schema_exists => StartupSyncDecision {
+                plan: StartupSyncPlan::SkipExisting,
+                use_server_schema: false,
+                push_local_schemas: false,
+                include_missing_file_states: false,
+                push_local_content: false,
+                materialize_server_content: false,
+            },
+            "skip" => StartupSyncDecision {
+                plan: StartupSyncPlan::BootstrapServer,
+                use_server_schema: true,
+                push_local_schemas: false,
+                include_missing_file_states: true,
+                push_local_content: false,
+                materialize_server_content: true,
+            },
+            _ => StartupSyncDecision {
+                plan: StartupSyncPlan::SkipExisting,
+                use_server_schema: false,
+                push_local_schemas: false,
+                include_missing_file_states: false,
+                push_local_content: false,
+                materialize_server_content: false,
+            },
+        }
+    };
+
+    if pull_only {
+        decision.push_local_schemas = false;
+        decision.push_local_content = false;
+    }
+
+    if push_only {
+        decision.use_server_schema = false;
+        decision.include_missing_file_states = false;
+        decision.materialize_server_content = false;
+    }
+
+    decision
+}
+
+fn collect_local_schema_paths(directory: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut stack = vec![directory.to_path_buf()];
+
+    while let Some(current) = stack.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(e) => e,
+            Err(e) => {
+                debug!(
+                    "Skipping unreadable directory while collecting schemas ({}): {}",
+                    current.display(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(e) => {
+                    debug!("Skipping unreadable entry {}: {}", path.display(), e);
+                    continue;
+                }
+            };
+
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+
+            if file_type.is_file()
+                && path.file_name().and_then(|n| n.to_str()) == Some(SCHEMA_FILENAME)
+            {
+                paths.push(path);
+            }
+        }
+    }
+
+    paths.sort_by_key(|p| {
+        p.strip_prefix(directory)
+            .map(|rel| rel.components().count())
+            .unwrap_or(usize::MAX)
+    });
+    paths
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn push_local_schemas_via_mqtt(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    directory: &Path,
+    author: &str,
+    written_schemas: &WrittenSchemas,
+    crdt_context: &CrdtFileSyncContext,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let schema_paths = collect_local_schema_paths(directory);
+    if schema_paths.is_empty() {
+        info!(
+            "No local schema files found under {}; skipping local schema publish",
+            directory.display()
+        );
+        return Ok(0);
+    }
+
+    let mut published = 0usize;
+    for schema_path in schema_paths {
+        let content = tokio::fs::read_to_string(&schema_path).await.map_err(|e| {
+            format!(
+                "Failed to read local schema {}: {}",
+                schema_path.display(),
+                e
+            )
+        })?;
+
+        handle_schema_modified(
+            client,
+            server,
+            fs_root_id,
+            directory,
+            &schema_path,
+            &content,
+            author,
+            Some(written_schemas),
+            Some(crdt_context),
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "Failed to publish local schema {} via MQTT: {}",
+                schema_path.display(),
+                e
+            )
+        })?;
+
+        published += 1;
+    }
+
+    Ok(published)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_startup_uuid_map(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    directory: &Path,
+    author: &str,
+    local_schema_exists: bool,
+    decision: StartupSyncDecision,
+    written_schemas: &WrittenSchemas,
+    crdt_context: &CrdtFileSyncContext,
+) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
+    if decision.push_local_schemas {
+        let published = push_local_schemas_via_mqtt(
+            client,
+            server,
+            fs_root_id,
+            directory,
+            author,
+            written_schemas,
+            crdt_context,
+        )
+        .await?;
+        info!(
+            "Published {} local schema file(s) for startup plan {:?}",
+            published, decision.plan
+        );
+    }
+
+    let mut uuid_map = HashMap::new();
+
+    if decision.use_server_schema {
+        let (server_uuid_map, all_succeeded) = build_uuid_map_and_write_schemas(
+            client,
+            server,
+            fs_root_id,
+            directory,
+            Some(written_schemas),
+        )
+        .await;
+
+        if !all_succeeded {
+            warn!(
+                "Startup schema fetch had partial failures (plan {:?}); UUID map may be incomplete",
+                decision.plan
+            );
+        }
+
+        if server_uuid_map.is_empty() && local_schema_exists {
+            warn!("Server-derived UUID map is empty; falling back to local schemas for startup");
+            build_uuid_map_from_local_schemas(directory, "", &mut uuid_map);
+        } else {
+            uuid_map = server_uuid_map;
+        }
+    } else {
+        build_uuid_map_from_local_schemas(directory, "", &mut uuid_map);
+    }
+
+    info!(
+        "Startup plan {:?} prepared UUID map with {} entries",
+        decision.plan,
+        uuid_map.len()
+    );
+
+    Ok(uuid_map)
+}
+
 /// Optional CRDT parameters for handling directory events via MQTT instead of HTTP.
+#[derive(Clone)]
 struct CrdtEventParams {
     mqtt_client: Arc<MqttClient>,
+    mqtt_request: Arc<MqttRequestClient>,
     workspace: String,
     crdt_state: Arc<RwLock<DirectorySyncState>>,
     subdir_cache: Arc<SubdirStateCache>,
@@ -170,6 +670,11 @@ async fn handle_dir_event(
 ) {
     match event {
         DirEvent::Created(path) => {
+            append_sandbox_trace(&format!(
+                "DIR_EVENT created path={} has_crdt_params={}",
+                path.display(),
+                crdt_params.is_some()
+            ));
             if let Some(crdt) = crdt_params {
                 handle_file_created_crdt(
                     client,
@@ -234,9 +739,15 @@ async fn handle_dir_event(
         }
         DirEvent::SchemaModified(path, content) => {
             info!("User edited schema file: {}", path.display());
+            append_sandbox_trace(&format!(
+                "DIR_EVENT schema_modified path={} content_len={}",
+                path.display(),
+                content.len()
+            ));
             // Build CrdtFileSyncContext from CrdtEventParams if available
             let crdt_ctx = crdt_params.map(|p| CrdtFileSyncContext {
                 mqtt_client: p.mqtt_client.clone(),
+                mqtt_request: p.mqtt_request.clone(),
                 workspace: p.workspace.clone(),
                 crdt_state: p.crdt_state.clone(),
                 subdir_cache: p.subdir_cache.clone(),
@@ -256,6 +767,16 @@ async fn handle_dir_event(
             .await
             {
                 warn!("Failed to push schema change: {}", e);
+                append_sandbox_trace(&format!(
+                    "DIR_EVENT schema_modified_err path={} err={}",
+                    path.display(),
+                    e
+                ));
+            } else {
+                append_sandbox_trace(&format!(
+                    "DIR_EVENT schema_modified_ok path={}",
+                    path.display()
+                ));
             }
         }
     }
@@ -282,6 +803,13 @@ async fn handle_file_created_crdt(
     pull_only: bool,
     written_schemas: Option<&WrittenSchemas>,
 ) {
+    append_sandbox_trace(&format!(
+        "CREATE_HANDLER start path={} directory={} fs_root_id={}",
+        path.display(),
+        directory.display(),
+        fs_root_id
+    ));
+
     // Skip directories - they will be created via ensure_parent_directories_exist
     // when a file inside them is created
     if path.is_dir() {
@@ -289,6 +817,7 @@ async fn handle_file_created_crdt(
             "Skipping directory in handle_file_created_crdt: {}",
             path.display()
         );
+        append_sandbox_trace(&format!("CREATE_HANDLER skip_dir path={}", path.display()));
         return;
     }
     // Get filename from path
@@ -296,6 +825,10 @@ async fn handle_file_created_crdt(
         Some(n) => n.to_string(),
         None => {
             warn!("Could not get filename from path: {}", path.display());
+            append_sandbox_trace(&format!(
+                "CREATE_HANDLER no_filename path={}",
+                path.display()
+            ));
             return;
         }
     };
@@ -317,25 +850,40 @@ async fn handle_file_created_crdt(
     });
     if should_ignore {
         debug!("Ignoring new file (matches ignore pattern): {}", filename);
+        append_sandbox_trace(&format!(
+            "CREATE_HANDLER ignore_pattern filename={}",
+            filename
+        ));
         return;
     }
 
     // Skip hidden files unless configured
     if !options.include_hidden && filename.starts_with('.') {
         debug!("Ignoring hidden file: {}", filename);
+        append_sandbox_trace(&format!("CREATE_HANDLER hidden_skip filename={}", filename));
         return;
     }
 
     // Skip if pull-only mode
     if pull_only {
         debug!("Skipping file creation in pull-only mode: {}", filename);
+        append_sandbox_trace(&format!("CREATE_HANDLER pull_only filename={}", filename));
         return;
     }
 
-    // Calculate relative path from root directory
-    // Canonicalize both paths to ensure prefix stripping works correctly
-    // when path is absolute and directory is relative (from --directory arg)
-    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Calculate relative path from root directory.
+    // Normalize to an absolute path first so strip_prefix works even when
+    // directory input is relative.
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let canonical_path = absolute_path
+        .canonicalize()
+        .unwrap_or_else(|_| absolute_path.clone());
     let canonical_directory = directory
         .canonicalize()
         .unwrap_or_else(|_| directory.to_path_buf());
@@ -351,6 +899,12 @@ async fn handle_file_created_crdt(
             filename.clone()
         }
     };
+    append_sandbox_trace(&format!(
+        "CREATE_HANDLER resolved relative_path={} canonical_path={} canonical_directory={}",
+        relative_path,
+        canonical_path.display(),
+        canonical_directory.display()
+    ));
 
     // Check for rename via inode tracking (same-directory renames only).
     // When a file is renamed (mv foo.txt bar.txt), the watcher sees Delete(foo) + Create(bar).
@@ -467,11 +1021,10 @@ async fn handle_file_created_crdt(
         }
     }
 
-    // Ensure parent directories exist as node-backed directories
-    // When CRDT context is available, uses local UUID gen + MQTT publish.
-    // Otherwise falls back to HTTP for directory creation.
+    // Ensure parent directories exist as node-backed directories via MQTT/CRDT.
     let crdt_ctx = Some(CrdtFileSyncContext {
         mqtt_client: crdt.mqtt_client.clone(),
+        mqtt_request: crdt.mqtt_request.clone(),
         workspace: crdt.workspace.clone(),
         crdt_state: crdt.crdt_state.clone(),
         subdir_cache: crdt.subdir_cache.clone(),
@@ -495,7 +1048,16 @@ async fn handle_file_created_crdt(
             "Failed to ensure parent directories for {}: {}",
             relative_path, e
         );
+        append_sandbox_trace(&format!(
+            "CREATE_HANDLER ensure_parents_err relative_path={} err={}",
+            relative_path, e
+        ));
         // Continue anyway - find_owning_document may still work if some directories exist
+    } else {
+        append_sandbox_trace(&format!(
+            "CREATE_HANDLER ensure_parents_ok relative_path={}",
+            relative_path
+        ));
     }
 
     // Find which document owns this file (may be a node-backed subdirectory)
@@ -504,6 +1066,13 @@ async fn handle_file_created_crdt(
         "CRDT file created: {} owned by document {} (relative: {})",
         relative_path, owning_doc.document_id, owning_doc.relative_path
     );
+    append_sandbox_trace(&format!(
+        "CREATE_HANDLER owning_doc relative_path={} document_id={} owning_relative={} owning_dir={}",
+        relative_path,
+        owning_doc.document_id,
+        owning_doc.relative_path,
+        owning_doc.directory.display()
+    ));
 
     // Check if file is already being tracked - don't create duplicate UUIDs.
     {
@@ -513,6 +1082,10 @@ async fn handle_file_created_crdt(
                 "File '{}' already in file_states, skipping create_new_file",
                 relative_path
             );
+            append_sandbox_trace(&format!(
+                "CREATE_HANDLER already_tracked relative_path={}",
+                relative_path
+            ));
             return;
         }
     }
@@ -527,6 +1100,11 @@ async fn handle_file_created_crdt(
             path.display(),
             e
         );
+        append_sandbox_trace(&format!(
+            "CREATE_HANDLER stability_err path={} err={}",
+            path.display(),
+            e
+        ));
         return;
     }
 
@@ -535,15 +1113,29 @@ async fn handle_file_created_crdt(
         Ok(c) => c,
         Err(e) => {
             warn!("Failed to read new file {}: {}", path.display(), e);
+            append_sandbox_trace(&format!(
+                "CREATE_HANDLER read_err path={} err={}",
+                path.display(),
+                e
+            ));
             return;
         }
     };
+    append_sandbox_trace(&format!(
+        "CREATE_HANDLER read_ok relative_path={} content_len={}",
+        relative_path,
+        content.len()
+    ));
 
     // Determine which DirectorySyncState to use
     // If the file is in a subdirectory, we need to load that subdirectory's state
     let is_subdirectory = owning_doc.document_id != fs_root_id;
 
     if is_subdirectory {
+        append_sandbox_trace(&format!(
+            "CREATE_HANDLER subdir_branch relative_path={} subdir_doc_id={} owning_relative={}",
+            relative_path, owning_doc.document_id, owning_doc.relative_path
+        ));
         // Load or create state for the subdirectory from cache
         let subdir_node_id = match uuid::Uuid::parse_str(&owning_doc.document_id) {
             Ok(id) => id,
@@ -552,6 +1144,10 @@ async fn handle_file_created_crdt(
                     "Invalid subdirectory node_id '{}': {}",
                     owning_doc.document_id, e
                 );
+                append_sandbox_trace(&format!(
+                    "CREATE_HANDLER invalid_subdir_uuid document_id={} err={}",
+                    owning_doc.document_id, e
+                ));
                 return;
             }
         };
@@ -568,6 +1164,11 @@ async fn handle_file_created_crdt(
                     owning_doc.directory.display(),
                     e
                 );
+                append_sandbox_trace(&format!(
+                    "CREATE_HANDLER subdir_state_load_err dir={} err={}",
+                    owning_doc.directory.display(),
+                    e
+                ));
                 return;
             }
         };
@@ -580,11 +1181,19 @@ async fn handle_file_created_crdt(
                     "File '{}' already in subdirectory CRDT state, skipping",
                     owning_doc.relative_path
                 );
+                append_sandbox_trace(&format!(
+                    "CREATE_HANDLER already_in_subdir_state owning_relative={}",
+                    owning_doc.relative_path
+                ));
                 return;
             }
         }
 
         // Create file via CRDT using subdirectory state
+        append_sandbox_trace(&format!(
+            "CREATE_HANDLER create_new_file subdir owning_relative={} subdir_doc_id={}",
+            owning_doc.relative_path, owning_doc.document_id
+        ));
         let result = {
             let mut subdir_state = subdir_state_arc.write().await;
             // Ensure schema Y.Doc has existing entries before adding new file.
@@ -607,6 +1216,10 @@ async fn handle_file_created_crdt(
 
         match result {
             Ok(new_file) => {
+                append_sandbox_trace(&format!(
+                    "CREATE_HANDLER create_new_file_ok subdir owning_relative={} uuid={}",
+                    owning_doc.relative_path, new_file.uuid
+                ));
                 info!(
                     "Created file '{}' via CRDT in subdir {}: uuid={}, schema_cid={}, file_cid={}",
                     owning_doc.relative_path,
@@ -749,6 +1362,10 @@ async fn handle_file_created_crdt(
                 );
             }
             Err(e) => {
+                append_sandbox_trace(&format!(
+                    "CREATE_HANDLER create_new_file_err subdir owning_relative={} err={}",
+                    owning_doc.relative_path, e
+                ));
                 warn!(
                     "Failed to create file '{}' via CRDT in subdir: {}",
                     owning_doc.relative_path, e
@@ -756,6 +1373,10 @@ async fn handle_file_created_crdt(
             }
         }
     } else {
+        append_sandbox_trace(&format!(
+            "CREATE_HANDLER root_branch relative_path={} filename={}",
+            relative_path, filename
+        ));
         // File is in the root directory - use the existing crdt_state
         // Check if already tracked in root CRDT state
         {
@@ -765,11 +1386,19 @@ async fn handle_file_created_crdt(
                     "File '{}' already in root CRDT state, skipping create_new_file",
                     filename
                 );
+                append_sandbox_trace(&format!(
+                    "CREATE_HANDLER already_in_root_state filename={}",
+                    filename
+                ));
                 return;
             }
         }
 
         // Create file via CRDT using root state
+        append_sandbox_trace(&format!(
+            "CREATE_HANDLER create_new_file root filename={}",
+            filename
+        ));
         let result = {
             let mut state = crdt.crdt_state.write().await;
             state.ensure_schema_initialized(directory).await;
@@ -786,6 +1415,10 @@ async fn handle_file_created_crdt(
 
         match result {
             Ok(new_file) => {
+                append_sandbox_trace(&format!(
+                    "CREATE_HANDLER create_new_file_ok root filename={} uuid={}",
+                    filename, new_file.uuid
+                ));
                 info!(
                     "Created file '{}' via CRDT: uuid={}, schema_cid={}, file_cid={}",
                     filename, new_file.uuid, new_file.schema_cid, new_file.file_cid
@@ -832,6 +1465,10 @@ async fn handle_file_created_crdt(
                 );
             }
             Err(e) => {
+                append_sandbox_trace(&format!(
+                    "CREATE_HANDLER create_new_file_err root filename={} err={}",
+                    filename, e
+                ));
                 warn!("Failed to create file '{}' via CRDT: {}", filename, e);
             }
         }
@@ -1289,10 +1926,19 @@ async fn handle_file_deleted_crdt(
         return;
     }
 
-    // Calculate relative path from root directory
-    // Canonicalize both paths to ensure prefix stripping works correctly
-    // when path is absolute and directory is relative (from --directory arg)
-    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Calculate relative path from root directory.
+    // For deletions, the path may no longer exist, so canonicalize() can fail.
+    // Normalize to an absolute path first, then strip the canonical directory prefix.
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let canonical_path = absolute_path
+        .canonicalize()
+        .unwrap_or_else(|_| absolute_path.clone());
     let canonical_directory = directory
         .canonicalize()
         .unwrap_or_else(|_| directory.to_path_buf());
@@ -1656,224 +2302,6 @@ struct Args {
     mqtt_only_sync: bool,
 }
 
-/// Resolve a path relative to fs-root to a UUID.
-///
-/// Discovers the fs-root first, then traverses the schema hierarchy.
-/// For example, "bartleby" finds schema.root.entries["bartleby"].node_id
-/// For nested paths like "foo/bar", follows intermediate node_ids.
-async fn resolve_path_to_uuid(
-    client: &Client,
-    server: &str,
-    path: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    use commonplace_doc::sync::resolve_path_to_uuid_http;
-
-    let fs_root_id = discover_fs_root(client, server).await?;
-    resolve_path_to_uuid_http(client, server, &fs_root_id, path).await
-}
-
-/// Resolve a path to UUID, or create the document if it doesn't exist.
-///
-/// This function first tries to resolve the path normally. If the final segment
-/// doesn't exist (but the parent path does), it creates a new entry in the parent's
-/// schema and waits for the reconciler to assign a UUID.
-///
-/// This is used for single-file sync when the server path doesn't exist yet.
-async fn resolve_or_create_path(
-    client: &Client,
-    server: &str,
-    path: &str,
-    local_file: &std::path::Path,
-    author: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // First try to resolve normally
-    match resolve_path_to_uuid(client, server, path).await {
-        Ok(id) => return Ok(id),
-        Err(e) => {
-            let err_msg = e.to_string();
-            // Only proceed if it's a "not found" error for the final segment
-            if !err_msg.contains("not found") && !err_msg.contains("no entry") {
-                return Err(e);
-            }
-            info!("Path '{}' not found, will create it", path);
-        }
-    }
-
-    // Split path into parent and filename
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if segments.is_empty() {
-        return Err("Cannot create document at root path".into());
-    }
-
-    let filename = segments.last().unwrap();
-    let parent_segments = &segments[..segments.len() - 1];
-
-    // Get the parent document ID
-    let (parent_id, parent_path) = if parent_segments.is_empty() {
-        // Parent is fs-root
-        let fs_root_id = discover_fs_root(client, server).await?;
-        (fs_root_id, "fs-root".to_string())
-    } else {
-        // Resolve parent path (must exist)
-        let parent_path_str = parent_segments.join("/");
-        let parent_id = resolve_path_to_uuid(client, server, &parent_path_str).await?;
-        (parent_id, parent_path_str)
-    };
-
-    info!(
-        "Creating '{}' in parent '{}' ({})",
-        filename, parent_path, parent_id
-    );
-
-    // Fetch current parent schema
-    let head_url = build_head_url(server, &parent_id, false);
-    let resp = client.get(&head_url).send().await?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Failed to fetch parent schema: HTTP {}", resp.status()).into());
-    }
-
-    #[derive(serde::Deserialize, serde::Serialize, Clone, Default)]
-    struct Schema {
-        #[serde(default)]
-        version: u32,
-        #[serde(default)]
-        root: SchemaRoot,
-    }
-
-    #[derive(serde::Deserialize, serde::Serialize, Clone)]
-    struct SchemaRoot {
-        #[serde(rename = "type")]
-        entry_type: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        entries: Option<std::collections::HashMap<String, SchemaEntry>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        node_id: Option<String>,
-    }
-
-    impl Default for SchemaRoot {
-        fn default() -> Self {
-            Self {
-                entry_type: "dir".to_string(),
-                entries: None,
-                node_id: None,
-            }
-        }
-    }
-
-    #[derive(serde::Deserialize, serde::Serialize, Clone)]
-    struct SchemaEntry {
-        #[serde(rename = "type")]
-        entry_type: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        node_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        content_type: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct HeadResp {
-        content: String,
-    }
-
-    let head: HeadResp = resp.json().await?;
-    // Parse schema, handling empty "{}" case
-    let mut schema: Schema = if head.content.trim() == "{}" {
-        Schema {
-            version: 1,
-            root: SchemaRoot::default(),
-        }
-    } else {
-        serde_json::from_str(&head.content)?
-    };
-
-    // Determine content type from local file
-    let content_info = detect_from_path(local_file);
-    let content_type = content_info.mime_type;
-
-    // Add entry for the new file with None node_id.
-    // Server's reconciler will generate the UUID to ensure all clients get the same one.
-    let entries = schema
-        .root
-        .entries
-        .get_or_insert_with(std::collections::HashMap::new);
-    entries.insert(
-        filename.to_string(),
-        SchemaEntry {
-            entry_type: "doc".to_string(),
-            node_id: None,
-            content_type: Some(content_type.to_string()),
-        },
-    );
-
-    // Push updated schema - this triggers the server-side reconciler
-    // which creates the document and assigns a UUID
-    let schema_json = serde_json::to_string_pretty(&schema)?;
-    push_schema_to_server(client, server, &parent_id, &schema_json, author)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
-
-    // Wait for the reconciler to create the document with exponential backoff
-    // (100ms, 200ms, 400ms, ...) up to 10 seconds total
-    info!("Waiting for server reconciler to create document...");
-    let head_url = build_head_url(server, &parent_id, false);
-
-    const INITIAL_DELAY_MS: u64 = 100;
-    const MAX_DELAY_MS: u64 = 1600;
-    const TIMEOUT_MS: u64 = 10_000;
-
-    let start = std::time::Instant::now();
-    let mut delay_ms = INITIAL_DELAY_MS;
-    let mut attempt = 0;
-
-    loop {
-        attempt += 1;
-        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-
-        // Fetch the updated schema to get the server-assigned UUID
-        let resp = client.get(&head_url).send().await?;
-        if !resp.status().is_success() {
-            return Err(format!("Failed to fetch updated schema: HTTP {}", resp.status()).into());
-        }
-
-        let head: HeadResp = resp.json().await?;
-        let updated_schema: Schema = serde_json::from_str(&head.content)?;
-
-        // Check if the UUID has been assigned
-        if let Some(node_id) = updated_schema
-            .root
-            .entries
-            .as_ref()
-            .and_then(|e| e.get(*filename))
-            .and_then(|entry| entry.node_id.clone())
-        {
-            info!(
-                "Created document: {} -> {} (after {} attempts)",
-                path, node_id, attempt
-            );
-            return Ok(node_id);
-        }
-
-        // Check timeout
-        let elapsed = start.elapsed();
-        if elapsed.as_millis() >= TIMEOUT_MS as u128 {
-            return Err(format!(
-                "Timeout waiting for reconciler to assign UUID for '{}' after {:?}. Check server logs.",
-                filename, elapsed
-            )
-            .into());
-        }
-
-        debug!(
-            "UUID not yet assigned for '{}', attempt {} (waiting {}ms)",
-            filename, attempt, delay_ms
-        );
-
-        // Exponential backoff
-        delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
-    }
-}
-
 #[tokio::main]
 async fn main() -> ExitCode {
     // Initialize tracing
@@ -1883,6 +2311,9 @@ async fn main() -> ExitCode {
                 .add_directive(tracing::Level::INFO.into()),
         )
         .init();
+    if watcher_create_trace_enabled() {
+        install_panic_trace_hook();
+    }
 
     let args = Args::parse();
 
@@ -1906,6 +2337,11 @@ async fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // Hard-disable HTTP transport for sync runtime.
+    // Any remaining HTTP call paths should fail fast so they can be replaced by MQTT/cyan.
+    set_sync_http_disabled(true);
+    info!("HTTP sync transport disabled (strict MQTT-only runtime)");
+
     // Create HTTP client
     let client = Client::new();
 
@@ -1927,6 +2363,12 @@ async fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    // Configure MQTT-backed ancestry checks for sync direction decisions.
+    set_sync_ancestry_mqtt_context(Some(SyncAncestryMqttContext::new(
+        mqtt_client.clone(),
+        args.workspace.clone(),
+    )));
 
     // Initialize local commit store if path provided
     // TODO: Wire commit_store through to sync tasks (receive_task_crdt, etc.)
@@ -1956,81 +2398,73 @@ async fn main() -> ExitCode {
         None
     };
 
+    // Initialize MQTT request/response client for startup operations (path resolution, fork).
+    let mqtt_request =
+        match MqttRequestClient::new(mqtt_client.clone(), args.workspace.clone()).await {
+            Ok(req) => req,
+            Err(e) => {
+                error!("Failed to create MQTT request client: {}", e);
+                return ExitCode::from(1);
+            }
+        };
+
     // Determine the node ID to sync with
     // Priority: --node > --path > --fork-from > --use-paths discovery
     let node_id = if let Some(ref node) = args.node {
-        // Check if it's a valid UUID - use directly if so
+        // UUID values are used directly.
         if uuid::Uuid::parse_str(node).is_ok() {
             node.clone()
         } else {
-            // Not a UUID - could be "workspace" (fs-root name) or a path
-            // First check if it's a document ID that exists directly
-            let info_url = build_info_url(&args.server, node);
-            match client.get(&info_url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    // Document exists with this ID
-                    info!("Using node ID directly: {}", node);
-                    node.clone()
+            // Non-UUID --node is treated as an fs-root-relative path.
+            info!(
+                "Resolving --node '{}' as fs-root-relative path via MQTT...",
+                node
+            );
+            let fs_root_id = match mqtt_request.discover_fs_root().await {
+                Ok(id) => id,
+                Err(e) => {
+                    error!(
+                        "Failed to discover fs-root for --node path resolution: {}",
+                        e
+                    );
+                    error!("Ensure server was started with --fs-root, or pass --node <uuid>");
+                    return ExitCode::from(1);
                 }
-                _ => {
-                    // Try to resolve as a path
-                    info!("Resolving node '{}' as path to UUID...", node);
-                    match resolve_path_to_uuid(&client, &args.server, node).await {
-                        Ok(id) => {
-                            info!("Resolved '{}' -> {}", node, id);
-                            id
-                        }
-                        Err(e) => {
-                            error!("Failed to resolve node '{}': {}", node, e);
-                            return ExitCode::from(1);
-                        }
-                    }
+            };
+            match mqtt_request.resolve_path_to_uuid(&fs_root_id, node).await {
+                Ok(id) => {
+                    info!("Resolved --node path '{}' -> {}", node, id);
+                    id
+                }
+                Err(e) => {
+                    error!("Failed to resolve --node path '{}' via MQTT: {}", node, e);
+                    return ExitCode::from(1);
                 }
             }
         }
     } else if let Some(ref path) = args.path {
-        // Path provided - resolve to UUID (or create if using single-file mode)
-        info!("Resolving path '{}' to UUID...", path);
-        if let Some(ref file) = args.file {
-            // Single-file mode with --path: create document if it doesn't exist
-            let author = args
-                .name
-                .clone()
-                .unwrap_or_else(|| "sync-client".to_string());
-            match resolve_or_create_path(&client, &args.server, path, file, &author).await {
-                Ok(id) => {
-                    info!("Resolved '{}' -> {}", path, id);
-                    id
-                }
-                Err(e) => {
-                    error!("Failed to resolve/create path '{}': {}", path, e);
-                    return ExitCode::from(1);
-                }
+        info!("Resolving --path '{}' via MQTT...", path);
+        let fs_root_id = match mqtt_request.discover_fs_root().await {
+            Ok(id) => id,
+            Err(e) => {
+                error!("Failed to discover fs-root for --path resolution: {}", e);
+                error!("Either specify --node <uuid>, or ensure server was started with --fs-root");
+                return ExitCode::from(1);
             }
-        } else {
-            // Directory mode: path must already exist
-            match resolve_path_to_uuid(&client, &args.server, path).await {
-                Ok(id) => {
-                    info!("Resolved '{}' -> {}", path, id);
-                    id
-                }
-                Err(e) => {
-                    error!("Failed to resolve path '{}': {}", path, e);
-                    return ExitCode::from(1);
-                }
+        };
+        match mqtt_request.resolve_path_to_uuid(&fs_root_id, path).await {
+            Ok(id) => {
+                info!("Resolved --path '{}' -> {}", path, id);
+                id
+            }
+            Err(e) => {
+                error!("Failed to resolve --path '{}' via MQTT: {}", path, e);
+                return ExitCode::from(1);
             }
         }
     } else if let Some(ref source) = args.fork_from {
         // Fork from another node via MQTT
         info!("Forking from node {} via MQTT...", source);
-        let mqtt_request =
-            match MqttRequestClient::new(mqtt_client.clone(), args.workspace.clone()).await {
-                Ok(req) => req,
-                Err(e) => {
-                    error!("Failed to create MQTT request client: {}", e);
-                    return ExitCode::from(1);
-                }
-            };
         match mqtt_request
             .fork_document(source, args.at_commit.as_deref())
             .await
@@ -2061,14 +2495,6 @@ async fn main() -> ExitCode {
     } else if args.use_paths {
         // No node specified - discover fs-root via MQTT retained message
         info!("Discovering fs-root via MQTT...");
-        let mqtt_request =
-            match MqttRequestClient::new(mqtt_client.clone(), args.workspace.clone()).await {
-                Ok(req) => req,
-                Err(e) => {
-                    error!("Failed to create MQTT request client: {}", e);
-                    return ExitCode::from(1);
-                }
-            };
         match mqtt_request.discover_fs_root().await {
             Ok(id) => {
                 info!("Discovered fs-root: {}", id);
@@ -2403,6 +2829,7 @@ async fn run_file_mode(
             node_id_uuid,
             &file,
             &author,
+            None,
         )
         .await
         {
@@ -2585,13 +3012,15 @@ async fn run_directory_mode(
     });
 
     // Verify fs-root document exists (or create it) via MQTT
-    let mqtt_request = MqttRequestClient::new(mqtt_client.clone(), workspace.clone())
-        .await
-        .map_err(|e| format!("Failed to create MQTT request client: {}", e))?;
+    let mqtt_request = Arc::new(
+        MqttRequestClient::new(mqtt_client.clone(), workspace.clone())
+            .await
+            .map_err(|e| format!("Failed to create MQTT request client: {}", e))?,
+    );
+    set_sync_schema_mqtt_request_client(Some(mqtt_request.clone()));
     ensure_fs_root_exists_mqtt(&mqtt_request, &fs_root_id).await?;
-
-    // Check if server has existing schema via MQTT
     let server_has_content = check_server_has_content_mqtt(&mqtt_request, &fs_root_id).await;
+    let local_schema_exists = directory.join(SCHEMA_FILENAME).exists();
 
     // Load or create state file for persisting per-file CIDs
     let state_file_path =
@@ -2627,70 +3056,99 @@ async fn run_directory_mode(
         }
     }
 
-    // If strategy is "server" and server has content, pull server files first
-    // This creates the temporary file_states that handle_schema_change needs
+    // Initialize per-file sync state map before watcher/subscription task startup.
     let file_states: Arc<RwLock<HashMap<String, FileSyncState>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
-    // Create written_schemas tracker for user schema edit detection
-    // This must be created before any handle_schema_change calls so we can track what we write
+    // Track schema writes emitted by this process to avoid feedback loops.
     let written_schemas: commonplace_doc::sync::WrittenSchemas =
         Arc::new(RwLock::new(std::collections::HashMap::new()));
 
-    if initial_sync_strategy == "server" && server_has_content {
-        info!("Pulling server schema first (initial-sync=server)...");
-        // Don't spawn tasks here - the main loop will spawn them for all files
-        handle_schema_change(
-            &client,
-            &server,
-            &fs_root_id,
-            &directory,
-            &file_states,
-            false,
-            use_paths,
-            push_only,
-            pull_only,
-            &author,
-            #[cfg(unix)]
-            inode_tracker.clone(),
-            Some(&written_schemas),
-            Some(&shared_state_file),
-            None, // No CRDT context during initial sync
-        )
-        .await?;
-        info!("Server files pulled to local directory");
-    }
+    // Load/create CRDT state early so startup schema reconciliation can use MQTT context.
+    // Note: If fs_root_id is not a UUID (e.g., "workspace"), use a nil UUID for the schema.
+    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id).unwrap_or_else(|_| {
+        warn!(
+            "fs_root_id '{}' is not a UUID, using nil UUID for CRDT schema state",
+            fs_root_id
+        );
+        uuid::Uuid::nil()
+    });
+    let crdt_state = Arc::new(RwLock::new(
+        DirectorySyncState::load_or_create(&directory, schema_node_id)
+            .await
+            .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
+    ));
+    let subdir_cache = Arc::new(SubdirStateCache::new());
+    let mqtt_only_config = if mqtt_only_sync {
+        MqttOnlySyncConfig::mqtt_only()
+    } else {
+        MqttOnlySyncConfig::with_http_fallback()
+    };
+    let crdt_context = CrdtFileSyncContext {
+        mqtt_client: mqtt_client.clone(),
+        mqtt_request: mqtt_request.clone(),
+        workspace: workspace.clone(),
+        crdt_state: crdt_state.clone(),
+        subdir_cache: subdir_cache.clone(),
+        mqtt_only_config,
+    };
 
-    // Synchronize schema between local and server.
-    // Capture the CID from initial sync to prevent subscription tasks from
-    // pulling stale server content that predates our push.
-    let (_schema_json, initial_schema_cid) = sync_schema(
+    let decision = decide_startup_sync(
+        &initial_sync_strategy,
+        server_has_content,
+        local_schema_exists,
+        push_only,
+        pull_only,
+    );
+    info!(
+        "Startup sync plan {:?} (strategy={}, server_has_content={}, local_schema_exists={}, push_only={}, pull_only={})",
+        decision.plan,
+        initial_sync_strategy,
+        server_has_content,
+        local_schema_exists,
+        push_only,
+        pull_only
+    );
+
+    let uuid_map = prepare_startup_uuid_map(
         &client,
         &server,
         &fs_root_id,
         &directory,
-        &options,
-        &initial_sync_strategy,
-        server_has_content,
         &author,
+        local_schema_exists,
+        decision,
+        &written_schemas,
+        &crdt_context,
     )
     .await?;
-
-    // Build UUID map from local schema files (no HTTP needed).
-    // sync_schema already ensured the local schemas are up to date.
-    let mut uuid_map = HashMap::new();
-    build_uuid_map_from_local_schemas(&directory, "", &mut uuid_map);
     let file_count = uuid_map.len();
-    info!("Built UUID map from local schemas: {} files", file_count);
 
-    // Populate file_states from UUID map (only for files that exist on disk).
-    // Content sync (push/pull) is handled later by CRDT init + push_local_if_differs.
+    // Reconcile sync state UUIDs with schema to detect and fix drift after startup prep.
+    {
+        let mut state = crdt_state.write().await;
+        if let Err(e) = state.reconcile_with_schema(&directory).await {
+            warn!("Failed to reconcile UUIDs with schema: {}", e);
+        }
+    }
+
+    let initial_schema_cid = {
+        let state = crdt_state.read().await;
+        state
+            .schema
+            .local_head_cid
+            .clone()
+            .or_else(|| state.schema.head_cid.clone())
+    };
+
+    // Populate file_states from UUID map.
+    // Server-authoritative startup includes missing files so they can be materialized.
     {
         let mut states = file_states.write().await;
         for (relative_path, uuid) in &uuid_map {
             let file_path = directory.join(relative_path);
-            if !file_path.exists() {
-                debug!("Skipping {} — not on disk yet", relative_path);
+            if !file_path.exists() && !decision.include_missing_file_states {
+                debug!("Skipping {} — not on disk for startup plan", relative_path);
                 continue;
             }
 
@@ -2718,28 +3176,6 @@ async fn run_directory_mode(
         }
     }
 
-    // Create local files for any schema entries that don't exist locally.
-    // This handles commonplace-link entries where the linked target exists but the
-    // link file needs to be created locally.
-    handle_schema_change(
-        &client,
-        &server,
-        &fs_root_id,
-        &directory,
-        &file_states,
-        false, // Don't spawn tasks - main loop will do that
-        use_paths,
-        push_only,
-        pull_only,
-        &author,
-        #[cfg(unix)]
-        inode_tracker.clone(),
-        Some(&written_schemas),
-        Some(&shared_state_file),
-        None, // No CRDT context during initial sync
-    )
-    .await?;
-
     // Publish initial-sync-complete event via MQTT
     publish_initial_sync_complete(
         &mqtt_client,
@@ -2753,6 +3189,7 @@ async fn run_directory_mode(
     // Start directory watcher and create shared state
     let WatcherSetup {
         mut dir_rx,
+        dir_tx,
         watcher_handle,
         watched_subdirs,
     } = setup_directory_watchers(
@@ -2761,43 +3198,6 @@ async fn run_directory_mode(
         options.clone(),
         written_schemas.clone(),
     );
-
-    // Load/create CRDT state early so subscription tasks can use it.
-    // Note: If fs_root_id is not a UUID (e.g., "workspace"), use a nil UUID for the schema.
-    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id).unwrap_or_else(|_| {
-        warn!(
-            "fs_root_id '{}' is not a UUID, using nil UUID for CRDT schema state",
-            fs_root_id
-        );
-        uuid::Uuid::nil()
-    });
-    let crdt_state = Arc::new(RwLock::new(
-        DirectorySyncState::load_or_create(&directory, schema_node_id)
-            .await
-            .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
-    ));
-
-    // Reconcile sync state UUIDs with schema to detect and fix drift
-    {
-        let mut state = crdt_state.write().await;
-        if let Err(e) = state.reconcile_with_schema(&directory).await {
-            warn!("Failed to reconcile UUIDs with schema: {}", e);
-        }
-    }
-
-    let subdir_cache = Arc::new(SubdirStateCache::new());
-    let mqtt_only_config = if mqtt_only_sync {
-        MqttOnlySyncConfig::mqtt_only()
-    } else {
-        MqttOnlySyncConfig::with_http_fallback()
-    };
-    let crdt_context = Some(CrdtFileSyncContext {
-        mqtt_client: mqtt_client.clone(),
-        workspace: workspace.clone(),
-        crdt_state: crdt_state.clone(),
-        subdir_cache: subdir_cache.clone(),
-        mqtt_only_config,
-    });
 
     // Start subscription task for fs-root (skip if push-only)
     let subscription_handle = if !push_only {
@@ -2826,7 +3226,7 @@ async fn run_directory_mode(
             initial_schema_cid.clone(),
             Some(shared_state_file.clone()),
             initial_uuid_map,
-            crdt_context.clone(),
+            Some(crdt_context.clone()),
         )))
     } else {
         info!("Push-only mode: skipping subscription");
@@ -2850,7 +3250,7 @@ async fn run_directory_mode(
             #[cfg(unix)]
             inode_tracker: inode_tracker.clone(),
             watched_subdirs: watched_subdirs.clone(),
-            crdt_context: crdt_context.clone(),
+            crdt_context: Some(crdt_context.clone()),
         };
         let transport = SubdirTransport::Mqtt {
             client: mqtt_client.clone(),
@@ -2944,7 +3344,7 @@ async fn run_directory_mode(
             // This runs after BOTH success and failure of CRDT init: when cyan sync fails
             // and we initialize empty, we still need to push local content to create the
             // first commit on the server.
-            if !pull_only {
+            if decision.push_local_content {
                 if let Err(e) = push_local_if_differs(
                     &mqtt_client,
                     &workspace,
@@ -2953,6 +3353,7 @@ async fn run_directory_mode(
                     node_id,
                     &file_path,
                     &author,
+                    inode_tracker.as_ref(),
                 )
                 .await
                 {
@@ -2962,7 +3363,7 @@ async fn run_directory_mode(
 
             // Pull case: if local file is empty/default but server has content,
             // write server content to disk so the file reflects the CRDT state.
-            {
+            if decision.materialize_server_content {
                 let local_content = tokio::fs::read_to_string(&file_path)
                     .await
                     .unwrap_or_default();
@@ -3067,6 +3468,7 @@ async fn run_directory_mode(
         // Create CRDT params for the event handler
         let crdt_params = CrdtEventParams {
             mqtt_client: mqtt_client.clone(),
+            mqtt_request: mqtt_request.clone(),
             workspace: workspace.clone(),
             crdt_state: crdt_state.clone(),
             subdir_cache: subdir_cache.clone(),
@@ -3075,23 +3477,45 @@ async fn run_directory_mode(
         };
         async move {
             while let Some(event) = dir_rx.recv().await {
-                handle_dir_event(
-                    &client,
-                    &server,
-                    &fs_root_id,
-                    &directory,
-                    &options,
-                    &file_states,
-                    pull_only,
-                    &author,
-                    Some(&written_schemas),
-                    Some(&crdt_params),
-                    event,
-                )
+                let client_for_event = client.clone();
+                let server_for_event = server.clone();
+                let fs_root_for_event = fs_root_id.clone();
+                let directory_for_event = directory.clone();
+                let options_for_event = options.clone();
+                let file_states_for_event = file_states.clone();
+                let author_for_event = author.clone();
+                let written_schemas_for_event = written_schemas.clone();
+                let crdt_params_for_event = crdt_params.clone();
+
+                let join_result = tokio::spawn(async move {
+                    handle_dir_event(
+                        &client_for_event,
+                        &server_for_event,
+                        &fs_root_for_event,
+                        &directory_for_event,
+                        &options_for_event,
+                        &file_states_for_event,
+                        pull_only,
+                        &author_for_event,
+                        Some(&written_schemas_for_event),
+                        Some(&crdt_params_for_event),
+                        event,
+                    )
+                    .await;
+                })
                 .await;
+
+                if let Err(e) = join_result {
+                    log_dir_event_join_error("DIR_EVENT handler", e);
+                }
             }
+            warn!("DIR_EVENT receiver closed (directory mode); exiting dir-event loop");
+            append_sandbox_trace("DIR_EVENT receiver_closed mode=directory");
         }
     });
+    if !pull_only {
+        enqueue_startup_untracked_created_events(&directory, &options, &file_states, &dir_tx).await;
+    }
 
     // Wait for Ctrl+C
     tokio::signal::ctrl_c().await?;
@@ -3232,13 +3656,15 @@ async fn run_exec_mode(
     });
 
     // Verify fs-root document exists (or create it) via MQTT
-    let mqtt_request = MqttRequestClient::new(mqtt_client.clone(), workspace.clone())
-        .await
-        .map_err(|e| format!("Failed to create MQTT request client: {}", e))?;
+    let mqtt_request = Arc::new(
+        MqttRequestClient::new(mqtt_client.clone(), workspace.clone())
+            .await
+            .map_err(|e| format!("Failed to create MQTT request client: {}", e))?,
+    );
+    set_sync_schema_mqtt_request_client(Some(mqtt_request.clone()));
     ensure_fs_root_exists_mqtt(&mqtt_request, &fs_root_id).await?;
-
-    // Check if server has existing schema via MQTT
     let server_has_content = check_server_has_content_mqtt(&mqtt_request, &fs_root_id).await;
+    let local_schema_exists = directory.join(SCHEMA_FILENAME).exists();
 
     // Load or create state file for persisting per-file CIDs (sandbox mode)
     let state_file_path =
@@ -3274,70 +3700,101 @@ async fn run_exec_mode(
         }
     }
 
-    // If strategy is "server" and server has content, pull server files first
+    // Initialize per-file sync state map before watcher/subscription task startup.
     let file_states: Arc<RwLock<HashMap<String, FileSyncState>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
-    // Create written_schemas tracker for user schema edit detection
-    // This must be created before any handle_schema_change calls so we can track what we write
+    // Track schema writes emitted by this process to avoid feedback loops.
     let written_schemas: commonplace_doc::sync::WrittenSchemas =
         Arc::new(RwLock::new(std::collections::HashMap::new()));
 
-    if initial_sync_strategy == "server" && server_has_content {
-        info!("Pulling server schema first (initial-sync=server)...");
-        handle_schema_change(
-            &client,
-            &server,
-            &fs_root_id,
-            &directory,
-            &file_states,
-            false,
-            use_paths,
-            push_only,
-            pull_only,
-            &author,
-            #[cfg(unix)]
-            inode_tracker.clone(),
-            Some(&written_schemas),
-            Some(&shared_state_file),
-            None, // No CRDT context during initial sync
-        )
-        .await?;
-        info!("Server files pulled to local directory");
-    }
+    let sync_start = Instant::now();
 
-    // Synchronize schema between local and server.
-    // Capture the CID from initial sync to prevent subscription tasks from
-    // pulling stale server content that predates our push.
-    let (_schema_json, initial_schema_cid) = sync_schema(
+    // Load/create CRDT state early so startup schema reconciliation can use MQTT context.
+    // Note: If fs_root_id is not a UUID (e.g., "workspace"), use a nil UUID for the schema.
+    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id).unwrap_or_else(|_| {
+        warn!(
+            "fs_root_id '{}' is not a UUID, using nil UUID for CRDT schema state",
+            fs_root_id
+        );
+        uuid::Uuid::nil()
+    });
+    let crdt_state = Arc::new(RwLock::new(
+        DirectorySyncState::load_or_create(&directory, schema_node_id)
+            .await
+            .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
+    ));
+    let subdir_cache = Arc::new(SubdirStateCache::new());
+    let mqtt_only_config = if mqtt_only_sync {
+        MqttOnlySyncConfig::mqtt_only()
+    } else {
+        MqttOnlySyncConfig::with_http_fallback()
+    };
+    let crdt_context = CrdtFileSyncContext {
+        mqtt_client: mqtt_client.clone(),
+        mqtt_request: mqtt_request.clone(),
+        workspace: workspace.clone(),
+        crdt_state: crdt_state.clone(),
+        subdir_cache: subdir_cache.clone(),
+        mqtt_only_config,
+    };
+
+    let decision = decide_startup_sync(
+        &initial_sync_strategy,
+        server_has_content,
+        local_schema_exists,
+        push_only,
+        pull_only,
+    );
+    info!(
+        "Startup sync plan {:?} (strategy={}, server_has_content={}, local_schema_exists={}, push_only={}, pull_only={})",
+        decision.plan,
+        initial_sync_strategy,
+        server_has_content,
+        local_schema_exists,
+        push_only,
+        pull_only
+    );
+
+    let uuid_map = prepare_startup_uuid_map(
         &client,
         &server,
         &fs_root_id,
         &directory,
-        &options,
-        &initial_sync_strategy,
-        server_has_content,
         &author,
+        local_schema_exists,
+        decision,
+        &written_schemas,
+        &crdt_context,
     )
     .await?;
-
-    let sync_start = Instant::now();
-
-    // Build UUID map from local schema files (no HTTP needed).
-    // sync_schema already ensured the local schemas are up to date.
-    let mut uuid_map = HashMap::new();
-    build_uuid_map_from_local_schemas(&directory, "", &mut uuid_map);
     let file_count = uuid_map.len();
-    info!("Built UUID map from local schemas: {} files", file_count);
 
-    // Populate file_states from UUID map (only for files that exist on disk).
-    // Content sync (push/pull) is handled later by CRDT init + push_local_if_differs.
+    // Reconcile sync state UUIDs with schema to detect and fix drift after startup prep.
+    {
+        let mut state = crdt_state.write().await;
+        if let Err(e) = state.reconcile_with_schema(&directory).await {
+            warn!("Failed to reconcile UUIDs with schema: {}", e);
+        }
+    }
+
+    let initial_schema_cid = {
+        let state = crdt_state.read().await;
+        state
+            .schema
+            .local_head_cid
+            .clone()
+            .or_else(|| state.schema.head_cid.clone())
+    };
+
+    // Populate file_states from UUID map.
+    // Server-authoritative startup includes missing files so they can be materialized.
     {
         let mut states = file_states.write().await;
         for (relative_path, uuid) in &uuid_map {
             let file_path = directory.join(relative_path);
-            if !file_path.exists() {
-                debug!("Skipping {} — not on disk yet", relative_path);
+            if !file_path.exists() && !decision.include_missing_file_states {
+                debug!("Skipping {} — not on disk for startup plan", relative_path);
                 continue;
             }
 
@@ -3378,6 +3835,7 @@ async fn run_exec_mode(
     // Start directory watcher and create shared state
     let WatcherSetup {
         mut dir_rx,
+        dir_tx,
         watcher_handle,
         watched_subdirs,
     } = setup_directory_watchers(
@@ -3386,43 +3844,6 @@ async fn run_exec_mode(
         options.clone(),
         written_schemas.clone(),
     );
-
-    // Load/create CRDT state early so subscription tasks can use it.
-    // Note: If fs_root_id is not a UUID (e.g., "workspace"), use a nil UUID for the schema.
-    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id).unwrap_or_else(|_| {
-        warn!(
-            "fs_root_id '{}' is not a UUID, using nil UUID for CRDT schema state",
-            fs_root_id
-        );
-        uuid::Uuid::nil()
-    });
-    let crdt_state = Arc::new(RwLock::new(
-        DirectorySyncState::load_or_create(&directory, schema_node_id)
-            .await
-            .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
-    ));
-
-    // Reconcile sync state UUIDs with schema to detect and fix drift
-    {
-        let mut state = crdt_state.write().await;
-        if let Err(e) = state.reconcile_with_schema(&directory).await {
-            warn!("Failed to reconcile UUIDs with schema: {}", e);
-        }
-    }
-
-    let subdir_cache = Arc::new(SubdirStateCache::new());
-    let mqtt_only_config = if mqtt_only_sync {
-        MqttOnlySyncConfig::mqtt_only()
-    } else {
-        MqttOnlySyncConfig::with_http_fallback()
-    };
-    let crdt_context = Some(CrdtFileSyncContext {
-        mqtt_client: mqtt_client.clone(),
-        workspace: workspace.clone(),
-        crdt_state: crdt_state.clone(),
-        subdir_cache: subdir_cache.clone(),
-        mqtt_only_config,
-    });
 
     // Start subscription task for fs-root (skip if push-only)
     let subscription_handle = if !push_only {
@@ -3450,7 +3871,7 @@ async fn run_exec_mode(
             initial_schema_cid.clone(),
             Some(shared_state_file.clone()),
             initial_uuid_map,
-            crdt_context.clone(),
+            Some(crdt_context.clone()),
         )))
     } else {
         info!("Push-only mode: skipping subscription");
@@ -3473,7 +3894,7 @@ async fn run_exec_mode(
             #[cfg(unix)]
             inode_tracker: inode_tracker.clone(),
             watched_subdirs: watched_subdirs.clone(),
-            crdt_context: crdt_context.clone(),
+            crdt_context: Some(crdt_context.clone()),
         };
         let transport = SubdirTransport::Mqtt {
             client: mqtt_client.clone(),
@@ -3562,7 +3983,7 @@ async fn run_exec_mode(
 
             // Push local content if it differs from server (replaces sync_single_file push).
             // This runs after BOTH success and failure of CRDT init.
-            if !pull_only {
+            if decision.push_local_content {
                 if let Err(e) = push_local_if_differs(
                     &mqtt_client,
                     &workspace,
@@ -3571,6 +3992,7 @@ async fn run_exec_mode(
                     node_id,
                     &file_path,
                     &author,
+                    inode_tracker.as_ref(),
                 )
                 .await
                 {
@@ -3580,7 +4002,7 @@ async fn run_exec_mode(
 
             // Pull case: if local file is empty/default but server has content,
             // write server content to disk so the file reflects the CRDT state.
-            {
+            if decision.materialize_server_content {
                 let local_content = tokio::fs::read_to_string(&file_path)
                     .await
                     .unwrap_or_default();
@@ -3686,6 +4108,7 @@ async fn run_exec_mode(
         // Create CRDT params for the event handler
         let crdt_params = CrdtEventParams {
             mqtt_client: mqtt_client.clone(),
+            mqtt_request: mqtt_request.clone(),
             workspace: workspace.clone(),
             crdt_state: crdt_state.clone(),
             subdir_cache: subdir_cache.clone(),
@@ -3695,23 +4118,45 @@ async fn run_exec_mode(
         async move {
             while let Some(event) = dir_rx.recv().await {
                 debug!("RECEIVED DIR EVENT (exec mode): {:?}", event);
-                handle_dir_event(
-                    &client,
-                    &server,
-                    &fs_root_id,
-                    &directory,
-                    &options,
-                    &file_states,
-                    pull_only,
-                    &author,
-                    Some(&written_schemas),
-                    Some(&crdt_params),
-                    event,
-                )
+                let client_for_event = client.clone();
+                let server_for_event = server.clone();
+                let fs_root_for_event = fs_root_id.clone();
+                let directory_for_event = directory.clone();
+                let options_for_event = options.clone();
+                let file_states_for_event = file_states.clone();
+                let author_for_event = author.clone();
+                let written_schemas_for_event = written_schemas.clone();
+                let crdt_params_for_event = crdt_params.clone();
+
+                let join_result = tokio::spawn(async move {
+                    handle_dir_event(
+                        &client_for_event,
+                        &server_for_event,
+                        &fs_root_for_event,
+                        &directory_for_event,
+                        &options_for_event,
+                        &file_states_for_event,
+                        pull_only,
+                        &author_for_event,
+                        Some(&written_schemas_for_event),
+                        Some(&crdt_params_for_event),
+                        event,
+                    )
+                    .await;
+                })
                 .await;
+
+                if let Err(e) = join_result {
+                    log_dir_event_join_error("DIR_EVENT handler (exec mode)", e);
+                }
             }
+            warn!("DIR_EVENT receiver closed (exec mode); exiting dir-event loop");
+            append_sandbox_trace("DIR_EVENT receiver_closed mode=exec");
         }
     });
+    if !pull_only {
+        enqueue_startup_untracked_created_events(&directory, &options, &file_states, &dir_tx).await;
+    }
 
     // Wait for CRDT readiness before starting exec (in sandbox mode)
     // This ensures all file sync tasks are ready to capture writes from the exec process

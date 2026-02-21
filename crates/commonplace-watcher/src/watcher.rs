@@ -9,7 +9,7 @@ use crate::WrittenSchemas;
 use commonplace_types::sync::events::{DirEvent, FileEvent, ScanOptions};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +21,13 @@ pub const FILE_DEBOUNCE_MS: u64 = 100;
 
 /// Default debounce duration for directory watcher (500ms)
 pub const DIR_DEBOUNCE_MS: u64 = 500;
+
+/// Fallback periodic rescan interval for directory watcher (1000ms).
+///
+/// Some backends can miss create/delete events in newly materialized subdirectories.
+/// A low-frequency full-tree rescan closes that gap by synthesizing events for paths
+/// that changed without a corresponding notify event.
+pub const DIR_RESCAN_MS: u64 = 1000;
 
 /// Interval for file stability checks (50ms)
 pub const STABILITY_CHECK_INTERVAL_MS: u64 = 50;
@@ -36,6 +43,26 @@ pub const STABILITY_REQUIRED_SNAPSHOTS: u32 = 3;
 /// Timeout for acquiring shared lock before reading (500ms)
 /// Short timeout to avoid blocking too long, but enough to wait for quick writes
 pub const FLOCK_READ_TIMEOUT_MS: u64 = 500;
+
+fn append_sandbox_trace(msg: &str) {
+    if std::env::var_os("COMMONPLACE_TRACE_WATCHER_CREATE").is_none() {
+        return;
+    }
+
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/sandbox-trace.log")
+    {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let _ = writeln!(file, "[{} pid={}] {}", timestamp, pid, msg);
+    }
+}
 
 /// Create a notify watcher with a channel for receiving events.
 ///
@@ -101,6 +128,49 @@ fn is_temp_file(name: &str) -> bool {
         return true;
     }
     false
+}
+
+fn scan_directory_files(root: &std::path::Path, options: &ScanOptions) -> HashSet<PathBuf> {
+    fn walk(dir: &std::path::Path, options: &ScanOptions, out: &mut HashSet<PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name = match entry.file_name().to_str() {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+
+            if !options.include_hidden && file_name.starts_with('.') {
+                continue;
+            }
+            if file_name == ".commonplace.json" || is_temp_file(&file_name) {
+                continue;
+            }
+
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                walk(&path, options, out);
+                continue;
+            }
+            if file_type.is_file() {
+                out.insert(path);
+            }
+        }
+    }
+
+    let mut files = HashSet::new();
+    walk(root, options, &mut files);
+    files
 }
 
 /// Metadata snapshot for stability checking.
@@ -498,6 +568,9 @@ pub async fn directory_watcher_task(
     let debounce_duration = Duration::from_millis(DIR_DEBOUNCE_MS);
     let mut pending_events: HashMap<PathBuf, DirEvent> = HashMap::new();
     let mut debounce_timer: Option<tokio::time::Instant> = None;
+    let mut known_files = scan_directory_files(&directory, &options);
+    let mut rescan_interval = tokio::time::interval(Duration::from_millis(DIR_RESCAN_MS));
+    rescan_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -578,6 +651,7 @@ pub async fn directory_watcher_task(
 
                             // Handle rename events specially - treat as delete+create
                             // so that sync tasks are properly stopped/started
+                            let raw_kind = format!("{:?}", event.kind);
                             let dir_event = if event.kind.is_create() {
                                 Some(DirEvent::Created(path.clone()))
                             } else if let EventKind::Modify(ModifyKind::Name(rename_mode)) =
@@ -621,6 +695,11 @@ pub async fn directory_watcher_task(
                             };
 
                             if let Some(evt) = dir_event {
+                                let previous_event = pending_events
+                                    .get(&path)
+                                    .map(|e| format!("{:?}", e))
+                                    .unwrap_or_else(|| "None".to_string());
+                                let current_event = format!("{:?}", evt);
                                 // Coalesce events to handle atomic writes and other patterns:
                                 //
                                 // 1. Modified after Created -> keep Created (new file gets modify events)
@@ -640,12 +719,35 @@ pub async fn directory_watcher_task(
                                             "Atomic write detected (Deleted + Created = Modified): {}",
                                             path.display()
                                         );
+                                        append_sandbox_trace(&format!(
+                                            "WATCHER coalesce_atomic path={} raw_kind={} prev={} current={} final=Modified",
+                                            path.display(),
+                                            raw_kind,
+                                            previous_event,
+                                            current_event
+                                        ));
                                         Some(DirEvent::Modified(path.clone()))
                                     }
                                     _ => Some(evt),
                                 };
                                 if let Some(final_event) = coalesced_event {
+                                    append_sandbox_trace(&format!(
+                                        "WATCHER queue path={} raw_kind={} prev={} current={} final={:?}",
+                                        path.display(),
+                                        raw_kind,
+                                        previous_event,
+                                        current_event,
+                                        final_event
+                                    ));
                                     pending_events.insert(path, final_event);
+                                } else {
+                                    append_sandbox_trace(&format!(
+                                        "WATCHER drop path={} raw_kind={} prev={} current={}",
+                                        path.display(),
+                                        raw_kind,
+                                        previous_event,
+                                        current_event
+                                    ));
                                 }
                                 debounce_timer = Some(tokio::time::Instant::now() + debounce_duration);
                             }
@@ -665,11 +767,43 @@ pub async fn directory_watcher_task(
                 }
             } => {
                 debounce_timer = None;
-                for (_path, event) in pending_events.drain() {
+                for (path, event) in pending_events.drain() {
+                    append_sandbox_trace(&format!("WATCHER emit event={:?}", event));
                     if tx.send(event).await.is_err() {
+                        warn!(
+                            "Directory watcher event channel closed while sending event for {}; exiting watcher task",
+                            path.display()
+                        );
+                        append_sandbox_trace(&format!(
+                            "WATCHER send_failed path={} reason=channel_closed",
+                            path.display()
+                        ));
                         return;
                     }
                 }
+            }
+            _ = rescan_interval.tick() => {
+                let current_files = scan_directory_files(&directory, &options);
+
+                for path in current_files.difference(&known_files) {
+                    append_sandbox_trace(&format!(
+                        "WATCHER rescan_new path={} (synth Created)",
+                        path.display()
+                    ));
+                    pending_events.insert(path.clone(), DirEvent::Created(path.clone()));
+                    debounce_timer = Some(tokio::time::Instant::now() + debounce_duration);
+                }
+
+                for path in known_files.difference(&current_files) {
+                    append_sandbox_trace(&format!(
+                        "WATCHER rescan_deleted path={} (synth Deleted)",
+                        path.display()
+                    ));
+                    pending_events.insert(path.clone(), DirEvent::Deleted(path.clone()));
+                    debounce_timer = Some(tokio::time::Instant::now() + debounce_duration);
+                }
+
+                known_files = current_files;
             }
         }
     }
@@ -809,6 +943,7 @@ pub async fn shadow_watcher_task(shadow_dir: PathBuf, tx: mpsc::Sender<ShadowWri
                         content.len()
                     );
 
+                    let shadow_path_display = path.display().to_string();
                     let event = ShadowWriteEvent {
                         inode_key,
                         shadow_path: path,
@@ -816,6 +951,14 @@ pub async fn shadow_watcher_task(shadow_dir: PathBuf, tx: mpsc::Sender<ShadowWri
                     };
 
                     if tx.send(event).await.is_err() {
+                        warn!(
+                            "Shadow watcher event channel closed while sending {}; exiting watcher task",
+                            shadow_path_display
+                        );
+                        append_sandbox_trace(&format!(
+                            "SHADOW_WATCHER send_failed path={} reason=channel_closed",
+                            shadow_path_display
+                        ));
                         return;
                     }
                 }

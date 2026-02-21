@@ -6,7 +6,9 @@
 use clap::Parser;
 use commonplace_doc::cli::OrchestratorArgs;
 use commonplace_doc::mqtt::{MqttClient, MqttConfig, MqttRequestClient};
-use commonplace_doc::orchestrator::{DiscoveredProcessManager, OrchestratorConfig, ProcessManager};
+use commonplace_doc::orchestrator::{
+    prune_stale_status_files, DiscoveredProcessManager, OrchestratorConfig, ProcessManager,
+};
 use commonplace_doc::sync::types::InitialSyncComplete;
 use commonplace_doc::sync::{
     build_head_url, build_health_url, discover_fs_root, DiscoverFsRootError,
@@ -399,6 +401,19 @@ async fn main() {
 
     // Keep _lock_file alive for the duration of the program
     // The lock is released automatically when the file is dropped (on exit)
+
+    match prune_stale_status_files() {
+        Ok(removed) if removed > 0 => {
+            tracing::info!(
+                "[orchestrator] Pruned {} stale orchestrator status file(s)",
+                removed
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!("[orchestrator] Failed to prune stale status files: {}", e);
+        }
+    }
 
     let config = match OrchestratorConfig::load(&args.config) {
         Ok(c) => c,

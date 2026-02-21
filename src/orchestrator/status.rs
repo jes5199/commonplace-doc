@@ -7,11 +7,86 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Legacy path for backwards compatibility (used by commonplace-ps when no config specified)
 pub const LEGACY_STATUS_FILE_PATH: &str = "/tmp/commonplace-orchestrator-status.json";
+
+fn status_file_candidates_in_dir(temp_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(temp_dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with("commonplace-orchestrator-") && name.ends_with(".status.json") {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn find_active_status_file_in_dir(temp_dir: &Path) -> Option<PathBuf> {
+    let candidates = status_file_candidates_in_dir(temp_dir).ok()?;
+
+    candidates
+        .into_iter()
+        .filter_map(|path| {
+            let status = OrchestratorStatus::read(&path).ok()?;
+            if crate::workspace::is_process_running(status.orchestrator_pid) {
+                Some((status.started_at, path))
+            } else {
+                None
+            }
+        })
+        .max_by_key(|(started_at, _)| *started_at)
+        .map(|(_, path)| path)
+}
+
+fn prune_stale_status_files_in_dir(temp_dir: &Path) -> io::Result<usize> {
+    let candidates = status_file_candidates_in_dir(temp_dir)?;
+    let mut removed = 0usize;
+
+    for path in candidates {
+        let status = match OrchestratorStatus::read(&path) {
+            Ok(status) => status,
+            Err(_) => continue,
+        };
+
+        if !crate::workspace::is_process_running(status.orchestrator_pid) {
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    removed += 1;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "[orchestrator] Failed to remove stale status file {}: {}",
+                        path.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
+/// Find the newest active orchestrator status file in the system temp dir.
+pub fn find_active_status_file() -> Option<PathBuf> {
+    find_active_status_file_in_dir(&std::env::temp_dir())
+}
+
+/// Remove stale orchestrator status files whose orchestrator PID is no longer running.
+pub fn prune_stale_status_files() -> io::Result<usize> {
+    prune_stale_status_files_in_dir(&std::env::temp_dir())
+}
 
 /// Information about a single managed process
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,4 +290,62 @@ fn find_deepest_child(pid: u32) -> Option<u32> {
 #[cfg(not(target_os = "linux"))]
 pub fn get_process_cwd(_pid: u32) -> Option<String> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        find_active_status_file_in_dir, prune_stale_status_files_in_dir, OrchestratorStatus,
+    };
+    use tempfile::TempDir;
+
+    fn write_status(path: &std::path::Path, pid: u32, started_at: u64) {
+        let status = OrchestratorStatus {
+            orchestrator_pid: pid,
+            started_at,
+            processes: Vec::new(),
+        };
+        status.write(path).expect("failed writing test status");
+    }
+
+    #[test]
+    fn finds_newest_active_status_file() {
+        let temp = TempDir::new().expect("failed to create temp dir");
+        let stale = temp
+            .path()
+            .join("commonplace-orchestrator-stale.status.json");
+        let active_old = temp
+            .path()
+            .join("commonplace-orchestrator-active-old.status.json");
+        let active_new = temp
+            .path()
+            .join("commonplace-orchestrator-active-new.status.json");
+
+        write_status(&stale, 999_999, 1);
+        write_status(&active_old, std::process::id(), 10);
+        write_status(&active_new, std::process::id(), 20);
+
+        let found =
+            find_active_status_file_in_dir(temp.path()).expect("expected active status file");
+        assert_eq!(found, active_new);
+    }
+
+    #[test]
+    fn prunes_stale_status_files_but_keeps_active() {
+        let temp = TempDir::new().expect("failed to create temp dir");
+        let stale = temp
+            .path()
+            .join("commonplace-orchestrator-stale.status.json");
+        let active = temp
+            .path()
+            .join("commonplace-orchestrator-active.status.json");
+
+        write_status(&stale, 999_999, 1);
+        write_status(&active, std::process::id(), 2);
+
+        let removed = prune_stale_status_files_in_dir(temp.path()).expect("prune should succeed");
+        assert_eq!(removed, 1);
+        assert!(!stale.exists(), "stale status file should be removed");
+        assert!(active.exists(), "active status file should be preserved");
+    }
 }

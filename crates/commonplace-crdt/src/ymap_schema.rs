@@ -298,9 +298,10 @@ pub fn rename_entry(doc: &Doc, old_name: &str, new_name: &str) -> Option<String>
 /// Remove an entry from the schema.
 pub fn remove_entry(doc: &Doc, name: &str) {
     let mut txn = doc.transact_mut();
-    if let Some(entries) = get_entries(&txn) {
-        entries.remove(&mut txn, name);
-    }
+    // Use get_or_create_entries() so schemas loaded as Any::Map are migrated
+    // to live YMap structure before removal.
+    let entries = get_or_create_entries(&mut txn);
+    entries.remove(&mut txn, name);
 }
 
 /// Get an entry from the schema.

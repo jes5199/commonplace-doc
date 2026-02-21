@@ -1,15 +1,14 @@
 //! UUID map building and path resolution for directory sync.
 //!
 //! Pure functions are re-exported from the `commonplace-schema` crate.
-//! HTTP-dependent functions remain here.
+//! Runtime fetch helpers prefer MQTT request/response when available.
 
 pub use commonplace_schema::uuid_map::{
     build_uuid_map_from_local_schemas, collect_paths_from_entry, UuidMapTimeoutError,
 };
 
-use super::schema_io::write_schema_file;
+use super::schema_io::{fetch_schema_content_with_optional_cid, write_schema_file};
 use crate::fs::{Entry, FsSchema};
-use crate::sync::client::fetch_head;
 use crate::sync::types::WrittenSchemas;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -44,25 +43,25 @@ pub async fn fetch_subdir_node_id(
     parent_doc_id: &str,
     subdir_name: &str,
 ) -> Option<String> {
-    use crate::sync::client::{fetch_head, FetchHeadError};
+    let (content, _cid) =
+        match fetch_schema_content_with_optional_cid(client, server, parent_doc_id).await {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                warn!("No schema found for parent document {}", parent_doc_id);
+                return None;
+            }
+            Err(e) => {
+                warn!("Failed to fetch schema for {}: {}", parent_doc_id, e);
+                return None;
+            }
+        };
 
-    let head = match fetch_head(client, server, parent_doc_id, false).await {
-        Ok(Some(h)) => h,
-        Ok(None) => {
-            warn!("No HEAD for parent document {}", parent_doc_id);
-            return None;
-        }
-        Err(FetchHeadError::Status(_, _)) => {
-            warn!("Document {} not found", parent_doc_id);
-            return None;
-        }
-        Err(e) => {
-            warn!("Failed to fetch HEAD for {}: {:?}", parent_doc_id, e);
-            return None;
-        }
-    };
+    if content.is_empty() {
+        warn!("Schema content for {} is empty", parent_doc_id);
+        return None;
+    }
 
-    let schema: FsSchema = match serde_json::from_str(&head.content) {
+    let schema: FsSchema = match serde_json::from_str(&content) {
         Ok(s) => s,
         Err(e) => {
             warn!(
@@ -199,8 +198,9 @@ pub async fn build_uuid_map_from_doc_with_status(
     written_schemas: Option<&WrittenSchemas>,
 ) {
     // Fetch the schema from this document
-    let head = match fetch_head(client, server, doc_id, false).await {
-        Ok(Some(h)) => h,
+    let (content, _cid) = match fetch_schema_content_with_optional_cid(client, server, doc_id).await
+    {
+        Ok(Some(result)) => result,
         Ok(None) => {
             warn!("Document {} not found", doc_id);
             *all_succeeded = false;
@@ -213,7 +213,7 @@ pub async fn build_uuid_map_from_doc_with_status(
         }
     };
 
-    let schema: FsSchema = match serde_json::from_str(&head.content) {
+    let schema: FsSchema = match serde_json::from_str(&content) {
         Ok(s) => s,
         Err(e) => {
             // In the context of deletion cleanup, a node-backed directory that doesn't
@@ -241,7 +241,7 @@ pub async fn build_uuid_map_from_doc_with_status(
             );
         } else {
             // Write the schema file
-            if let Err(e) = write_schema_file(&schema_dir, &head.content, written_schemas).await {
+            if let Err(e) = write_schema_file(&schema_dir, &content, written_schemas).await {
                 warn!("Failed to write schema file to {:?}: {}", schema_dir, e);
             } else {
                 debug!("Wrote schema file to {:?}", schema_dir);
@@ -372,8 +372,10 @@ pub async fn collect_node_backed_dir_ids(
                 result.push((prefix.to_string(), node_id.clone()));
 
                 // Also recursively check if this subdirectory has nested node-backed dirs
-                if let Ok(Some(head)) = fetch_head(client, server, node_id, false).await {
-                    if let Ok(schema) = serde_json::from_str::<FsSchema>(&head.content) {
+                if let Ok(Some((content, _cid))) =
+                    fetch_schema_content_with_optional_cid(client, server, node_id).await
+                {
+                    if let Ok(schema) = serde_json::from_str::<FsSchema>(&content) {
                         if let Some(ref root) = schema.root {
                             collect_node_backed_dir_ids(client, server, root, prefix, result).await;
                         }
@@ -409,19 +411,25 @@ pub async fn get_all_node_backed_dir_ids(
 ) -> Vec<(String, String)> {
     let mut result = Vec::new();
 
-    let head = match fetch_head(client, server, fs_root_id, false).await {
-        Ok(Some(h)) => h,
-        Ok(None) => {
-            warn!("fs-root document {} not found", fs_root_id);
-            return result;
-        }
-        Err(e) => {
-            warn!("Failed to fetch fs-root schema: {}", e);
-            return result;
-        }
-    };
+    let (content, _cid) =
+        match fetch_schema_content_with_optional_cid(client, server, fs_root_id).await {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                warn!("fs-root document {} not found", fs_root_id);
+                return result;
+            }
+            Err(e) => {
+                warn!("Failed to fetch fs-root schema: {}", e);
+                return result;
+            }
+        };
 
-    let schema: FsSchema = match serde_json::from_str(&head.content) {
+    if content.is_empty() {
+        warn!("fs-root schema {} is empty", fs_root_id);
+        return result;
+    }
+
+    let schema: FsSchema = match serde_json::from_str(&content) {
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to parse fs-root schema: {}", e);

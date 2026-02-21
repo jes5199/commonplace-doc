@@ -72,6 +72,35 @@ pub async fn publish_text_change(
     new_content: &str,
     author: &str,
 ) -> SyncResult<PublishResult> {
+    publish_text_change_with_parent(
+        mqtt_client,
+        workspace,
+        node_id,
+        state,
+        old_content,
+        new_content,
+        author,
+        None,
+    )
+    .await
+}
+
+/// Publish a local text file change as a CRDT commit with an optional parent override.
+///
+/// When `parent_override` is present, it is used as the commit parent instead of
+/// `state.local_head_cid`. This enables higher-fidelity ancestry attribution when
+/// callers have stronger provenance (for example, inode-tracker-based base commits).
+#[allow(clippy::too_many_arguments)]
+pub async fn publish_text_change_with_parent(
+    mqtt_client: &Arc<impl MqttPublisher>,
+    workspace: &str,
+    node_id: &str,
+    state: &mut CrdtPeerState,
+    old_content: &str,
+    new_content: &str,
+    author: &str,
+    parent_override: Option<&str>,
+) -> SyncResult<PublishResult> {
     // Load or create Y.Doc
     let doc = state.to_doc()?;
 
@@ -95,10 +124,7 @@ pub async fn publish_text_change(
     }
 
     // Create commit
-    let parents = match &state.local_head_cid {
-        Some(cid) => vec![cid.clone()],
-        None => vec![],
-    };
+    let parents = select_parents(state, parent_override);
 
     // Encode update as base64 for the commit
     let update_b64 = STANDARD.encode(&update_bytes);
@@ -166,6 +192,28 @@ pub async fn publish_yjs_update(
     update_bytes: Vec<u8>,
     author: &str,
 ) -> SyncResult<PublishResult> {
+    publish_yjs_update_with_parent(
+        mqtt_client,
+        workspace,
+        node_id,
+        state,
+        update_bytes,
+        author,
+        None,
+    )
+    .await
+}
+
+/// Publish a raw Yjs update as a CRDT commit with an optional parent override.
+pub async fn publish_yjs_update_with_parent(
+    mqtt_client: &Arc<impl MqttPublisher>,
+    workspace: &str,
+    node_id: &str,
+    state: &mut CrdtPeerState,
+    update_bytes: Vec<u8>,
+    author: &str,
+    parent_override: Option<&str>,
+) -> SyncResult<PublishResult> {
     if state.needs_server_init() {
         return Err(SyncError::stale_crdt_state(
             "CRDT state not initialized".to_string(),
@@ -182,10 +230,7 @@ pub async fn publish_yjs_update(
     }
 
     // Create commit
-    let parents = match &state.local_head_cid {
-        Some(cid) => vec![cid.clone()],
-        None => vec![],
-    };
+    let parents = select_parents(state, parent_override);
 
     // Encode update as base64 for the commit
     let update_b64 = STANDARD.encode(&update_bytes);
@@ -238,6 +283,17 @@ pub async fn publish_yjs_update(
     );
 
     Ok(PublishResult { cid, update_bytes })
+}
+
+fn select_parents(state: &CrdtPeerState, parent_override: Option<&str>) -> Vec<String> {
+    if let Some(parent) = parent_override {
+        return vec![parent.to_string()];
+    }
+
+    match &state.local_head_cid {
+        Some(cid) => vec![cid.clone()],
+        None => vec![],
+    }
 }
 
 /// Check if a commit CID is already known in the state.
@@ -336,7 +392,34 @@ fn compute_text_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use uuid::Uuid;
+
+    #[derive(Default)]
+    struct MockPublisher {
+        payloads: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl MqttPublisher for MockPublisher {
+        async fn publish_retained(&self, _topic: &str, payload: &[u8]) -> Result<(), String> {
+            self.payloads.lock().unwrap().push(payload.to_vec());
+            Ok(())
+        }
+    }
+
+    impl MockPublisher {
+        fn last_edit(&self) -> EditMessage {
+            let payload = self
+                .payloads
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("expected at least one published payload");
+            serde_json::from_slice(&payload)
+                .expect("published payload should decode as EditMessage")
+        }
+    }
 
     #[test]
     fn test_is_commit_known() {
@@ -536,5 +619,65 @@ mod tests {
 
         let result = check_text_publish_preconditions(&doc, "local", "local updated");
         assert!(matches!(result, Err(SyncError::StaleCrdtState(_))));
+    }
+
+    #[tokio::test]
+    async fn test_publish_text_change_with_parent_override_uses_override_parent() {
+        let mqtt = Arc::new(MockPublisher::default());
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+        state.local_head_cid = Some("local-head".to_string());
+
+        let result = publish_text_change_with_parent(
+            &mqtt,
+            "workspace",
+            "node",
+            &mut state,
+            "",
+            "hello",
+            "author",
+            Some("tracked-parent"),
+        )
+        .await
+        .expect("publish should succeed");
+
+        let edit = mqtt.last_edit();
+        assert_eq!(edit.parents, vec!["tracked-parent".to_string()]);
+        assert_eq!(state.local_head_cid, Some(result.cid.clone()));
+        assert_eq!(state.head_cid, Some(result.cid));
+    }
+
+    #[tokio::test]
+    async fn test_publish_yjs_update_with_parent_override_uses_override_parent() {
+        use yrs::{Doc, Text, WriteTxn};
+
+        let mqtt = Arc::new(MockPublisher::default());
+        let mut state = CrdtPeerState::new(Uuid::new_v4());
+        state.initialize_empty();
+        state.local_head_cid = Some("local-head".to_string());
+
+        let update_bytes = {
+            let doc = Doc::new();
+            let mut txn = doc.transact_mut();
+            let text = txn.get_or_insert_text("content");
+            text.insert(&mut txn, 0, "hello from update");
+            txn.encode_update_v1()
+        };
+
+        let result = publish_yjs_update_with_parent(
+            &mqtt,
+            "workspace",
+            "node",
+            &mut state,
+            update_bytes,
+            "author",
+            Some("tracked-parent"),
+        )
+        .await
+        .expect("publish should succeed");
+
+        let edit = mqtt.last_edit();
+        assert_eq!(edit.parents, vec!["tracked-parent".to_string()]);
+        assert_eq!(state.local_head_cid, Some(result.cid.clone()));
+        assert_eq!(state.head_cid, Some(result.cid));
     }
 }

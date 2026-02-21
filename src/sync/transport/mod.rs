@@ -21,13 +21,15 @@ pub mod urls;
 // Re-export public items from submodules
 
 // From ancestry
-pub use ancestry::{all_are_ancestors, determine_sync_direction, is_ancestor, SyncDirection};
+pub use ancestry::{
+    all_are_ancestors, determine_sync_direction, is_ancestor, set_sync_ancestry_mqtt_context,
+    SyncAncestryMqttContext, SyncDirection,
+};
 
 // From client
 pub use client::{
-    delete_schema_entry, discover_fs_root, fetch_head, fork_node, push_content_by_type,
-    push_file_content, push_json_content, push_jsonl_content, push_schema_to_server,
-    refresh_from_head, resolve_path_to_uuid_http, DiscoverFsRootError, FetchHeadError,
+    delete_schema_entry, discover_fs_root, fetch_head, fork_node, push_schema_to_server,
+    resolve_path_to_uuid_http, DiscoverFsRootError, FetchHeadError,
 };
 
 // From commands

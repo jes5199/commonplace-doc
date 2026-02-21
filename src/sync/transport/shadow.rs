@@ -35,8 +35,8 @@ pub enum InboundWriteError {
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
 
-    #[error("HTTP error checking ancestry: {0}")]
-    Http(#[from] reqwest::Error),
+    #[error("Error checking ancestry: {0}")]
+    Ancestry(#[from] super::ancestry::AncestryError),
 }
 
 /// Result of an inbound write attempt

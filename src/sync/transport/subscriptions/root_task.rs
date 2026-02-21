@@ -4,7 +4,7 @@
 //! for schema changes and all file UUIDs for content changes.
 
 use super::recovery::{resync_schema_from_server, resync_subscribed_files, sync_schema_via_cyan};
-use super::{trace_log, CrdtFileSyncContext};
+use super::{is_http_recovery_disabled, trace_log, CrdtFileSyncContext};
 use crate::commit::Commit;
 use crate::events::{recv_broadcast_with_lag, BroadcastRecvResult};
 use crate::mqtt::{MqttClient, Topic};
@@ -26,6 +26,70 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+async fn apply_crdt_content_to_paths(
+    directory: &Path,
+    paths: &[String],
+    content: &str,
+    result: &crate::sync::crdt_merge::MergeResult,
+    received_cid: &str,
+    inode_tracker: Option<&Arc<RwLock<crate::sync::InodeTracker>>>,
+) {
+    let commit_id = crate::sync::file_sync::commit_id_for_write(result, received_cid);
+
+    for rel_path in paths {
+        let file_path = directory.join(rel_path);
+
+        if let Some(parent) = file_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        if let Err(e) = crate::sync::file_sync::write_content_with_tracker(
+            &file_path,
+            content,
+            inode_tracker,
+            commit_id.clone(),
+            "CRDT directory mqtt task",
+        )
+        .await
+        {
+            warn!("Failed to write {}: {}", rel_path, e);
+        } else {
+            debug!(
+                "CRDT edit applied to {} ({} bytes, {:?})",
+                rel_path,
+                content.len(),
+                result
+            );
+        }
+    }
+}
+
+async fn load_root_schema_from_state(
+    ctx: &CrdtFileSyncContext,
+) -> Option<(crate::fs::FsSchema, String, Option<String>)> {
+    let state = ctx.crdt_state.read().await;
+    let doc = match state.schema.to_doc() {
+        Ok(doc) => doc,
+        Err(e) => {
+            warn!("Failed to convert root schema state to doc: {}", e);
+            return None;
+        }
+    };
+
+    let schema = crate::sync::ymap_schema::to_fs_schema(&doc);
+    let schema_json = match crate::sync::schema_to_json(&schema) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "Failed to serialize root schema snapshot after cyan resync: {}",
+                e
+            );
+            return None;
+        }
+    };
+
+    Some((schema, schema_json, state.schema.head_cid.clone()))
+}
 
 /// MQTT task for directory-level events (watching fs-root via MQTT).
 ///
@@ -59,6 +123,12 @@ pub async fn directory_mqtt_task(
     initial_uuid_map: HashMap<String, String>,
     crdt_context: Option<CrdtFileSyncContext>,
 ) {
+    // Ensure ancestry checks in this process use MQTT/cyan instead of HTTP.
+    crate::sync::set_sync_ancestry_mqtt_context(Some(crate::sync::SyncAncestryMqttContext::new(
+        mqtt_client.clone(),
+        workspace.clone(),
+    )));
+
     // CRITICAL: Create the broadcast receiver BEFORE any MQTT subscriptions.
     // This ensures we receive retained messages that the broker sends immediately
     // after we subscribe. If we create the receiver after subscribing, retained
@@ -68,6 +138,12 @@ pub async fn directory_mqtt_task(
     let inode_tracker_for_crdt = inode_tracker.clone();
     #[cfg(not(unix))]
     let inode_tracker_for_crdt = None;
+    let http_recovery_disabled = is_http_recovery_disabled(
+        crdt_context
+            .as_ref()
+            .map(|ctx| ctx.mqtt_only_config.mqtt_only)
+            .unwrap_or(false),
+    );
 
     // Subscribe to edits for the fs-root document (schema changes)
     let fs_root_topic = Topic::edits(&workspace, &fs_root_id).to_topic_string();
@@ -153,23 +229,18 @@ pub async fn directory_mqtt_task(
 
                 if initialized {
                     debug!("Schema CRDT initialized via cyan sync for {}", fs_root_id);
-                } else if ctx.mqtt_only_config.mqtt_only {
-                    warn!(
-                        "Cyan sync failed for {} and HTTP bootstrap is disabled (MQTT-only)",
-                        fs_root_id
-                    );
                 } else {
                     warn!(
-                        "Cyan sync failed for {} — falling back to HTTP bootstrap",
+                        "Cyan sync failed for {} — no HTTP bootstrap fallback in MQTT runtime",
                         fs_root_id
                     );
                 }
             }
 
             // Bootstrap files from the schema (whether initialized via cyan or already present)
-            if ctx.mqtt_only_config.mqtt_only {
+            if http_recovery_disabled {
                 warn!(
-                    "Skipping HTTP file bootstrap for {} (MQTT-only mode)",
+                    "Skipping HTTP file bootstrap for {} (HTTP recovery disabled)",
                     fs_root_id
                 );
             } else if let Err(e) = handle_subdir_new_files(
@@ -274,29 +345,47 @@ pub async fn directory_mqtt_task(
             //
             // When CRDT context is NOT available, fall back to HTTP-based processing.
             if let Some(ref ctx) = crdt_context {
-                // Apply MQTT delta to persistent CRDT state
-                let mut state = ctx.crdt_state.write().await;
-                let mqtt_schema_result =
-                    apply_schema_update_to_state(&mut state.schema, &msg.payload);
-                // Extract the updated CID before releasing the lock (for ancestry tracking)
-                let updated_cid = state.schema.head_cid.clone();
+                // Apply MQTT delta to persistent CRDT state.
+                let mut schema_recovered_from_cyan = false;
+                let mut updated_cid: Option<String> = None;
+                let mut root_deleted_entries = std::collections::HashSet::new();
 
-                // Extract fields from SchemaUpdateResult (CP-seha)
-                let (mqtt_schema, root_deleted_entries) = match mqtt_schema_result {
-                    Some(r) => (Some((r.schema, r.schema_json)), r.deleted_entries),
-                    None => (None, std::collections::HashSet::new()),
+                let mut mqtt_schema = {
+                    let mut state = ctx.crdt_state.write().await;
+                    let schema_result =
+                        apply_schema_update_to_state(&mut state.schema, &msg.payload)
+                            .map(|r| (r.schema, r.schema_json, r.deleted_entries));
+
+                    if let Some((_, _, deleted_entries)) = &schema_result {
+                        updated_cid = state.schema.head_cid.clone();
+                        root_deleted_entries = deleted_entries.clone();
+
+                        if let Err(e) = state.save(&directory).await {
+                            warn!("Failed to save root CRDT state: {}", e);
+                        } else {
+                            debug!(
+                                "[SANDBOX-TRACE] Persisted schema CRDT state for root directory"
+                            );
+                        }
+                    }
+
+                    schema_result.map(|(schema, schema_json, _)| (schema, schema_json))
                 };
 
-                // Persist the updated CRDT state to disk so it survives restarts
-                if mqtt_schema.is_some() {
-                    if let Err(e) = state.save(&directory).await {
-                        warn!("Failed to save root CRDT state: {}", e);
-                    } else {
-                        debug!("[SANDBOX-TRACE] Persisted schema CRDT state for root directory");
-                    }
+                if mqtt_schema.is_none() {
+                    trace_log(
+                        "MQTT: Failed to decode schema from CRDT state; triggering cyan resync",
+                    );
+                    debug!("MQTT: Failed to decode schema from CRDT state; triggering cyan resync");
+                    resync_schema_from_server(&fs_root_id, ctx).await;
+                    mqtt_schema = load_root_schema_from_state(ctx).await.map(
+                        |(schema, schema_json, recovered_cid)| {
+                            schema_recovered_from_cyan = true;
+                            updated_cid = recovered_cid;
+                            (schema, schema_json)
+                        },
+                    );
                 }
-
-                drop(state); // Release lock before doing I/O
 
                 if let Some((ref schema, ref schema_json)) = mqtt_schema {
                     let entry_count = if let Some(crate::fs::Entry::Dir(ref root)) = schema.root {
@@ -329,7 +418,9 @@ pub async fn directory_mqtt_task(
                             crate::sync::state_file::compute_content_hash(schema_json.as_bytes());
                         let is_duplicate = last_schema_hash.as_ref() == Some(&current_hash);
 
-                        if !is_duplicate {
+                        // Full snapshot recovery after decode failure still needs reconciliation
+                        // even if schema hash is unchanged.
+                        if !is_duplicate || schema_recovered_from_cyan {
                             // Write the schema to disk
                             if let Err(e) = crate::sync::write_schema_file(
                                 &directory,
@@ -344,9 +435,9 @@ pub async fn directory_mqtt_task(
                             // Handle new files using MQTT schema
                             let schema_tuple = (schema.clone(), schema_json.clone());
                             if !push_only {
-                                if ctx.mqtt_only_config.mqtt_only {
+                                if http_recovery_disabled {
                                     warn!(
-                                        "MQTT: Skipping new file sync for {} (MQTT-only mode, HTTP disabled)",
+                                        "MQTT: Skipping new file sync for {} (HTTP recovery disabled)",
                                         fs_root_id
                                     );
                                 } else if let Err(e) = handle_subdir_new_files(
@@ -394,6 +485,10 @@ pub async fn directory_mqtt_task(
                                     &root_deleted_entries,
                                 )
                                 .await;
+                            } else if schema_recovered_from_cyan {
+                                debug!(
+                                    "MQTT: Root schema recovered from cyan snapshot with no explicit deletions; skipping deletion sweep"
+                                );
                             }
 
                             // Ensure CRDT tasks exist for all files
@@ -434,92 +529,86 @@ pub async fn directory_mqtt_task(
                             if updated_cid.is_some() {
                                 last_schema_cid = updated_cid.clone();
                             }
+
+                            if schema_recovered_from_cyan && !push_only {
+                                // Materialize current file state immediately from the recovered
+                                // snapshot so convergence does not wait for a later edit.
+                                resync_subscribed_files(
+                                    &http_client,
+                                    &server,
+                                    &subscribed_uuids,
+                                    &uuid_to_paths,
+                                    &directory,
+                                    use_paths,
+                                    &file_states,
+                                    crdt_context.as_ref(),
+                                    inode_tracker_for_crdt.clone(),
+                                    &author,
+                                )
+                                .await;
+                            }
                         } else {
                             debug!("MQTT: Schema unchanged (same hash), skipped processing");
                         }
                     }
-                } else {
-                    trace_log(
-                        "MQTT: Failed to decode schema from CRDT state, falling back to HTTP",
+                } else if schema_recovered_from_cyan {
+                    warn!(
+                        "MQTT: Cyan resync completed for {}, but no schema snapshot could be loaded",
+                        fs_root_id
                     );
-                    debug!("MQTT: Failed to decode schema from CRDT state, falling back to HTTP");
-                    if ctx.mqtt_only_config.mqtt_only {
-                        warn!(
-                            "MQTT: Schema decode failed for {} but HTTP fallback is disabled (MQTT-only)",
-                            fs_root_id
-                        );
-                    } else {
-                        // Fall through to HTTP-based processing
-                        if let Err(e) = handle_schema_change_with_dedup(
-                            &http_client,
-                            &server,
-                            &fs_root_id,
-                            &directory,
-                            &file_states,
-                            true,
-                            use_paths,
-                            &mut last_schema_hash,
-                            &mut last_schema_cid,
-                            push_only,
-                            pull_only,
-                            &author,
-                            #[cfg(unix)]
-                            inode_tracker.clone(),
-                            written_schemas.as_ref(),
-                            shared_state_file.as_ref(),
-                            crdt_context.as_ref(),
-                        )
-                        .await
-                        {
-                            warn!("MQTT: Failed to handle schema change: {}", e);
-                        }
-                    }
                 }
             } else {
-                // No CRDT context - use HTTP-based processing (legacy mode)
-                match handle_schema_change_with_dedup(
-                    &http_client,
-                    &server,
-                    &fs_root_id,
-                    &directory,
-                    &file_states,
-                    true, // spawn_tasks: true for runtime schema changes
-                    use_paths,
-                    &mut last_schema_hash,
-                    &mut last_schema_cid,
-                    push_only,
-                    pull_only,
-                    &author,
-                    #[cfg(unix)]
-                    inode_tracker.clone(),
-                    written_schemas.as_ref(),
-                    shared_state_file.as_ref(),
-                    crdt_context.as_ref(),
-                )
-                .await
-                {
-                    Ok(true) => {
-                        debug!("MQTT: Schema change processed successfully (HTTP mode)");
-                        // Update UUID subscriptions in legacy mode
-                        sync_uuid_subscriptions(
-                            &http_client,
-                            &server,
-                            &fs_root_id,
-                            &mqtt_client,
-                            &workspace,
-                            &mut subscribed_uuids,
-                            &mut uuid_to_paths,
-                            &directory,
-                            use_paths,
-                            &file_states,
-                        )
-                        .await;
-                    }
-                    Ok(false) => {
-                        debug!("MQTT: Schema unchanged, skipped processing (HTTP mode)");
-                    }
-                    Err(e) => {
-                        warn!("MQTT: Failed to handle schema change: {}", e);
+                if http_recovery_disabled {
+                    warn!(
+                        "MQTT: Received schema change for {} but no CRDT context is available and HTTP recovery is disabled",
+                        fs_root_id
+                    );
+                } else {
+                    // No CRDT context - use HTTP-based processing (legacy mode)
+                    match handle_schema_change_with_dedup(
+                        &http_client,
+                        &server,
+                        &fs_root_id,
+                        &directory,
+                        &file_states,
+                        true, // spawn_tasks: true for runtime schema changes
+                        use_paths,
+                        &mut last_schema_hash,
+                        &mut last_schema_cid,
+                        push_only,
+                        pull_only,
+                        &author,
+                        #[cfg(unix)]
+                        inode_tracker.clone(),
+                        written_schemas.as_ref(),
+                        shared_state_file.as_ref(),
+                        crdt_context.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            debug!("MQTT: Schema change processed successfully (HTTP mode)");
+                            // Update UUID subscriptions in legacy mode
+                            sync_uuid_subscriptions(
+                                &http_client,
+                                &server,
+                                &fs_root_id,
+                                &mqtt_client,
+                                &workspace,
+                                &mut subscribed_uuids,
+                                &mut uuid_to_paths,
+                                &directory,
+                                use_paths,
+                                &file_states,
+                            )
+                            .await;
+                        }
+                        Ok(false) => {
+                            debug!("MQTT: Schema unchanged, skipped processing (HTTP mode)");
+                        }
+                        Err(e) => {
+                            warn!("MQTT: Failed to handle schema change: {}", e);
+                        }
                     }
                 }
             }
@@ -691,30 +780,15 @@ pub async fn directory_mqtt_task(
                                             drop(state_guard); // Release lock before file I/O
 
                                             if let Some(content) = maybe_content {
-                                                // Write to all paths
-                                                for rel_path in paths {
-                                                    let file_path = directory.join(rel_path);
-
-                                                    if let Some(parent) = file_path.parent() {
-                                                        let _ =
-                                                            tokio::fs::create_dir_all(parent).await;
-                                                    }
-                                                    if let Err(e) =
-                                                        tokio::fs::write(&file_path, &content).await
-                                                    {
-                                                        warn!(
-                                                            "Failed to write {}: {}",
-                                                            rel_path, e
-                                                        );
-                                                    } else {
-                                                        debug!(
-                                                        "CRDT edit applied to {} ({} bytes, {:?})",
-                                                        rel_path,
-                                                        content.len(),
-                                                        result
-                                                    );
-                                                    }
-                                                }
+                                                apply_crdt_content_to_paths(
+                                                    &directory,
+                                                    paths,
+                                                    &content,
+                                                    &result,
+                                                    &received_cid,
+                                                    inode_tracker_for_crdt.as_ref(),
+                                                )
+                                                .await;
                                                 true // Handled via CRDT
                                             } else {
                                                 debug!(
@@ -950,5 +1024,80 @@ async fn sync_uuid_subscriptions(
             to_remove.len(),
             subscribed_uuids.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::crdt_merge::MergeResult;
+    #[cfg(unix)]
+    use crate::sync::{InodeKey, InodeTracker};
+    use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_crdt_content_to_paths_uses_tracker_atomic_write_and_commit_id() {
+        let dir = tempdir().unwrap();
+        let rel_path = "nested/note.txt".to_string();
+        let file_path = dir.path().join(&rel_path);
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "old content").unwrap();
+
+        let old_inode = InodeKey::from_path(&file_path).unwrap();
+        let tracker = Arc::new(RwLock::new(InodeTracker::new(dir.path().join(".shadow"))));
+        {
+            let mut guard = tracker.write().await;
+            guard.track(old_inode, "cid-before".to_string(), file_path.clone(), None);
+        }
+
+        let paths = vec![rel_path];
+        let result = MergeResult::FastForward {
+            new_head: "cid-after".to_string(),
+        };
+        apply_crdt_content_to_paths(
+            dir.path(),
+            &paths,
+            "new content",
+            &result,
+            "received-cid-ignored-for-fast-forward",
+            Some(&tracker),
+        )
+        .await;
+
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "new content");
+
+        let new_inode = InodeKey::from_path(&file_path).unwrap();
+        assert_ne!(
+            old_inode, new_inode,
+            "tracker-aware write should replace inode atomically"
+        );
+
+        let guard = tracker.read().await;
+        let new_state = guard
+            .get(&new_inode)
+            .expect("new inode should be tracked after write");
+        assert_eq!(new_state.commit_id, "cid-after");
+    }
+
+    #[tokio::test]
+    async fn test_apply_crdt_content_to_paths_without_tracker_writes_content() {
+        let dir = tempdir().unwrap();
+        let rel_path = "deep/path/note.txt".to_string();
+        let file_path = dir.path().join(&rel_path);
+
+        let paths = vec![rel_path];
+        let result = MergeResult::LocalAhead;
+        apply_crdt_content_to_paths(
+            dir.path(),
+            &paths,
+            "hello",
+            &result,
+            "cid-local-ahead",
+            None,
+        )
+        .await;
+
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "hello");
     }
 }

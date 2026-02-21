@@ -767,17 +767,10 @@ pub async fn handle_subdir_new_files(
     #[cfg(not(unix))]
     let inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>> = None;
 
-    if crdt_context
+    let mqtt_only_mode = crdt_context
         .as_ref()
         .map(|ctx| ctx.mqtt_only_config.mqtt_only)
-        .unwrap_or(false)
-    {
-        warn!(
-            "Skipping subdir new file sync for '{}' (MQTT-only mode, HTTP disabled)",
-            subdir_path
-        );
-        return Ok(());
-    }
+        .unwrap_or(false);
 
     // Use MQTT schema if provided, otherwise fetch from HTTP
     let schema = if let Some((schema, _content)) = mqtt_schema {
@@ -790,8 +783,13 @@ pub async fn handle_subdir_new_files(
         }
     };
 
-    // Build UUID map for the subdirectory (for files with explicit node_id)
-    let subdir_uuid_map = build_uuid_map_recursive(client, server, subdir_node_id).await;
+    // Build UUID map for the subdirectory (for files with explicit node_id).
+    // In strict MQTT-only mode, avoid HTTP fetches here and rely on schema snapshot node_ids.
+    let subdir_uuid_map = if mqtt_only_mode {
+        HashMap::new()
+    } else {
+        build_uuid_map_recursive(client, server, subdir_node_id).await
+    };
 
     // Convert to path -> (root_relative_path, subdir_relative_path, Option<node_id>) tuples
     // We need the subdir-relative path for API calls but root-relative path for file_states
@@ -1055,6 +1053,12 @@ pub async fn handle_subdir_new_files(
 
         // Track if we have a valid UUID from MQTT schema for fallback when HTTP returns 404
         let has_mqtt_uuid = node_id.is_some() && crdt_context.is_some();
+        let mqtt_only_fallback = matches!(&fetch_result, Ok(None))
+            || matches!(
+                &fetch_result,
+                Err(crate::sync::FetchHeadError::Status(code, _))
+                    if *code == reqwest::StatusCode::FORBIDDEN
+            );
 
         if let Ok(Some(file_head)) = fetch_result {
             // Note: We must NOT skip when content is empty. If we skip, the file
@@ -1240,10 +1244,11 @@ pub async fn handle_subdir_new_files(
                     file_state.crdt_tasks_spawned = true;
                 }
             }
-        } else if has_mqtt_uuid && matches!(fetch_result, Ok(None)) {
+        } else if has_mqtt_uuid && mqtt_only_fallback {
             // MQTT-only fallback: HTTP returned 404 but we have a UUID from MQTT schema.
             // This happens when a new file is created via MQTT but the server hasn't
-            // processed it yet. Create an empty file and start CRDT tasks - the retained
+            // processed it yet, or HTTP is disabled in sync runtime. Create an empty file
+            // and start CRDT tasks - the retained
             // MQTT content message will be received by the CRDT receive task.
             //
             // See: CP-1ual (flaky sync test due to HTTP/MQTT race condition)

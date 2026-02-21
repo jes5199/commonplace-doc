@@ -191,8 +191,8 @@ pub use schema::directory::{
     ScanError, ScanOptions, ScannedFile,
 };
 pub use schema::schema_io::{
-    fetch_and_validate_schema, write_nested_schemas, write_schema_file, FetchedSchema,
-    SCHEMA_FILENAME,
+    fetch_and_validate_schema, set_sync_schema_mqtt_request_client, write_nested_schemas,
+    write_schema_file, FetchedSchema, SCHEMA_FILENAME,
 };
 pub use schema::uuid_map::{
     build_uuid_map_and_write_schemas, build_uuid_map_from_doc, build_uuid_map_from_local_schemas,
@@ -202,11 +202,13 @@ pub use schema::uuid_map::{
 };
 
 // --- From transport/ ---
-pub use transport::ancestry::{determine_sync_direction, is_ancestor, SyncDirection};
+pub use transport::ancestry::{
+    determine_sync_direction, is_ancestor, set_sync_ancestry_mqtt_context, SyncAncestryMqttContext,
+    SyncDirection,
+};
 pub use transport::client::{
-    delete_schema_entry, discover_fs_root, fetch_head, fork_node, push_content_by_type,
-    push_file_content, push_json_content, push_jsonl_content, push_schema_to_server,
-    refresh_from_head, resolve_path_to_uuid_http, DiscoverFsRootError, FetchHeadError,
+    delete_schema_entry, discover_fs_root, fetch_head, fork_node, push_schema_to_server,
+    resolve_path_to_uuid_http, set_sync_http_disabled, DiscoverFsRootError, FetchHeadError,
 };
 pub use transport::commands::{spawn_command_listener, CommandEntry};
 pub use transport::missing_parent::{
