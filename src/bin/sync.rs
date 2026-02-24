@@ -1424,6 +1424,52 @@ async fn handle_file_created_crdt(
                     filename, new_file.uuid, new_file.schema_cid, new_file.file_cid
                 );
 
+                // Save root state and update local schema file so local tools see the new entry.
+                {
+                    let state = crdt.crdt_state.read().await;
+
+                    if let Err(e) = state.save(directory).await {
+                        warn!(
+                            "Failed to save root state for {}: {}",
+                            directory.display(),
+                            e
+                        );
+                    }
+
+                    match state.schema.to_doc() {
+                        Ok(doc) => {
+                            let fs_schema = ymap_schema::to_fs_schema(&doc);
+                            match schema_to_json(&fs_schema) {
+                                Ok(schema_json) => {
+                                    if let Err(e) =
+                                        write_schema_file(directory, &schema_json, None).await
+                                    {
+                                        warn!(
+                                            "Failed to write local schema for {}: {}",
+                                            directory.display(),
+                                            e
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to serialize root schema for {}: {}",
+                                        directory.display(),
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to convert root schema state to Y.Doc for {}: {}",
+                                directory.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+
                 // Spawn CRDT sync tasks for the new file
                 let file_path = path.to_path_buf();
                 // Check for existing tasks before spawning (prevents duplicates)
