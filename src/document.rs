@@ -254,6 +254,37 @@ impl DocumentStore {
                         root_text = Some(text);
                     }
                 }
+                Value::UndefinedRef(branch_ptr) => {
+                    // When a Y.Doc is created without pre-inserting root types
+                    // (uninit), incoming CRDT updates create roots that appear
+                    // as UndefinedRef. Check the branch's actual type_ref to
+                    // resolve to the correct typed accessor.
+                    use yrs::types::TypeRef;
+                    match branch_ptr.as_ref().type_ref() {
+                        TypeRef::Map => {
+                            if root_map.is_none() {
+                                if let Some(map) = txn.get_map(Self::TEXT_ROOT_NAME) {
+                                    root_map = Some(map);
+                                }
+                            }
+                        }
+                        TypeRef::Array => {
+                            if root_array.is_none() {
+                                if let Some(array) = txn.get_array(Self::TEXT_ROOT_NAME) {
+                                    root_array = Some(array);
+                                }
+                            }
+                        }
+                        TypeRef::Text => {
+                            if root_text.is_none() {
+                                if let Some(text) = txn.get_text(Self::TEXT_ROOT_NAME) {
+                                    root_text = Some(text);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }

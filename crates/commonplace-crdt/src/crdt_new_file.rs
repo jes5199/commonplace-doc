@@ -625,6 +625,24 @@ pub async fn publish_schema_via_mqtt(
     schema: &commonplace_types::fs::FsSchema,
     author: &str,
 ) -> SyncResult<String> {
+    publish_schema_via_mqtt_with_topic(mqtt_client, workspace, schema_state, schema, author, None)
+        .await
+}
+
+/// Publish a schema via MQTT with an optional topic override for the node ID.
+///
+/// When the fs-root ID is not a UUID (e.g., "workspace"), the CrdtPeerState
+/// may use a nil UUID. The `topic_node_id` override lets the caller specify
+/// the correct topic path (e.g., "workspace") so the server maps the edit
+/// to the right document.
+pub async fn publish_schema_via_mqtt_with_topic(
+    mqtt_client: &Arc<impl MqttPublisher>,
+    workspace: &str,
+    schema_state: &mut CrdtPeerState,
+    schema: &commonplace_types::fs::FsSchema,
+    author: &str,
+    topic_node_id: Option<&str>,
+) -> SyncResult<String> {
     // Load schema Y.Doc
     let doc = schema_state.to_doc()?;
 
@@ -679,8 +697,9 @@ pub async fn publish_schema_via_mqtt(
         req: None,
     };
 
-    let schema_node_id = schema_state.node_id.to_string();
-    let topic = edits_topic(workspace, &schema_node_id);
+    let default_node_id = schema_state.node_id.to_string();
+    let effective_node_id = topic_node_id.unwrap_or(&default_node_id);
+    let topic = edits_topic(workspace, effective_node_id);
     let payload = serde_json::to_vec(&edit_msg)?;
 
     mqtt_client
@@ -688,7 +707,10 @@ pub async fn publish_schema_via_mqtt(
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
 
-    info!("Published schema commit {} via MQTT (retained)", cid);
+    info!(
+        "Published schema commit {} via MQTT (retained) to {}",
+        cid, effective_node_id
+    );
 
     Ok(cid)
 }

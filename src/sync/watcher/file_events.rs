@@ -280,9 +280,9 @@ pub async fn ensure_parent_directories_exist(
         }
 
         if needs_creation {
-            let ctx = crdt_context.ok_or_else(|| {
-                "CRDT context is required for parent directory creation in MQTT-only sync runtime"
-            })?;
+            let ctx = crdt_context.ok_or(
+                "CRDT context is required for parent directory creation in MQTT-only sync runtime",
+            )?;
             info!(
                 "Creating node-backed directory '{}' (parent: {})",
                 dir_name, current_parent_id

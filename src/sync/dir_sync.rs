@@ -2800,12 +2800,15 @@ pub async fn handle_schema_modified(
         if let Some(ctx) = crdt_context {
             info!("Pushing root schema via MQTT (fs_root_id: {})", fs_root_id);
             let mut state = ctx.crdt_state.write().await;
-            publish_schema_via_mqtt(
+            // Use fs_root_id as the topic override so the edit goes to the
+            // correct server document (e.g., "workspace" instead of nil UUID).
+            crate::sync::publish_schema_via_mqtt_with_topic(
                 &ctx.mqtt_client,
                 &ctx.workspace,
                 &mut state.schema,
                 &schema,
                 author,
+                Some(fs_root_id),
             )
             .await
             .map_err(|e| format!("Failed to publish schema via MQTT: {}", e))?;

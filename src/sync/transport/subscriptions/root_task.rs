@@ -557,58 +557,56 @@ pub async fn directory_mqtt_task(
                         fs_root_id
                     );
                 }
+            } else if http_recovery_disabled {
+                warn!(
+                    "MQTT: Received schema change for {} but no CRDT context is available and HTTP recovery is disabled",
+                    fs_root_id
+                );
             } else {
-                if http_recovery_disabled {
-                    warn!(
-                        "MQTT: Received schema change for {} but no CRDT context is available and HTTP recovery is disabled",
-                        fs_root_id
-                    );
-                } else {
-                    // No CRDT context - use HTTP-based processing (legacy mode)
-                    match handle_schema_change_with_dedup(
-                        &http_client,
-                        &server,
-                        &fs_root_id,
-                        &directory,
-                        &file_states,
-                        true, // spawn_tasks: true for runtime schema changes
-                        use_paths,
-                        &mut last_schema_hash,
-                        &mut last_schema_cid,
-                        push_only,
-                        pull_only,
-                        &author,
-                        #[cfg(unix)]
-                        inode_tracker.clone(),
-                        written_schemas.as_ref(),
-                        shared_state_file.as_ref(),
-                        crdt_context.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(true) => {
-                            debug!("MQTT: Schema change processed successfully (HTTP mode)");
-                            // Update UUID subscriptions in legacy mode
-                            sync_uuid_subscriptions(
-                                &http_client,
-                                &server,
-                                &fs_root_id,
-                                &mqtt_client,
-                                &workspace,
-                                &mut subscribed_uuids,
-                                &mut uuid_to_paths,
-                                &directory,
-                                use_paths,
-                                &file_states,
-                            )
-                            .await;
-                        }
-                        Ok(false) => {
-                            debug!("MQTT: Schema unchanged, skipped processing (HTTP mode)");
-                        }
-                        Err(e) => {
-                            warn!("MQTT: Failed to handle schema change: {}", e);
-                        }
+                // No CRDT context - use HTTP-based processing (legacy mode)
+                match handle_schema_change_with_dedup(
+                    &http_client,
+                    &server,
+                    &fs_root_id,
+                    &directory,
+                    &file_states,
+                    true, // spawn_tasks: true for runtime schema changes
+                    use_paths,
+                    &mut last_schema_hash,
+                    &mut last_schema_cid,
+                    push_only,
+                    pull_only,
+                    &author,
+                    #[cfg(unix)]
+                    inode_tracker.clone(),
+                    written_schemas.as_ref(),
+                    shared_state_file.as_ref(),
+                    crdt_context.as_ref(),
+                )
+                .await
+                {
+                    Ok(true) => {
+                        debug!("MQTT: Schema change processed successfully (HTTP mode)");
+                        // Update UUID subscriptions in legacy mode
+                        sync_uuid_subscriptions(
+                            &http_client,
+                            &server,
+                            &fs_root_id,
+                            &mqtt_client,
+                            &workspace,
+                            &mut subscribed_uuids,
+                            &mut uuid_to_paths,
+                            &directory,
+                            use_paths,
+                            &file_states,
+                        )
+                        .await;
+                    }
+                    Ok(false) => {
+                        debug!("MQTT: Schema unchanged, skipped processing (HTTP mode)");
+                    }
+                    Err(e) => {
+                        warn!("MQTT: Failed to handle schema change: {}", e);
                     }
                 }
             }
