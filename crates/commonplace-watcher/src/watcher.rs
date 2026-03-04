@@ -582,6 +582,15 @@ pub async fn directory_watcher_task(
                                 let name_str = name.to_string_lossy();
 
                                 // Handle .commonplace.json files specially
+                                // Skip schema files inside .commonplace-shadow (internal metadata dir)
+                                if name_str == ".commonplace.json"
+                                    && path.components().any(|c| {
+                                        c.as_os_str() == ".commonplace-shadow"
+                                    })
+                                {
+                                    debug!("Skipping schema file in shadow dir: {}", path.display());
+                                    continue;
+                                }
                                 if name_str == ".commonplace.json" {
                                     // If we have written_schemas tracking, check for user edits
                                     if let Some(ref ws) = written_schemas {

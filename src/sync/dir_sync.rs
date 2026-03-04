@@ -2769,6 +2769,18 @@ pub async fn handle_schema_modified(
     written_schemas: Option<&crate::sync::WrittenSchemas>,
     crdt_context: Option<&CrdtFileSyncContext>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Skip schemas inside .commonplace-shadow (internal metadata directory)
+    if schema_path
+        .components()
+        .any(|c| c.as_os_str() == ".commonplace-shadow")
+    {
+        tracing::debug!(
+            "Skipping schema in .commonplace-shadow: {}",
+            schema_path.display()
+        );
+        return Ok(());
+    }
+
     // Check for echo - if we recently wrote to this path, skip pushing
     if let Some(ws) = written_schemas {
         let canonical = schema_path

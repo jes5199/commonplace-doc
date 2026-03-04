@@ -494,6 +494,10 @@ fn collect_local_schema_paths(directory: &Path) -> Vec<PathBuf> {
             };
 
             if file_type.is_dir() {
+                // Skip .commonplace-shadow (internal metadata directory)
+                if path.file_name().and_then(|n| n.to_str()) == Some(".commonplace-shadow") {
+                    continue;
+                }
                 stack.push(path);
                 continue;
             }
