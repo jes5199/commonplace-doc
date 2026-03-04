@@ -745,6 +745,27 @@ fn wait_for_path_missing(path: &std::path::Path, timeout: Duration) {
     );
 }
 
+/// Wait for a `.commonplace.json` schema file to exist inside a directory.
+///
+/// This is stronger than `wait_for_path_exists(dir)` — it ensures the subdir
+/// watcher has finished writing the schema file, preventing races where the
+/// directory exists but schema lookups (e.g., `find_owning_document`) would
+/// fail because the schema hasn't been flushed yet.
+fn wait_for_schema_file_exists(dir: &std::path::Path, timeout: Duration) {
+    let schema_path = dir.join(".commonplace.json");
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if schema_path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "Timed out waiting for schema file at: {}",
+        schema_path.display()
+    );
+}
+
 fn wait_for_schema_entry_presence(
     client: &reqwest::blocking::Client,
     server_url: &str,
@@ -2442,8 +2463,10 @@ fn test_mqtt_only_watcher_create_in_subdir_propagates_to_server_and_peer() {
 
     let subdir_a = sync_dir_a.join("shared");
     let subdir_b = sync_dir_b.join("shared");
-    wait_for_path_exists(&subdir_a, Duration::from_secs(30));
-    wait_for_path_exists(&subdir_b, Duration::from_secs(30));
+    // Wait for both the directory AND its schema file to exist, ensuring the
+    // subdir watcher has fully initialized before we create files.
+    wait_for_schema_file_exists(&subdir_a, Duration::from_secs(30));
+    wait_for_schema_file_exists(&subdir_b, Duration::from_secs(30));
 
     let local_new_file = subdir_a.join("created-via-watcher.txt");
     let content = "created from watcher path in mqtt-only runtime";
@@ -2853,8 +2876,8 @@ fn test_mqtt_only_watcher_delete_in_subdir_propagates_to_server_and_peer() {
 
     let subdir_a = sync_dir_a.join("shared");
     let subdir_b = sync_dir_b.join("shared");
-    wait_for_path_exists(&subdir_a, Duration::from_secs(20));
-    wait_for_path_exists(&subdir_b, Duration::from_secs(20));
+    wait_for_schema_file_exists(&subdir_a, Duration::from_secs(20));
+    wait_for_schema_file_exists(&subdir_b, Duration::from_secs(20));
 
     let file_a = subdir_a.join("delete-me.txt");
     let file_b = subdir_b.join("delete-me.txt");

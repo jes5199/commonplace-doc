@@ -74,42 +74,72 @@ pub fn find_owning_document(
             i
         );
 
-        // Check if parent has a .commonplace.json with this component as a node-backed entry
+        // Check if parent has a .commonplace.json with this component as a node-backed entry.
+        // Retry up to 2 times with a short delay if the schema file is missing but the
+        // subdirectory exists on disk — this handles the race between directory creation
+        // and schema file write during subdir watcher startup.
         let schema_path = current_dir.join(SCHEMA_FILENAME);
-        if let Ok(content) = std::fs::read_to_string(&schema_path) {
-            if let Ok(schema) = serde_json::from_str::<FsSchema>(&content) {
-                if let Some(Entry::Dir(dir_entry)) = schema.root.as_ref() {
-                    if let Some(ref entries) = dir_entry.entries {
-                        trace!("find_owning_document: schema has {} entries", entries.len());
-                        if let Some(entry) = entries.get(*component) {
-                            trace!("find_owning_document: found entry for '{}'", component);
-                            if let Entry::Dir(subdir) = entry {
+        let max_attempts = if current_dir.join(component).is_dir() {
+            3
+        } else {
+            1
+        };
+
+        'retry: for attempt in 0..max_attempts {
+            if attempt > 0 {
+                debug!(
+                    "find_owning_document: retry {} reading schema at {:?}",
+                    attempt, schema_path
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+
+            match std::fs::read_to_string(&schema_path) {
+                Ok(content) => {
+                    if let Ok(schema) = serde_json::from_str::<FsSchema>(&content) {
+                        if let Some(Entry::Dir(dir_entry)) = schema.root.as_ref() {
+                            if let Some(ref entries) = dir_entry.entries {
                                 trace!(
-                                    "find_owning_document: entry is dir, node_id={:?}",
-                                    subdir.node_id
+                                    "find_owning_document: schema has {} entries",
+                                    entries.len()
                                 );
-                                if let Some(ref node_id) = subdir.node_id {
-                                    // This is a node-backed directory!
-                                    // The remaining path belongs to this document
+                                if let Some(entry) = entries.get(*component) {
                                     trace!(
-                                        "find_owning_document: FOUND node-backed dir '{}' with id {}",
-                                        component, node_id
+                                        "find_owning_document: found entry for '{}'",
+                                        component
                                     );
-                                    current_document_id = node_id.clone();
-                                    path_start_index = i + 1;
+                                    if let Entry::Dir(subdir) = entry {
+                                        trace!(
+                                            "find_owning_document: entry is dir, node_id={:?}",
+                                            subdir.node_id
+                                        );
+                                        if let Some(ref node_id) = subdir.node_id {
+                                            trace!(
+                                                "find_owning_document: FOUND node-backed dir '{}' with id {}",
+                                                component, node_id
+                                            );
+                                            current_document_id = node_id.clone();
+                                            path_start_index = i + 1;
+                                            break 'retry;
+                                        }
+                                    }
                                 }
                             }
                         }
+                    } else {
+                        debug!(
+                            "find_owning_document: failed to parse schema from {:?}",
+                            schema_path
+                        );
                     }
+                    // Schema file exists but doesn't contain the entry — no point retrying
+                    break;
                 }
-            } else {
-                debug!(
-                    "find_owning_document: failed to parse schema from {:?}",
-                    schema_path
-                );
+                Err(_) => {
+                    trace!("find_owning_document: no schema at {:?}", schema_path);
+                    // Schema file doesn't exist yet — worth retrying if subdir exists
+                }
             }
-        } else {
-            trace!("find_owning_document: no schema at {:?}", schema_path);
         }
 
         // Move into this directory for next iteration
