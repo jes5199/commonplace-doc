@@ -625,6 +625,19 @@ pub async fn subdir_mqtt_task(
             let has_explicit_deletions = !crdt_deleted_entries.is_empty();
             let schema_snapshot_for_subscriptions = mqtt_schema.clone();
 
+            // Write .commonplace.json for the subdirectory so local tools can read it
+            if let Some((_, ref schema_json)) = mqtt_schema {
+                if let Err(e) = crate::sync::write_schema_file(
+                    &subdir_full_path,
+                    schema_json,
+                    None,
+                )
+                .await
+                {
+                    warn!("Failed to write subdir schema file for {}: {}", subdir_path, e);
+                }
+            }
+
             if mqtt_schema.is_none() && http_recovery_disabled {
                 warn!(
                     "Subdir {}: skipping schema edit handling (no schema snapshot and HTTP recovery disabled)",
