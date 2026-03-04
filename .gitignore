@@ -12,3 +12,7 @@ uv.lock
 .venv/
 data.redb
 data/
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
