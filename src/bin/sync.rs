@@ -2410,6 +2410,15 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Start MQTT event loop early so discover_fs_root and other startup
+    // MQTT operations can receive messages from the broker.
+    let mqtt_for_main_loop = mqtt_client.clone();
+    tokio::spawn(async move {
+        if let Err(e) = mqtt_for_main_loop.run_event_loop().await {
+            error!("MQTT event loop error: {}", e);
+        }
+    });
+
     // Configure MQTT-backed ancestry checks for sync direction decisions.
     set_sync_ancestry_mqtt_context(Some(SyncAncestryMqttContext::new(
         mqtt_client.clone(),
@@ -2477,14 +2486,21 @@ async fn main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            match mqtt_request.resolve_path_to_uuid(&fs_root_id, node).await {
-                Ok(id) => {
-                    info!("Resolved --node path '{}' -> {}", node, id);
-                    id
-                }
-                Err(e) => {
-                    error!("Failed to resolve --node path '{}' via MQTT: {}", node, e);
-                    return ExitCode::from(1);
+            // If --node matches the fs-root ID itself, use it directly
+            // (e.g., --node workspace when fs-root is "workspace")
+            if node == &fs_root_id {
+                info!("--node '{}' matches fs-root ID, using directly", node);
+                fs_root_id
+            } else {
+                match mqtt_request.resolve_path_to_uuid(&fs_root_id, node).await {
+                    Ok(id) => {
+                        info!("Resolved --node path '{}' -> {}", node, id);
+                        id
+                    }
+                    Err(e) => {
+                        error!("Failed to resolve --node path '{}' via MQTT: {}", node, e);
+                        return ExitCode::from(1);
+                    }
                 }
             }
         }
@@ -2820,13 +2836,7 @@ async fn run_file_mode(
             .map_err(|e| format!("Failed to load CRDT state: {}", e))?,
     ));
 
-    // Start MQTT event loop
-    let mqtt_for_loop = mqtt_client.clone();
-    tokio::spawn(async move {
-        if let Err(e) = mqtt_for_loop.run_event_loop().await {
-            error!("MQTT event loop error: {}", e);
-        }
-    });
+    // MQTT event loop is started in main() before mode dispatch.
 
     // Initialize CRDT state via cyan sync (MQTT).
     // Don't write to disk yet — we need to check if local content should take precedence.
@@ -3049,13 +3059,7 @@ async fn run_directory_mode(
     #[cfg(not(unix))]
     let inode_tracker: Option<Arc<RwLock<InodeTracker>>> = None;
 
-    // Start MQTT event loop before making any MQTT request/response calls.
-    let mqtt_for_loop = mqtt_client.clone();
-    tokio::spawn(async move {
-        if let Err(e) = mqtt_for_loop.run_event_loop().await {
-            error!("MQTT event loop error: {}", e);
-        }
-    });
+    // MQTT event loop is started in main() before mode dispatch.
 
     // Verify fs-root document exists (or create it) via MQTT
     let mqtt_request = Arc::new(
@@ -3693,13 +3697,7 @@ async fn run_exec_mode(
     #[cfg(not(unix))]
     let inode_tracker: Option<Arc<RwLock<InodeTracker>>> = None;
 
-    // Start MQTT event loop before making any MQTT request/response calls.
-    let mqtt_for_loop = mqtt_client.clone();
-    tokio::spawn(async move {
-        if let Err(e) = mqtt_for_loop.run_event_loop().await {
-            error!("MQTT event loop error: {}", e);
-        }
-    });
+    // MQTT event loop is started in main() before mode dispatch.
 
     // Verify fs-root document exists (or create it) via MQTT
     let mqtt_request = Arc::new(
@@ -4681,11 +4679,7 @@ async fn run_log_listener_mode(
         return Err(format!("Failed to subscribe: {}", e).into());
     }
 
-    // Spawn the MQTT event loop
-    let mqtt_for_loop = mqtt_client.clone();
-    tokio::spawn(async move {
-        let _ = mqtt_for_loop.run_event_loop().await;
-    });
+    // MQTT event loop is started in main() before mode dispatch.
 
     // Get a receiver for incoming messages
     let mut message_rx = mqtt_client.subscribe_messages();
