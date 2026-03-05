@@ -227,6 +227,9 @@ fn load_workspace_existing_file_node_ids(
         if !is_allowed_extension(std::path::Path::new(&relative_path)) {
             continue;
         }
+        if should_ignore(filename, &options.ignore_patterns) {
+            continue;
+        }
         if workspace_root.join(&relative_path).is_file() {
             node_ids.insert(node_id);
         }
