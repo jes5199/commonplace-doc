@@ -3,6 +3,7 @@
 //! These types are used by the watcher module to communicate filesystem
 //! changes to the sync orchestrator.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// File watcher events
@@ -32,4 +33,8 @@ pub struct ScanOptions {
     pub include_hidden: bool,
     /// Custom ignore patterns (glob-style)
     pub ignore_patterns: Vec<String>,
+    /// Pre-computed workspace UUID map (relative_path → node_id).
+    /// When set, `load_workspace_existing_file_node_ids` skips rebuilding
+    /// via `build_uuid_map_from_local_schemas`.
+    pub workspace_uuid_map_cache: Option<HashMap<String, String>>,
 }

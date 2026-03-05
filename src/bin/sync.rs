@@ -2610,6 +2610,7 @@ async fn main() -> ExitCode {
         let scan_options = ScanOptions {
             include_hidden: args.include_hidden,
             ignore_patterns,
+            workspace_uuid_map_cache: None,
         };
 
         // Sandbox mode defaults to pulling server content (since local sandbox is empty)
@@ -2712,6 +2713,7 @@ async fn main() -> ExitCode {
         let scan_options = ScanOptions {
             include_hidden: args.include_hidden,
             ignore_patterns,
+            workspace_uuid_map_cache: None,
         };
 
         if let Some(exec_cmd) = args.exec {

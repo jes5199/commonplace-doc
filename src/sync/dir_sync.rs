@@ -18,8 +18,8 @@ use crate::sync::state_file::{
 };
 use crate::sync::subscriptions::CrdtFileSyncContext;
 use crate::sync::uuid_map::{
-    build_uuid_map_and_write_schemas, build_uuid_map_recursive,
-    build_uuid_map_recursive_with_status,
+    build_uuid_map_and_write_schemas, build_uuid_map_from_local_schemas,
+    build_uuid_map_recursive, build_uuid_map_recursive_with_status,
 };
 use crate::sync::ymap_schema;
 use crate::sync::{
@@ -1015,6 +1015,32 @@ pub async fn handle_subdir_new_files(
                             continue;
                         }
                     };
+
+                    // Initialize CRDT state via cyan sync before spawning tasks
+                    // (CP-6ypo: missing cyan sync caused yjs_state=None, blocking uploads)
+                    if let Err(e) =
+                        crate::sync::file_sync::resync_crdt_state_via_cyan_with_pending(
+                            &ctx.mqtt_client,
+                            &ctx.workspace,
+                            node_uuid,
+                            &subdir_state,
+                            &filename,
+                            &file_path,
+                            author,
+                            inode_tracker.as_ref(),
+                            true,
+                            true,
+                        )
+                        .await
+                    {
+                        warn!(
+                            "Failed to initialize CRDT state for {}: {} — initializing empty",
+                            root_relative_path, e
+                        );
+                        let mut state = subdir_state.write().await;
+                        let fs = state.get_or_create_file(&filename, node_uuid);
+                        fs.initialize_empty();
+                    }
 
                     // Spawn CRDT sync tasks
                     let handles = spawn_file_sync_tasks_crdt(
@@ -2370,6 +2396,10 @@ async fn create_documents_for_null_entries(
     schema: &FsSchema,
     directory: &Path,
 ) -> Result<FsSchema, Box<dyn std::error::Error + Send + Sync>> {
+    // Build workspace UUID map once for reuse across subdirectory scans (CP-vogw).
+    let mut workspace_uuid_cache = HashMap::new();
+    build_uuid_map_from_local_schemas(directory, "", &mut workspace_uuid_cache);
+
     let mut updated_schema = schema.clone();
 
     if let Some(Entry::Dir(ref mut root_dir)) = updated_schema.root {
@@ -2434,8 +2464,12 @@ async fn create_documents_for_null_entries(
                         if let Some(ref node_id) = dir.node_id {
                             let subdir_path = directory.join(name);
                             if subdir_path.is_dir() {
-                                // Scan the subdirectory
-                                let options = ScanOptions::default();
+                                // Scan the subdirectory, reusing the workspace UUID cache
+                                // to avoid redundant full-tree schema walks (CP-vogw).
+                                let options = ScanOptions {
+                                    workspace_uuid_map_cache: Some(workspace_uuid_cache.clone()),
+                                    ..ScanOptions::default()
+                                };
                                 if let Ok(sub_schema) = scan_directory(&subdir_path, &options) {
                                     // Recursively create documents for null entries in subdirectory
                                     let updated_sub_schema =

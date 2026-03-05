@@ -211,8 +211,13 @@ fn load_workspace_existing_file_node_ids(
     }
 
     let workspace_root = find_workspace_root_with_schema(directory);
-    let mut uuid_map = HashMap::new();
-    build_uuid_map_from_local_schemas(&workspace_root, "", &mut uuid_map);
+    let uuid_map = if let Some(ref cached) = options.workspace_uuid_map_cache {
+        cached.clone()
+    } else {
+        let mut map = HashMap::new();
+        build_uuid_map_from_local_schemas(&workspace_root, "", &mut map);
+        map
+    };
 
     let mut node_ids = HashSet::new();
     for (relative_path, node_id) in uuid_map {
