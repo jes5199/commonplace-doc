@@ -156,6 +156,13 @@ pub fn build_uuid_to_paths_map(uuid_map: &HashMap<String, String>) -> UuidToPath
             .or_default()
             .push(path.clone());
     }
+    // Sort paths so that paths.first() is deterministic across calls.
+    // Without this, HashMap iteration order causes non-deterministic file_key
+    // selection, which can mismatch between normal MQTT processing and lag
+    // recovery, silently skipping fanout writes (CP-2w17).
+    for paths in reverse_map.values_mut() {
+        paths.sort();
+    }
     reverse_map
 }
 

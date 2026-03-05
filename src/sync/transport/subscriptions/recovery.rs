@@ -235,10 +235,26 @@ pub(super) async fn resync_subdir_subscribed_files(
 
         let content = {
             let state_guard = subdir_state.read().await;
-            state_guard.get_file(&filename).and_then(|fs| {
+            // Try the primary filename first, then fall back to alternate
+            // path-derived keys in case of key mismatch (CP-2w17).
+            let mut result = state_guard.get_file(&filename).and_then(|fs| {
                 let doc = fs.to_doc().ok()?;
                 Some(crate::sync::crdt_merge::get_doc_text_content(&doc))
-            })
+            });
+            if result.is_none() {
+                for alt_path in paths.iter().skip(1) {
+                    if let Some(alt_name) = subdir_relative_path(alt_path, subdir_path) {
+                        result = state_guard.get_file(&alt_name).and_then(|fs| {
+                            let doc = fs.to_doc().ok()?;
+                            Some(crate::sync::crdt_merge::get_doc_text_content(&doc))
+                        });
+                        if result.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+            result
         };
 
         let Some(content) = content else {
