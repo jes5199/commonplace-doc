@@ -431,6 +431,8 @@ pub struct AncestorResponse {
 struct ForkResponse {
     id: String,
     head: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest: Option<commonplace_types::fs::ForkManifest>,
 }
 
 async fn fork_doc(
@@ -438,6 +440,21 @@ async fn fork_doc(
     Path(source_id): Path<String>,
     Query(params): Query<ForkParams>,
 ) -> Result<Json<ForkResponse>, ServiceError> {
+    // Check if this is a directory by trying to parse its content as FsSchema
+    let doc = state.service.get_document(&source_id).await?;
+
+    if doc.content_type == ContentType::Json
+        && serde_json::from_str::<commonplace_types::fs::FsSchema>(&doc.content).is_ok()
+    {
+        let (new_id, manifest) = state.service.fork_directory(&source_id).await?;
+        return Ok(Json(ForkResponse {
+            id: new_id,
+            head: String::new(),
+            manifest: Some(manifest),
+        }));
+    }
+
+    // Single document fork (existing behavior)
     let result = state
         .service
         .fork_document(&source_id, params.at_commit)
@@ -446,6 +463,7 @@ async fn fork_doc(
     Ok(Json(ForkResponse {
         id: result.id,
         head: result.head,
+        manifest: None,
     }))
 }
 

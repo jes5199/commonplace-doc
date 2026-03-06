@@ -14,6 +14,7 @@ use commonplace_doc::{
     events::CommitBroadcaster,
     services::DocumentService,
     store::CommitStore,
+    sync::create_yjs_json_update,
 };
 use std::sync::Arc;
 use yrs::{Doc, Text, Transact};
@@ -527,4 +528,218 @@ async fn test_invalid_update_rejected() {
         .await;
 
     assert!(result.is_err());
+}
+
+/// Helper to create a Yjs update for JSON content on a fresh document.
+fn create_json_update(json_str: &str) -> Vec<u8> {
+    let update_b64 = create_yjs_json_update(json_str, None).unwrap();
+    b64::decode(&update_b64).unwrap()
+}
+
+/// Test fork_directory clones all documents with new UUIDs.
+#[tokio::test]
+async fn test_fork_directory() {
+    let (service, doc_store, _dir) = create_service_with_store();
+
+    // Create a directory document with FsSchema containing 2 files
+    let dir_id = service.create_document(ContentType::Json).await;
+
+    // Create two child documents with commits
+    let file1_id = service.create_document(ContentType::Text).await;
+    let file2_id = service.create_document(ContentType::Text).await;
+
+    let update1 = create_text_update("file one content");
+    service
+        .edit_document(&file1_id, &b64::encode(&update1), None, None)
+        .await
+        .unwrap();
+
+    let update2 = create_text_update("file two content");
+    service
+        .edit_document(&file2_id, &b64::encode(&update2), None, None)
+        .await
+        .unwrap();
+
+    // Set up the directory's FsSchema content
+    let schema_json = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "file1.txt": { "type": "doc", "node_id": file1_id },
+                "file2.txt": { "type": "doc", "node_id": file2_id }
+            }
+        }
+    });
+    let schema_update = create_json_update(&schema_json.to_string());
+    service
+        .edit_document(&dir_id, &b64::encode(&schema_update), None, None)
+        .await
+        .unwrap();
+
+    // Fork the directory
+    let (new_dir_id, manifest) = service.fork_directory(&dir_id).await.unwrap();
+
+    // New directory should have different UUID
+    assert_ne!(new_dir_id, dir_id);
+
+    // Manifest should have entries for both files
+    assert_eq!(manifest.document_map.len(), 2);
+    assert_eq!(manifest.forked_from, dir_id);
+
+    // Each forked doc should have different UUID but reference originals
+    for (_new_uuid, entry) in &manifest.document_map {
+        assert!(entry.original_uuid == file1_id || entry.original_uuid == file2_id);
+        assert!(!entry.fork_point_commit.is_empty());
+    }
+
+    // Verify forked docs have the correct content
+    let new_dir_doc = doc_store.get_document(&new_dir_id).await.unwrap();
+    let new_schema: serde_json::Value = serde_json::from_str(&new_dir_doc.content).unwrap();
+    let entries = new_schema["root"]["entries"].as_object().unwrap();
+    assert_eq!(entries.len(), 2);
+
+    // File1 fork should have same content as original
+    let new_file1_node_id = entries["file1.txt"]["node_id"].as_str().unwrap();
+    let new_file1 = doc_store.get_document(new_file1_node_id).await.unwrap();
+    assert_eq!(new_file1.content, "file one content");
+}
+
+/// Test fork_directory handles nested subdirectories.
+#[tokio::test]
+async fn test_fork_nested_directory() {
+    let (service, doc_store, _dir) = create_service_with_store();
+
+    // Create inner directory with a file
+    let inner_dir_id = service.create_document(ContentType::Json).await;
+    let inner_file_id = service.create_document(ContentType::Text).await;
+    let update = create_text_update("inner file");
+    service
+        .edit_document(&inner_file_id, &b64::encode(&update), None, None)
+        .await
+        .unwrap();
+
+    let inner_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "inner.txt": { "type": "doc", "node_id": inner_file_id }
+            }
+        }
+    });
+    let inner_update = create_json_update(&inner_schema.to_string());
+    service
+        .edit_document(&inner_dir_id, &b64::encode(&inner_update), None, None)
+        .await
+        .unwrap();
+
+    // Create outer directory containing the inner directory + a file
+    let outer_dir_id = service.create_document(ContentType::Json).await;
+    let outer_file_id = service.create_document(ContentType::Text).await;
+    let update2 = create_text_update("outer file");
+    service
+        .edit_document(&outer_file_id, &b64::encode(&update2), None, None)
+        .await
+        .unwrap();
+
+    let outer_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "outer.txt": { "type": "doc", "node_id": outer_file_id },
+                "subdir": { "type": "dir", "node_id": inner_dir_id }
+            }
+        }
+    });
+    let outer_update = create_json_update(&outer_schema.to_string());
+    service
+        .edit_document(&outer_dir_id, &b64::encode(&outer_update), None, None)
+        .await
+        .unwrap();
+
+    // Fork the outer directory
+    let (new_outer_id, manifest) = service.fork_directory(&outer_dir_id).await.unwrap();
+
+    // Should have forked both files (outer + inner)
+    assert_ne!(new_outer_id, outer_dir_id);
+    assert_eq!(manifest.document_map.len(), 2);
+
+    // Verify the new outer dir has a subdir with different UUID
+    let new_outer_doc = doc_store.get_document(&new_outer_id).await.unwrap();
+    let new_schema: serde_json::Value = serde_json::from_str(&new_outer_doc.content).unwrap();
+    let new_subdir_id = new_schema["root"]["entries"]["subdir"]["node_id"]
+        .as_str()
+        .unwrap();
+    assert_ne!(new_subdir_id, inner_dir_id.as_str());
+
+    // Verify inner file was forked with correct content
+    let new_inner_doc = doc_store.get_document(new_subdir_id).await.unwrap();
+    let new_inner_schema: serde_json::Value =
+        serde_json::from_str(&new_inner_doc.content).unwrap();
+    let new_inner_file_id = new_inner_schema["root"]["entries"]["inner.txt"]["node_id"]
+        .as_str()
+        .unwrap();
+    let new_inner_file = doc_store.get_document(new_inner_file_id).await.unwrap();
+    assert_eq!(new_inner_file.content, "inner file");
+}
+
+/// Test that editing a forked document doesn't affect the original.
+#[tokio::test]
+async fn test_fork_independence() {
+    let (service, doc_store, _dir) = create_service_with_store();
+
+    let dir_id = service.create_document(ContentType::Json).await;
+    let file_id = service.create_document(ContentType::Text).await;
+    let update = create_text_update("original");
+    service
+        .edit_document(&file_id, &b64::encode(&update), None, None)
+        .await
+        .unwrap();
+
+    let schema_json = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                "file.txt": { "type": "doc", "node_id": file_id }
+            }
+        }
+    });
+    let schema_update = create_json_update(&schema_json.to_string());
+    service
+        .edit_document(&dir_id, &b64::encode(&schema_update), None, None)
+        .await
+        .unwrap();
+
+    let (_new_dir_id, manifest) = service.fork_directory(&dir_id).await.unwrap();
+
+    // Find the forked file's UUID
+    let forked_file_id = manifest
+        .document_map
+        .iter()
+        .find(|(_, e)| e.original_uuid == file_id)
+        .map(|(id, _)| id.clone())
+        .unwrap();
+
+    // Edit the forked file
+    let edit_update = create_text_update(" modified");
+    service
+        .edit_document(
+            &forked_file_id,
+            &b64::encode(&edit_update),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Original should be unchanged
+    let original = doc_store.get_document(&file_id).await.unwrap();
+    assert_eq!(original.content, "original");
+
+    // Forked should be modified
+    let forked = doc_store.get_document(&forked_file_id).await.unwrap();
+    assert!(forked.content.contains("modified"));
 }

@@ -4,6 +4,7 @@
 //! separating it from HTTP handler concerns. The service orchestrates
 //! between DocumentStore, CommitStore, and CommitBroadcaster.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tracing::debug;
@@ -16,8 +17,9 @@ use crate::mqtt::client::MqttClient;
 use crate::mqtt::messages::EditMessage;
 use crate::mqtt::topics::Topic;
 use crate::store::CommitStore;
-use crate::sync::{base64_decode, create_yjs_structured_update};
+use crate::sync::{base64_decode, create_yjs_json_update, create_yjs_structured_update};
 use crate::{b64, diff, replay::CommitReplayer};
+use commonplace_types::fs::{DirEntry, DocEntry, Entry, ForkEntry, ForkManifest, FsSchema};
 use rumqttc::QoS;
 
 fn preview_text(text: &str, max_chars: usize) -> String {
@@ -722,6 +724,154 @@ impl DocumentService {
         Ok(ForkResult {
             id: new_id,
             head: new_cid,
+        })
+    }
+
+    /// Fork an entire directory subtree, creating new UUIDs for every document.
+    ///
+    /// Recursively deep-clones all documents in the FsSchema, builds a new
+    /// schema with the cloned UUIDs, and returns a ForkManifest tracking all
+    /// fork-point commits for future diff/merge operations.
+    pub async fn fork_directory(
+        &self,
+        source_dir_id: &str,
+    ) -> Result<(String, ForkManifest), ServiceError> {
+        let mut document_map = HashMap::new();
+        let new_dir_id = self
+            .fork_directory_inner(source_dir_id, &mut document_map)
+            .await?;
+
+        let manifest = ForkManifest {
+            id: uuid::Uuid::new_v4().to_string(),
+            forked_from: source_dir_id.to_string(),
+            forked_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            document_map,
+        };
+
+        Ok((new_dir_id, manifest))
+    }
+
+    /// Inner recursive implementation of directory fork.
+    ///
+    /// Shares `document_map` across recursive calls so the manifest captures
+    /// all documents in the entire subtree, not just the immediate directory.
+    async fn fork_directory_inner(
+        &self,
+        source_dir_id: &str,
+        document_map: &mut HashMap<String, ForkEntry>,
+    ) -> Result<String, ServiceError> {
+        let source_doc = self.get_document(source_dir_id).await?;
+
+        let schema: FsSchema = serde_json::from_str(&source_doc.content)
+            .map_err(|e| ServiceError::InvalidInput(format!("Invalid FsSchema: {}", e)))?;
+
+        let new_schema = self.fork_schema_entries(&schema, document_map).await?;
+
+        // Create the new directory document
+        let new_dir_id = self
+            .doc_store
+            .create_document(source_doc.content_type)
+            .await;
+
+        // Write the new schema as the directory's content via Yjs update
+        let new_schema_json = serde_json::to_string(&new_schema)
+            .map_err(|e| ServiceError::Internal(format!("Schema serialization: {}", e)))?;
+
+        let update_b64 = create_yjs_json_update(&new_schema_json, None)
+            .map_err(|e| ServiceError::Internal(format!("Yjs update creation: {}", e)))?;
+        let update_bytes =
+            b64::decode_with_context(&update_b64, "fork schema").map_err(ServiceError::InvalidInput)?;
+
+        self.doc_store
+            .apply_yjs_update(&new_dir_id, &update_bytes)
+            .await?;
+
+        // Create a root commit for the directory if persistence is available
+        if let Some(commit_store) = &self.commit_store {
+            let commit = Commit::new(
+                vec![],
+                update_b64,
+                "fork".to_string(),
+                Some(format!("Forked directory from {}", source_dir_id)),
+            );
+            commit_store
+                .store_commit_and_set_head(&new_dir_id, &commit)
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+        }
+
+        Ok(new_dir_id)
+    }
+
+    /// Recursively fork all entries in an FsSchema, building a new schema
+    /// with cloned UUIDs.
+    async fn fork_schema_entries(
+        &self,
+        schema: &FsSchema,
+        document_map: &mut HashMap<String, ForkEntry>,
+    ) -> Result<FsSchema, ServiceError> {
+        let root = match &schema.root {
+            Some(Entry::Dir(dir)) => dir,
+            _ => {
+                return Err(ServiceError::InvalidInput(
+                    "Schema root must be a directory".to_string(),
+                ))
+            }
+        };
+
+        let mut new_entries = HashMap::new();
+
+        if let Some(entries) = &root.entries {
+            for (name, entry) in entries {
+                let new_entry = match entry {
+                    Entry::Doc(doc_entry) => {
+                        if let Some(node_id) = &doc_entry.node_id {
+                            let fork_result = self.fork_document(node_id, None).await?;
+                            document_map.insert(
+                                fork_result.id.clone(),
+                                ForkEntry {
+                                    original_uuid: node_id.clone(),
+                                    fork_point_commit: fork_result.head.clone(),
+                                },
+                            );
+                            Entry::Doc(DocEntry {
+                                node_id: Some(fork_result.id),
+                                content_type: doc_entry.content_type.clone(),
+                            })
+                        } else {
+                            Entry::Doc(doc_entry.clone())
+                        }
+                    }
+                    Entry::Dir(sub_dir) => {
+                        if let Some(node_id) = &sub_dir.node_id {
+                            let new_sub_id = Box::pin(
+                                self.fork_directory_inner(node_id, document_map),
+                            )
+                            .await?;
+                            Entry::Dir(DirEntry {
+                                entries: None,
+                                node_id: Some(new_sub_id),
+                                content_type: sub_dir.content_type.clone(),
+                            })
+                        } else {
+                            Entry::Dir(sub_dir.clone())
+                        }
+                    }
+                };
+                new_entries.insert(name.clone(), new_entry);
+            }
+        }
+
+        Ok(FsSchema {
+            version: schema.version,
+            root: Some(Entry::Dir(DirEntry {
+                entries: Some(new_entries),
+                node_id: None,
+                content_type: None,
+            })),
         })
     }
 
