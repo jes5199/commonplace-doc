@@ -32,7 +32,7 @@ pub enum Entry {
 ///
 /// **DEPRECATED**: Inline subdirectories (non-root directories with `entries` but no `node_id`)
 /// are no longer supported and will be rejected during schema validation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DirEntry {
     /// Child entries - only valid for the root directory of a schema document.
     /// Subdirectories must have `entries: None` and use `node_id` instead.
@@ -45,6 +45,10 @@ pub struct DirEntry {
     /// Content type for node-backed directories (default: application/json)
     #[serde(default)]
     pub content_type: Option<String>,
+    /// Whether this directory should be synced. Default (None) means sync.
+    /// Set to `Some(false)` to skip syncing this branch/directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<bool>,
 }
 
 /// A document entry.

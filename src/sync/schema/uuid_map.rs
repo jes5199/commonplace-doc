@@ -305,6 +305,10 @@ pub async fn collect_paths_with_node_backed_dirs_with_status(
 ) {
     match entry {
         Entry::Dir(dir) => {
+            // Skip directories marked as not synced (sparse sync)
+            if dir.sync == Some(false) {
+                return;
+            }
             // Node-backed directory: fetch its document and recurse
             if let Some(ref node_id) = dir.node_id {
                 build_uuid_map_from_doc_with_status(
@@ -366,6 +370,10 @@ pub async fn collect_node_backed_dir_ids(
 ) {
     match entry {
         Entry::Dir(dir) => {
+            // Skip directories marked as not synced (sparse sync)
+            if dir.sync == Some(false) {
+                return;
+            }
             // Node-backed directory: add to result and recurse into its content
             if let Some(ref node_id) = dir.node_id {
                 // Add to result

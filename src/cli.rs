@@ -541,6 +541,16 @@ pub enum BranchCommand {
         /// Branch name to delete
         name: String,
     },
+    /// Activate a branch (enable syncing)
+    Activate {
+        /// Branch name to activate
+        name: String,
+    },
+    /// Deactivate a branch (disable syncing)
+    Deactivate {
+        /// Branch name to deactivate
+        name: String,
+    },
 }
 
 /// Arguments for `commonplace-checkout`.

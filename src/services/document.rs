@@ -855,6 +855,7 @@ impl DocumentService {
                                 entries: None,
                                 node_id: Some(new_sub_id),
                                 content_type: sub_dir.content_type.clone(),
+                                sync: sub_dir.sync,
                             })
                         } else {
                             Entry::Dir(sub_dir.clone())
@@ -871,6 +872,7 @@ impl DocumentService {
                 entries: Some(new_entries),
                 node_id: None,
                 content_type: None,
+                ..Default::default()
             })),
         })
     }

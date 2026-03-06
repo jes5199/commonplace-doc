@@ -559,6 +559,7 @@ pub fn to_fs_schema(doc: &Doc) -> commonplace_types::fs::FsSchema {
                 node_id: entry.node_id,
                 entries: None,
                 content_type: None,
+                ..Default::default()
             }),
         };
         entries.insert(name, fs_entry);
@@ -570,6 +571,7 @@ pub fn to_fs_schema(doc: &Doc) -> commonplace_types::fs::FsSchema {
             node_id: None,
             entries: Some(entries),
             content_type: None,
+            ..Default::default()
         })),
     }
 }

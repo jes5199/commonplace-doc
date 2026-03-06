@@ -3251,6 +3251,7 @@ mod tests {
                             entries: None,
                             node_id: None, // Local doesn't know the UUID
                             content_type: Some("application/json".to_string()),
+                            ..Default::default()
                         }),
                     ),
                     (
@@ -3263,6 +3264,7 @@ mod tests {
                 ])),
                 node_id: None,
                 content_type: None,
+                ..Default::default()
             })),
         };
 
@@ -3276,6 +3278,7 @@ mod tests {
                             entries: None,
                             node_id: Some("server-dir-uuid".to_string()),
                             content_type: Some("application/json".to_string()),
+                            ..Default::default()
                         }),
                     ),
                     (
@@ -3288,6 +3291,7 @@ mod tests {
                 ])),
                 node_id: None,
                 content_type: None,
+                ..Default::default()
             })),
         };
 
@@ -3326,10 +3330,12 @@ mod tests {
                         entries: None,
                         node_id: Some("local-uuid".to_string()), // Already has UUID
                         content_type: Some("application/json".to_string()),
+                        ..Default::default()
                     }),
                 )])),
                 node_id: None,
                 content_type: None,
+                ..Default::default()
             })),
         };
 
@@ -3342,10 +3348,12 @@ mod tests {
                         entries: None,
                         node_id: Some("server-uuid".to_string()),
                         content_type: Some("application/json".to_string()),
+                        ..Default::default()
                     }),
                 )])),
                 node_id: None,
                 content_type: None,
+                ..Default::default()
             })),
         };
 

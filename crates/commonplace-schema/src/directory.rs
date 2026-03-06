@@ -455,6 +455,7 @@ fn scan_dir_recursive(
                     entries: None,
                     node_id,
                     content_type: Some("application/json".to_string()),
+                    ..Default::default()
                 }),
             );
         } else if file_type.is_file() {
@@ -497,6 +498,7 @@ fn scan_dir_recursive(
         entries: Some(entries),
         node_id: None,
         content_type: None,
+        ..Default::default()
     }))
 }
 

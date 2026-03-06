@@ -688,6 +688,7 @@ impl FilesystemReconciler {
                         entries: None,
                         node_id: Some(uuid::Uuid::new_v4().to_string()),
                         content_type: dir.content_type,
+                        sync: dir.sync,
                     }),
                     1,
                 ));
@@ -728,6 +729,7 @@ impl FilesystemReconciler {
                                 entries: None,
                                 node_id: Some(uuid::Uuid::new_v4().to_string()),
                                 content_type: child_dir.content_type,
+                                sync: child_dir.sync,
                             }),
                         );
                         total_uuids += 1;
@@ -741,6 +743,7 @@ impl FilesystemReconciler {
                 entries: Some(new_entries),
                 node_id: dir.node_id,
                 content_type: dir.content_type,
+                sync: dir.sync,
             }),
             total_uuids,
         ))

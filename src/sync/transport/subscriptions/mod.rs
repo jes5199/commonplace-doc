@@ -350,6 +350,7 @@ mod tests {
                 entries: None,
                 node_id: Some(uuid::Uuid::new_v4().to_string()),
                 content_type: None,
+                ..Default::default()
             }),
         );
         let schema = FsSchema {
@@ -358,6 +359,7 @@ mod tests {
                 entries: Some(entries),
                 node_id: Some(uuid::Uuid::new_v4().to_string()),
                 content_type: None,
+                ..Default::default()
             })),
         };
 

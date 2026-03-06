@@ -23,6 +23,7 @@ fn create_test_schema(entries: Vec<(&str, Option<&str>)>) -> FsSchema {
             entries: Some(entry_map),
             node_id: None,
             content_type: None,
+            ..Default::default()
         })),
     }
 }
@@ -160,6 +161,7 @@ fn create_nested_schema() -> FsSchema {
             entries: Some(telegram_entries),
             node_id: None,
             content_type: None,
+            ..Default::default()
         }),
     );
     root_entries.insert(
@@ -168,6 +170,7 @@ fn create_nested_schema() -> FsSchema {
             entries: Some(bartleby_entries),
             node_id: None,
             content_type: None,
+            ..Default::default()
         }),
     );
 
@@ -177,6 +180,7 @@ fn create_nested_schema() -> FsSchema {
             entries: Some(root_entries),
             node_id: None,
             content_type: None,
+            ..Default::default()
         })),
     }
 }

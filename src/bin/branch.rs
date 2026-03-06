@@ -49,6 +49,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(BranchCommand::Delete { name }) => {
             delete_branch(&directory, &name)?;
         }
+        Some(BranchCommand::Activate { name }) => {
+            set_branch_sync(&args.server, &directory, &name, true).await?;
+        }
+        Some(BranchCommand::Deactivate { name }) => {
+            set_branch_sync(&args.server, &directory, &name, false).await?;
+        }
         None => {
             list_branches(&directory)?;
         }
@@ -82,7 +88,15 @@ fn list_branches(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(false);
 
             if is_dir {
-                println!("  {}", name);
+                let sync_disabled = entry
+                    .get("sync")
+                    .and_then(|s| s.as_bool())
+                    == Some(false);
+                if sync_disabled {
+                    println!("  {} (inactive)", name);
+                } else {
+                    println!("  {}", name);
+                }
                 found_branches = true;
             }
         }
@@ -268,6 +282,85 @@ fn find_repo_node_id(repo_dir: &Path) -> Result<String, Box<dyn std::error::Erro
         })?;
 
     Ok(node_id.to_string())
+}
+
+/// Set the `sync` flag on a branch entry in the repo schema.
+///
+/// When `sync` is false, the sync agent will skip this branch entirely
+/// (sparse sync). When true (or absent), the branch syncs normally.
+async fn set_branch_sync(
+    server: &str,
+    directory: &Path,
+    name: &str,
+    sync: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema_path = directory.join(".commonplace.json");
+    if !schema_path.exists() {
+        eprintln!("Not a commonplace repo (no .commonplace.json found)");
+        std::process::exit(1);
+    }
+
+    let schema_content = std::fs::read_to_string(&schema_path)?;
+    let schema: serde_json::Value = serde_json::from_str(&schema_content)?;
+
+    // Verify the branch exists
+    let branch_entry = schema
+        .get("root")
+        .and_then(|r| r.get("entries"))
+        .and_then(|e| e.get(name))
+        .ok_or_else(|| format!("Branch '{}' not found in repo schema", name))?;
+
+    let node_id = branch_entry
+        .get("node_id")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| format!("Branch '{}' has no node_id", name))?;
+
+    // Build a partial schema update that sets the sync flag
+    let sync_value = if sync {
+        // To re-enable, we omit the sync field (None = default = sync enabled)
+        serde_json::json!(null)
+    } else {
+        serde_json::json!(false)
+    };
+
+    let mut entry = serde_json::json!({
+        "type": "dir",
+        "node_id": node_id,
+    });
+    if !sync {
+        entry.as_object_mut().unwrap().insert("sync".to_string(), sync_value);
+    }
+
+    let repo_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                name: entry
+            }
+        }
+    });
+
+    let repo_node_id = find_repo_node_id(directory)?;
+    let http_client = reqwest::Client::new();
+    push_schema_to_server(
+        &http_client,
+        server,
+        &repo_node_id,
+        &repo_schema.to_string(),
+        "commonplace-branch",
+    )
+    .await
+    .map_err(|e| format!("Failed to update repo schema: {}", e))?;
+
+    let action = if sync { "activated" } else { "deactivated" };
+    println!("Branch '{}' {} (sync: {}).", name, action, sync);
+    if !sync {
+        println!("The sync agent will stop syncing this branch on next reconciliation.");
+        println!("Local files are preserved. Use 'branch activate' to re-enable.");
+    }
+
+    Ok(())
 }
 
 fn delete_branch(_directory: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
