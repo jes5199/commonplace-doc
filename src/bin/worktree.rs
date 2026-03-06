@@ -112,7 +112,8 @@ fn add_worktree(
             "--server", "http://localhost:5199",
             "--node", branch_uuid,
             "--directory", worktree_dir_str,
-            "--initial-sync", "remote"
+            "--initial-sync", "server",
+            "--name", &process_name
         ],
         "cwd": workspace_dir.to_string_lossy()
     });

@@ -110,20 +110,11 @@ async fn create_branch(
         std::process::exit(1);
     }
 
-    // Find the root directory UUID from sync state
-    let sync_path = directory.join(".commonplace-sync.json");
-    if !sync_path.exists() {
-        eprintln!("Workspace not synced (no .commonplace-sync.json found)");
-        std::process::exit(1);
-    }
-
-    let sync_content = std::fs::read_to_string(&sync_path)?;
-    let sync_state: serde_json::Value = serde_json::from_str(&sync_content)?;
-
-    let root_uuid = sync_state
-        .get("document_id")
-        .and_then(|d| d.as_str())
-        .ok_or("Cannot find root document UUID in sync state")?;
+    // Fork from the workspace root (fs-root). This always creates a branch from
+    // the main workspace, regardless of which branch is currently checked out.
+    // To branch from a specific branch, a --from flag would be needed (future work).
+    let root_uuid = request_client.discover_fs_root().await
+        .map_err(|e| format!("Cannot discover fs-root: {}. Is the server running?", e))?;
 
     println!(
         "Creating branch '{}' from root {}...",
@@ -132,7 +123,7 @@ async fn create_branch(
     );
 
     // Fork via MQTT command
-    let fork_result = request_client.fork_document(root_uuid, None).await?;
+    let fork_result = request_client.fork_document(&root_uuid, None).await?;
 
     if let Some(error) = fork_result.error {
         eprintln!("Fork failed: {}", error);
@@ -196,7 +187,8 @@ fn register_sync_agent(
             "--server", "http://localhost:5199",
             "--node", forked_root_uuid,
             "--directory", branch_dir_str,
-            "--initial-sync", "remote"
+            "--initial-sync", "server",
+            "--name", process_name
         ],
         "cwd": workspace_dir.to_string_lossy()
     });

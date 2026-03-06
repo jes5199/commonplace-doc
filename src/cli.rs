@@ -552,6 +552,10 @@ pub struct CheckoutArgs {
     #[clap(long, short, default_value = ".")]
     pub directory: PathBuf,
 
+    /// Name of the sync agent to re-root (must match the --author used by the sync process)
+    #[clap(long, env = "COMMONPLACE_SYNC_NAME", default_value = "sync-client")]
+    pub sync_name: String,
+
     /// Branch name to checkout
     pub branch: String,
 }

@@ -49,6 +49,14 @@ use tracing::{debug, error, info, warn};
 use commonplace_doc::sync::WrittenSchemas;
 use tokio::task::JoinHandle;
 
+/// Why did run_directory_mode exit?
+enum SyncExitReason {
+    /// Normal shutdown (Ctrl+C)
+    Shutdown,
+    /// Re-root to a new UUID (checkout)
+    ReRoot(String),
+}
+
 /// Default shadow dir when running with inode tracking enabled.
 const DEFAULT_SHADOW_DIR: &str = "/tmp/commonplace-sync/hardlinks";
 
@@ -389,6 +397,8 @@ struct StartupSyncDecision {
     include_missing_file_states: bool,
     push_local_content: bool,
     materialize_server_content: bool,
+    /// When true, overwrite local files even if non-empty (used on re-root/checkout)
+    force_overwrite_local: bool,
 }
 
 fn decide_startup_sync(
@@ -406,6 +416,7 @@ fn decide_startup_sync(
             include_missing_file_states: false,
             push_local_content: true,
             materialize_server_content: false,
+            force_overwrite_local: false,
         }
     } else {
         match initial_sync_strategy {
@@ -416,6 +427,7 @@ fn decide_startup_sync(
                 include_missing_file_states: false,
                 push_local_content: true,
                 materialize_server_content: false,
+                force_overwrite_local: false,
             },
             "server" => StartupSyncDecision {
                 plan: StartupSyncPlan::ServerAuthoritative,
@@ -424,6 +436,7 @@ fn decide_startup_sync(
                 include_missing_file_states: true,
                 push_local_content: false,
                 materialize_server_content: true,
+                force_overwrite_local: true,
             },
             "skip" if local_schema_exists => StartupSyncDecision {
                 plan: StartupSyncPlan::SkipExisting,
@@ -432,6 +445,7 @@ fn decide_startup_sync(
                 include_missing_file_states: false,
                 push_local_content: false,
                 materialize_server_content: false,
+                force_overwrite_local: false,
             },
             "skip" => StartupSyncDecision {
                 plan: StartupSyncPlan::BootstrapServer,
@@ -440,6 +454,7 @@ fn decide_startup_sync(
                 include_missing_file_states: true,
                 push_local_content: false,
                 materialize_server_content: true,
+                force_overwrite_local: false,
             },
             _ => StartupSyncDecision {
                 plan: StartupSyncPlan::SkipExisting,
@@ -448,6 +463,7 @@ fn decide_startup_sync(
                 include_missing_file_states: false,
                 push_local_content: false,
                 materialize_server_content: false,
+                force_overwrite_local: false,
             },
         }
     };
@@ -461,6 +477,7 @@ fn decide_startup_sync(
         decision.use_server_schema = false;
         decision.include_missing_file_states = false;
         decision.materialize_server_content = false;
+        decision.force_overwrite_local = false;
     }
 
     decision
@@ -2741,25 +2758,39 @@ async fn main() -> ExitCode {
             )
             .await
         } else {
-            // Normal directory sync mode
-            run_directory_mode(
-                client,
-                args.server,
-                node_id,
-                directory,
-                scan_options,
-                args.initial_sync,
-                args.use_paths,
-                args.push_only,
-                args.pull_only,
-                args.shadow_dir,
-                mqtt_client,
-                args.workspace,
-                args.name.clone(),
-                args.mqtt_only_sync,
-            )
-            .await
-            .map(|_| 0u8)
+            // Normal directory sync mode (with re-root loop)
+            let mut current_root = node_id;
+            let mut current_initial_sync = args.initial_sync.clone();
+            loop {
+                let result = run_directory_mode(
+                    client.clone(),
+                    args.server.clone(),
+                    current_root.clone(),
+                    directory.clone(),
+                    scan_options.clone(),
+                    current_initial_sync.clone(),
+                    args.use_paths,
+                    args.push_only,
+                    args.pull_only,
+                    args.shadow_dir.clone(),
+                    mqtt_client.clone(),
+                    args.workspace.clone(),
+                    args.name.clone(),
+                    args.mqtt_only_sync,
+                )
+                .await;
+                match result {
+                    Ok(SyncExitReason::Shutdown) => break Ok(0u8),
+                    Ok(SyncExitReason::ReRoot(new_root)) => {
+                        info!("Re-rooting to new UUID: {}", new_root);
+                        current_root = new_root;
+                        // After re-root, server is authoritative for initial sync
+                        current_initial_sync = "server".to_string();
+                        continue;
+                    }
+                    Err(e) => break Err(e).map(|_: ()| 0u8),
+                }
+            }
         }
     } else if let Some(file) = args.file {
         run_file_mode(
@@ -3010,7 +3041,7 @@ async fn run_directory_mode(
     workspace: String,
     name: Option<String>,
     mqtt_only_sync: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<SyncExitReason, Box<dyn std::error::Error + Send + Sync>> {
     // Derive author from name parameter, defaulting to "sync-client"
     let author = name.unwrap_or_else(|| "sync-client".to_string());
 
@@ -3417,42 +3448,53 @@ async fn run_directory_mode(
                 }
             }
 
-            // Pull case: if local file is empty/default but server has content,
-            // write server content to disk so the file reflects the CRDT state.
+            // Pull case: write server content to disk so the file reflects the CRDT state.
+            // On force_overwrite_local (re-root/checkout), overwrite even non-empty files
+            // to prevent stale content from the previous branch persisting locally.
             if decision.materialize_server_content {
-                let local_content = tokio::fs::read_to_string(&file_path)
-                    .await
-                    .unwrap_or_default();
-                let content_info = detect_from_path(&file_path);
-                if local_content.is_empty()
-                    || commonplace_doc::sync::is_default_content(&local_content, &content_info)
-                {
-                    let crdt_content = {
+                let should_materialize = if decision.force_overwrite_local {
+                    true
+                } else {
+                    let local_content = tokio::fs::read_to_string(&file_path)
+                        .await
+                        .unwrap_or_default();
+                    let content_info = detect_from_path(&file_path);
+                    local_content.is_empty()
+                        || commonplace_doc::sync::is_default_content(&local_content, &content_info)
+                };
+                if should_materialize {
+                    let (crdt_found, crdt_content) = {
                         let state = file_crdt_state.read().await;
-                        state.get_file(&filename).and_then(|fs| {
-                            let doc = fs.to_doc().ok()?;
-                            let c = commonplace_doc::sync::crdt_merge::get_doc_text_content(&doc);
-                            if c.is_empty() {
-                                None
-                            } else {
-                                Some(c)
-                            }
-                        })
+                        match state.get_file(&filename) {
+                            Some(fs) => match fs.to_doc() {
+                                Ok(doc) => {
+                                    let c = commonplace_doc::sync::crdt_merge::get_doc_text_content(&doc);
+                                    (true, if c.is_empty() { None } else { Some(c) })
+                                }
+                                Err(_) => (false, None),
+                            },
+                            None => (false, None),
+                        }
                     };
                     if let Some(ref content) = crdt_content {
-                        if !content.is_empty() {
-                            info!(
-                                "Writing CRDT content to {} ({} bytes, pull case)",
+                        info!(
+                            "Writing CRDT content to {} ({} bytes, pull case)",
+                            file_path.display(),
+                            content.len()
+                        );
+                        if let Err(e) = tokio::fs::write(&file_path, content).await {
+                            warn!(
+                                "Failed to write CRDT content to {}: {}",
                                 file_path.display(),
-                                content.len()
+                                e
                             );
-                            if let Err(e) = tokio::fs::write(&file_path, content).await {
-                                warn!(
-                                    "Failed to write CRDT content to {}: {}",
-                                    file_path.display(),
-                                    e
-                                );
-                            }
+                        }
+                    } else if decision.force_overwrite_local && crdt_found && file_path.exists() {
+                        // Only truncate when CRDT state was successfully loaded but content
+                        // is empty. Don't truncate on bootstrap failure (crdt_found = false).
+                        info!("Truncating {} (empty in target branch)", file_path.display());
+                        if let Err(e) = tokio::fs::write(&file_path, "").await {
+                            warn!("Failed to truncate {}: {}", file_path.display(), e);
                         }
                     }
                 }
@@ -3569,15 +3611,63 @@ async fn run_directory_mode(
             append_sandbox_trace("DIR_EVENT receiver_closed mode=directory");
         }
     });
-    if !pull_only {
+    if !pull_only && !decision.force_overwrite_local {
+        // Replay untracked local files as synthetic Created events so they get tracked.
+        // Skip this on re-root/checkout (force_overwrite_local) to avoid pushing stale
+        // files from the previous branch into the target branch.
         enqueue_startup_untracked_created_events(&directory, &options, &file_states, &dir_tx).await;
     }
 
-    // Wait for Ctrl+C
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down...");
+    // Set up re-root control channel
+    let (reroot_tx, mut reroot_rx) = mpsc::channel::<String>(1);
+    let control_handle = {
+        let mqtt_client = mqtt_client.clone();
+        let workspace = workspace.clone();
+        let sync_name = author.clone();
+        tokio::spawn(async move {
+            // Subscribe to control commands for this sync agent
+            let topic = format!("{}/commands/__sync/{}/re-root", workspace, sync_name);
+            if let Err(e) = mqtt_client.subscribe(&topic, QoS::AtLeastOnce).await {
+                warn!("Failed to subscribe to re-root topic {}: {}", topic, e);
+                return;
+            }
+            info!("Listening for re-root commands on {}", topic);
+
+            let mut message_rx = mqtt_client.subscribe_messages();
+            loop {
+                match message_rx.recv().await {
+                    Ok(msg) if msg.topic == topic => {
+                        if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                            if let Some(new_root) = payload.get("root_uuid").and_then(|v| v.as_str()) {
+                                info!("Received re-root command: new_root={}", new_root);
+                                let _ = reroot_tx.send(new_root.to_string()).await;
+                                return;
+                            }
+                        }
+                        warn!("Invalid re-root payload: {:?}", String::from_utf8_lossy(&msg.payload));
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+
+    // Wait for Ctrl+C or re-root command
+    let exit_reason = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("Shutting down...");
+            SyncExitReason::Shutdown
+        }
+        Some(new_root) = reroot_rx.recv() => {
+            info!("Re-rooting to {}, tearing down current sync...", new_root);
+            SyncExitReason::ReRoot(new_root)
+        }
+    };
 
     // Cancel all tasks
+    control_handle.abort();
     if let Some(handle) = watcher_handle {
         handle.abort();
     }
@@ -3607,7 +3697,7 @@ async fn run_directory_mode(
         }
     }
 
-    // Save state file on shutdown
+    // Save state file on shutdown/re-root
     info!("Saving state file...");
     {
         let sf = shared_state_file.read().await;
@@ -3618,8 +3708,11 @@ async fn run_directory_mode(
         }
     }
 
-    info!("Goodbye!");
-    Ok(())
+    match &exit_reason {
+        SyncExitReason::Shutdown => info!("Goodbye!"),
+        SyncExitReason::ReRoot(new_root) => info!("Re-rooting to {}...", new_root),
+    }
+    Ok(exit_reason)
 }
 
 /// Run exec mode: sync directory, run command, exit when command exits
@@ -4050,42 +4143,51 @@ async fn run_exec_mode(
                 }
             }
 
-            // Pull case: if local file is empty/default but server has content,
-            // write server content to disk so the file reflects the CRDT state.
+            // Pull case: write server content to disk so the file reflects the CRDT state.
+            // On force_overwrite_local (re-root/checkout), overwrite even non-empty files
+            // to prevent stale content from the previous branch persisting locally.
             if decision.materialize_server_content {
-                let local_content = tokio::fs::read_to_string(&file_path)
-                    .await
-                    .unwrap_or_default();
-                let content_info = detect_from_path(&file_path);
-                if local_content.is_empty()
-                    || commonplace_doc::sync::is_default_content(&local_content, &content_info)
-                {
-                    let crdt_content = {
+                let should_materialize = if decision.force_overwrite_local {
+                    true
+                } else {
+                    let local_content = tokio::fs::read_to_string(&file_path)
+                        .await
+                        .unwrap_or_default();
+                    let content_info = detect_from_path(&file_path);
+                    local_content.is_empty()
+                        || commonplace_doc::sync::is_default_content(&local_content, &content_info)
+                };
+                if should_materialize {
+                    let (crdt_found, crdt_content) = {
                         let state = file_crdt_state.read().await;
-                        state.get_file(&filename).and_then(|fs| {
-                            let doc = fs.to_doc().ok()?;
-                            let c = commonplace_doc::sync::crdt_merge::get_doc_text_content(&doc);
-                            if c.is_empty() {
-                                None
-                            } else {
-                                Some(c)
-                            }
-                        })
+                        match state.get_file(&filename) {
+                            Some(fs) => match fs.to_doc() {
+                                Ok(doc) => {
+                                    let c = commonplace_doc::sync::crdt_merge::get_doc_text_content(&doc);
+                                    (true, if c.is_empty() { None } else { Some(c) })
+                                }
+                                Err(_) => (false, None),
+                            },
+                            None => (false, None),
+                        }
                     };
                     if let Some(ref content) = crdt_content {
-                        if !content.is_empty() {
-                            info!(
-                                "Writing CRDT content to {} ({} bytes, pull case)",
+                        info!(
+                            "Writing CRDT content to {} ({} bytes, pull case)",
+                            file_path.display(),
+                            content.len()
+                        );
+                        if let Err(e) = tokio::fs::write(&file_path, content).await {
+                            warn!(
+                                "Failed to write CRDT content to {}: {}",
                                 file_path.display(),
-                                content.len()
+                                e
                             );
-                            if let Err(e) = tokio::fs::write(&file_path, content).await {
-                                warn!(
-                                    "Failed to write CRDT content to {}: {}",
-                                    file_path.display(),
-                                    e
-                                );
-                            }
+                        }
+                    } else if decision.force_overwrite_local && crdt_found && file_path.exists() {
+                        info!("Truncating {} (empty in target branch)", file_path.display());
+                        if let Err(e) = tokio::fs::write(&file_path, "").await {
+                            warn!("Failed to truncate {}: {}", file_path.display(), e);
                         }
                     }
                 }
