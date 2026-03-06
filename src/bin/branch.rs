@@ -1,14 +1,17 @@
 //! commonplace-branch: Manage workspace branches
 //!
-//! Creates, lists, and deletes branches in a commonplace workspace.
-//! Uses MQTT commands to fork documents and manage branches.
-//! After forking, registers a sync agent in `__processes.json` so the
-//! orchestrator auto-starts sync for the new branch.
+//! Creates, lists, and deletes branches in a commonplace repo.
+//! Branches are directory entries within a repo container (created by
+//! `commonplace init`). Creating a branch forks an existing branch's
+//! directory doc and adds the new branch as an entry in the repo schema.
+//!
+//! The main sync agent discovers new branches automatically since they
+//! are reachable from the root tree via the repo directory.
 
 use clap::Parser;
 use commonplace_doc::cli::{BranchArgs, BranchCommand};
 use commonplace_doc::mqtt::{MqttClient, MqttConfig, MqttRequestClient};
-use commonplace_doc::orchestrator::ProcessesConfig;
+use commonplace_doc::sync::client::push_schema_to_server;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory = args.directory.canonicalize().unwrap_or(args.directory);
 
     match args.command {
-        Some(BranchCommand::Create { name }) => {
+        Some(BranchCommand::Create { name, from }) => {
             // Connect to MQTT for fork operation
             let config = MqttConfig {
                 broker_url: args.mqtt_broker.clone(),
@@ -39,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let request_client =
                 MqttRequestClient::new(client.clone(), args.workspace.clone()).await?;
-            create_branch(&request_client, &directory, &name).await?;
+            create_branch(&request_client, &args.server, &directory, &name, &from).await?;
 
             loop_handle.abort();
         }
@@ -57,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn list_branches(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let schema_path = directory.join(".commonplace.json");
     if !schema_path.exists() {
-        eprintln!("Not a commonplace workspace (no .commonplace.json found)");
+        eprintln!("Not a commonplace repo (no .commonplace.json found)");
         std::process::exit(1);
     }
 
@@ -87,7 +90,7 @@ fn list_branches(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
             println!("No branches found. Use 'commonplace branch create <name>' to create one.");
         }
     } else {
-        println!("Empty workspace.");
+        println!("Empty repo.");
     }
 
     Ok(())
@@ -95,8 +98,10 @@ fn list_branches(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 async fn create_branch(
     request_client: &MqttRequestClient,
+    server: &str,
     directory: &Path,
     name: &str,
+    from: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate branch name
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
@@ -106,125 +111,163 @@ async fn create_branch(
 
     let schema_path = directory.join(".commonplace.json");
     if !schema_path.exists() {
-        eprintln!("Not a commonplace workspace (no .commonplace.json found)");
+        eprintln!("Not a commonplace repo (no .commonplace.json found)");
         std::process::exit(1);
     }
 
-    // Fork from the workspace root (fs-root). This always creates a branch from
-    // the main workspace, regardless of which branch is currently checked out.
-    // To branch from a specific branch, a --from flag would be needed (future work).
-    let root_uuid = request_client.discover_fs_root().await
-        .map_err(|e| format!("Cannot discover fs-root: {}. Is the server running?", e))?;
+    let schema_content = std::fs::read_to_string(&schema_path)?;
+    let schema: serde_json::Value = serde_json::from_str(&schema_content)?;
+
+    let entries = schema
+        .get("root")
+        .and_then(|r| r.get("entries"))
+        .and_then(|e| e.as_object())
+        .ok_or("Invalid repo schema: missing root.entries")?;
+
+    // Check that the target branch doesn't already exist
+    if entries.contains_key(name) {
+        eprintln!("Branch '{}' already exists.", name);
+        std::process::exit(1);
+    }
+
+    // Find the source branch to fork from
+    let source_entry = entries.get(from).ok_or_else(|| {
+        format!(
+            "Source branch '{}' not found. Available branches: {}",
+            from,
+            entries
+                .keys()
+                .filter(|k| {
+                    entries
+                        .get(*k)
+                        .and_then(|e| e.get("type"))
+                        .and_then(|t| t.as_str())
+                        == Some("dir")
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+
+    let source_uuid = source_entry
+        .get("node_id")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| format!("Source branch '{}' has no node_id", from))?;
 
     println!(
-        "Creating branch '{}' from root {}...",
+        "Creating branch '{}' from '{}' ({})...",
         name,
-        &root_uuid[..8.min(root_uuid.len())]
+        from,
+        &source_uuid[..8.min(source_uuid.len())]
     );
 
     // Fork via MQTT command
-    let fork_result = request_client.fork_document(&root_uuid, None).await?;
+    let fork_result = request_client.fork_document(source_uuid, None).await?;
 
     if let Some(error) = fork_result.error {
         eprintln!("Fork failed: {}", error);
         std::process::exit(1);
     }
 
-    let new_id = fork_result.id.as_deref().unwrap_or("unknown");
+    let new_id = fork_result
+        .id
+        .as_deref()
+        .ok_or("Fork succeeded but no ID returned")?;
+
     println!(
         "Branch '{}' created (root: {})",
         name,
         &new_id[..8.min(new_id.len())]
     );
 
-    // Register sync agent in __processes.json
-    let branch_dir = directory.join("branches").join(name);
-    register_sync_agent(directory, name, new_id, &branch_dir)?;
+    // Find the repo's node_id so we can update its schema on the server
+    let repo_node_id = find_repo_node_id(directory)?;
+
+    // Update repo schema to include the new branch
+    let repo_schema = serde_json::json!({
+        "version": 1,
+        "root": {
+            "type": "dir",
+            "entries": {
+                name: {
+                    "type": "dir",
+                    "node_id": new_id
+                }
+            }
+        }
+    });
+
+    let http_client = reqwest::Client::new();
+    push_schema_to_server(
+        &http_client,
+        server,
+        &repo_node_id,
+        &repo_schema.to_string(),
+        "commonplace-branch",
+    )
+    .await
+    .map_err(|e| format!("Failed to update repo schema: {}", e))?;
 
     println!(
-        "Sync agent registered. Branch will sync to: {}",
-        branch_dir.display()
+        "Branch '{}' added to repo. The sync agent will discover it automatically.",
+        name
     );
 
     Ok(())
 }
 
-/// Register a sync agent entry in `__processes.json` for the new branch.
+/// Find the node_id for the repo directory by reading the parent schema.
 ///
-/// The orchestrator will detect the change and auto-start a commonplace-sync
-/// process pointing at the forked root UUID.
-fn register_sync_agent(
-    workspace_dir: &Path,
-    branch_name: &str,
-    forked_root_uuid: &str,
-    branch_dir: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let processes_path = workspace_dir.join("__processes.json");
-
-    // Load existing config or start fresh
-    let mut config_json: serde_json::Value = if processes_path.exists() {
-        let content = std::fs::read_to_string(&processes_path)?;
-        serde_json::from_str(&content)?
-    } else {
-        serde_json::json!({})
-    };
-
-    // Find the commonplace-sync binary (same directory as this executable)
-    let sync_binary = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("commonplace-sync")))
-        .unwrap_or_else(|| std::path::PathBuf::from("commonplace-sync"));
-
-    let sync_binary_str = sync_binary.to_string_lossy().to_string();
-    let branch_dir_str = branch_dir.to_string_lossy().to_string();
-
-    // Build the sync agent entry
-    let process_name = format!("branch-sync-{}", branch_name);
-    let entry = serde_json::json!({
-        "comment": format!("Sync agent for branch '{}' (forked from root)", branch_name),
-        "command": [
-            sync_binary_str,
-            "--server", "http://localhost:5199",
-            "--node", forked_root_uuid,
-            "--directory", branch_dir_str,
-            "--initial-sync", "server",
-            "--name", process_name
-        ],
-        "cwd": workspace_dir.to_string_lossy()
-    });
-
-    // Handle both legacy and new format
-    if let Some(obj) = config_json.as_object_mut() {
-        if obj.contains_key("processes") {
-            // Legacy format
-            if let Some(processes) = obj
-                .get_mut("processes")
-                .and_then(|p| p.as_object_mut())
-            {
-                processes.insert(process_name, entry);
-            }
-        } else {
-            // New format — but we need to be careful not to break existing entries
-            obj.insert(process_name, entry);
+/// Walks up from `repo_dir` to find the parent `.commonplace.json` that
+/// contains this repo as an entry, then returns the repo's node_id.
+fn find_repo_node_id(repo_dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    // First check the sync metadata file which has the node_id directly
+    let sync_path = repo_dir.join(".commonplace-sync.json");
+    if sync_path.exists() {
+        let sync_content = std::fs::read_to_string(&sync_path)?;
+        let sync_json: serde_json::Value = serde_json::from_str(&sync_content)?;
+        if let Some(node_id) = sync_json.get("node_id").and_then(|n| n.as_str()) {
+            return Ok(node_id.to_string());
         }
     }
 
-    // Create branch directory if it doesn't exist
-    std::fs::create_dir_all(branch_dir)?;
+    // Fall back: look at parent directory's schema for this dir's node_id
+    let repo_name = repo_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Cannot determine repo directory name")?;
 
-    // Write the updated config
-    let updated = serde_json::to_string_pretty(&config_json)?;
-    std::fs::write(&processes_path, format!("{}\n", updated))?;
+    let parent_dir = repo_dir
+        .parent()
+        .ok_or("Repo directory has no parent")?;
 
-    // Verify the config is parseable
-    ProcessesConfig::parse(&updated).map_err(|e| {
-        format!(
-            "Generated invalid __processes.json: {}. File saved but may not be picked up.",
-            e
+    let parent_schema_path = parent_dir.join(".commonplace.json");
+    if !parent_schema_path.exists() {
+        return Err(format!(
+            "No .commonplace.json found in parent directory: {}",
+            parent_dir.display()
         )
-    })?;
+        .into());
+    }
 
-    Ok(())
+    let parent_schema_content = std::fs::read_to_string(&parent_schema_path)?;
+    let parent_schema: serde_json::Value = serde_json::from_str(&parent_schema_content)?;
+
+    let node_id = parent_schema
+        .get("root")
+        .and_then(|r| r.get("entries"))
+        .and_then(|e| e.get(repo_name))
+        .and_then(|entry| entry.get("node_id"))
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| {
+            format!(
+                "Cannot find node_id for '{}' in parent schema",
+                repo_name
+            )
+        })?;
+
+    Ok(node_id.to_string())
 }
 
 fn delete_branch(_directory: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {

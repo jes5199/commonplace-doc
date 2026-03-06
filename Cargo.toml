@@ -96,6 +96,10 @@ name = "commonplace-checkout"
 path = "src/bin/checkout.rs"
 
 [[bin]]
+name = "commonplace-init"
+path = "src/bin/init.rs"
+
+[[bin]]
 name = "commonplace-worktree"
 path = "src/bin/worktree.rs"
 

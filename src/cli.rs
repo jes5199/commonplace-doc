@@ -512,7 +512,11 @@ pub struct BranchArgs {
     #[clap(long, short = 'w', env = "COMMONPLACE_WORKSPACE", default_value = DEFAULT_WORKSPACE)]
     pub workspace: String,
 
-    /// Workspace directory
+    /// Server URL (for schema updates)
+    #[clap(long, default_value = DEFAULT_SERVER_URL)]
+    pub server: String,
+
+    /// Repo directory (e.g., workspace/myapp)
     #[clap(long, short, default_value = ".")]
     pub directory: PathBuf,
 
@@ -524,10 +528,13 @@ pub struct BranchArgs {
 /// Branch subcommands.
 #[derive(clap::Subcommand)]
 pub enum BranchCommand {
-    /// Create a new branch from the current branch
+    /// Create a new branch (forks from an existing branch)
     Create {
         /// Name for the new branch
         name: String,
+        /// Branch to fork from (default: main)
+        #[clap(long, default_value = "main")]
+        from: String,
     },
     /// Delete a branch
     Delete {
@@ -558,6 +565,22 @@ pub struct CheckoutArgs {
 
     /// Branch name to checkout
     pub branch: String,
+}
+
+/// Arguments for `commonplace-init`.
+#[derive(Parser)]
+#[command(name = "commonplace-init", about = "Initialize a repo/branch workspace")]
+pub struct InitArgs {
+    /// Name for the repo (e.g., "myapp")
+    pub name: String,
+
+    /// Server URL
+    #[clap(long, default_value = DEFAULT_SERVER_URL)]
+    pub server: String,
+
+    /// Workspace directory (where sync materializes files)
+    #[clap(long, short, default_value = ".")]
+    pub directory: PathBuf,
 }
 
 /// Arguments for `commonplace-worktree`.

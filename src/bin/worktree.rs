@@ -1,9 +1,14 @@
-//! commonplace-worktree: Manage additional branch checkouts
+//! commonplace-worktree: Manage additional branch checkouts (flat-branch model)
 //!
 //! Like `git worktree`, allows multiple branches to be checked out
 //! simultaneously in different directories. Each worktree runs its own
 //! commonplace-sync agent, registered in `__processes.json` so the
 //! orchestrator manages its lifecycle.
+//!
+//! Note: With the repo/branch layout (`commonplace init`), worktrees are
+//! typically unnecessary — all branches are materialized simultaneously
+//! as subdirectories of the repo. This command is primarily for the
+//! flat-branch model where branches need separate sync agents.
 
 use clap::Parser;
 use commonplace_doc::cli::{WorktreeArgs, WorktreeCommand};

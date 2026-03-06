@@ -1,7 +1,12 @@
-//! commonplace-checkout: Switch active branch
+//! commonplace-checkout: Switch active branch (flat-branch model)
 //!
 //! Sends a re-root MQTT command to the sync agent, causing it to
 //! switch from the current branch's root UUID to the target branch's.
+//!
+//! Note: With the repo/branch layout (`commonplace init`), checkout is
+//! typically unnecessary — all branches are materialized simultaneously
+//! as subdirectories. This command is primarily for the flat-branch model
+//! where branches are separate sync agents.
 
 use clap::Parser;
 use commonplace_doc::cli::CheckoutArgs;

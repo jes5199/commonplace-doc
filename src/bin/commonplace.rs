@@ -17,6 +17,7 @@ const SUBCOMMANDS: &[(&str, &str)] = &[
         "orchestrator",
         "Process supervisor for commonplace services",
     ),
+    ("init", "Initialize a repo/branch workspace"),
     ("status", "Show workspace sync status"),
     ("branch", "Manage workspace branches"),
     ("checkout", "Switch active branch"),
