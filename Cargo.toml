@@ -83,6 +83,18 @@ path = "src/bin/commonplace_bd.rs"
 name = "commonplace-beads-bridge"
 path = "src/bin/beads_bridge.rs"
 
+[[bin]]
+name = "commonplace-status"
+path = "src/bin/status.rs"
+
+[[bin]]
+name = "commonplace-branch"
+path = "src/bin/branch.rs"
+
+[[bin]]
+name = "commonplace-checkout"
+path = "src/bin/checkout.rs"
+
 [dependencies]
 commonplace-types = { path = "crates/commonplace-types" }
 commonplace-crdt = { path = "crates/commonplace-crdt" }

@@ -478,3 +478,68 @@ pub fn compute_diff_stats(old: &str, new: &str) -> ChangeStats {
         chars_removed,
     }
 }
+
+/// Arguments for `commonplace-status`.
+#[derive(Parser)]
+#[command(name = "commonplace-status", about = "Show workspace sync status")]
+pub struct StatusArgs {
+    /// Server URL
+    #[clap(long, short, env = "COMMONPLACE_SERVER", default_value = "http://localhost:5199")]
+    pub server: String,
+
+    /// Workspace directory
+    #[clap(long, short, default_value = ".")]
+    pub directory: PathBuf,
+
+    /// Output in JSON format
+    #[clap(long)]
+    pub json: bool,
+}
+
+/// Arguments for `commonplace-branch`.
+#[derive(Parser)]
+#[command(name = "commonplace-branch", about = "Manage workspace branches")]
+pub struct BranchArgs {
+    /// Server URL
+    #[clap(long, short, env = "COMMONPLACE_SERVER", default_value = "http://localhost:5199")]
+    pub server: String,
+
+    /// Workspace directory
+    #[clap(long, short, default_value = ".")]
+    pub directory: PathBuf,
+
+    /// Branch subcommand
+    #[command(subcommand)]
+    pub command: Option<BranchCommand>,
+}
+
+/// Branch subcommands.
+#[derive(clap::Subcommand)]
+pub enum BranchCommand {
+    /// Create a new branch from the current branch
+    Create {
+        /// Name for the new branch
+        name: String,
+    },
+    /// Delete a branch
+    Delete {
+        /// Branch name to delete
+        name: String,
+    },
+}
+
+/// Arguments for `commonplace-checkout`.
+#[derive(Parser)]
+#[command(name = "commonplace-checkout", about = "Switch active branch")]
+pub struct CheckoutArgs {
+    /// Server URL
+    #[clap(long, short, env = "COMMONPLACE_SERVER", default_value = "http://localhost:5199")]
+    pub server: String,
+
+    /// Workspace directory
+    #[clap(long, short, default_value = ".")]
+    pub directory: PathBuf,
+
+    /// Branch name to checkout
+    pub branch: String,
+}
