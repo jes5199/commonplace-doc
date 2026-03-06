@@ -1,17 +1,19 @@
 //! commonplace-status: Show workspace sync status
 //!
-//! Queries the sync agent and server to show current workspace state.
-//! Shows branch info, sync status, and pending changes.
+//! Queries the server via MQTT to show current workspace state.
+//! Shows branch info, sync status, and directory listing.
 
 use clap::Parser;
 use commonplace_doc::cli::StatusArgs;
-use reqwest::blocking::Client;
+use commonplace_doc::mqtt::{MqttClient, MqttConfig, MqttRequestClient};
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = StatusArgs::parse();
 
-    let client = Client::new();
     let directory = args.directory.canonicalize().unwrap_or(args.directory);
 
     // Read .commonplace.json to find the workspace root UUID
@@ -26,47 +28,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let schema_content = std::fs::read_to_string(&schema_path)?;
     let schema: serde_json::Value = serde_json::from_str(&schema_content)?;
 
-    // Find workspace UUID from schema
-    let _workspace_uuid = schema
-        .as_object()
-        .and_then(|obj| {
-            // Look for the root node_id or document_id
-            obj.get("root")
-                .and_then(|r| r.get("node_id"))
-                .and_then(|n| n.as_str())
-        })
-        .or({
-            // Try sync state for the root UUID
-            None
-        });
+    // Connect to MQTT broker
+    let config = MqttConfig {
+        broker_url: args.mqtt_broker.clone(),
+        client_id: format!("commonplace-status-{}", uuid::Uuid::new_v4()),
+        workspace: args.workspace.clone(),
+        ..Default::default()
+    };
+
+    let client = Arc::new(MqttClient::connect(config).await?);
+    let client_for_loop = client.clone();
+    let loop_handle = tokio::spawn(async move {
+        let _ = client_for_loop.run_event_loop().await;
+    });
+
+    // Brief delay for connection establishment
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let request_client = MqttRequestClient::new(client.clone(), args.workspace.clone()).await?;
 
     if args.json {
-        let status = build_status_json(&client, &args.server, &directory, &schema)?;
+        let status =
+            build_status_json(&request_client, &args.mqtt_broker, &directory, &schema).await?;
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
-        print_status(&client, &args.server, &directory, &schema, &sync_state_path)?;
+        print_status(
+            &request_client,
+            &args.mqtt_broker,
+            &directory,
+            &schema,
+            &sync_state_path,
+        )
+        .await?;
     }
 
+    loop_handle.abort();
     Ok(())
 }
 
-fn print_status(
-    client: &Client,
-    server: &str,
+async fn print_status(
+    request_client: &MqttRequestClient,
+    broker: &str,
     directory: &Path,
     schema: &serde_json::Value,
     sync_state_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Workspace: {}", directory.display());
-    println!("Server:    {}", server);
+    println!("Broker:    {}", broker);
 
-    // Check server health
-    match client.get(format!("{}/health", server)).send() {
-        Ok(resp) if resp.status().is_success() => {
-            println!("Server:    connected");
+    // Check server connectivity by trying to discover fs-root
+    match request_client.discover_fs_root().await {
+        Ok(root_id) => {
+            println!("Server:    connected (fs-root: {})", &root_id[..8.min(root_id.len())]);
         }
-        _ => {
-            println!("Server:    disconnected");
+        Err(_) => {
+            println!("Server:    disconnected (no fs-root response)");
         }
     }
 
@@ -105,7 +121,6 @@ fn list_branches(schema: &serde_json::Value) -> Result<(), Box<dyn std::error::E
         .and_then(|e| e.as_object());
 
     if let Some(entries) = entries {
-        // Look for directories that contain __branch.json
         let branches: Vec<&String> = entries
             .iter()
             .filter(|(_, v)| {
@@ -128,17 +143,13 @@ fn list_branches(schema: &serde_json::Value) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-fn build_status_json(
-    client: &Client,
-    server: &str,
+async fn build_status_json(
+    request_client: &MqttRequestClient,
+    broker: &str,
     directory: &Path,
     schema: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let server_connected = client
-        .get(format!("{}/health", server))
-        .send()
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+    let server_connected = request_client.discover_fs_root().await.is_ok();
 
     let entry_count = schema
         .get("root")
@@ -149,7 +160,7 @@ fn build_status_json(
 
     Ok(serde_json::json!({
         "workspace": directory.display().to_string(),
-        "server": server,
+        "broker": broker,
         "server_connected": server_connected,
         "entry_count": entry_count,
     }))

@@ -483,9 +483,13 @@ pub fn compute_diff_stats(old: &str, new: &str) -> ChangeStats {
 #[derive(Parser)]
 #[command(name = "commonplace-status", about = "Show workspace sync status")]
 pub struct StatusArgs {
-    /// Server URL
-    #[clap(long, short, env = "COMMONPLACE_SERVER", default_value = "http://localhost:5199")]
-    pub server: String,
+    /// MQTT broker URL
+    #[clap(long, env = "COMMONPLACE_BROKER", default_value = DEFAULT_MQTT_BROKER_URL)]
+    pub mqtt_broker: String,
+
+    /// Workspace name (MQTT topic namespace)
+    #[clap(long, short = 'w', env = "COMMONPLACE_WORKSPACE", default_value = DEFAULT_WORKSPACE)]
+    pub workspace: String,
 
     /// Workspace directory
     #[clap(long, short, default_value = ".")]
@@ -500,9 +504,13 @@ pub struct StatusArgs {
 #[derive(Parser)]
 #[command(name = "commonplace-branch", about = "Manage workspace branches")]
 pub struct BranchArgs {
-    /// Server URL
-    #[clap(long, short, env = "COMMONPLACE_SERVER", default_value = "http://localhost:5199")]
-    pub server: String,
+    /// MQTT broker URL
+    #[clap(long, env = "COMMONPLACE_BROKER", default_value = DEFAULT_MQTT_BROKER_URL)]
+    pub mqtt_broker: String,
+
+    /// Workspace name (MQTT topic namespace)
+    #[clap(long, short = 'w', env = "COMMONPLACE_WORKSPACE", default_value = DEFAULT_WORKSPACE)]
+    pub workspace: String,
 
     /// Workspace directory
     #[clap(long, short, default_value = ".")]
@@ -532,9 +540,13 @@ pub enum BranchCommand {
 #[derive(Parser)]
 #[command(name = "commonplace-checkout", about = "Switch active branch")]
 pub struct CheckoutArgs {
-    /// Server URL
-    #[clap(long, short, env = "COMMONPLACE_SERVER", default_value = "http://localhost:5199")]
-    pub server: String,
+    /// MQTT broker URL
+    #[clap(long, env = "COMMONPLACE_BROKER", default_value = DEFAULT_MQTT_BROKER_URL)]
+    pub mqtt_broker: String,
+
+    /// Workspace name (MQTT topic namespace)
+    #[clap(long, short = 'w', env = "COMMONPLACE_WORKSPACE", default_value = DEFAULT_WORKSPACE)]
+    pub workspace: String,
 
     /// Workspace directory
     #[clap(long, short, default_value = ".")]
@@ -542,4 +554,44 @@ pub struct CheckoutArgs {
 
     /// Branch name to checkout
     pub branch: String,
+}
+
+/// Arguments for `commonplace-worktree`.
+#[derive(Parser)]
+#[command(name = "commonplace-worktree", about = "Manage additional branch checkouts")]
+pub struct WorktreeArgs {
+    /// MQTT broker URL
+    #[clap(long, env = "COMMONPLACE_BROKER", default_value = DEFAULT_MQTT_BROKER_URL)]
+    pub mqtt_broker: String,
+
+    /// Workspace name (MQTT topic namespace)
+    #[clap(long, short = 'w', env = "COMMONPLACE_WORKSPACE", default_value = DEFAULT_WORKSPACE)]
+    pub workspace: String,
+
+    /// Workspace directory
+    #[clap(long, short, default_value = ".")]
+    pub directory: PathBuf,
+
+    /// Worktree subcommand
+    #[command(subcommand)]
+    pub command: WorktreeCommand,
+}
+
+/// Worktree subcommands.
+#[derive(clap::Subcommand)]
+pub enum WorktreeCommand {
+    /// Add a new worktree for a branch
+    Add {
+        /// Branch name (must exist — use 'commonplace branch create' first)
+        branch: String,
+        /// Directory path for the worktree checkout
+        path: PathBuf,
+    },
+    /// Remove a worktree
+    Remove {
+        /// Directory path of the worktree to remove
+        path: PathBuf,
+    },
+    /// List active worktrees
+    List,
 }

@@ -95,6 +95,10 @@ path = "src/bin/branch.rs"
 name = "commonplace-checkout"
 path = "src/bin/checkout.rs"
 
+[[bin]]
+name = "commonplace-worktree"
+path = "src/bin/worktree.rs"
+
 [dependencies]
 commonplace-types = { path = "crates/commonplace-types" }
 commonplace-crdt = { path = "crates/commonplace-crdt" }

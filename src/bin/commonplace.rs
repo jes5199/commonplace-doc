@@ -20,6 +20,7 @@ const SUBCOMMANDS: &[(&str, &str)] = &[
     ("status", "Show workspace sync status"),
     ("branch", "Manage workspace branches"),
     ("checkout", "Switch active branch"),
+    ("worktree", "Manage additional branch checkouts"),
     (
         "log",
         "Show commit history for a synced file (like git log)",
