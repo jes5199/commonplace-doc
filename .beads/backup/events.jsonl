@@ -76,3 +76,4 @@
 {"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-06T22:43:06Z","event_type":"created","id":76,"issue_id":"CP-oajb","new_value":"","old_value":""}
 {"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-06T22:47:24Z","event_type":"created","id":77,"issue_id":"CP-4hs0","new_value":"","old_value":""}
 {"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-06T23:00:17Z","event_type":"closed","id":78,"issue_id":"CP-1gad","new_value":"CLI tools (branch, checkout) now query the server directly via HTTP instead of reading local .commonplace.json files. This means they work immediately after init without waiting for the sync agent to materialize directories.","old_value":""}
+{"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-06T23:18:18Z","event_type":"created","id":79,"issue_id":"CP-39o0","new_value":"","old_value":""}
