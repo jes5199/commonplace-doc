@@ -48,3 +48,10 @@
 {"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-06T09:57:23Z","event_type":"created","id":48,"issue_id":"CP-hlk7","new_value":"","old_value":""}
 {"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-06T09:58:00Z","event_type":"closed","id":49,"issue_id":"CP-ngl0","new_value":"Implemented checkout via sync agent re-root. Sync agent listens on MQTT control topic, exits with ReRoot, caller restarts with new root UUID. Server-authoritative startup on re-root with force_overwrite_local. Validated through 10 iterations of codex review.","old_value":""}
 {"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-06T20:01:18Z","event_type":"created","id":50,"issue_id":"CP-g9ea","new_value":"","old_value":""}
+{"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-06T20:01:34Z","event_type":"created","id":51,"issue_id":"CP-nrwe","new_value":"","old_value":""}
+{"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-06T20:01:34Z","event_type":"created","id":52,"issue_id":"CP-bw2c","new_value":"","old_value":""}
+{"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-06T20:01:34Z","event_type":"created","id":53,"issue_id":"CP-xkom","new_value":"","old_value":""}
+{"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-06T20:01:34Z","event_type":"created","id":54,"issue_id":"CP-totc","new_value":"","old_value":""}
+{"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-06T20:01:52Z","event_type":"closed","id":55,"issue_id":"CP-wdm2","new_value":"Duplicate — checkout implemented in CP-ngl0","old_value":""}
+{"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-06T20:01:52Z","event_type":"closed","id":56,"issue_id":"CP-eqve","new_value":"Branch command already implemented in CP-adn2/CP-bhul","old_value":""}
+{"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-06T20:01:53Z","event_type":"closed","id":57,"issue_id":"CP-m0bq","new_value":"Status command already implemented in CP-bhul","old_value":""}
