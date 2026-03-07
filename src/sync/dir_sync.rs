@@ -940,7 +940,10 @@ pub async fn handle_subdir_new_files(
 
             // Read local content and start sync tasks
             if let Some(ctx) = crdt_context {
-                if let Ok(node_uuid) = Uuid::parse_str(&identifier) {
+                // CP-3s0q: Use node_id (UUID from schema) rather than identifier,
+                // which may be a file path when use_paths=true.
+                let uuid_source = node_id.as_deref().unwrap_or(&identifier);
+                if let Ok(node_uuid) = Uuid::parse_str(uuid_source) {
                     // Check if already registered
                     {
                         let states = file_states.read().await;
@@ -1171,8 +1174,10 @@ pub async fn handle_subdir_new_files(
             // Spawn sync tasks for the new file
             // Use CRDT tasks if context is provided and identifier is a valid UUID
             let task_handles = if let Some(ctx) = crdt_context {
-                // Try to parse identifier as UUID for CRDT sync
-                if let Ok(node_uuid) = Uuid::parse_str(&identifier) {
+                // CP-3s0q: Use node_id (UUID from schema) rather than identifier,
+                // which may be a file path when use_paths=true.
+                let uuid_source = node_id.as_deref().unwrap_or(&identifier);
+                if let Ok(node_uuid) = Uuid::parse_str(uuid_source) {
                     // Initialize CRDT state from server
                     let filename = file_path
                         .file_name()
