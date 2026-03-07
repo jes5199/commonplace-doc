@@ -237,13 +237,12 @@ pub async fn directory_mqtt_task(
                 }
             }
 
-            // Bootstrap files from the schema (whether initialized via cyan or already present)
-            if http_recovery_disabled {
-                warn!(
-                    "Skipping HTTP file bootstrap for {} (HTTP recovery disabled)",
-                    fs_root_id
-                );
-            } else if let Err(e) = handle_subdir_new_files(
+            // Bootstrap files from the schema (whether initialized via cyan or already present).
+            // Extract schema from CRDT state so handle_subdir_new_files can use it
+            // without needing HTTP (CP-dk9l: CRDT-based file materialization).
+            let bootstrap_schema = load_root_schema_from_state(ctx).await
+                .map(|(schema, json, _cid)| (schema, json));
+            if let Err(e) = handle_subdir_new_files(
                 &http_client,
                 &server,
                 &fs_root_id,
@@ -259,7 +258,7 @@ pub async fn directory_mqtt_task(
                 #[cfg(unix)]
                 inode_tracker.clone(),
                 Some(ctx),
-                None, // Schema already initialized — HTTP fetch will populate files
+                bootstrap_schema,
             )
             .await
             {
@@ -435,12 +434,9 @@ pub async fn directory_mqtt_task(
                             // Handle new files using MQTT schema
                             let schema_tuple = (schema.clone(), schema_json.clone());
                             if !push_only {
-                                if http_recovery_disabled {
-                                    warn!(
-                                        "MQTT: Skipping new file sync for {} (HTTP recovery disabled)",
-                                        fs_root_id
-                                    );
-                                } else if let Err(e) = handle_subdir_new_files(
+                                // CP-dk9l: Always attempt file materialization — handle_subdir_new_files
+                                // handles mqtt_only mode internally via CRDT fallback path.
+                                if let Err(e) = handle_subdir_new_files(
                                     &http_client,
                                     &server,
                                     &fs_root_id,

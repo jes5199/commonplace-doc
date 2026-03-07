@@ -784,8 +784,12 @@ pub async fn handle_subdir_new_files(
     };
 
     // Build UUID map for the subdirectory (for files with explicit node_id).
-    // In strict MQTT-only mode, avoid HTTP fetches here and rely on schema snapshot node_ids.
-    let subdir_uuid_map = if mqtt_only_mode {
+    // Skip HTTP when mqtt_only mode OR when HTTP is hard-disabled in the sync runtime
+    // (CP-dk9l: these are independent flags — mqtt_only is a config option while
+    // set_sync_http_disabled is always called by the sync binary).
+    let subdir_uuid_map = if mqtt_only_mode
+        || crate::sync::transport::client::is_sync_http_disabled()
+    {
         HashMap::new()
     } else {
         build_uuid_map_recursive(client, server, subdir_node_id).await
