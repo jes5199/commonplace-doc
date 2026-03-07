@@ -39,6 +39,7 @@
 {"created_at":"2026-01-27T05:37:13Z","created_by":"Jes Wolfe!","depends_on_id":"CP-000v","issue_id":"CP-4za5","type":"blocks"}
 {"created_at":"2026-02-20T03:00:23Z","created_by":"Jes Wolfe!","depends_on_id":"CP-ntgh","issue_id":"CP-51b4","type":"discovered-from"}
 {"created_at":"2025-12-30T08:36:37Z","created_by":"daemon","depends_on_id":"CP-ejh","issue_id":"CP-56w","type":"blocks"}
+{"created_at":"2026-03-07T18:53:27Z","created_by":"Jes Wolfe!","depends_on_id":"CP-la8u","issue_id":"CP-576f","type":"blocks"}
 {"created_at":"2025-12-29T07:53:19Z","created_by":"daemon","depends_on_id":"CP-nno","issue_id":"CP-5af","type":"blocks"}
 {"created_at":"2026-01-27T07:36:56Z","created_by":"Jes Wolfe!","depends_on_id":"CP-44ym","issue_id":"CP-5o4w","type":"parent-child"}
 {"created_at":"2026-02-18T22:03:31Z","created_by":"Jes Wolfe!","depends_on_id":"CP-hkgh","issue_id":"CP-5o68","type":"discovered-from"}
@@ -97,12 +98,14 @@
 {"created_at":"2026-01-23T02:16:26Z","created_by":"Jes Wolfe!","depends_on_id":"CP-hr34","issue_id":"CP-cj9e","type":"blocks"}
 {"created_at":"2026-01-23T23:38:16Z","created_by":"Jes Wolfe!","depends_on_id":"CP-gz0p","issue_id":"CP-dja4","type":"blocks"}
 {"created_at":"2026-01-23T21:39:14Z","created_by":"Jes Wolfe!","depends_on_id":"CP-1ual","issue_id":"CP-dkqk","type":"discovered-from"}
+{"created_at":"2026-03-07T18:54:51Z","created_by":"Jes Wolfe!","depends_on_id":"CP-576f","issue_id":"CP-e3km","type":"blocks"}
 {"created_at":"2026-01-06T01:50:49Z","created_by":"jes","depends_on_id":"CP-g99w","issue_id":"CP-e3km","type":"blocks"}
 {"created_at":"2025-12-29T06:50:34Z","created_by":"daemon","depends_on_id":"CP-nno","issue_id":"CP-egb","type":"blocks"}
 {"created_at":"2026-01-27T05:37:14Z","created_by":"Jes Wolfe!","depends_on_id":"CP-wp53","issue_id":"CP-eqvb","type":"blocks"}
 {"created_at":"2026-03-06T06:16:37Z","created_by":"Jes Wolfe!","depends_on_id":"CP-5e97","issue_id":"CP-eqve","type":"blocks"}
 {"created_at":"2026-01-29T06:01:31Z","created_by":"Jes Wolfe!","depends_on_id":"CP-a54h","issue_id":"CP-eyi","type":"blocks"}
 {"created_at":"2026-01-23T23:43:57Z","created_by":"Jes Wolfe!","depends_on_id":"CP-rmgu","issue_id":"CP-ez9b","type":"blocks"}
+{"created_at":"2026-03-07T18:53:27Z","created_by":"Jes Wolfe!","depends_on_id":"CP-576f","issue_id":"CP-f8cy","type":"blocks"}
 {"created_at":"2026-01-12T15:22:16Z","created_by":"jes","depends_on_id":"CP-2wie","issue_id":"CP-fi7t","type":"blocks"}
 {"created_at":"2026-02-17T20:30:12Z","created_by":"Jes Wolfe!","depends_on_id":"CP-sdun","issue_id":"CP-fk52","type":"discovered-from"}
 {"created_at":"2026-02-17T20:30:12Z","created_by":"Jes Wolfe!","depends_on_id":"CP-sdun","issue_id":"CP-fxfy","type":"discovered-from"}
@@ -118,6 +121,7 @@
 {"created_at":"2026-01-29T05:52:45Z","created_by":"Jes Wolfe!","depends_on_id":"CP-jh5d","issue_id":"CP-gyyc","type":"blocks"}
 {"created_at":"2026-01-23T21:39:05Z","created_by":"Jes Wolfe!","depends_on_id":"CP-1ual","issue_id":"CP-gz0p","type":"discovered-from"}
 {"created_at":"2026-01-27T07:36:57Z","created_by":"Jes Wolfe!","depends_on_id":"CP-44ym","issue_id":"CP-h4x5","type":"parent-child"}
+{"created_at":"2026-03-07T18:53:27Z","created_by":"Jes Wolfe!","depends_on_id":"CP-la8u","issue_id":"CP-hr4j","type":"blocks"}
 {"created_at":"2026-01-27T05:37:13Z","created_by":"Jes Wolfe!","depends_on_id":"CP-000v","issue_id":"CP-hwg2","type":"blocks"}
 {"created_at":"2026-01-23T21:38:50Z","created_by":"Jes Wolfe!","depends_on_id":"CP-1ual","issue_id":"CP-hykz","type":"discovered-from"}
 {"created_at":"2026-02-14T18:08:58Z","created_by":"Jes Wolfe!","depends_on_id":"CP-a54h","issue_id":"CP-ib9l","type":"blocks"}
@@ -131,6 +135,8 @@
 {"created_at":"2026-02-18T06:56:22Z","created_by":"Jes Wolfe!","depends_on_id":"CP-yrsb","issue_id":"CP-kk3w","type":"discovered-from"}
 {"created_at":"2026-02-05T20:46:24Z","created_by":"Jes Wolfe!","depends_on_id":"CP-rulu","issue_id":"CP-knqq","type":"blocks"}
 {"created_at":"2026-02-16T03:26:21Z","created_by":"Jes Wolfe!","depends_on_id":"CP-5dii","issue_id":"CP-kogc","type":"discovered-from"}
+{"created_at":"2026-03-07T18:53:27Z","created_by":"Jes Wolfe!","depends_on_id":"CP-576f","issue_id":"CP-l950","type":"blocks"}
+{"created_at":"2026-03-07T18:53:27Z","created_by":"Jes Wolfe!","depends_on_id":"CP-fnor","issue_id":"CP-la8u","type":"blocks"}
 {"created_at":"2026-01-15T00:00:52Z","created_by":"Jes Wolfe!","depends_on_id":"CP-ljmv","issue_id":"CP-lawm","type":"blocks"}
 {"created_at":"2026-01-23T23:44:32Z","created_by":"Jes Wolfe!","depends_on_id":"CP-l38o","issue_id":"CP-lfgo","type":"blocks"}
 {"created_at":"2025-12-30T17:50:59Z","created_by":"daemon","depends_on_id":"CP-8ci","issue_id":"CP-lzy","type":"blocks"}
