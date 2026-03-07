@@ -4,12 +4,9 @@
 //! for schema changes and all file UUIDs for content changes.
 
 use super::recovery::{
-    resync_subdir_schema_from_server, resync_subdir_subscribed_files, resync_subscribed_files,
-    sync_schema_via_cyan,
+    resync_subdir_schema_from_server, resync_subdir_subscribed_files, sync_schema_via_cyan,
 };
-use super::{
-    collect_new_subdirs, handle_subdir_edit, is_http_recovery_disabled, CrdtFileSyncContext,
-};
+use super::{collect_new_subdirs, handle_subdir_edit, CrdtFileSyncContext};
 use crate::events::{recv_broadcast_with_lag, BroadcastRecvResult};
 use crate::mqtt::{MqttClient, Topic};
 use crate::sync::dir_sync::{apply_schema_update_to_state, decode_schema_from_mqtt_payload};
@@ -165,13 +162,6 @@ pub async fn subdir_mqtt_task(
     let inode_tracker_for_crdt = inode_tracker.clone();
     #[cfg(not(unix))]
     let inode_tracker_for_crdt = None;
-    let http_recovery_disabled = is_http_recovery_disabled(
-        crdt_context
-            .as_ref()
-            .map(|ctx| ctx.mqtt_only_config.mqtt_only)
-            .unwrap_or(false),
-    );
-
     // CRITICAL: Create the broadcast receiver BEFORE subscribing.
     // This ensures we receive retained messages.
     let mut message_rx = mqtt_client.subscribe_messages();
@@ -355,34 +345,13 @@ pub async fn subdir_mqtt_task(
                         std::collections::HashSet::new(),
                     )
                     .await;
-                } else if http_recovery_disabled {
+                } else {
+                    // No CRDT context available — CRDT is required for lag recovery
+                    // in the MQTT runtime. HTTP-based legacy mode has been removed (CP-jg14).
                     warn!(
-                        "Subdir {}: lag recovery skipped (no CRDT context and HTTP recovery disabled)",
+                        "Subdir {}: lag recovery skipped (no CRDT context available)",
                         subdir_path
                     );
-                } else {
-                    // Legacy path for non-MQTT runtime contexts.
-                    handle_subdir_edit(
-                        &http_client,
-                        &server,
-                        &subdir_node_id,
-                        &subdir_path,
-                        &subdir_full_path,
-                        &directory,
-                        &file_states,
-                        use_paths,
-                        push_only,
-                        pull_only,
-                        shared_state_file.as_ref(),
-                        &author,
-                        #[cfg(unix)]
-                        inode_tracker.clone(),
-                        "MQTT-resync",
-                        crdt_context.as_ref(),
-                        None,
-                        std::collections::HashSet::new(),
-                    )
-                    .await;
                 }
 
                 if let Some(ref ctx) = crdt_context {
@@ -393,21 +362,6 @@ pub async fn subdir_mqtt_task(
                         &subdir_path,
                         &subdir_node_id,
                         ctx,
-                        inode_tracker_for_crdt.clone(),
-                        &author,
-                    )
-                    .await;
-                } else {
-                    // Legacy retained-message recovery path when CRDT context is unavailable.
-                    resync_subscribed_files(
-                        &http_client,
-                        &server,
-                        &subscribed_uuids,
-                        &uuid_to_paths,
-                        &directory,
-                        use_paths,
-                        &file_states,
-                        None,
                         inode_tracker_for_crdt.clone(),
                         &author,
                     )
@@ -638,9 +592,11 @@ pub async fn subdir_mqtt_task(
                 }
             }
 
-            if mqtt_schema.is_none() && http_recovery_disabled {
+            if mqtt_schema.is_none() {
+                // No schema snapshot available — CRDT is required for schema processing
+                // in the MQTT runtime. HTTP-based legacy mode has been removed (CP-jg14).
                 warn!(
-                    "Subdir {}: skipping schema edit handling (no schema snapshot and HTTP recovery disabled)",
+                    "Subdir {}: skipping schema edit handling (no schema snapshot available)",
                     subdir_path
                 );
                 continue;
@@ -681,24 +637,11 @@ pub async fn subdir_mqtt_task(
                     &mut uuid_to_paths,
                 )
                 .await;
-            } else if crdt_context.is_none() && !http_recovery_disabled {
-                sync_subdir_uuid_subscriptions(
-                    &http_client,
-                    &server,
-                    &subdir_node_id,
-                    &subdir_path,
-                    &mqtt_client,
-                    &workspace,
-                    &mut subscribed_uuids,
-                    &mut uuid_to_paths,
-                    &directory,
-                    use_paths,
-                    &file_states,
-                )
-                .await;
             } else if crdt_context.is_none() {
+                // No CRDT context available — CRDT is required for subscription sync
+                // in the MQTT runtime. HTTP-based legacy mode has been removed (CP-jg14).
                 warn!(
-                    "Subdir {}: skipping HTTP subscription sync (HTTP recovery disabled)",
+                    "Subdir {}: skipping subscription sync (no CRDT context available)",
                     subdir_path
                 );
             }
@@ -1058,116 +1001,3 @@ async fn sync_subdir_uuid_subscriptions_from_snapshot(
     }
 }
 
-/// Sync UUID subscriptions for a subdirectory after its schema changes.
-///
-/// Similar to `sync_uuid_subscriptions` but scoped to a single subdirectory.
-/// Compares the current subscribed UUIDs with the new UUID map from the subdir's schema,
-/// subscribing to new UUIDs and unsubscribing from removed ones.
-#[allow(clippy::too_many_arguments)]
-async fn sync_subdir_uuid_subscriptions(
-    http_client: &Client,
-    server: &str,
-    subdir_node_id: &str,
-    subdir_path: &str,
-    mqtt_client: &Arc<MqttClient>,
-    workspace: &str,
-    subscribed_uuids: &mut HashSet<String>,
-    uuid_to_paths: &mut crate::sync::UuidToPathsMap,
-    _directory: &std::path::Path,
-    _use_paths: bool,
-    _file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
-) {
-    // Fetch the current UUID map from the subdirectory's schema
-    let (new_uuid_map, fetch_succeeded) =
-        crate::sync::uuid_map::build_uuid_map_recursive_with_status(
-            http_client,
-            server,
-            subdir_node_id,
-        )
-        .await;
-
-    // If fetch failed, don't modify subscriptions
-    if !fetch_succeeded {
-        warn!(
-            "Subdir {}: Schema fetch failed during subscription sync - keeping existing subscriptions",
-            subdir_path
-        );
-        return;
-    }
-
-    // Prefix paths with subdir_path
-    let prefixed_uuid_map: HashMap<String, String> = new_uuid_map
-        .into_iter()
-        .map(|(path, uuid)| {
-            let full_path = if subdir_path.is_empty() {
-                path
-            } else {
-                format!("{}/{}", subdir_path, path)
-            };
-            (full_path, uuid)
-        })
-        .collect();
-
-    // Build new reverse map
-    let new_uuid_to_paths = crate::sync::build_uuid_to_paths_map(&prefixed_uuid_map);
-    let new_uuids: HashSet<String> = new_uuid_to_paths.keys().cloned().collect();
-
-    // Find UUIDs to add and remove
-    let to_add: Vec<String> = new_uuids.difference(subscribed_uuids).cloned().collect();
-    let to_remove: Vec<String> = subscribed_uuids.difference(&new_uuids).cloned().collect();
-
-    // Subscribe to new UUIDs
-    for uuid in &to_add {
-        let topic = Topic::edits(workspace, uuid).to_topic_string();
-        if let Err(e) = mqtt_client.subscribe(&topic, QoS::AtLeastOnce).await {
-            warn!(
-                "Subdir {}: Failed to subscribe to new file UUID {}: {}",
-                subdir_path, uuid, e
-            );
-        } else {
-            subscribed_uuids.insert(uuid.clone());
-            debug!(
-                "Subdir {}: Subscribed to new file UUID: {}",
-                subdir_path, uuid
-            );
-        }
-    }
-
-    // Unsubscribe from removed UUIDs
-    for uuid in &to_remove {
-        let topic = Topic::edits(workspace, uuid).to_topic_string();
-        if let Err(e) = mqtt_client.unsubscribe(&topic).await {
-            warn!(
-                "Subdir {}: Failed to unsubscribe from file UUID {}: {}",
-                subdir_path, uuid, e
-            );
-        } else {
-            subscribed_uuids.remove(uuid);
-            debug!(
-                "Subdir {}: Unsubscribed from removed file UUID: {}",
-                subdir_path, uuid
-            );
-        }
-    }
-
-    // Update the reverse map BEFORE fetching content
-    *uuid_to_paths = new_uuid_to_paths;
-
-    // Brief delay to allow MQTT event loop to process retained messages
-    if !to_add.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-
-    // Initial content for newly subscribed UUIDs arrives via MQTT retained messages
-    // and is handled by the CRDT receive path. No HTTP fetch needed.
-
-    if !to_add.is_empty() || !to_remove.is_empty() {
-        info!(
-            "Subdir {}: UUID subscriptions updated: +{} -{} (total: {})",
-            subdir_path,
-            to_add.len(),
-            to_remove.len(),
-            subscribed_uuids.len()
-        );
-    }
-}
