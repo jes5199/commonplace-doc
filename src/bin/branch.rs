@@ -5,13 +5,13 @@
 //! `commonplace init`). Creating a branch forks an existing branch's
 //! directory doc and adds the new branch as an entry in the repo schema.
 //!
-//! The main sync agent discovers new branches automatically since they
-//! are reachable from the root tree via the repo directory.
+//! All schema reads go through the server (not local files) so commands
+//! work immediately after `commonplace init` without waiting for sync.
 
 use clap::Parser;
 use commonplace_doc::cli::{BranchArgs, BranchCommand};
 use commonplace_doc::mqtt::{MqttClient, MqttConfig, MqttRequestClient};
-use commonplace_doc::sync::client::push_schema_to_server;
+use commonplace_doc::sync::client::{discover_fs_root, fetch_head, push_schema_to_server};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,22 +56,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             set_branch_sync(&args.server, &directory, &name, false).await?;
         }
         None => {
-            list_branches(&directory)?;
+            list_branches(&args.server, &directory).await?;
         }
     }
 
     Ok(())
 }
 
-fn list_branches(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let schema_path = directory.join(".commonplace.json");
-    if !schema_path.exists() {
-        eprintln!("Not a commonplace repo (no .commonplace.json found)");
-        std::process::exit(1);
-    }
-
-    let schema_content = std::fs::read_to_string(&schema_path)?;
-    let schema: serde_json::Value = serde_json::from_str(&schema_content)?;
+async fn list_branches(server: &str, directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let (_, schema) = fetch_repo_schema_from_server(server, directory).await?;
 
     let entries = schema
         .get("root")
@@ -123,14 +116,7 @@ async fn create_branch(
         std::process::exit(1);
     }
 
-    let schema_path = directory.join(".commonplace.json");
-    if !schema_path.exists() {
-        eprintln!("Not a commonplace repo (no .commonplace.json found)");
-        std::process::exit(1);
-    }
-
-    let schema_content = std::fs::read_to_string(&schema_path)?;
-    let schema: serde_json::Value = serde_json::from_str(&schema_content)?;
+    let (repo_node_id, schema) = fetch_repo_schema_from_server(server, directory).await?;
 
     let entries = schema
         .get("root")
@@ -195,11 +181,8 @@ async fn create_branch(
         &new_id[..8.min(new_id.len())]
     );
 
-    // Find the repo's node_id so we can update its schema on the server
-    let repo_node_id = find_repo_node_id(directory)?;
-
     // Update repo schema to include the new branch
-    let repo_schema = serde_json::json!({
+    let update_schema = serde_json::json!({
         "version": 1,
         "root": {
             "type": "dir",
@@ -217,7 +200,7 @@ async fn create_branch(
         &http_client,
         server,
         &repo_node_id,
-        &repo_schema.to_string(),
+        &update_schema.to_string(),
         "commonplace-branch",
     )
     .await
@@ -231,44 +214,36 @@ async fn create_branch(
     Ok(())
 }
 
-/// Find the node_id for the repo directory by reading the parent schema.
+/// Fetch the repo schema from the server by navigating root → repo.
 ///
-/// Walks up from `repo_dir` to find the parent `.commonplace.json` that
-/// contains this repo as an entry, then returns the repo's node_id.
-fn find_repo_node_id(repo_dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    // First check the sync metadata file which has the node_id directly
-    let sync_path = repo_dir.join(".commonplace-sync.json");
-    if sync_path.exists() {
-        let sync_content = std::fs::read_to_string(&sync_path)?;
-        let sync_json: serde_json::Value = serde_json::from_str(&sync_content)?;
-        if let Some(node_id) = sync_json.get("node_id").and_then(|n| n.as_str()) {
-            return Ok(node_id.to_string());
-        }
-    }
-
-    // Fall back: look at parent directory's schema for this dir's node_id
+/// Returns (repo_node_id, repo_schema_json). Determines the repo name
+/// from the directory path, discovers the fs-root via HTTP, looks up
+/// the repo entry in the root schema, then fetches the repo's own schema.
+async fn fetch_repo_schema_from_server(
+    server: &str,
+    repo_dir: &Path,
+) -> Result<(String, serde_json::Value), Box<dyn std::error::Error>> {
     let repo_name = repo_dir
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or("Cannot determine repo directory name")?;
 
-    let parent_dir = repo_dir
-        .parent()
-        .ok_or("Repo directory has no parent")?;
+    let http_client = reqwest::Client::new();
 
-    let parent_schema_path = parent_dir.join(".commonplace.json");
-    if !parent_schema_path.exists() {
-        return Err(format!(
-            "No .commonplace.json found in parent directory: {}",
-            parent_dir.display()
-        )
-        .into());
-    }
+    // Discover the fs-root UUID
+    let root_id = discover_fs_root(&http_client, server)
+        .await
+        .map_err(|e| format!("Cannot discover fs-root: {}. Is the server running?", e))?;
 
-    let parent_schema_content = std::fs::read_to_string(&parent_schema_path)?;
-    let parent_schema: serde_json::Value = serde_json::from_str(&parent_schema_content)?;
+    // Fetch root schema to find the repo's node_id
+    let root_head = fetch_head(&http_client, server, &root_id, false)
+        .await
+        .map_err(|e| format!("Cannot read root schema: {}", e))?
+        .ok_or("Root schema is empty")?;
 
-    let node_id = parent_schema
+    let root_schema: serde_json::Value = serde_json::from_str(&root_head.content)?;
+
+    let repo_node_id = root_schema
         .get("root")
         .and_then(|r| r.get("entries"))
         .and_then(|e| e.get(repo_name))
@@ -276,12 +251,21 @@ fn find_repo_node_id(repo_dir: &Path) -> Result<String, Box<dyn std::error::Erro
         .and_then(|n| n.as_str())
         .ok_or_else(|| {
             format!(
-                "Cannot find node_id for '{}' in parent schema",
-                repo_name
+                "Repo '{}' not found in root schema on server. Use 'commonplace init {}' first.",
+                repo_name, repo_name
             )
-        })?;
+        })?
+        .to_string();
 
-    Ok(node_id.to_string())
+    // Fetch the repo's own schema
+    let repo_head = fetch_head(&http_client, server, &repo_node_id, false)
+        .await
+        .map_err(|e| format!("Cannot read repo schema: {}", e))?
+        .ok_or_else(|| format!("Repo '{}' schema is empty on server", repo_name))?;
+
+    let repo_schema: serde_json::Value = serde_json::from_str(&repo_head.content)?;
+
+    Ok((repo_node_id, repo_schema))
 }
 
 /// Set the `sync` flag on a branch entry in the repo schema.
@@ -294,14 +278,7 @@ async fn set_branch_sync(
     name: &str,
     sync: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema_path = directory.join(".commonplace.json");
-    if !schema_path.exists() {
-        eprintln!("Not a commonplace repo (no .commonplace.json found)");
-        std::process::exit(1);
-    }
-
-    let schema_content = std::fs::read_to_string(&schema_path)?;
-    let schema: serde_json::Value = serde_json::from_str(&schema_content)?;
+    let (repo_node_id, schema) = fetch_repo_schema_from_server(server, directory).await?;
 
     // Verify the branch exists
     let branch_entry = schema
@@ -315,23 +292,15 @@ async fn set_branch_sync(
         .and_then(|n| n.as_str())
         .ok_or_else(|| format!("Branch '{}' has no node_id", name))?;
 
-    // Build a partial schema update that sets the sync flag
-    let sync_value = if sync {
-        // To re-enable, we omit the sync field (None = default = sync enabled)
-        serde_json::json!(null)
-    } else {
-        serde_json::json!(false)
-    };
-
-    let mut entry = serde_json::json!({
+    // Build a partial schema update that sets the sync flag.
+    // Always include sync explicitly — CRDT merge can't delete keys by omission.
+    let entry = serde_json::json!({
         "type": "dir",
         "node_id": node_id,
+        "sync": sync,
     });
-    if !sync {
-        entry.as_object_mut().unwrap().insert("sync".to_string(), sync_value);
-    }
 
-    let repo_schema = serde_json::json!({
+    let update_schema = serde_json::json!({
         "version": 1,
         "root": {
             "type": "dir",
@@ -341,13 +310,12 @@ async fn set_branch_sync(
         }
     });
 
-    let repo_node_id = find_repo_node_id(directory)?;
     let http_client = reqwest::Client::new();
     push_schema_to_server(
         &http_client,
         server,
         &repo_node_id,
-        &repo_schema.to_string(),
+        &update_schema.to_string(),
         "commonplace-branch",
     )
     .await

@@ -42,10 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
 
-    println!(
-        "Found root: {}",
-        &root_id[..8.min(root_id.len())]
-    );
+    println!("Found root: {}", root_id);
 
     // 2. Check if repo already exists in root schema
     let root_head = fetch_head(&client, server, &root_id, false)

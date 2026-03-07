@@ -11,6 +11,7 @@
 use clap::Parser;
 use commonplace_doc::cli::CheckoutArgs;
 use commonplace_doc::mqtt::{MqttClient, MqttConfig};
+use commonplace_doc::sync::client::{discover_fs_root, fetch_head};
 use rumqttc::QoS;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,15 +22,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let directory = args.directory.canonicalize().unwrap_or(args.directory);
 
-    let schema_path = directory.join(".commonplace.json");
-    if !schema_path.exists() {
-        eprintln!("Not a commonplace workspace (no .commonplace.json found)");
-        std::process::exit(1);
-    }
+    // Determine repo name from directory
+    let repo_name = directory
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Cannot determine repo directory name")?;
 
-    // Find the branch's root UUID from the schema
-    let schema_content = std::fs::read_to_string(&schema_path)?;
-    let schema: serde_json::Value = serde_json::from_str(&schema_content)?;
+    // Fetch schema from server instead of local files
+    let http_client = reqwest::Client::new();
+    let root_id = discover_fs_root(&http_client, &args.server)
+        .await
+        .map_err(|e| format!("Cannot discover fs-root: {}. Is the server running?", e))?;
+
+    let root_head = fetch_head(&http_client, &args.server, &root_id, false)
+        .await
+        .map_err(|e| format!("Cannot read root schema: {}", e))?
+        .ok_or("Root schema is empty")?;
+
+    let root_schema: serde_json::Value = serde_json::from_str(&root_head.content)?;
+
+    let repo_node_id = root_schema
+        .get("root")
+        .and_then(|r| r.get("entries"))
+        .and_then(|e| e.get(repo_name))
+        .and_then(|entry| entry.get("node_id"))
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| format!("Repo '{}' not found in root schema on server", repo_name))?;
+
+    let repo_head = fetch_head(&http_client, &args.server, repo_node_id, false)
+        .await
+        .map_err(|e| format!("Cannot read repo schema: {}", e))?
+        .ok_or_else(|| format!("Repo '{}' schema is empty on server", repo_name))?;
+
+    let schema: serde_json::Value = serde_json::from_str(&repo_head.content)?;
 
     let branch_entry = schema
         .get("root")

@@ -565,6 +565,10 @@ pub struct CheckoutArgs {
     #[clap(long, short = 'w', env = "COMMONPLACE_WORKSPACE", default_value = DEFAULT_WORKSPACE)]
     pub workspace: String,
 
+    /// Server URL (for schema lookups)
+    #[clap(long, default_value = DEFAULT_SERVER_URL)]
+    pub server: String,
+
     /// Workspace directory
     #[clap(long, short, default_value = ".")]
     pub directory: PathBuf,
