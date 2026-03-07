@@ -143,7 +143,11 @@ impl MqttService {
         let sync_handler =
             sync::SyncHandler::new(client.clone(), commit_store.clone(), workspace.clone());
 
-        let events_handler = events::EventsHandler::new(client.clone(), workspace.clone());
+        let event_log_service = Arc::new(crate::services::event_log::EventLogService::new(
+            document_store.clone(),
+        ));
+        let events_handler = events::EventsHandler::new(client.clone(), workspace.clone())
+            .with_event_log_service(event_log_service);
 
         let commands_handler = commands::CommandsHandler::new(
             client.clone(),
@@ -257,6 +261,14 @@ impl MqttService {
         self.sync_handler.subscribe_all_sync().await
     }
 
+    /// Subscribe to ALL events in the workspace for persistent logging.
+    pub async fn subscribe_all_events(&self) -> Result<(), MqttError> {
+        let topic = topics::Topic::events_wildcard_all(&self.workspace);
+        self.client.subscribe(&topic, QoS::AtMostOnce).await?;
+        tracing::debug!("Subscribed to all events: {}", topic);
+        Ok(())
+    }
+
     /// Unsubscribe from a path.
     pub async fn unsubscribe_path(&self, path: &str) -> Result<(), MqttError> {
         self.edits_handler.unsubscribe_path(path).await?;
@@ -283,6 +295,11 @@ impl MqttService {
         // Re-subscribe all sync wildcard
         if let Err(e) = self.subscribe_all_sync().await {
             tracing::warn!("Failed to re-subscribe all sync on reconnect: {}", e);
+        }
+
+        // Re-subscribe all events wildcard
+        if let Err(e) = self.subscribe_all_events().await {
+            tracing::warn!("Failed to re-subscribe all events on reconnect: {}", e);
         }
 
         // Re-subscribe per-path edits subscriptions
@@ -452,8 +469,9 @@ impl MqttService {
                 );
             }
             topics::Port::Events => {
-                // Events are outbound only from this doc store - we don't receive them
-                tracing::debug!("Ignoring incoming event message on {}", topic_str);
+                self.events_handler
+                    .handle_event_log_append(&topic, payload)
+                    .await?;
             }
         }
 

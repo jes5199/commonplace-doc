@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::document::{ContentType, DocumentStore};
 use crate::events::CommitBroadcaster;
+use crate::services::event_log::{EventLogEntry, EventLogService};
 use crate::services::{DocumentService, ServiceError};
 use crate::store::{CommitStore, StoreError};
 
@@ -20,6 +21,7 @@ pub struct ApiState {
     pub commit_broadcaster: Option<CommitBroadcaster>,
     pub fs_root: Option<String>,
     pub service: Arc<DocumentService>,
+    pub event_log_service: Arc<EventLogService>,
 }
 
 impl ServiceError {
@@ -50,12 +52,15 @@ pub fn router(
     fs_root: Option<String>,
     service: Arc<DocumentService>,
 ) -> Router {
+    let event_log_service = Arc::new(EventLogService::new(doc_store.clone()));
+
     let state = ApiState {
         doc_store,
         commit_store,
         commit_broadcaster,
         fs_root,
         service,
+        event_log_service,
     };
 
     Router::new()
@@ -70,6 +75,7 @@ pub fn router(
         .route("/docs/:id/replace", post(replace_doc))
         .route("/docs/:id/fork", post(fork_doc))
         .route("/docs/:id/is-ancestor", get(is_ancestor_handler))
+        .route("/docs/:id/events", post(append_event))
         // fs-root discovery endpoint
         .route("/fs-root", get(get_fs_root))
         .with_state(state)
@@ -490,4 +496,34 @@ pub async fn is_ancestor_handler(
         })?;
 
     Ok(Json(AncestorResponse { is_ancestor }))
+}
+
+// --- Event Log ---
+
+#[derive(Deserialize)]
+struct AppendEventRequest {
+    event_type: String,
+    source: String,
+    payload: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct AppendEventResponse {
+    event_log_id: String,
+}
+
+async fn append_event(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<AppendEventRequest>,
+) -> Result<Json<AppendEventResponse>, ServiceError> {
+    let entry = EventLogEntry::from_event(&body.event_type, &body.source, &body.payload);
+
+    let event_log_id = state
+        .event_log_service
+        .append_event(Some(&id), &entry)
+        .await
+        .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+    Ok(Json(AppendEventResponse { event_log_id }))
 }

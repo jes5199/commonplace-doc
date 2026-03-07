@@ -1046,3 +1046,66 @@ async fn test_is_ancestor_endpoint() {
         serde_json::from_str(&body_to_string(response.into_body()).await).unwrap();
     assert_eq!(body["is_ancestor"], false);
 }
+
+#[tokio::test]
+async fn test_append_event_creates_log_and_returns_uuid() {
+    let app = create_app();
+
+    // Create a JSONL document to be the event log target
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/docs")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"content_type": "application/x-ndjson"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_to_string(response.into_body()).await).unwrap();
+    let doc_id = body["id"].as_str().unwrap().to_string();
+
+    // Append an event to the doc
+    let event_body = serde_json::json!({
+        "event_type": "test:ping",
+        "source": "api-test",
+        "payload": {"message": "hello"}
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/docs/{}/events", doc_id))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&event_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_to_string(response.into_body()).await).unwrap();
+    // Should return the event_log UUID
+    assert!(body["event_log_id"].is_string());
+
+    // Verify the event was appended by reading the doc
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/docs/{}", doc_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let content = body_to_string(response.into_body()).await;
+    let parsed: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert_eq!(parsed["event_type"], "test:ping");
+    assert_eq!(parsed["source"], "api-test");
+}
