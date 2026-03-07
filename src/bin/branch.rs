@@ -181,7 +181,8 @@ async fn create_branch(
         &new_id[..8.min(new_id.len())]
     );
 
-    // Update repo schema to include the new branch
+    // Update repo schema to include the new branch.
+    // If this fails, clean up the orphaned forked document.
     let update_schema = serde_json::json!({
         "version": 1,
         "root": {
@@ -196,7 +197,7 @@ async fn create_branch(
     });
 
     let http_client = reqwest::Client::new();
-    push_schema_to_server(
+    if let Err(e) = push_schema_to_server(
         &http_client,
         server,
         &repo_node_id,
@@ -204,7 +205,42 @@ async fn create_branch(
         "commonplace-branch",
     )
     .await
-    .map_err(|e| format!("Failed to update repo schema: {}", e))?;
+    {
+        // The schema push failed, but it might have been a transient network error
+        // after the server already applied the edit. Re-read the schema to check
+        // whether the branch was actually added before cleaning up.
+        eprintln!("Failed to update repo schema: {}. Checking if branch was added...", e);
+        match fetch_repo_schema_from_server(server, directory).await {
+            Ok((_, schema)) => {
+                let already_added = schema
+                    .get("root")
+                    .and_then(|r| r.get("entries"))
+                    .and_then(|e| e.get(name))
+                    .and_then(|entry| entry.get("node_id"))
+                    .and_then(|id| id.as_str())
+                    .map(|id| id == new_id)
+                    .unwrap_or(false);
+
+                if already_added {
+                    eprintln!("Branch '{}' was actually added despite the error. Continuing.", name);
+                } else {
+                    eprintln!("Branch not in schema. Cleaning up forked document...");
+                    let delete_url = format!("{}/docs/{}", server, new_id);
+                    let _ = http_client.delete(&delete_url).send().await;
+                    return Err("Branch create failed: schema update error (orphan cleaned up)".into());
+                }
+            }
+            Err(verify_err) => {
+                // Cannot verify schema state — don't delete, as the branch may exist.
+                // Report both errors and let the user investigate.
+                return Err(format!(
+                    "Branch create failed: schema update error ({}), and verification also failed ({}). \
+                     The forked document {} may be orphaned — check manually.",
+                    e, verify_err, new_id
+                ).into());
+            }
+        }
+    }
 
     println!(
         "Branch '{}' added to repo. The sync agent will discover it automatically.",
