@@ -75,7 +75,7 @@ pub fn router(
         .route("/docs/:id/replace", post(replace_doc))
         .route("/docs/:id/fork", post(fork_doc))
         .route("/docs/:id/is-ancestor", get(is_ancestor_handler))
-        .route("/docs/:id/events", post(append_event))
+        .route("/docs/:id/events", post(append_event).get(get_events))
         // fs-root discovery endpoint
         .route("/fs-root", get(get_fs_root))
         .with_state(state)
@@ -526,4 +526,35 @@ async fn append_event(
         .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
     Ok(Json(AppendEventResponse { event_log_id }))
+}
+
+#[derive(Deserialize)]
+struct GetEventsParams {
+    since: Option<usize>,
+    limit: Option<usize>,
+    event_type: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GetEventsResponse {
+    events: Vec<EventLogEntry>,
+}
+
+async fn get_events(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(params): Query<GetEventsParams>,
+) -> Result<Json<GetEventsResponse>, ServiceError> {
+    let mut events = state
+        .event_log_service
+        .read_events(&id, params.since, params.limit)
+        .await
+        .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+    // Apply event_type filter if specified
+    if let Some(ref event_type) = params.event_type {
+        events.retain(|e| e.event_type == *event_type);
+    }
+
+    Ok(Json(GetEventsResponse { events }))
 }

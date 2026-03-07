@@ -69,6 +69,35 @@ impl EventLogService {
 
         Ok(log_id)
     }
+
+    /// Read events from an event log document.
+    ///
+    /// Returns events with optional filtering by offset (`since`) and `limit`.
+    pub async fn read_events(
+        &self,
+        log_id: &str,
+        since: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<Vec<EventLogEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        let doc = self
+            .store
+            .get_document(log_id)
+            .await
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("Event log document not found: {}", log_id).into()
+            })?;
+
+        let content = &doc.content;
+        let entries: Vec<EventLogEntry> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .skip(since.unwrap_or(0))
+            .take(limit.unwrap_or(usize::MAX))
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+
+        Ok(entries)
+    }
 }
 
 /// A single entry in an event log.

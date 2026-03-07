@@ -1109,3 +1109,141 @@ async fn test_append_event_creates_log_and_returns_uuid() {
     assert_eq!(parsed["event_type"], "test:ping");
     assert_eq!(parsed["source"], "api-test");
 }
+
+#[tokio::test]
+async fn test_get_events_returns_event_list() {
+    let app = create_app();
+
+    // Create a JSONL doc
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/docs")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"content_type": "application/x-ndjson"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(&body_to_string(response.into_body()).await).unwrap();
+    let doc_id = body["id"].as_str().unwrap().to_string();
+
+    // Append two events
+    for i in 0..2 {
+        let event_body = serde_json::json!({
+            "event_type": format!("test:event-{}", i),
+            "source": "api-test",
+            "payload": {"index": i}
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/docs/{}/events", doc_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&event_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // GET events
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/docs/{}/events", doc_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_to_string(response.into_body()).await).unwrap();
+    let events = body["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["event_type"], "test:event-0");
+    assert_eq!(events[1]["event_type"], "test:event-1");
+}
+
+#[tokio::test]
+async fn test_get_events_with_since_filter() {
+    let app = create_app();
+
+    // Create doc and append 3 events
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/docs")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"content_type": "application/x-ndjson"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(&body_to_string(response.into_body()).await).unwrap();
+    let doc_id = body["id"].as_str().unwrap().to_string();
+
+    for i in 0..3 {
+        let event_body = serde_json::json!({
+            "event_type": format!("test:event-{}", i),
+            "source": "api-test",
+            "payload": {}
+        });
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/docs/{}/events", doc_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&event_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // GET with since=1 (skip first event)
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/docs/{}/events?since=1", doc_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_to_string(response.into_body()).await).unwrap();
+    let events = body["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["event_type"], "test:event-1");
+
+    // GET with limit=1
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/docs/{}/events?limit=1", doc_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_to_string(response.into_body()).await).unwrap();
+    let events = body["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+}
