@@ -103,6 +103,10 @@ path = "src/bin/init.rs"
 name = "commonplace-worktree"
 path = "src/bin/worktree.rs"
 
+[[bin]]
+name = "commonplace-migrate"
+path = "src/bin/migrate.rs"
+
 [dependencies]
 commonplace-types = { path = "crates/commonplace-types" }
 commonplace-crdt = { path = "crates/commonplace-crdt" }
