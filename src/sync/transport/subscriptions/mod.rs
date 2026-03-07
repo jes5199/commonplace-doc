@@ -16,7 +16,7 @@ use std::io::Write;
 use crate::fs::FsSchema;
 use crate::mqtt::{MqttClient, MqttRequestClient};
 use crate::sync::dir_sync::{
-    apply_explicit_deletions, create_subdir_nested_directories, handle_subdir_new_files,
+    apply_explicit_deletions, handle_subdir_new_files,
 };
 use crate::sync::FileSyncState;
 use reqwest::Client;
@@ -25,10 +25,6 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
-
-pub(super) fn is_http_recovery_disabled(mqtt_only_mode: bool) -> bool {
-    mqtt_only_mode || crate::sync::transport::client::is_sync_http_disabled()
-}
 
 async fn create_node_backed_dirs_from_schema(schema: &FsSchema, subdir_full_path: &Path) {
     if let Some(crate::fs::Entry::Dir(root)) = schema.root.as_ref() {
@@ -194,13 +190,6 @@ pub async fn handle_subdir_edit(
     mqtt_schema: Option<(FsSchema, String)>,
     deleted_entries: std::collections::HashSet<String>,
 ) {
-    let http_recovery_disabled = is_http_recovery_disabled(
-        crdt_context
-            .as_ref()
-            .map(|ctx| ctx.mqtt_only_config.mqtt_only)
-            .unwrap_or(false),
-    );
-
     // Cleanup deleted files using ONLY explicit CRDT deletions (CP-seha).
     // When CRDT path is active, empty deleted_entries means "no deletions"
     // — NOT "fall back to schema-diff". Schema-diff is unreliable when
@@ -214,67 +203,49 @@ pub async fn handle_subdir_edit(
         );
     }
 
-    // Then, sync NEW files.
-    // In strict MQTT runtime we still run this when CRDT context is available,
-    // because it can materialize new files using MQTT schema/UUID data without HTTP.
-    if http_recovery_disabled && crdt_context.is_none() {
-        warn!(
-            "{}: Skipping new file sync for {} (HTTP recovery disabled, no CRDT context)",
-            log_prefix, subdir_path
-        );
-    } else {
-        let mqtt_schema_for_new_files = mqtt_schema.clone();
-        match handle_subdir_new_files(
-            client,
-            server,
-            subdir_node_id,
-            subdir_path,
-            subdir_full_path,
-            directory,
-            file_states,
-            use_paths,
-            push_only,
-            pull_only,
-            shared_state_file,
-            author,
-            #[cfg(unix)]
-            inode_tracker,
-            crdt_context,
-            mqtt_schema_for_new_files,
-        )
-        .await
-        {
-            Ok(()) => {
-                debug!(
-                    "{}: Subdir {} new files sync completed",
-                    log_prefix, subdir_path
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "{}: Failed to sync new files for subdir {}: {}",
-                    log_prefix, subdir_path, e
-                );
-            }
+    // Sync NEW files using CRDT context or MQTT schema data.
+    let mqtt_schema_for_new_files = mqtt_schema.clone();
+    match handle_subdir_new_files(
+        client,
+        server,
+        subdir_node_id,
+        subdir_path,
+        subdir_full_path,
+        directory,
+        file_states,
+        use_paths,
+        push_only,
+        pull_only,
+        shared_state_file,
+        author,
+        #[cfg(unix)]
+        inode_tracker,
+        crdt_context,
+        mqtt_schema_for_new_files,
+    )
+    .await
+    {
+        Ok(()) => {
+            debug!(
+                "{}: Subdir {} new files sync completed",
+                log_prefix, subdir_path
+            );
+        }
+        Err(e) => {
+            warn!(
+                "{}: Failed to sync new files for subdir {}: {}",
+                log_prefix, subdir_path, e
+            );
         }
     }
 
     // Also create directories for any NEW node-backed subdirectories.
-    // Prefer schema snapshots (MQTT/cyan state) and avoid HTTP fetches in strict runtime.
+    // Use schema snapshots (MQTT/cyan state). HTTP fallback removed (CP-jg14).
     if let Some((schema, _)) = mqtt_schema.as_ref() {
         create_node_backed_dirs_from_schema(schema, subdir_full_path).await;
-    } else if !http_recovery_disabled {
-        if let Err(e) =
-            create_subdir_nested_directories(client, server, subdir_node_id, subdir_full_path).await
-        {
-            warn!(
-                "{}: Failed to create nested directories for subdir {}: {}",
-                log_prefix, subdir_path, e
-            );
-        }
     } else {
         warn!(
-            "{}: Skipping nested directory creation for {} (no schema snapshot, HTTP recovery disabled)",
+            "{}: Skipping nested directory creation for {} (no schema snapshot available)",
             log_prefix, subdir_path
         );
     }
@@ -308,32 +279,10 @@ pub async fn collect_new_subdirs(
 
 #[cfg(test)]
 mod tests {
-    use super::{create_node_backed_dirs_from_schema, is_http_recovery_disabled};
+    use super::create_node_backed_dirs_from_schema;
     use crate::fs::{DirEntry, Entry, FsSchema};
-    use crate::sync::transport::client::set_sync_http_disabled;
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
-
-    fn lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    #[test]
-    fn http_disable_flag_forces_recovery_disable() {
-        let _guard = lock().lock().expect("lock poisoned");
-        set_sync_http_disabled(true);
-        assert!(is_http_recovery_disabled(false));
-        set_sync_http_disabled(false);
-    }
-
-    #[test]
-    fn mqtt_only_forces_recovery_disable() {
-        let _guard = lock().lock().expect("lock poisoned");
-        set_sync_http_disabled(false);
-        assert!(is_http_recovery_disabled(true));
-    }
 
     #[tokio::test]
     async fn creates_nested_node_backed_dirs_from_schema_snapshot() {
