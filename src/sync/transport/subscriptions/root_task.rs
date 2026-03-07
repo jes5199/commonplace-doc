@@ -15,7 +15,9 @@ use crate::sync::dir_sync::{
 use crate::sync::error::SyncResult;
 #[cfg(unix)]
 use crate::sync::flock::{try_flock_exclusive, FlockResult};
-use crate::sync::subdir_spawn::{spawn_subdir_watchers, SubdirSpawnParams, SubdirTransport};
+use crate::sync::subdir_spawn::{
+    spawn_subdir_watchers, spawn_subdir_watchers_from_schema, SubdirSpawnParams, SubdirTransport,
+};
 use crate::sync::{spawn_file_sync_tasks_crdt, FileSyncState};
 use reqwest::Client;
 use rumqttc::QoS;
@@ -338,6 +340,11 @@ pub async fn directory_mqtt_task(
                 msg.payload.len()
             );
 
+            // Track the latest schema for subdir discovery (CP-38zp).
+            // Populated by the CRDT path below so spawn_subdir_watchers_from_schema
+            // can discover new node-backed dirs without HTTP.
+            let mut latest_schema_for_subdirs: Option<crate::fs::FsSchema> = None;
+
             // When CRDT context is available, apply the MQTT delta to persistent state
             // and use it DIRECTLY for file creation and deletion. This avoids race
             // conditions where HTTP may return stale data.
@@ -420,6 +427,9 @@ pub async fn directory_mqtt_task(
                         // Full snapshot recovery after decode failure still needs reconciliation
                         // even if schema hash is unchanged.
                         if !is_duplicate || schema_recovered_from_cyan {
+                            // Capture schema for subdir discovery (CP-38zp)
+                            latest_schema_for_subdirs = Some(schema.clone());
+
                             // Write the schema to disk
                             if let Err(e) = crate::sync::write_schema_file(
                                 &directory,
@@ -607,7 +617,8 @@ pub async fn directory_mqtt_task(
                 }
             }
 
-            // Check for newly discovered node-backed subdirs and spawn tasks
+            // Check for newly discovered node-backed subdirs and spawn tasks.
+            // CP-38zp: Use schema from CRDT state when available (no HTTP needed).
             if !push_only {
                 let params = SubdirSpawnParams {
                     client: http_client.clone(),
@@ -625,14 +636,17 @@ pub async fn directory_mqtt_task(
                     watched_subdirs: watched_subdirs.clone(),
                     crdt_context: crdt_context.clone(),
                 };
-                spawn_subdir_watchers(
-                    &params,
-                    SubdirTransport::Mqtt {
-                        client: mqtt_client.clone(),
-                        workspace: workspace.clone(),
-                    },
-                )
-                .await;
+                let transport = SubdirTransport::Mqtt {
+                    client: mqtt_client.clone(),
+                    workspace: workspace.clone(),
+                };
+                if let Some(ref schema) = latest_schema_for_subdirs {
+                    // CRDT path: extract subdirs from in-memory schema (no HTTP)
+                    spawn_subdir_watchers_from_schema(&params, transport, schema).await;
+                } else {
+                    // HTTP fallback or no schema change this iteration
+                    spawn_subdir_watchers(&params, transport).await;
+                }
             }
         } else if let Some(paths) = uuid_to_paths.get(&doc_id) {
             // This is a file content edit - pull and write to local file(s)
