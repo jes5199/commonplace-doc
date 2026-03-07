@@ -202,6 +202,8 @@ struct WatcherSetup {
     watcher_handle: Option<JoinHandle<()>>,
     /// Tracks which subdirectories have subscription tasks.
     watched_subdirs: Arc<RwLock<HashSet<String>>>,
+    /// Handles to spawned subdir sync tasks for teardown on re-root.
+    subdir_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
 }
 
 /// Set up directory watchers and shared state for sync.
@@ -232,6 +234,7 @@ fn setup_directory_watchers(
         dir_tx,
         watcher_handle,
         watched_subdirs: Arc::new(RwLock::new(HashSet::new())),
+        subdir_handles: Arc::new(RwLock::new(Vec::new())),
     }
 }
 
@@ -3274,6 +3277,7 @@ async fn run_directory_mode(
         dir_tx,
         watcher_handle,
         watched_subdirs,
+        subdir_handles,
     } = setup_directory_watchers(
         pull_only,
         directory.clone(),
@@ -3309,6 +3313,7 @@ async fn run_directory_mode(
             Some(shared_state_file.clone()),
             initial_uuid_map,
             Some(crdt_context.clone()),
+            subdir_handles.clone(),
         )))
     } else {
         info!("Push-only mode: skipping subscription");
@@ -3333,6 +3338,7 @@ async fn run_directory_mode(
             inode_tracker: inode_tracker.clone(),
             watched_subdirs: watched_subdirs.clone(),
             crdt_context: Some(crdt_context.clone()),
+            subdir_handles: subdir_handles.clone(),
         };
         let transport = SubdirTransport::Mqtt {
             client: mqtt_client.clone(),
@@ -3692,6 +3698,18 @@ async fn run_directory_mode(
         }
     }
 
+    // Abort all subdir sync tasks (CP-kjoh)
+    {
+        let handles = subdir_handles.read().await;
+        let count = handles.len();
+        for handle in handles.iter() {
+            handle.abort();
+        }
+        if count > 0 {
+            info!("Aborted {} subdir sync task(s)", count);
+        }
+    }
+
     // Save state file on shutdown/re-root
     info!("Saving state file...");
     {
@@ -3976,6 +3994,7 @@ async fn run_exec_mode(
         dir_tx,
         watcher_handle,
         watched_subdirs,
+        subdir_handles,
     } = setup_directory_watchers(
         pull_only,
         directory.clone(),
@@ -4010,6 +4029,7 @@ async fn run_exec_mode(
             Some(shared_state_file.clone()),
             initial_uuid_map,
             Some(crdt_context.clone()),
+            subdir_handles.clone(),
         )))
     } else {
         info!("Push-only mode: skipping subscription");
@@ -4033,6 +4053,7 @@ async fn run_exec_mode(
             inode_tracker: inode_tracker.clone(),
             watched_subdirs: watched_subdirs.clone(),
             crdt_context: Some(crdt_context.clone()),
+            subdir_handles: subdir_handles.clone(),
         };
         let transport = SubdirTransport::Mqtt {
             client: mqtt_client.clone(),
@@ -4616,6 +4637,18 @@ async fn run_exec_mode(
             for handle in &file_state.task_handles {
                 handle.abort();
             }
+        }
+    }
+
+    // Abort all subdir sync tasks (CP-kjoh)
+    {
+        let handles = subdir_handles.read().await;
+        let count = handles.len();
+        for handle in handles.iter() {
+            handle.abort();
+        }
+        if count > 0 {
+            info!("Aborted {} subdir sync task(s)", count);
         }
     }
 

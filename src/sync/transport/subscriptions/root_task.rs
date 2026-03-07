@@ -123,6 +123,7 @@ pub async fn directory_mqtt_task(
     shared_state_file: Option<crate::sync::SharedStateFile>,
     initial_uuid_map: HashMap<String, String>,
     crdt_context: Option<CrdtFileSyncContext>,
+    subdir_handles: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
 ) {
     // Ensure ancestry checks in this process use MQTT/cyan instead of HTTP.
     crate::sync::set_sync_ancestry_mqtt_context(Some(crate::sync::SyncAncestryMqttContext::new(
@@ -574,6 +575,7 @@ pub async fn directory_mqtt_task(
                     inode_tracker: inode_tracker.clone(),
                     watched_subdirs: watched_subdirs.clone(),
                     crdt_context: crdt_context.clone(),
+                    subdir_handles: subdir_handles.clone(),
                 };
                 let transport = SubdirTransport::Mqtt {
                     client: mqtt_client.clone(),

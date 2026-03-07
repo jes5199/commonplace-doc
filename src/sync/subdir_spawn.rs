@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 /// Transport mode for subdir sync tasks.
@@ -47,6 +48,10 @@ pub struct SubdirSpawnParams {
     /// CRDT context for spawning CRDT sync tasks instead of HTTP sync tasks.
     /// When provided, subdirectory file syncs will use MQTT instead of HTTP.
     pub crdt_context: Option<CrdtFileSyncContext>,
+    /// Shared collection of subdir task handles for teardown on re-root.
+    /// When present, spawned task handles are stored here so they can be
+    /// aborted during cleanup.
+    pub subdir_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
 }
 
 /// Discover and spawn tasks for all node-backed subdirectories.
@@ -102,7 +107,7 @@ pub async fn spawn_subdir_watchers(
                     "Spawning MQTT task for node-backed subdir: {} ({})",
                     subdir_path, subdir_node_id
                 );
-                tokio::spawn(subdir_mqtt_task(
+                let handle = tokio::spawn(subdir_mqtt_task(
                     params.client.clone(),
                     params.server.clone(),
                     params.fs_root_id.clone(),
@@ -122,6 +127,7 @@ pub async fn spawn_subdir_watchers(
                     params.watched_subdirs.clone(),
                     params.crdt_context.clone(),
                 ));
+                params.subdir_handles.write().await.push(handle);
             }
         }
     }
@@ -179,7 +185,7 @@ pub async fn spawn_subdir_watchers_from_schema(
                     "Spawning MQTT task for node-backed subdir (from schema): {} ({})",
                     subdir_path, subdir_node_id
                 );
-                tokio::spawn(subdir_mqtt_task(
+                let handle = tokio::spawn(subdir_mqtt_task(
                     params.client.clone(),
                     params.server.clone(),
                     params.fs_root_id.clone(),
@@ -199,6 +205,7 @@ pub async fn spawn_subdir_watchers_from_schema(
                     params.watched_subdirs.clone(),
                     params.crdt_context.clone(),
                 ));
+                params.subdir_handles.write().await.push(handle);
             }
         }
     }
