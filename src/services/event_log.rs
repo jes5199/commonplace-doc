@@ -9,19 +9,61 @@ use commonplace_types::content_type::ContentType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use yrs::updates::decoder::Decode;
 use yrs::{Array, ReadTxn, Transact, WriteTxn};
+
+/// Notification sent when an event is appended to an event log.
+#[derive(Debug, Clone)]
+pub struct EventNotification {
+    /// The event log document ID
+    pub log_id: String,
+    /// The appended event entry
+    pub entry: EventLogEntry,
+}
+
+/// Broadcaster for real-time event notifications.
+#[derive(Clone)]
+pub struct EventBroadcaster {
+    sender: Arc<broadcast::Sender<EventNotification>>,
+}
+
+impl EventBroadcaster {
+    pub fn new(capacity: usize) -> Self {
+        let (sender, _) = broadcast::channel(capacity);
+        Self {
+            sender: Arc::new(sender),
+        }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<EventNotification> {
+        self.sender.subscribe()
+    }
+
+    pub fn notify(&self, notification: EventNotification) {
+        let _ = self.sender.send(notification);
+    }
+}
 
 /// Service for managing event log documents.
 ///
 /// Handles lazy creation of JSONL event log docs and appending events.
 pub struct EventLogService {
     store: Arc<DocumentStore>,
+    broadcaster: Option<EventBroadcaster>,
 }
 
 impl EventLogService {
     pub fn new(store: Arc<DocumentStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            broadcaster: None,
+        }
+    }
+
+    pub fn with_broadcaster(mut self, broadcaster: EventBroadcaster) -> Self {
+        self.broadcaster = Some(broadcaster);
+        self
     }
 
     /// Append an event to an event log document.
@@ -66,6 +108,14 @@ impl EventLogService {
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("Failed to apply event log update: {:?}", e).into()
             })?;
+
+        // Notify subscribers
+        if let Some(ref broadcaster) = self.broadcaster {
+            broadcaster.notify(EventNotification {
+                log_id: log_id.clone(),
+                entry: entry.clone(),
+            });
+        }
 
         Ok(log_id)
     }
@@ -261,6 +311,23 @@ mod tests {
         let doc = store.get_document(&log_id).await.unwrap();
         let lines: Vec<&str> = doc.content.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_broadcaster_notifies_on_append() {
+        let store = Arc::new(DocumentStore::new());
+        let broadcaster = EventBroadcaster::new(16);
+        let mut receiver = broadcaster.subscribe();
+        let service = EventLogService::new(store.clone()).with_broadcaster(broadcaster);
+
+        let entry = EventLogEntry::from_event("test:event", "unit-test", &json!({"data": 1}));
+        let log_id = service.append_event(None, &entry).await.unwrap();
+
+        // Should receive the notification
+        let notification = receiver.try_recv().unwrap();
+        assert_eq!(notification.log_id, log_id);
+        assert_eq!(notification.entry.event_type, "test:event");
+        assert_eq!(notification.entry.source, "unit-test");
     }
 
     #[test]

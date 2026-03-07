@@ -297,6 +297,7 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
             doc_store.clone(),
             commit_store.clone(),
             commit_broadcaster.clone(),
+            None, // Event broadcaster created separately when needed
             fs_root.clone(),
         ))
         .merge(ws::router(
@@ -357,7 +358,8 @@ pub fn create_router_with_store(store: Option<CommitStore>) -> Router {
             doc_store.clone(),
             commit_store.clone(),
             commit_broadcaster.clone(),
-            None,
+            None, // Event broadcaster
+            None, // fs_root
         ))
         .merge(ws::router(
             doc_store,

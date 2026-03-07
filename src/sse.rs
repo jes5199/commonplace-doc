@@ -14,6 +14,7 @@ use tokio::time::Duration;
 
 use crate::document::DocumentStore;
 use crate::events::CommitBroadcaster;
+use crate::services::event_log::EventBroadcaster;
 use crate::store::{CommitStore, StoreError};
 
 #[derive(Clone)]
@@ -21,6 +22,7 @@ pub struct SseState {
     pub doc_store: Arc<DocumentStore>,
     pub commit_store: Option<Arc<CommitStore>>,
     pub broadcaster: Option<CommitBroadcaster>,
+    pub event_broadcaster: Option<EventBroadcaster>,
     pub fs_root: Option<String>,
 }
 
@@ -28,12 +30,14 @@ pub fn router(
     doc_store: Arc<DocumentStore>,
     commit_store: Option<Arc<CommitStore>>,
     broadcaster: Option<CommitBroadcaster>,
+    event_broadcaster: Option<EventBroadcaster>,
     fs_root: Option<String>,
 ) -> Router {
     let state = SseState {
         doc_store,
         commit_store,
         broadcaster,
+        event_broadcaster,
         fs_root,
     };
 
@@ -46,6 +50,8 @@ pub fn router(
         .route("/documents/stream", get(stream_documents_changes))
         // Document SSE endpoints (for sync client)
         .route("/sse/docs/:id", get(stream_doc))
+        // Event log SSE endpoint
+        .route("/sse/docs/:id/events", get(stream_events))
         // Path-based SSE endpoint
         .route("/sse/files/*path", get(stream_file))
         .with_state(state)
@@ -430,6 +436,53 @@ async fn stream_doc_by_id(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30))))
+}
+
+// ============================================================================
+// Event log SSE streaming
+// ============================================================================
+
+/// Stream event log entries for a document as SSE events.
+async fn stream_events(
+    State(state): State<SseState>,
+    Path(doc_id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    // Verify document exists
+    if state.doc_store.get_document(&doc_id).await.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let event_broadcaster = state
+        .event_broadcaster
+        .as_ref()
+        .ok_or(StatusCode::NOT_IMPLEMENTED)?;
+
+    let mut receiver = event_broadcaster.subscribe();
+    let target_doc_id = doc_id.clone();
+
+    let stream = async_stream::stream! {
+        loop {
+            match receiver.recv().await {
+                Ok(notification) => {
+                    if notification.log_id != target_doc_id {
+                        continue;
+                    }
+
+                    if let Ok(json) = serde_json::to_string(&notification.entry) {
+                        yield Ok(Event::default().event("event").data(json));
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    yield Ok(Event::default().event("error").data(format!("lagged {}", n)));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     break;
