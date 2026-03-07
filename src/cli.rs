@@ -471,6 +471,68 @@ pub fn compute_diff_stats(old: &str, new: &str) -> ChangeStats {
     }
 }
 
+/// CLI arguments for commonplace-event (event log management)
+#[derive(Parser, Debug)]
+#[clap(name = "commonplace-event")]
+#[clap(about = "Manage red event logs for synced files", long_about = None)]
+pub struct EventArgs {
+    /// Server URL
+    #[clap(long, default_value = DEFAULT_SERVER_URL)]
+    pub server: String,
+
+    /// Output in JSON format
+    #[clap(long)]
+    pub json: bool,
+
+    /// Subcommand
+    #[command(subcommand)]
+    pub command: EventCommand,
+}
+
+/// Event subcommands.
+#[derive(clap::Subcommand, Debug)]
+pub enum EventCommand {
+    /// Append an event to an event log
+    Append {
+        /// Event log UUID or file path
+        target: String,
+
+        /// Event type (e.g., "red:update", "process:stdout")
+        #[clap(long, short = 't')]
+        event_type: String,
+
+        /// Source identifier (e.g., process name)
+        #[clap(long, short)]
+        source: String,
+
+        /// JSON payload (as string)
+        #[clap(long, short, default_value = "{}")]
+        payload: String,
+    },
+    /// Read events from an event log
+    Log {
+        /// Event log UUID or file path
+        target: String,
+
+        /// Skip this many events from the start
+        #[clap(long)]
+        since: Option<usize>,
+
+        /// Maximum number of events to return
+        #[clap(long, short = 'n')]
+        limit: Option<usize>,
+
+        /// Filter by event type
+        #[clap(long, short = 't')]
+        event_type: Option<String>,
+    },
+    /// Live-tail events via SSE
+    Tail {
+        /// Event log UUID or file path
+        target: String,
+    },
+}
+
 /// Arguments for `commonplace-status`.
 #[derive(Parser)]
 #[command(name = "commonplace-status", about = "Show workspace sync status")]

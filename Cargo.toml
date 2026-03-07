@@ -84,6 +84,10 @@ name = "commonplace-beads-bridge"
 path = "src/bin/beads_bridge.rs"
 
 [[bin]]
+name = "commonplace-event"
+path = "src/bin/event.rs"
+
+[[bin]]
 name = "commonplace-status"
 path = "src/bin/status.rs"
 

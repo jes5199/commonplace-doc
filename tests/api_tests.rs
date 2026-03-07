@@ -1247,3 +1247,92 @@ async fn test_get_events_with_since_filter() {
     let events = body["events"].as_array().unwrap();
     assert_eq!(events.len(), 1);
 }
+
+/// Test event log round-trip: append via POST then read via GET (as commonplace-event CLI would)
+#[tokio::test]
+async fn test_event_cli_append_then_log_round_trip() {
+    let app = create_app();
+
+    // Create a JSONL doc for the event log
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/docs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"content_type": "application/x-ndjson"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_to_string(response.into_body()).await).unwrap();
+    let log_id = body["id"].as_str().unwrap().to_string();
+
+    // Append 3 events (simulating CLI append calls)
+    for i in 0..3 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/docs/{}/events", log_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "event_type": format!("test:event-{}", i),
+                            "source": "cli-test",
+                            "payload": {"index": i}
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // Read all events (CLI log command)
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/docs/{}/events", log_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_to_string(response.into_body()).await).unwrap();
+    let events = body["events"].as_array().unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0]["event_type"], "test:event-0");
+    assert_eq!(events[1]["event_type"], "test:event-1");
+    assert_eq!(events[2]["event_type"], "test:event-2");
+
+    // Read with event_type filter (CLI --event-type flag)
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/docs/{}/events?event_type=test:event-1", log_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_to_string(response.into_body()).await).unwrap();
+    let events = body["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["event_type"], "test:event-1");
+    assert_eq!(events[0]["source"], "cli-test");
+}

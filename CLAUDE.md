@@ -265,6 +265,27 @@ commonplace-signal -n sync -s KILL
 commonplace-signal -n sync -p /text-to-telegram
 ```
 
+#### commonplace-event
+
+Manage red event logs for synced files:
+
+```bash
+# Append an event to an event log
+commonplace-event append <uuid> -t "red:update" -s "my-process" -p '{"key":"value"}'
+
+# Read events from a log
+commonplace-event log <uuid>
+
+# Read with filters
+commonplace-event log <uuid> --since 5 -n 10 -t "red:update"
+
+# Live-tail events via SSE
+commonplace-event tail <uuid>
+
+# JSON output
+commonplace-event --json log <uuid>
+```
+
 #### commonplace-link
 
 Link two files to share the same UUID (see "File Linking" section below).
