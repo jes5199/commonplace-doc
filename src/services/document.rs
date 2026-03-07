@@ -840,6 +840,7 @@ impl DocumentService {
                             Entry::Doc(DocEntry {
                                 node_id: Some(fork_result.id),
                                 content_type: doc_entry.content_type.clone(),
+                                event_log: None,
                             })
                         } else {
                             Entry::Doc(doc_entry.clone())

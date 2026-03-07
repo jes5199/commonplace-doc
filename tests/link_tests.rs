@@ -13,6 +13,7 @@ fn create_test_schema(entries: Vec<(&str, Option<&str>)>) -> FsSchema {
             Entry::Doc(DocEntry {
                 node_id: node_id.map(|s| s.to_string()),
                 content_type: None,
+                event_log: None,
             }),
         );
     }
@@ -88,6 +89,7 @@ fn test_schema_roundtrip_with_links() {
                 Entry::Doc(DocEntry {
                     node_id: Some("test-uuid-123".to_string()),
                     content_type: None,
+                    event_log: None,
                 }),
             );
         }
@@ -126,6 +128,7 @@ fn create_nested_schema() -> FsSchema {
         Entry::Doc(DocEntry {
             node_id: None,
             content_type: Some("text/plain".to_string()),
+            event_log: None,
         }),
     );
     telegram_entries.insert(
@@ -133,6 +136,7 @@ fn create_nested_schema() -> FsSchema {
         Entry::Doc(DocEntry {
             node_id: None,
             content_type: Some("text/plain".to_string()),
+            event_log: None,
         }),
     );
 
@@ -143,6 +147,7 @@ fn create_nested_schema() -> FsSchema {
         Entry::Doc(DocEntry {
             node_id: None,
             content_type: Some("text/plain".to_string()),
+            event_log: None,
         }),
     );
     bartleby_entries.insert(
@@ -150,6 +155,7 @@ fn create_nested_schema() -> FsSchema {
         Entry::Doc(DocEntry {
             node_id: None,
             content_type: Some("text/plain".to_string()),
+            event_log: None,
         }),
     );
 

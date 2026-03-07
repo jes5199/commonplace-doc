@@ -554,6 +554,7 @@ pub fn to_fs_schema(doc: &Doc) -> commonplace_types::fs::FsSchema {
             SchemaEntryType::Doc => Entry::Doc(DocEntry {
                 node_id: entry.node_id,
                 content_type: None,
+                event_log: None,
             }),
             SchemaEntryType::Dir => Entry::Dir(DirEntry {
                 node_id: entry.node_id,

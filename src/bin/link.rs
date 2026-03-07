@@ -408,6 +408,7 @@ fn set_entry_node_id(
         Entry::Doc(DocEntry {
             node_id: Some(node_id.to_string()),
             content_type,
+            event_log: None,
         }),
     );
 

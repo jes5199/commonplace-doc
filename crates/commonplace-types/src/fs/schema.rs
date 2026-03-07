@@ -60,6 +60,10 @@ pub struct DocEntry {
     /// MIME type for new nodes (default: application/json)
     #[serde(default)]
     pub content_type: Option<String>,
+    /// UUID of the JSONL event log document for this file's red event stream.
+    /// When present, events can be appended to this log for audit/replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_log: Option<String>,
 }
 
 impl FsSchema {

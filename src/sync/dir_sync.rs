@@ -3156,6 +3156,7 @@ mod tests {
                         Entry::Doc(DocEntry {
                             node_id: None, // Local doesn't know the UUID
                             content_type: Some("text/plain".to_string()),
+                            event_log: None,
                         }),
                     ),
                 ])),
@@ -3183,6 +3184,7 @@ mod tests {
                         Entry::Doc(DocEntry {
                             node_id: Some("server-file-uuid".to_string()),
                             content_type: Some("text/plain".to_string()),
+                            event_log: None,
                         }),
                     ),
                 ])),

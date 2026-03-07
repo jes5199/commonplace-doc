@@ -376,6 +376,7 @@ fn scan_dir_recursive(
                         let doc_entry = Entry::Doc(DocEntry {
                             node_id: Some(target_node_id.clone()),
                             content_type: Some(content_info.mime_type.clone()),
+                            event_log: None,
                         });
                         entries.insert(name, doc_entry);
                         tracing::info!(
@@ -486,6 +487,7 @@ fn scan_dir_recursive(
             let doc_entry = Entry::Doc(DocEntry {
                 node_id,
                 content_type: Some(content_type),
+                event_log: None,
             });
             entries.insert(name, doc_entry);
         }
