@@ -23,7 +23,7 @@ use crate::sync::uuid_map::{
 };
 use crate::sync::ymap_schema;
 use crate::sync::{
-    ancestry::determine_sync_direction, build_info_url, detect_from_path, is_allowed_extension,
+    build_info_url, detect_from_path, is_allowed_extension,
     is_binary_content, looks_like_base64_binary, push_schema_to_server,
     remove_file_state_and_abort, spawn_file_sync_tasks_crdt, FileSyncState, SyncState,
 };
@@ -2199,104 +2199,6 @@ pub async fn handle_schema_change(
     }
 
     Ok(())
-}
-
-/// Handle schema change with content-based deduplication.
-///
-/// Returns Ok(true) if schema was processed, Ok(false) if skipped due to no change.
-#[allow(clippy::too_many_arguments)]
-pub async fn handle_schema_change_with_dedup(
-    client: &Client,
-    server: &str,
-    fs_root_id: &str,
-    directory: &Path,
-    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
-    spawn_tasks: bool,
-    use_paths: bool,
-    last_schema_hash: &mut Option<String>,
-    last_schema_cid: &mut Option<String>,
-    push_only: bool,
-    pull_only: bool,
-    author: &str,
-    #[cfg(unix)] inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
-    written_schemas: Option<&crate::sync::WrittenSchemas>,
-    shared_state_file: Option<&crate::sync::SharedStateFile>,
-    crdt_context: Option<&CrdtFileSyncContext>,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    // Fetch current schema from server
-    let head = match fetch_head(client, server, fs_root_id, false).await {
-        Ok(Some(h)) => h,
-        Ok(None) => return Ok(false), // Document not found, nothing to poll
-        Err(e) => return Err(format!("Failed to fetch fs-root HEAD: {}", e).into()),
-    };
-    if head.content.is_empty() {
-        return Ok(false);
-    }
-
-    // Use CRDT ancestry to determine if we should apply server schema.
-    // Only pull if server is ahead of us (our CID is ancestor of server's CID).
-    let server_cid = head.cid.as_deref();
-    let direction = match determine_sync_direction(
-        client,
-        server,
-        fs_root_id,
-        last_schema_cid.as_deref(),
-        server_cid,
-    )
-    .await
-    {
-        Ok(d) => d,
-        Err(e) => {
-            warn!("Ancestry check failed for schema sync: {}", e);
-            // On error, fall through to content-based checks as fallback
-            crate::sync::ancestry::SyncDirection::Pull
-        }
-    };
-
-    if !direction.should_pull() {
-        debug!(
-            "Ancestry check for schema: {:?}, skipping server schema",
-            direction
-        );
-        return Ok(false);
-    }
-
-    // Compute hash of schema content for deduplication
-    let current_hash = compute_content_hash(head.content.as_bytes());
-
-    // Skip if schema hasn't changed
-    if let Some(ref last_hash) = last_schema_hash {
-        if &current_hash == last_hash {
-            return Ok(false);
-        }
-    }
-
-    // Delegate to the regular handler
-    // Note: hash is updated AFTER successful processing to ensure retries on failure
-    handle_schema_change(
-        client,
-        server,
-        fs_root_id,
-        directory,
-        file_states,
-        spawn_tasks,
-        use_paths,
-        push_only,
-        pull_only,
-        author,
-        #[cfg(unix)]
-        inode_tracker,
-        written_schemas,
-        shared_state_file,
-        crdt_context,
-    )
-    .await?;
-
-    // Update last hash and CID only after successful processing
-    *last_schema_hash = Some(current_hash);
-    *last_schema_cid = head.cid.clone();
-
-    Ok(true)
 }
 
 /// Ensure fs-root document exists on the server, creating it if necessary.
