@@ -19,7 +19,7 @@ use crate::sync::state_file::{
 use crate::sync::subscriptions::CrdtFileSyncContext;
 use crate::sync::uuid_map::{
     build_uuid_map_and_write_schemas, build_uuid_map_from_local_schemas,
-    build_uuid_map_recursive, build_uuid_map_recursive_with_status,
+    build_uuid_map_recursive_with_status,
 };
 use crate::sync::ymap_schema;
 use crate::sync::{
@@ -767,33 +767,19 @@ pub async fn handle_subdir_new_files(
     #[cfg(not(unix))]
     let inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>> = None;
 
-    let mqtt_only_mode = crdt_context
-        .as_ref()
-        .map(|ctx| ctx.mqtt_only_config.mqtt_only)
-        .unwrap_or(false);
-
-    // Use MQTT schema if provided, otherwise fetch from HTTP
+    // Use MQTT schema — HTTP fallback removed (CP-obpd).
     let schema = if let Some((schema, _content)) = mqtt_schema {
         schema
     } else {
-        // Fetch and parse schema from server (validation only, no root check needed)
-        match fetch_and_validate_schema(client, server, subdir_node_id, false).await {
-            Some(fetched) => fetched.schema,
-            None => return Ok(()), // Logged inside fetch_and_validate_schema
-        }
+        warn!(
+            "handle_subdir_new_files: no schema available for {}, skipping",
+            subdir_path
+        );
+        return Ok(());
     };
 
-    // Build UUID map for the subdirectory (for files with explicit node_id).
-    // Skip HTTP when mqtt_only mode OR when HTTP is hard-disabled in the sync runtime
-    // (CP-dk9l: these are independent flags — mqtt_only is a config option while
-    // set_sync_http_disabled is always called by the sync binary).
-    let subdir_uuid_map = if mqtt_only_mode
-        || crate::sync::transport::client::is_sync_http_disabled()
-    {
-        HashMap::new()
-    } else {
-        build_uuid_map_recursive(client, server, subdir_node_id).await
-    };
+    // UUID map is built from schema entries below — no HTTP fetch needed (CP-obpd).
+    let subdir_uuid_map: HashMap<String, String> = HashMap::new();
 
     // Convert to path -> (root_relative_path, subdir_relative_path, Option<node_id>) tuples
     // We need the subdir-relative path for API calls but root-relative path for file_states

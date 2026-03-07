@@ -209,7 +209,7 @@ pub use transport::ancestry::{
 };
 pub use transport::client::{
     delete_schema_entry, discover_fs_root, fetch_head, fork_node, push_schema_to_server,
-    resolve_path_to_uuid_http, set_sync_http_disabled, DiscoverFsRootError, FetchHeadError,
+    resolve_path_to_uuid_http, DiscoverFsRootError, FetchHeadError,
 };
 pub use transport::commands::{spawn_command_listener, CommandEntry};
 pub use transport::missing_parent::{

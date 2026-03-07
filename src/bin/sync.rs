@@ -24,7 +24,7 @@ use commonplace_doc::sync::{
     ensure_parent_directories_exist, find_owning_document, handle_file_deleted,
     handle_file_modified, handle_schema_modified, push_local_if_differs, remove_file_from_schema,
     remove_file_state_and_abort, rename_file_in_schema, resync_crdt_state_via_cyan_with_pending,
-    schema_to_json, set_sync_ancestry_mqtt_context, set_sync_http_disabled,
+    schema_to_json, set_sync_ancestry_mqtt_context,
     set_sync_schema_mqtt_request_client, spawn_command_listener, spawn_file_sync_tasks_crdt,
     trace_timeline, wait_for_file_stability, write_schema_file, ymap_schema, CrdtFileSyncContext,
     DirEvent, FileSyncState, InodeKey, InodeTracker, InodeTrackerInit, MqttOnlySyncConfig,
@@ -2403,11 +2403,6 @@ async fn main() -> ExitCode {
         error!("--sandbox requires either --exec or --log-listener");
         return ExitCode::from(1);
     }
-
-    // Hard-disable HTTP transport for sync runtime.
-    // Any remaining HTTP call paths should fail fast so they can be replaced by MQTT/cyan.
-    set_sync_http_disabled(true);
-    info!("HTTP sync transport disabled (strict MQTT-only runtime)");
 
     // Create HTTP client
     let client = Client::new();

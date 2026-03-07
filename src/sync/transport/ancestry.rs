@@ -73,8 +73,6 @@ pub enum AncestryError {
     #[error("MQTT ancestry query failed: {0}")]
     Response(String),
 
-    #[error("HTTP disabled in sync runtime and MQTT ancestry context is not configured")]
-    HttpDisabledWithoutMqtt,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,10 +236,7 @@ pub async fn is_ancestor(
         return is_ancestor_via_mqtt(&context, doc_id, ancestor, descendant).await;
     }
 
-    if super::client::is_sync_http_disabled() {
-        return Err(AncestryError::HttpDisabledWithoutMqtt);
-    }
-
+    // No MQTT context — fall back to HTTP ancestry check.
     Ok(is_ancestor_via_http(client, server_url, ancestor, descendant).await?)
 }
 
@@ -356,39 +351,4 @@ mod tests {
         assert_eq!(direction, SyncDirection::Diverged);
     }
 
-    #[tokio::test]
-    async fn determine_sync_direction_unknown_when_ancestry_query_errors() {
-        set_sync_ancestry_mqtt_context(None);
-        super::super::client::set_sync_http_disabled(true);
-
-        let client = Client::new();
-        let err = determine_sync_direction(
-            &client,
-            "http://127.0.0.1:1",
-            "doc-id",
-            Some("local-cid"),
-            Some("server-cid"),
-        )
-        .await
-        .unwrap_err();
-
-        super::super::client::set_sync_http_disabled(false);
-
-        assert!(matches!(err, AncestryError::HttpDisabledWithoutMqtt));
-    }
-
-    #[tokio::test]
-    async fn is_ancestor_fails_fast_when_http_disabled_without_mqtt_context() {
-        set_sync_ancestry_mqtt_context(None);
-        super::super::client::set_sync_http_disabled(true);
-
-        let client = Client::new();
-        let err = is_ancestor(&client, "http://127.0.0.1:1", "doc-id", "a", "b")
-            .await
-            .unwrap_err();
-
-        super::super::client::set_sync_http_disabled(false);
-
-        assert!(matches!(err, AncestryError::HttpDisabledWithoutMqtt));
-    }
 }
