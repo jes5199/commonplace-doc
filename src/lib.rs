@@ -75,12 +75,22 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
     let commit_store = config.commit_store.map(Arc::new);
     let commit_broadcaster = commit_store.as_ref().map(|_| CommitBroadcaster::new(1024));
 
-    // Initialize filesystem if --fs-root is specified
+    // Derive fs-root: use test override if provided, otherwise auto-create from CommitStore
+    let fs_root: Option<String> = config.fs_root.or_else(|| {
+        commit_store.as_ref().map(|store| {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(store.get_or_create_fs_root())
+            })
+            .expect("Failed to initialize fs-root UUID")
+        })
+    });
+
+    // Initialize filesystem if fs-root is available
     // Capture fs-root content for MQTT handlers and reconciler for DocumentService
     let (fs_root_context, reconciler): (
         Option<(String, String)>,
         Option<Arc<FilesystemReconciler>>,
-    ) = if let Some(ref fs_root_id) = config.fs_root {
+    ) = if let Some(ref fs_root_id) = fs_root {
         // Get or create the fs-root document
         // Use Json type since the fs-root schema is a JSON map structure
         let fs_doc = doc_store
@@ -103,7 +113,7 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
             }
         }
 
-        (Some((fs_root_id.clone(), content)), Some(reconciler))
+        (Some((fs_root_id.to_string(), content)), Some(reconciler))
     } else {
         (None, None)
     };
@@ -216,9 +226,9 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
 
     // Create shared service for handlers
     // DocumentService needs MQTT client to publish commits for real-time sync
-    let service = Arc::new(match (reconciler, &config.fs_root, mqtt_context) {
+    let service = Arc::new(match (reconciler, &fs_root, mqtt_context) {
         // Reconciler + MQTT
-        (Some(reconciler), Some(ref fs_root_id), Some((mqtt_client, mqtt_workspace))) => {
+        (Some(reconciler), Some(fs_root_id), Some((mqtt_client, mqtt_workspace))) => {
             DocumentService::with_reconciler_and_mqtt(
                 doc_store.clone(),
                 commit_store.clone(),
@@ -230,7 +240,7 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
             )
         }
         // Reconciler only
-        (Some(reconciler), Some(ref fs_root_id), None) => DocumentService::with_reconciler(
+        (Some(reconciler), Some(fs_root_id), None) => DocumentService::with_reconciler(
             doc_store.clone(),
             commit_store.clone(),
             commit_broadcaster.clone(),
@@ -259,27 +269,27 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
             doc_store.clone(),
             commit_store.clone(),
             commit_broadcaster.clone(),
-            config.fs_root.clone(),
+            fs_root.clone(),
             service.clone(),
         ))
         .merge(files::router(
             doc_store.clone(),
             commit_store.clone(),
             commit_broadcaster.clone(),
-            config.fs_root.clone(),
+            fs_root.clone(),
             service,
         ))
         .merge(sse::router(
             doc_store.clone(),
             commit_store.clone(),
             commit_broadcaster.clone(),
-            config.fs_root.clone(),
+            fs_root.clone(),
         ))
         .merge(ws::router(
             doc_store,
             commit_store,
             commit_broadcaster,
-            config.fs_root,
+            fs_root,
         ));
 
     // Add viewer routes if static_dir is configured

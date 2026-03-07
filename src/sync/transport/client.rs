@@ -347,7 +347,7 @@ pub enum DiscoverFsRootError {
     Request(reqwest::Error),
     /// JSON parsing failed
     Parse(reqwest::Error),
-    /// Server not configured with --fs-root (503)
+    /// Server has no fs-root (no database configured, 503)
     NotConfigured,
     /// Server returned error status
     Status(reqwest::StatusCode, String),
@@ -358,7 +358,7 @@ impl std::fmt::Display for DiscoverFsRootError {
         match self {
             Self::Request(e) => write!(f, "fs-root request failed: {}", e),
             Self::Parse(e) => write!(f, "Failed to parse fs-root response: {}", e),
-            Self::NotConfigured => write!(f, "Server was not started with --fs-root"),
+            Self::NotConfigured => write!(f, "Server has no fs-root (is --database configured?)"),
             Self::Status(code, body) => write!(f, "fs-root failed with {}: {}", code, body),
         }
     }
@@ -379,7 +379,7 @@ struct FsRootResponse {
 ///
 /// Returns:
 /// - `Ok(id)` if the fs-root was discovered successfully
-/// - `Err(NotConfigured)` if the server wasn't started with --fs-root (503)
+/// - `Err(NotConfigured)` if the server has no fs-root (no database, 503)
 /// - `Err(_)` if there was a network error or parse error
 pub async fn discover_fs_root(
     client: &Client,

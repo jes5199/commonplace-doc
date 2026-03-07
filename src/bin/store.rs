@@ -38,20 +38,23 @@ async fn main() {
     // Create document store
     let doc_store = Arc::new(DocumentStore::new());
 
-    // Initialize filesystem root
-    tracing::info!("Filesystem root: {}", args.fs_root);
+    // Get or create fs-root UUID from the database
+    let fs_root = commit_store
+        .get_or_create_fs_root()
+        .await
+        .expect("Failed to initialize fs-root UUID");
+    tracing::info!("Filesystem root: {}", &fs_root[..8]);
 
-    // Get or create the fs-root document (required)
-    // Use Json type since the fs-root schema is a JSON map structure
+    // Get or create the fs-root document
     let fs_doc = doc_store
-        .get_or_create_with_id(&args.fs_root, ContentType::Json)
+        .get_or_create_with_id(&fs_root, ContentType::Json)
         .await;
 
-    tracing::info!("Filesystem root initialized at document: {}", args.fs_root);
+    tracing::info!("Filesystem root initialized at document: {}", &fs_root[..8]);
 
     // Create filesystem reconciler
     let reconciler = Arc::new(FilesystemReconciler::new(
-        args.fs_root.clone(),
+        fs_root.clone(),
         doc_store.clone(),
     ));
 
@@ -103,11 +106,11 @@ async fn main() {
     // Set the fs-root path so handlers can resolve paths correctly
     mqtt_service
         .edits_handler()
-        .set_fs_root_path(args.fs_root.clone())
+        .set_fs_root_path(fs_root.clone())
         .await;
     mqtt_service
         .sync_handler()
-        .set_fs_root_path(args.fs_root.clone())
+        .set_fs_root_path(fs_root.clone())
         .await;
 
     // Subscribe to store-level commands (e.g., create-document)
@@ -118,10 +121,10 @@ async fn main() {
     }
 
     // Subscribe to fs-root document itself (so we receive updates to filesystem structure)
-    if let Err(e) = mqtt_service.subscribe_path(&args.fs_root).await {
-        tracing::warn!("Failed to subscribe to fs-root {}: {}", args.fs_root, e);
+    if let Err(e) = mqtt_service.subscribe_path(&fs_root).await {
+        tracing::warn!("Failed to subscribe to fs-root {}: {}", fs_root, e);
     } else {
-        tracing::info!("Subscribed to fs-root path: {}", args.fs_root);
+        tracing::info!("Subscribed to fs-root path: {}", fs_root);
     }
 
     // Subscribe to paths based on fs-root content

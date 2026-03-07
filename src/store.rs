@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 // Table definitions
 const COMMITS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("commits");
 const DOC_HEADS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("doc_heads");
+const METADATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
 #[derive(Debug, Clone)]
 pub enum StoreError {
@@ -292,6 +293,111 @@ impl CommitStore {
 
             Ok(false)
         })
+    }
+
+    /// Read a value from the metadata table.
+    pub async fn get_metadata(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let db = self.db.read().await;
+        let read_txn = db
+            .begin_read()
+            .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+
+        let table = match read_txn.open_table(METADATA_TABLE) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+
+        let result = table
+            .get(key)
+            .map_err(|e| StoreError::DatabaseError(e.to_string()))?
+            .map(|v| v.value().to_string());
+
+        Ok(result)
+    }
+
+    /// Write a value to the metadata table.
+    pub async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        let db = self.db.write().await;
+        let write_txn = db
+            .begin_write()
+            .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+
+        {
+            let mut table = write_txn
+                .open_table(METADATA_TABLE)
+                .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+
+            table
+                .insert(key, value)
+                .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+        }
+
+        write_txn
+            .commit()
+            .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Get or create the fs-root UUID.
+    ///
+    /// 1. If metadata["fs_root_uuid"] exists, return it (already migrated).
+    /// 2. If doc_heads["workspace"] exists (legacy), migrate: generate UUID,
+    ///    copy the head entry, store UUID in metadata, delete old key.
+    /// 3. Otherwise generate a fresh UUID and store it.
+    pub async fn get_or_create_fs_root(&self) -> Result<String, StoreError> {
+        // 1. Already migrated?
+        if let Some(uuid) = self.get_metadata("fs_root_uuid").await? {
+            return Ok(uuid);
+        }
+
+        // 2. Legacy migration: check for doc_heads["workspace"]
+        if let Some(head_cid) = self.get_document_head("workspace").await? {
+            let uuid = uuid::Uuid::new_v4().to_string();
+            tracing::info!(
+                "Migrating legacy fs-root 'workspace' -> {} (head: {})",
+                &uuid[..8],
+                &head_cid[..8.min(head_cid.len())]
+            );
+
+            // Copy head to new UUID key and remove old key in one transaction
+            let db = self.db.write().await;
+            let write_txn = db
+                .begin_write()
+                .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+
+            {
+                let mut heads = write_txn
+                    .open_table(DOC_HEADS_TABLE)
+                    .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+                heads
+                    .insert(uuid.as_str(), head_cid.as_str())
+                    .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+                heads
+                    .remove("workspace")
+                    .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+            }
+
+            {
+                let mut meta = write_txn
+                    .open_table(METADATA_TABLE)
+                    .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+                meta.insert("fs_root_uuid", uuid.as_str())
+                    .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+            }
+
+            write_txn
+                .commit()
+                .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+
+            return Ok(uuid);
+        }
+
+        // 3. Fresh database
+        let uuid = uuid::Uuid::new_v4().to_string();
+        tracing::info!("Creating fresh fs-root UUID: {}", &uuid[..8]);
+        self.set_metadata("fs_root_uuid", &uuid).await?;
+        Ok(uuid)
     }
 
     /// Validate that a new commit can be added to a document

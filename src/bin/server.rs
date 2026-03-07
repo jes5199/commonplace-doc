@@ -40,11 +40,6 @@ async fn async_main() {
         tracing::warn!("Use --database <path> to enable commits");
     }
 
-    // Log filesystem root if configured
-    if let Some(ref fs_root) = args.fs_root {
-        tracing::info!("Filesystem root: {}", fs_root);
-    }
-
     // Create MQTT config if broker URL is specified
     let mqtt_config = args.mqtt_broker.as_ref().map(|broker_url| {
         let client_id = args
@@ -73,10 +68,10 @@ async fn async_main() {
     // Build our application with routes
     let app = create_router_with_config(RouterConfig {
         commit_store,
-        fs_root: args.fs_root,
         mqtt: mqtt_config,
         mqtt_subscribe: args.mqtt_subscribe,
         static_dir: args.static_dir.map(|p| p.to_string_lossy().to_string()),
+        ..Default::default()
     })
     .await;
 

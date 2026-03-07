@@ -539,7 +539,7 @@ async fn main() {
     let fs_root_id = match discover_fs_root(&client, &args.server).await {
         Ok(id) => id,
         Err(DiscoverFsRootError::NotConfigured) => {
-            tracing::error!("[orchestrator] Server was not started with --fs-root");
+            tracing::error!("[orchestrator] Server has no fs-root (is --database configured?)");
             base_manager.shutdown().await;
             std::process::exit(1);
         }

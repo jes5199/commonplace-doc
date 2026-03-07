@@ -3150,14 +3150,8 @@ async fn run_directory_mode(
         Arc::new(RwLock::new(std::collections::HashMap::new()));
 
     // Load/create CRDT state early so startup schema reconciliation can use MQTT context.
-    // Note: If fs_root_id is not a UUID (e.g., "workspace"), use a nil UUID for the schema.
-    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id).unwrap_or_else(|_| {
-        warn!(
-            "fs_root_id '{}' is not a UUID, using nil UUID for CRDT schema state",
-            fs_root_id
-        );
-        uuid::Uuid::nil()
-    });
+    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id)
+        .expect("fs_root_id must be a valid UUID");
     let crdt_state = Arc::new(RwLock::new(
         DirectorySyncState::load_or_create(&directory, schema_node_id)
             .await
@@ -3867,14 +3861,8 @@ async fn run_exec_mode(
     let sync_start = Instant::now();
 
     // Load/create CRDT state early so startup schema reconciliation can use MQTT context.
-    // Note: If fs_root_id is not a UUID (e.g., "workspace"), use a nil UUID for the schema.
-    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id).unwrap_or_else(|_| {
-        warn!(
-            "fs_root_id '{}' is not a UUID, using nil UUID for CRDT schema state",
-            fs_root_id
-        );
-        uuid::Uuid::nil()
-    });
+    let schema_node_id = uuid::Uuid::parse_str(&fs_root_id)
+        .expect("fs_root_id must be a valid UUID");
     let crdt_state = Arc::new(RwLock::new(
         DirectorySyncState::load_or_create(&directory, schema_node_id)
             .await

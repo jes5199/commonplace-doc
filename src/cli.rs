@@ -20,10 +20,6 @@ pub struct Args {
     #[clap(long, default_value = "127.0.0.1")]
     pub host: String,
 
-    /// Node ID for filesystem root document
-    #[clap(long, value_name = "NODE_ID")]
-    pub fs_root: Option<String>,
-
     /// MQTT broker URL (e.g., mqtt://localhost:1883)
     #[clap(long, value_name = "URL")]
     pub mqtt_broker: Option<String>,
@@ -63,10 +59,6 @@ pub struct StoreArgs {
     /// MQTT client ID (defaults to "commonplace-store")
     #[clap(long, value_name = "ID", default_value = "commonplace-store")]
     pub mqtt_client_id: String,
-
-    /// Node ID for filesystem root document (required - determines MQTT subscriptions)
-    #[clap(long, value_name = "NODE_ID")]
-    pub fs_root: String,
 
     /// Workspace name for MQTT topic namespacing
     #[clap(long, default_value = DEFAULT_WORKSPACE)]
