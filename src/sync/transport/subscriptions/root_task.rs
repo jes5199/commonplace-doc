@@ -4,13 +4,12 @@
 //! for schema changes and all file UUIDs for content changes.
 
 use super::recovery::{resync_schema_from_server, resync_subscribed_files, sync_schema_via_cyan};
-use super::{is_http_recovery_disabled, trace_log, CrdtFileSyncContext};
+use super::{trace_log, CrdtFileSyncContext};
 use crate::commit::Commit;
 use crate::events::{recv_broadcast_with_lag, BroadcastRecvResult};
 use crate::mqtt::{MqttClient, Topic};
 use crate::sync::dir_sync::{
-    apply_explicit_deletions, apply_schema_update_to_state, handle_schema_change_with_dedup,
-    handle_subdir_new_files,
+    apply_explicit_deletions, apply_schema_update_to_state, handle_subdir_new_files,
 };
 use crate::sync::error::SyncResult;
 #[cfg(unix)]
@@ -140,12 +139,6 @@ pub async fn directory_mqtt_task(
     let inode_tracker_for_crdt = inode_tracker.clone();
     #[cfg(not(unix))]
     let inode_tracker_for_crdt = None;
-    let http_recovery_disabled = is_http_recovery_disabled(
-        crdt_context
-            .as_ref()
-            .map(|ctx| ctx.mqtt_only_config.mqtt_only)
-            .unwrap_or(false),
-    );
 
     // Subscribe to edits for the fs-root document (schema changes)
     let fs_root_topic = Topic::edits(&workspace, &fs_root_id).to_topic_string();
@@ -271,9 +264,8 @@ pub async fn directory_mqtt_task(
 
     // Track last processed schema to prevent redundant processing
     let mut last_schema_hash: Option<String> = None;
-    // Track last applied schema CID for ancestry checking.
-    // Initialize with the CID from initial sync to prevent pulling stale server content.
-    let mut last_schema_cid: Option<String> = initial_schema_cid;
+    // initial_schema_cid is retained for future use but not currently tracked at runtime.
+    let _ = initial_schema_cid;
 
     // Process incoming MQTT messages with lag detection
     loop {
@@ -353,7 +345,6 @@ pub async fn directory_mqtt_task(
             if let Some(ref ctx) = crdt_context {
                 // Apply MQTT delta to persistent CRDT state.
                 let mut schema_recovered_from_cyan = false;
-                let mut updated_cid: Option<String> = None;
                 let mut root_deleted_entries = std::collections::HashSet::new();
 
                 let mut mqtt_schema = {
@@ -363,7 +354,6 @@ pub async fn directory_mqtt_task(
                             .map(|r| (r.schema, r.schema_json, r.deleted_entries));
 
                     if let Some((_, _, deleted_entries)) = &schema_result {
-                        updated_cid = state.schema.head_cid.clone();
                         root_deleted_entries = deleted_entries.clone();
 
                         if let Err(e) = state.save(&directory).await {
@@ -385,9 +375,8 @@ pub async fn directory_mqtt_task(
                     debug!("MQTT: Failed to decode schema from CRDT state; triggering cyan resync");
                     resync_schema_from_server(&fs_root_id, ctx).await;
                     mqtt_schema = load_root_schema_from_state(ctx).await.map(
-                        |(schema, schema_json, recovered_cid)| {
+                        |(schema, schema_json, _recovered_cid)| {
                             schema_recovered_from_cyan = true;
-                            updated_cid = recovered_cid;
                             (schema, schema_json)
                         },
                     );
@@ -531,11 +520,6 @@ pub async fn directory_mqtt_task(
 
                             // Update dedup state (hash and CID for ancestry tracking)
                             last_schema_hash = Some(current_hash);
-                            // Sync last_schema_cid from CRDT state to maintain ancestry checks
-                            if updated_cid.is_some() {
-                                last_schema_cid = updated_cid.clone();
-                            }
-
                             if schema_recovered_from_cyan && !push_only {
                                 // Materialize current file state immediately from the recovered
                                 // snapshot so convergence does not wait for a later edit.
@@ -563,58 +547,13 @@ pub async fn directory_mqtt_task(
                         fs_root_id
                     );
                 }
-            } else if http_recovery_disabled {
+            } else {
+                // No CRDT context available — CRDT is required for schema processing
+                // in the MQTT runtime. HTTP-based legacy mode has been removed (CP-zfai).
                 warn!(
-                    "MQTT: Received schema change for {} but no CRDT context is available and HTTP recovery is disabled",
+                    "MQTT: Received schema change for {} but no CRDT context is available",
                     fs_root_id
                 );
-            } else {
-                // No CRDT context - use HTTP-based processing (legacy mode)
-                match handle_schema_change_with_dedup(
-                    &http_client,
-                    &server,
-                    &fs_root_id,
-                    &directory,
-                    &file_states,
-                    true, // spawn_tasks: true for runtime schema changes
-                    use_paths,
-                    &mut last_schema_hash,
-                    &mut last_schema_cid,
-                    push_only,
-                    pull_only,
-                    &author,
-                    #[cfg(unix)]
-                    inode_tracker.clone(),
-                    written_schemas.as_ref(),
-                    shared_state_file.as_ref(),
-                    crdt_context.as_ref(),
-                )
-                .await
-                {
-                    Ok(true) => {
-                        debug!("MQTT: Schema change processed successfully (HTTP mode)");
-                        // Update UUID subscriptions in legacy mode
-                        sync_uuid_subscriptions(
-                            &http_client,
-                            &server,
-                            &fs_root_id,
-                            &mqtt_client,
-                            &workspace,
-                            &mut subscribed_uuids,
-                            &mut uuid_to_paths,
-                            &directory,
-                            use_paths,
-                            &file_states,
-                        )
-                        .await;
-                    }
-                    Ok(false) => {
-                        debug!("MQTT: Schema unchanged, skipped processing (HTTP mode)");
-                    }
-                    Err(e) => {
-                        warn!("MQTT: Failed to handle schema change: {}", e);
-                    }
-                }
             }
 
             // Check for newly discovered node-backed subdirs and spawn tasks.
