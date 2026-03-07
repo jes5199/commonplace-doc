@@ -203,6 +203,30 @@ impl CommitStore {
         Ok(())
     }
 
+    /// Remove the head commit for a document.
+    pub async fn delete_document_head(&self, doc_id: &str) -> Result<(), StoreError> {
+        let db = self.db.write().await;
+        let write_txn = db
+            .begin_write()
+            .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+
+        {
+            let mut table = write_txn
+                .open_table(DOC_HEADS_TABLE)
+                .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+
+            table
+                .remove(doc_id)
+                .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+        }
+
+        write_txn
+            .commit()
+            .map_err(|e| StoreError::DatabaseError(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Get the head commit for a document
     pub async fn get_document_head(&self, doc_id: &str) -> Result<Option<String>, StoreError> {
         let db = self.db.read().await;

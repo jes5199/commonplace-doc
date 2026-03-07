@@ -93,11 +93,26 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
     ) = if let Some(ref fs_root_id) = fs_root {
         // Get or create the fs-root document
         // Use Json type since the fs-root schema is a JSON map structure
-        let fs_doc = doc_store
+        doc_store
             .get_or_create_with_id(fs_root_id, ContentType::Json)
             .await;
 
         tracing::info!("Filesystem root initialized at document: {}", fs_root_id);
+
+        // Hydrate fs-root and its schema chain from redb if content is empty.
+        // This ensures path resolution works after migration (repo/main layout).
+        if let Some(ref store) = commit_store {
+            if let Err(e) = hydrate_schema_chain(fs_root_id, store, &doc_store).await {
+                tracing::warn!("Failed to hydrate schema chain: {}", e);
+            }
+        }
+
+        // Re-read content after potential hydration
+        let content = doc_store
+            .get_document(fs_root_id)
+            .await
+            .map(|d| d.content.clone())
+            .unwrap_or_default();
 
         // Create the reconciler
         let reconciler = Arc::new(FilesystemReconciler::new(
@@ -106,7 +121,6 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
         ));
 
         // Perform initial reconciliation
-        let content = fs_doc.content.clone();
         if !content.is_empty() && content != "{}" {
             if let Err(e) = reconciler.reconcile(&content).await {
                 tracing::warn!("Initial fs reconcile failed: {}", e);
@@ -357,4 +371,81 @@ pub fn create_router_with_store(store: Option<CommitStore>) -> Router {
 
 pub fn create_router() -> Router {
     create_router_with_store(None)
+}
+
+/// Hydrate a document from redb commits into the in-memory doc store.
+/// Returns the replayed content, or None if no commits exist.
+async fn hydrate_doc_from_redb(
+    doc_id: &str,
+    store: &Arc<CommitStore>,
+    doc_store: &Arc<DocumentStore>,
+) -> Result<Option<String>, String> {
+    let head = store
+        .get_document_head(doc_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(head_cid) = head else {
+        return Ok(None);
+    };
+
+    // Check if in-memory doc already has content
+    if let Some(doc) = doc_store.get_document(doc_id).await {
+        if !doc.content.is_empty() && doc.content != "{}" {
+            return Ok(Some(doc.content.clone()));
+        }
+    }
+
+    let replayer = replay::CommitReplayer::new(store);
+    let content = replayer
+        .get_content_at_commit(doc_id, &head_cid, &ContentType::Json)
+        .await
+        .map_err(|e| format!("{}", e))?;
+
+    if !content.is_empty() && content != "{}" {
+        // Update the in-memory doc (ensure it exists first)
+        doc_store
+            .get_or_create_with_id(doc_id, ContentType::Json)
+            .await;
+        let _ = doc_store.set_content(doc_id, &content).await;
+        tracing::info!(
+            "Hydrated doc {} from redb (content: {}...)",
+            &doc_id[..12.min(doc_id.len())],
+            &content[..60.min(content.len())]
+        );
+        Ok(Some(content))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Hydrate the fs-root schema chain from redb.
+/// This replays commits for the fs-root doc and any schema docs it references,
+/// ensuring path resolution works for `--node workspace/main` etc.
+async fn hydrate_schema_chain(
+    fs_root_id: &str,
+    store: &Arc<CommitStore>,
+    doc_store: &Arc<DocumentStore>,
+) -> Result<(), String> {
+    // Hydrate the fs-root doc itself
+    let Some(content) = hydrate_doc_from_redb(fs_root_id, store, doc_store).await? else {
+        return Ok(());
+    };
+
+    // Parse the schema to find child node_ids and hydrate them too
+    if let Ok(schema) = serde_json::from_str::<serde_json::Value>(&content) {
+        if let Some(entries) = schema
+            .pointer("/root/entries")
+            .and_then(|e| e.as_object())
+        {
+            for (name, entry) in entries {
+                if let Some(node_id) = entry.get("node_id").and_then(|v| v.as_str()) {
+                    if let Err(e) = hydrate_doc_from_redb(node_id, store, doc_store).await {
+                        tracing::warn!("Failed to hydrate schema child '{}': {}", name, e);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
