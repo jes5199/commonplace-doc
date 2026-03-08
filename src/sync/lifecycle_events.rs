@@ -83,6 +83,15 @@ impl SyncEventEmitter {
         }))
         .await;
     }
+
+    /// Emit a command-received event (magenta-to-red onramp).
+    pub async fn emit_command_received(&self, verb: &str, payload: &serde_json::Value) {
+        self.emit(&format!("command:{}", verb), serde_json::json!({
+            "verb": verb,
+            "payload": payload,
+        }))
+        .await;
+    }
 }
 
 #[cfg(test)]
@@ -114,5 +123,30 @@ mod tests {
             topic.to_topic_string(),
             "my-workspace/events/sync/file-created"
         );
+    }
+
+    #[test]
+    fn test_command_event_topic_format() {
+        let topic = Topic::events("my-workspace", "sync", "command:restart");
+        assert_eq!(
+            topic.to_topic_string(),
+            "my-workspace/events/sync/command:restart"
+        );
+    }
+
+    #[test]
+    fn test_command_event_payload_structure() {
+        let message = EventMessage {
+            payload: serde_json::json!({
+                "verb": "clear",
+                "payload": {"lines": 10},
+            }),
+            source: "sync-client".to_string(),
+        };
+
+        let json: serde_json::Value = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["source"], "sync-client");
+        assert_eq!(json["payload"]["verb"], "clear");
+        assert_eq!(json["payload"]["payload"]["lines"], 10);
     }
 }

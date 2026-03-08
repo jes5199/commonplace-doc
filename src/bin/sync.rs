@@ -4577,6 +4577,7 @@ async fn run_exec_mode(
             workspace.clone(),
             event_path,
             directory.clone(),
+            None,
         );
     }
 

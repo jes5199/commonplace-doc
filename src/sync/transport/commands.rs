@@ -6,6 +6,7 @@
 
 use crate::events::recv_broadcast;
 use crate::mqtt::{MqttClient, Topic};
+use crate::sync::lifecycle_events::SyncEventEmitter;
 use rumqttc::QoS;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -34,6 +35,7 @@ pub struct CommandEntry {
 /// * `workspace` - The workspace name
 /// * `path` - The document path to subscribe to commands for
 /// * `directory` - The local directory where __commands.jsonl will be written
+/// * `lifecycle` - Optional event emitter for magenta-to-red onramp
 ///
 /// # Returns
 /// A JoinHandle for the spawned task
@@ -42,12 +44,14 @@ pub fn spawn_command_listener(
     workspace: String,
     path: String,
     directory: std::path::PathBuf,
+    lifecycle: Option<SyncEventEmitter>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(command_listener_task(
         mqtt_client,
         workspace,
         path,
         directory,
+        lifecycle,
     ))
 }
 
@@ -57,6 +61,7 @@ async fn command_listener_task(
     workspace: String,
     path: String,
     directory: std::path::PathBuf,
+    lifecycle: Option<SyncEventEmitter>,
 ) {
     // CRITICAL: Create the broadcast receiver BEFORE subscribing.
     // This ensures we receive any retained messages.
@@ -128,6 +133,10 @@ async fn command_listener_task(
         match append_command(&commands_file, &entry).await {
             Ok(()) => {
                 debug!("Wrote command '{}' to {:?}", verb, commands_file);
+                // Magenta-to-red onramp: republish as red event
+                if let Some(ref lc) = lifecycle {
+                    lc.emit_command_received(&verb, &entry.payload).await;
+                }
             }
             Err(e) => {
                 warn!("Failed to write command '{}' to file: {}", verb, e);
