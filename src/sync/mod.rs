@@ -16,6 +16,12 @@ use tracing::{error, info};
 // Submodules (organized by concern)
 // =============================================================================
 
+/// Actor IO document management
+pub mod actor_io;
+
+/// Sync lifecycle event emission
+pub mod lifecycle_events;
+
 /// CRDT operations: state management, merge, publish, Yjs utilities
 pub mod crdt;
 

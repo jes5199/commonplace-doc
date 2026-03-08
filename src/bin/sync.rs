@@ -9,7 +9,9 @@ use commonplace_doc::events::recv_broadcast;
 use commonplace_doc::mqtt::MqttRequestClient;
 use commonplace_doc::mqtt::{MqttClient, MqttConfig, Topic};
 use commonplace_doc::store::CommitStore;
+use commonplace_doc::sync::actor_io::ActorIOWriter;
 use commonplace_doc::sync::crdt_state::DirectorySyncState;
+use commonplace_doc::sync::lifecycle_events::SyncEventEmitter;
 #[cfg(unix)]
 use commonplace_doc::sync::spawn_shadow_tasks;
 use commonplace_doc::sync::state_file::compute_content_hash;
@@ -31,6 +33,7 @@ use commonplace_doc::sync::{
     ScanOptions, SubdirStateCache, SyncAncestryMqttContext, SyncError, SyncState,
     TimelineMilestone, SCHEMA_FILENAME,
 };
+use commonplace_types::fs::ActorStatus;
 use commonplace_doc::workspace::is_process_running;
 use commonplace_doc::{DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
 use reqwest::Client;
@@ -690,6 +693,7 @@ async fn handle_dir_event(
     author: &str,
     written_schemas: Option<&WrittenSchemas>,
     crdt_params: Option<&CrdtEventParams>,
+    lifecycle: Option<&SyncEventEmitter>,
     event: DirEvent,
 ) {
     match event {
@@ -720,6 +724,14 @@ async fn handle_dir_event(
                     path.display()
                 );
             }
+            if let Some(lc) = lifecycle {
+                let rel = path.strip_prefix(directory).unwrap_or(&path);
+                let uuid = file_states.read().await
+                    .get(&rel.to_string_lossy().to_string())
+                    .map(|s| s.identifier.clone())
+                    .unwrap_or_default();
+                lc.emit_file_event("file-created", &rel.to_string_lossy(), &uuid).await;
+            }
         }
         DirEvent::Modified(path) => {
             // Skip HTTP schema push when CRDT is enabled - MQTT handles schema propagation
@@ -733,8 +745,24 @@ async fn handle_dir_event(
             // When CRDT is enabled, file content changes are handled by the per-file CRDT sync tasks
             // spawned in handle_file_created_crdt. Schema updates are not needed for modifications
             // since the file entry already exists in the schema.
+            if let Some(lc) = lifecycle {
+                let rel = path.strip_prefix(directory).unwrap_or(&path);
+                let uuid = file_states.read().await
+                    .get(&rel.to_string_lossy().to_string())
+                    .map(|s| s.identifier.clone())
+                    .unwrap_or_default();
+                lc.emit_file_event("file-updated", &rel.to_string_lossy(), &uuid).await;
+            }
         }
         DirEvent::Deleted(path) => {
+            if let Some(lc) = lifecycle {
+                let rel = path.strip_prefix(directory).unwrap_or(&path);
+                let uuid = file_states.read().await
+                    .get(&rel.to_string_lossy().to_string())
+                    .map(|s| s.identifier.clone())
+                    .unwrap_or_default();
+                lc.emit_file_event("file-deleted", &rel.to_string_lossy(), &uuid).await;
+            }
             // Use CRDT path if available
             if let Some(crdt) = crdt_params {
                 handle_file_deleted_crdt(
@@ -3043,6 +3071,16 @@ async fn run_directory_mode(
     // Derive author from name parameter, defaulting to "sync-client"
     let author = name.unwrap_or_else(|| "sync-client".to_string());
 
+    // Write actor IO document to advertise sync agent presence
+    let actor_io = ActorIOWriter::new(&directory, &author);
+    if let Err(e) = actor_io.write_status(ActorStatus::Starting).await {
+        warn!("Failed to write actor IO document: {}", e);
+    }
+
+    // Create lifecycle event emitter for red events
+    let lifecycle = SyncEventEmitter::new(mqtt_client.clone(), &workspace, &author);
+    lifecycle.emit_started().await;
+
     // Track timing for initial sync event
     let sync_start = Instant::now();
 
@@ -3264,6 +3302,11 @@ async fn run_directory_mode(
         sync_start.elapsed().as_millis() as u64,
     )
     .await;
+
+    // Update actor IO to active after initial sync
+    if let Err(e) = actor_io.update_status(ActorStatus::Active).await {
+        warn!("Failed to update actor IO to active: {}", e);
+    }
 
     // Start directory watcher and create shared state
     let WatcherSetup {
@@ -3558,6 +3601,7 @@ async fn run_directory_mode(
         let file_states = file_states.clone();
         let written_schemas = written_schemas.clone();
         let author = author.clone();
+        let lifecycle = lifecycle.clone();
         // Create CRDT params for the event handler
         let crdt_params = CrdtEventParams {
             mqtt_client: mqtt_client.clone(),
@@ -3579,6 +3623,7 @@ async fn run_directory_mode(
                 let author_for_event = author.clone();
                 let written_schemas_for_event = written_schemas.clone();
                 let crdt_params_for_event = crdt_params.clone();
+                let lifecycle_for_event = lifecycle.clone();
 
                 let join_result = tokio::spawn(async move {
                     handle_dir_event(
@@ -3592,6 +3637,7 @@ async fn run_directory_mode(
                         &author_for_event,
                         Some(&written_schemas_for_event),
                         Some(&crdt_params_for_event),
+                        Some(&lifecycle_for_event),
                         event,
                     )
                     .await;
@@ -3713,6 +3759,15 @@ async fn run_directory_mode(
         } else {
             info!("Saved state file with {} tracked files", sf.files.len());
         }
+    }
+
+    // Emit stopped lifecycle event and clean up actor IO document
+    lifecycle.emit_stopped().await;
+    if let Err(e) = actor_io.update_status(ActorStatus::Stopped).await {
+        warn!("Failed to update actor IO to stopped: {}", e);
+    }
+    if let Err(e) = actor_io.remove().await {
+        warn!("Failed to remove actor IO document: {}", e);
     }
 
     match &exit_reason {
@@ -4296,6 +4351,7 @@ async fn run_exec_mode(
                         &author_for_event,
                         Some(&written_schemas_for_event),
                         Some(&crdt_params_for_event),
+                        None,
                         event,
                     )
                     .await;
