@@ -25,6 +25,8 @@
 {"created_at":"2026-01-25T06:35:52Z","created_by":"Jes Wolfe!","depends_on_id":"CP-29n3","issue_id":"CP-29n3.3","type":"parent-child"}
 {"created_at":"2026-01-05T07:02:50Z","created_by":"jes","depends_on_id":"CP-1evh","issue_id":"CP-2ee8","type":"blocks"}
 {"created_at":"2026-01-05T07:02:50Z","created_by":"jes","depends_on_id":"CP-1j5m","issue_id":"CP-2ee8","type":"discovered-from"}
+{"created_at":"2026-03-08T06:27:36Z","created_by":"Jes Wolfe!","depends_on_id":"CP-dx8f","issue_id":"CP-2el2","type":"blocks"}
+{"created_at":"2026-03-08T06:27:36Z","created_by":"Jes Wolfe!","depends_on_id":"CP-xek4","issue_id":"CP-2el2","type":"blocks"}
 {"created_at":"2026-01-05T07:02:45Z","created_by":"jes","depends_on_id":"CP-1evh","issue_id":"CP-2gv7","type":"blocks"}
 {"created_at":"2026-01-05T07:02:45Z","created_by":"jes","depends_on_id":"CP-1j5m","issue_id":"CP-2gv7","type":"discovered-from"}
 {"created_at":"2026-02-18T17:54:54Z","created_by":"Jes Wolfe!","depends_on_id":"CP-kk3w","issue_id":"CP-2w17","type":"discovered-from"}
@@ -218,6 +220,7 @@
 {"created_at":"2026-01-27T05:37:13Z","created_by":"Jes Wolfe!","depends_on_id":"CP-mxjk","issue_id":"CP-wp53","type":"blocks"}
 {"created_at":"2026-01-10T07:54:10Z","created_by":"jes","depends_on_id":"CP-rrw8","issue_id":"CP-wpty","type":"blocks"}
 {"created_at":"2026-02-17T20:30:32Z","created_by":"Jes Wolfe!","depends_on_id":"CP-sdun","issue_id":"CP-x9o5","type":"discovered-from"}
+{"created_at":"2026-03-08T06:27:36Z","created_by":"Jes Wolfe!","depends_on_id":"CP-8585","issue_id":"CP-xek4","type":"blocks"}
 {"created_at":"2026-03-06T20:01:43Z","created_by":"Jes Wolfe!","depends_on_id":"CP-bw2c","issue_id":"CP-xkom","type":"blocks"}
 {"created_at":"2026-01-23T21:39:29Z","created_by":"Jes Wolfe!","depends_on_id":"CP-1ual","issue_id":"CP-xp5h","type":"discovered-from"}
 {"created_at":"2026-01-23T21:43:28Z","created_by":"Jes Wolfe!","depends_on_id":"CP-xp5h","issue_id":"CP-xp5h.1","type":"parent-child"}
