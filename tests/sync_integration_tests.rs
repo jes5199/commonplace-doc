@@ -3123,3 +3123,306 @@ fn test_timeline_milestone_ordering_invariants() {
     // Cleanup
     let _ = fs::remove_file(trace_path);
 }
+
+// ---------------------------------------------------------------------------
+// Observer Presence Integration Tests
+// ---------------------------------------------------------------------------
+
+/// Helper to spawn sync client in directory mode with a custom --name flag
+/// for observer presence testing.
+fn spawn_sync_directory_named(
+    server_url: &str,
+    mqtt_broker: &str,
+    directory: &std::path::Path,
+    node_id: &str,
+    name: &str,
+) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_commonplace-sync"))
+        .args([
+            "--server",
+            server_url,
+            "--mqtt-broker",
+            mqtt_broker,
+            "--node",
+            node_id,
+            "--directory",
+            directory.to_str().unwrap(),
+            "--name",
+            name,
+        ])
+        .env("COMMONPLACE_MQTT_ONLY_SYNC", "true")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn named sync client")
+}
+
+/// CP-wd01: Sync agent creates a `{name}.exe` presence file on startup.
+///
+/// Verifies:
+/// 1. Sync agent creates `sync-alpha.exe` in its local directory
+/// 2. The presence file contains valid JSON with "active" status
+#[test]
+fn test_presence_file_created_on_sync_startup() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    // Create fs-root document
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse fs-root response");
+    let fs_root_id = body["id"].as_str().expect("Missing fs-root id").to_string();
+
+    // Initialize empty root schema
+    let root_schema = serde_json::json!({
+        "version": 1,
+        "root": { "type": "dir", "entries": {} }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(root_schema.to_string())
+        .send()
+        .expect("Failed to init root schema");
+    assert!(resp.status().is_success());
+
+    // Start sync agent with name "sync-alpha"
+    guard.add(spawn_sync_directory_named(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir,
+        &fs_root_id,
+        "sync-alpha",
+    ));
+
+    // Wait for the presence file to appear
+    let presence_file = sync_dir.join("sync-alpha.exe");
+    wait_for_path_exists(&presence_file, Duration::from_secs(15));
+
+    // Verify presence file contents
+    wait_for_file_content_contains(&presence_file, "\"status\": \"active\"", Duration::from_secs(10));
+
+    let content = std::fs::read_to_string(&presence_file).expect("Failed to read presence file");
+    let io: serde_json::Value = serde_json::from_str(&content).expect("Invalid JSON in presence file");
+    assert_eq!(io["name"], "sync-alpha");
+    assert_eq!(io["status"], "active");
+    assert!(io["pid"].is_number(), "Presence file should contain PID");
+}
+
+/// CP-wd01: Two sync agents see each other's presence files via sync.
+///
+/// Verifies:
+/// 1. Agent A creates sync-alpha.exe in its directory
+/// 2. Agent B creates sync-beta.exe in its directory
+/// 3. Agent A sees sync-beta.exe (synced from server)
+/// 4. Agent B sees sync-alpha.exe (synced from server)
+#[test]
+fn test_presence_files_visible_across_peers() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir_a = temp_dir.path().join("workspace-a");
+    let sync_dir_b = temp_dir.path().join("workspace-b");
+    std::fs::create_dir_all(&sync_dir_a).unwrap();
+    std::fs::create_dir_all(&sync_dir_b).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    // Create fs-root document
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse fs-root response");
+    let fs_root_id = body["id"].as_str().expect("Missing fs-root id").to_string();
+
+    // Initialize empty root schema
+    let root_schema = serde_json::json!({
+        "version": 1,
+        "root": { "type": "dir", "entries": {} }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(root_schema.to_string())
+        .send()
+        .expect("Failed to init root schema");
+    assert!(resp.status().is_success());
+
+    // Start both sync agents with different names
+    guard.add(spawn_sync_directory_named(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir_a,
+        &fs_root_id,
+        "sync-alpha",
+    ));
+    guard.add(spawn_sync_directory_named(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir_b,
+        &fs_root_id,
+        "sync-beta",
+    ));
+
+    // Each agent should create its own presence file locally
+    wait_for_path_exists(&sync_dir_a.join("sync-alpha.exe"), Duration::from_secs(15));
+    wait_for_path_exists(&sync_dir_b.join("sync-beta.exe"), Duration::from_secs(15));
+
+    // Wait for active status
+    wait_for_file_content_contains(
+        &sync_dir_a.join("sync-alpha.exe"),
+        "\"status\": \"active\"",
+        Duration::from_secs(10),
+    );
+    wait_for_file_content_contains(
+        &sync_dir_b.join("sync-beta.exe"),
+        "\"status\": \"active\"",
+        Duration::from_secs(10),
+    );
+
+    // Each agent should see the OTHER agent's presence file (synced via server)
+    // Agent A should see sync-beta.exe
+    wait_for_file_content_contains(
+        &sync_dir_a.join("sync-beta.exe"),
+        "\"status\": \"active\"",
+        Duration::from_secs(30),
+    );
+
+    // Agent B should see sync-alpha.exe
+    wait_for_file_content_contains(
+        &sync_dir_b.join("sync-alpha.exe"),
+        "\"status\": \"active\"",
+        Duration::from_secs(30),
+    );
+}
+
+/// CP-wd01: Shutdown sets Stopped status (presence file persists).
+///
+/// Verifies:
+/// 1. Running agent has "active" presence file
+/// 2. After SIGTERM, presence file changes to "stopped"
+/// 3. File persists (not deleted)
+#[test]
+fn test_presence_file_shows_stopped_on_shutdown() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.redb");
+    let sync_dir = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&sync_dir).unwrap();
+    let port = get_available_port();
+    let mqtt_port = get_available_port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+    let mqtt_broker = format!("mqtt://127.0.0.1:{}", mqtt_port);
+
+    let mut guard = ProcessGuard::new();
+    guard.add(spawn_mqtt_broker(mqtt_port));
+    guard.add(spawn_server_with_mqtt(port, &db_path, Some(&mqtt_broker)));
+
+    let client = reqwest::blocking::Client::new();
+
+    // Create fs-root
+    let resp = client
+        .post(format!("{}/docs", server_url))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .expect("Failed to create fs-root document");
+    let body: serde_json::Value = resp.json().expect("Failed to parse fs-root response");
+    let fs_root_id = body["id"].as_str().expect("Missing fs-root id").to_string();
+
+    let root_schema = serde_json::json!({
+        "version": 1,
+        "root": { "type": "dir", "entries": {} }
+    });
+    let resp = client
+        .post(format!("{}/docs/{}/replace", server_url, fs_root_id))
+        .header("Content-Type", "application/json")
+        .body(root_schema.to_string())
+        .send()
+        .expect("Failed to init root schema");
+    assert!(resp.status().is_success());
+
+    // Start sync agent — DON'T add to guard, we need to kill it manually
+    let mut sync = spawn_sync_directory_named(
+        &server_url,
+        &mqtt_broker,
+        &sync_dir,
+        &fs_root_id,
+        "sync-alpha",
+    );
+
+    // Wait for active presence
+    let presence_file = sync_dir.join("sync-alpha.exe");
+    wait_for_file_content_contains(&presence_file, "\"status\": \"active\"", Duration::from_secs(15));
+
+    // Send SIGTERM for graceful shutdown
+    let sync_pid = sync.id();
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(sync_pid as i32, libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sync.kill();
+    }
+
+    // Wait for the process to exit (with timeout)
+    let start = std::time::Instant::now();
+    loop {
+        match sync.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() > Duration::from_secs(10) {
+                    let _ = sync.kill();
+                    let _ = sync.wait();
+                    panic!("Sync process didn't exit within 10 seconds of SIGTERM");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("Error waiting for sync process: {}", e),
+        }
+    }
+
+    // Presence file should still exist with "stopped" status
+    assert!(
+        presence_file.exists(),
+        "Presence file should persist after shutdown"
+    );
+
+    let content = std::fs::read_to_string(&presence_file)
+        .expect("Failed to read presence file after shutdown");
+    let io: serde_json::Value =
+        serde_json::from_str(&content).expect("Invalid JSON in presence file after shutdown");
+    assert_eq!(
+        io["status"], "stopped",
+        "Presence file should show 'stopped' after shutdown, got: {}",
+        io["status"]
+    );
+}

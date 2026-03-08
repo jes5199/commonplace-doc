@@ -3071,6 +3071,12 @@ async fn run_directory_mode(
     // Derive author from name parameter, defaulting to "sync-client"
     let author = name.unwrap_or_else(|| "sync-client".to_string());
 
+    // Register signal handlers early so SIGTERM is caught even during startup/initial sync.
+    // The handler is registered here but the future is polled later in the main select! loop.
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("Failed to register SIGTERM handler");
+
     // Write presence file to advertise sync agent (e.g., sync-client.exe)
     // Uses collision check so multiple agents in the same directory get suffixed names
     let actor_io = ActorIOWriter::with_collision_check(&directory, &author, "exe").await;
@@ -3696,9 +3702,26 @@ async fn run_directory_mode(
         })
     };
 
-    // Wait for Ctrl+C or re-root command
+    // Wait for Ctrl+C/SIGTERM or re-root command
+    // Combine Ctrl+C and SIGTERM into a single shutdown future.
+    // The SIGTERM handler was registered early so signals arriving during
+    // startup are queued rather than causing immediate process exit.
+    let shutdown_signal = async {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.ok();
+        }
+    };
+
     let exit_reason = tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
+        _ = shutdown_signal => {
             info!("Shutting down...");
             SyncExitReason::Shutdown
         }
