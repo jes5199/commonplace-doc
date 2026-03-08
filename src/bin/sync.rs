@@ -3071,8 +3071,8 @@ async fn run_directory_mode(
     // Derive author from name parameter, defaulting to "sync-client"
     let author = name.unwrap_or_else(|| "sync-client".to_string());
 
-    // Write actor IO document to advertise sync agent presence
-    let actor_io = ActorIOWriter::new(&directory, &author);
+    // Write presence file to advertise sync agent (e.g., sync-client.exe)
+    let actor_io = ActorIOWriter::new(&directory, &author, "exe");
     if let Err(e) = actor_io.write_status(ActorStatus::Starting).await {
         warn!("Failed to write actor IO document: {}", e);
     }
@@ -3761,13 +3761,10 @@ async fn run_directory_mode(
         }
     }
 
-    // Emit stopped lifecycle event and clean up actor IO document
+    // Emit stopped lifecycle event and mark presence file as stopped (persistent)
     lifecycle.emit_stopped().await;
-    if let Err(e) = actor_io.update_status(ActorStatus::Stopped).await {
-        warn!("Failed to update actor IO to stopped: {}", e);
-    }
-    if let Err(e) = actor_io.remove().await {
-        warn!("Failed to remove actor IO document: {}", e);
+    if let Err(e) = actor_io.shutdown().await {
+        warn!("Failed to update presence file to stopped: {}", e);
     }
 
     match &exit_reason {

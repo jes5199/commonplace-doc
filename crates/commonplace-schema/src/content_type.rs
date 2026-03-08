@@ -73,6 +73,16 @@ const TEXT_EXTENSIONS: &[(&str, &str)] = &[
     ("cmake", "text/x-cmake"),
     // Binary-looking but synced as text
     ("bin", "text/plain"),
+    // Observer presence extensions (JSON documents)
+    ("who", "application/json"),
+    ("web", "application/json"),
+    ("usr", "application/json"),
+    ("com", "application/json"),
+    ("org", "application/json"),
+    ("alt", "application/json"),
+    ("exe", "application/json"),
+    ("bot", "application/json"),
+    ("actor", "application/json"),
 ];
 
 /// Known binary file extensions.
@@ -83,17 +93,35 @@ const BINARY_EXTENSIONS: &[&str] = &[
     "mp4", "avi", "mkv", "mov", "wmv", "flv", "webm", // Archives
     "zip", "tar", "gz", "bz2", "xz", "7z", "rar", // Documents
     "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp",
-    // Executables
-    "exe", "dll", "so", "dylib", "app", // Other binary
+    // Executables (note: .exe is now a presence extension, not binary)
+    "dll", "so", "dylib", "app", // Other binary
     "wasm", "class", "pyc", "pyo", "o", "a", "lib", // Fonts
     "ttf", "otf", "woff", "woff2", "eot", // Database
     "db", "sqlite", "sqlite3",
+];
+
+/// Observer presence file extensions.
+/// These are first-class JSON documents representing actor presence in a directory.
+/// The extension serves as an honorific — a self-selected declaration of how the
+/// observer wishes to be recognized.
+pub const PRESENCE_EXTENSIONS: &[&str] = &[
+    "who",   // Unknown or undeclared (default)
+    "web",   // Human via web browser
+    "usr",   // Known user
+    "com",   // Communicator (API/integration)
+    "org",   // Organism (embodiment claim)
+    "alt",   // Pseudonym
+    "exe",   // Running process
+    "bot",   // Autonomous software agent
+    "actor", // Vague or hybrid entity
 ];
 
 /// Allowed file extensions for sync operations.
 /// Only files with these extensions will be synced.
 pub const ALLOWED_EXTENSIONS: &[&str] = &[
     "json", "jsonl", "ndjson", "txt", "xml", "xhtml", "bin", "md", "ts", "js",
+    // Observer presence extensions
+    "who", "web", "usr", "com", "org", "alt", "exe", "bot", "actor",
 ];
 
 /// Check if a file path has an allowed extension for syncing.
@@ -519,6 +547,44 @@ mod tests {
         assert!(is_default_content_for_mime("{}", "application/json"));
         assert!(is_default_content_for_mime("", "text/plain"));
         assert!(!is_default_content_for_mime("hello", "text/plain"));
+    }
+
+    #[test]
+    fn test_presence_extensions_are_allowed() {
+        // All observer presence extensions should be allowed for sync
+        for ext in PRESENCE_EXTENSIONS {
+            assert!(
+                is_allowed_extension(Path::new(&format!("test.{}", ext))),
+                "Presence extension .{} should be allowed",
+                ext
+            );
+        }
+    }
+
+    #[test]
+    fn test_presence_extensions_detect_as_json() {
+        // Presence files are JSON documents
+        for ext in PRESENCE_EXTENSIONS {
+            let info = detect_from_path(Path::new(&format!("sync.{}", ext)));
+            assert_eq!(
+                info.mime_type, "application/json",
+                "Presence extension .{} should detect as application/json",
+                ext
+            );
+            assert!(
+                !info.is_binary,
+                "Presence extension .{} should not be binary",
+                ext
+            );
+        }
+    }
+
+    #[test]
+    fn test_exe_is_not_binary() {
+        // .exe is now a presence extension, not a binary executable
+        let info = detect_from_path(Path::new("sync.exe"));
+        assert!(!info.is_binary);
+        assert_eq!(info.mime_type, "application/json");
     }
 
     #[test]
