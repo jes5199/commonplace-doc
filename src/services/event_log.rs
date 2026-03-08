@@ -5,11 +5,14 @@
 //! stored in the file's schema entry.
 
 use crate::document::DocumentStore;
+use crate::mqtt::MqttClient;
 use commonplace_types::content_type::ContentType;
+use rumqttc::QoS;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tracing::warn;
 use yrs::updates::decoder::Decode;
 use yrs::{Array, ReadTxn, Transact, WriteTxn};
 
@@ -45,12 +48,19 @@ impl EventBroadcaster {
     }
 }
 
+/// MQTT broadcast configuration for publishing event notifications.
+struct MqttBroadcastConfig {
+    client: Arc<MqttClient>,
+    workspace: String,
+}
+
 /// Service for managing event log documents.
 ///
 /// Handles lazy creation of JSONL event log docs and appending events.
 pub struct EventLogService {
     store: Arc<DocumentStore>,
     broadcaster: Option<EventBroadcaster>,
+    mqtt_broadcast: Option<MqttBroadcastConfig>,
 }
 
 impl EventLogService {
@@ -58,11 +68,21 @@ impl EventLogService {
         Self {
             store,
             broadcaster: None,
+            mqtt_broadcast: None,
         }
     }
 
     pub fn with_broadcaster(mut self, broadcaster: EventBroadcaster) -> Self {
         self.broadcaster = Some(broadcaster);
+        self
+    }
+
+    /// Enable MQTT broadcast of event notifications.
+    ///
+    /// When set, appended events are published to `{workspace}/red/{log_id}`
+    /// with QoS 0 (best-effort). The persistent JSONL log is the source of truth.
+    pub fn with_mqtt_broadcast(mut self, client: Arc<MqttClient>, workspace: String) -> Self {
+        self.mqtt_broadcast = Some(MqttBroadcastConfig { client, workspace });
         self
     }
 
@@ -109,12 +129,27 @@ impl EventLogService {
                 format!("Failed to apply event log update: {:?}", e).into()
             })?;
 
-        // Notify subscribers
+        // Notify in-process subscribers
         if let Some(ref broadcaster) = self.broadcaster {
             broadcaster.notify(EventNotification {
                 log_id: log_id.clone(),
                 entry: entry.clone(),
             });
+        }
+
+        // Broadcast via MQTT (best-effort, QoS 0)
+        if let Some(ref mqtt) = self.mqtt_broadcast {
+            let topic = format!("{}/red/{}", mqtt.workspace, log_id);
+            match serde_json::to_vec(entry) {
+                Ok(bytes) => {
+                    if let Err(e) = mqtt.client.publish(&topic, &bytes, QoS::AtMostOnce).await {
+                        warn!("Failed to broadcast event to MQTT {}: {}", topic, e);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to serialize event for MQTT broadcast: {}", e);
+                }
+            }
         }
 
         Ok(log_id)
@@ -328,6 +363,14 @@ mod tests {
         assert_eq!(notification.log_id, log_id);
         assert_eq!(notification.entry.event_type, "test:event");
         assert_eq!(notification.entry.source, "unit-test");
+    }
+
+    #[test]
+    fn test_mqtt_broadcast_topic_format() {
+        let workspace = "my-workspace";
+        let log_id = "abc-123";
+        let topic = format!("{}/red/{}", workspace, log_id);
+        assert_eq!(topic, "my-workspace/red/abc-123");
     }
 
     #[test]

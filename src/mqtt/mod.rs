@@ -145,7 +145,7 @@ impl MqttService {
 
         let event_log_service = Arc::new(crate::services::event_log::EventLogService::new(
             document_store.clone(),
-        ));
+        ).with_mqtt_broadcast(client.clone(), workspace.clone()));
         let events_handler = events::EventsHandler::new(client.clone(), workspace.clone())
             .with_event_log_service(event_log_service);
 
