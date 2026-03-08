@@ -93,6 +93,7 @@ impl ActorIOWriter {
             pid: Some(self.pid),
             capabilities: vec!["sync".to_string(), "edit".to_string()],
             metadata: None,
+            docref: None,
         };
 
         let json = serde_json::to_string_pretty(&io)
@@ -120,7 +121,8 @@ impl ActorIOWriter {
             last_heartbeat: Some(now),
             pid: Some(self.pid),
             capabilities: vec!["sync".to_string(), "edit".to_string()],
-            metadata: existing.and_then(|e| e.metadata),
+            metadata: existing.as_ref().and_then(|e| e.metadata.clone()),
+            docref: existing.and_then(|e| e.docref),
         };
 
         let json = serde_json::to_string_pretty(&io)
@@ -272,6 +274,7 @@ mod tests {
             pid: Some(99999),
             capabilities: vec![],
             metadata: None,
+            docref: None,
         };
         let fake_json = serde_json::to_string_pretty(&fake_io).unwrap();
         fs::write(dir.path().join("sync.exe"), &fake_json).await.unwrap();
@@ -301,6 +304,7 @@ mod tests {
             pid: Some(our_pid),
             capabilities: vec![],
             metadata: None,
+            docref: None,
         };
         let json = serde_json::to_string_pretty(&io).unwrap();
         fs::write(dir.path().join("sync.exe"), &json).await.unwrap();
@@ -317,5 +321,31 @@ mod tests {
         // No existing file — should get the plain name
         let writer = ActorIOWriter::with_collision_check(dir.path(), "sync", "exe").await;
         assert_eq!(writer.path(), dir.path().join("sync.exe"));
+    }
+
+    #[tokio::test]
+    async fn test_reroot_reclaims_presence_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Simulate first run: start → active → shutdown (Stopped)
+        let writer1 = ActorIOWriter::with_collision_check(dir.path(), "sync", "exe").await;
+        writer1.write_status(ActorStatus::Starting).await.unwrap();
+        writer1.update_status(ActorStatus::Active).await.unwrap();
+        writer1.shutdown().await.unwrap();
+
+        // Verify file exists with Stopped status
+        let content = fs::read_to_string(writer1.path()).await.unwrap();
+        let io: ActorIO = serde_json::from_str(&content).unwrap();
+        assert_eq!(io.status, ActorStatus::Stopped);
+
+        // Simulate re-root: same PID reclaims the name
+        let writer2 = ActorIOWriter::with_collision_check(dir.path(), "sync", "exe").await;
+        assert_eq!(writer2.path(), dir.path().join("sync.exe")); // Same name, no suffix
+        writer2.write_status(ActorStatus::Starting).await.unwrap();
+
+        // Verify it overwrites with Starting status
+        let content2 = fs::read_to_string(writer2.path()).await.unwrap();
+        let io2: ActorIO = serde_json::from_str(&content2).unwrap();
+        assert_eq!(io2.status, ActorStatus::Starting);
     }
 }

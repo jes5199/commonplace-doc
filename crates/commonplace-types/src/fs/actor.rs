@@ -52,6 +52,11 @@ pub struct ActorIO {
     /// Actor-specific metadata
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+
+    /// DocRef identity: this file's own path:uuid@cid reference.
+    /// Set once the file's UUID is known (after sync assigns it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docref: Option<String>,
 }
 
 /// Conventional filename for actor IO documents.
@@ -71,6 +76,7 @@ mod tests {
             pid: Some(12345),
             capabilities: vec!["sync".to_string(), "edit".to_string()],
             metadata: None,
+            docref: None,
         };
 
         let json = serde_json::to_string_pretty(&io).unwrap();
@@ -138,6 +144,7 @@ mod tests {
                 "node_id": "abc-123",
                 "directory": "/workspace/main"
             })),
+            docref: None,
         };
 
         let json = serde_json::to_string(&io).unwrap();
@@ -146,5 +153,44 @@ mod tests {
             roundtrip.metadata.unwrap()["node_id"],
             "abc-123"
         );
+    }
+
+    #[test]
+    fn test_actor_io_with_docref() {
+        let io = ActorIO {
+            name: "sync".to_string(),
+            status: ActorStatus::Active,
+            started_at: None,
+            last_heartbeat: None,
+            pid: None,
+            capabilities: vec![],
+            metadata: None,
+            docref: Some("workspace/sync.exe:abc-def-123".to_string()),
+        };
+
+        let json = serde_json::to_string_pretty(&io).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["docref"], "workspace/sync.exe:abc-def-123");
+
+        let roundtrip: ActorIO = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.docref.unwrap(), "workspace/sync.exe:abc-def-123");
+    }
+
+    #[test]
+    fn test_actor_io_docref_omitted_when_none() {
+        let io = ActorIO {
+            name: "sync".to_string(),
+            status: ActorStatus::Active,
+            started_at: None,
+            last_heartbeat: None,
+            pid: None,
+            capabilities: vec![],
+            metadata: None,
+            docref: None,
+        };
+
+        let json = serde_json::to_string(&io).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("docref").is_none());
     }
 }
