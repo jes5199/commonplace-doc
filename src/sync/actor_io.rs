@@ -32,6 +32,46 @@ impl ActorIOWriter {
         }
     }
 
+    /// Create a new IO writer with collision detection.
+    ///
+    /// Checks if `{name}.{extension}` already exists and belongs to a different
+    /// PID. If so, appends a short hash suffix: `{name}-{hash}.{extension}`.
+    /// If the file doesn't exist or belongs to our PID (restart), claims the
+    /// plain name.
+    pub async fn with_collision_check(directory: &Path, name: &str, extension: &str) -> Self {
+        let plain_path = directory.join(format!("{}.{}", name, extension));
+        let our_pid = std::process::id();
+
+        let needs_suffix = match fs::read_to_string(&plain_path).await {
+            Ok(content) => {
+                // File exists — check if it belongs to a different PID
+                match serde_json::from_str::<ActorIO>(&content) {
+                    Ok(io) => io.pid != Some(our_pid),
+                    Err(_) => true, // Can't parse — treat as taken
+                }
+            }
+            Err(_) => false, // File doesn't exist — name is available
+        };
+
+        if needs_suffix {
+            // Generate a short hash from our PID for disambiguation
+            let hash = format!("{:x}", our_pid);
+            let short_hash = &hash[..hash.len().min(3)];
+            let filename = format!("{}-{}.{}", name, short_hash, extension);
+            Self {
+                path: directory.join(filename),
+                name: name.to_string(),
+                pid: our_pid,
+            }
+        } else {
+            Self {
+                path: plain_path,
+                name: name.to_string(),
+                pid: our_pid,
+            }
+        }
+    }
+
     /// Create a new IO writer using the legacy `__io.json` filename.
     #[allow(dead_code)]
     pub fn new_legacy(directory: &Path, name: &str) -> Self {
@@ -213,5 +253,69 @@ mod tests {
 
         // Should not error when file doesn't exist
         writer.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_collision_suffix_when_name_taken_by_different_pid() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // First writer claims sync.exe
+        let writer1 = ActorIOWriter::new(dir.path(), "sync", "exe");
+        writer1.write_status(ActorStatus::Active).await.unwrap();
+
+        // Simulate a different PID by writing a fake presence file with PID 99999
+        let fake_io = ActorIO {
+            name: "sync".to_string(),
+            status: ActorStatus::Active,
+            started_at: None,
+            last_heartbeat: None,
+            pid: Some(99999),
+            capabilities: vec![],
+            metadata: None,
+        };
+        let fake_json = serde_json::to_string_pretty(&fake_io).unwrap();
+        fs::write(dir.path().join("sync.exe"), &fake_json).await.unwrap();
+
+        // Second writer should get a suffixed name since sync.exe is taken by PID 99999
+        let writer2 = ActorIOWriter::with_collision_check(dir.path(), "sync", "exe").await;
+        writer2.write_status(ActorStatus::Active).await.unwrap();
+
+        // The suffixed file should exist and NOT be sync.exe
+        assert_ne!(writer2.path(), dir.path().join("sync.exe"));
+        let filename = writer2.path().file_name().unwrap().to_str().unwrap();
+        assert!(filename.starts_with("sync-"), "Expected sync-{{hash}}.exe, got {}", filename);
+        assert!(filename.ends_with(".exe"), "Expected sync-{{hash}}.exe, got {}", filename);
+    }
+
+    #[tokio::test]
+    async fn test_no_collision_suffix_when_name_taken_by_same_pid() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write a presence file with our own PID
+        let our_pid = std::process::id();
+        let io = ActorIO {
+            name: "sync".to_string(),
+            status: ActorStatus::Stopped,
+            started_at: None,
+            last_heartbeat: None,
+            pid: Some(our_pid),
+            capabilities: vec![],
+            metadata: None,
+        };
+        let json = serde_json::to_string_pretty(&io).unwrap();
+        fs::write(dir.path().join("sync.exe"), &json).await.unwrap();
+
+        // Same PID should reclaim the name (e.g., restart scenario)
+        let writer = ActorIOWriter::with_collision_check(dir.path(), "sync", "exe").await;
+        assert_eq!(writer.path(), dir.path().join("sync.exe"));
+    }
+
+    #[tokio::test]
+    async fn test_no_collision_suffix_when_name_available() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // No existing file — should get the plain name
+        let writer = ActorIOWriter::with_collision_check(dir.path(), "sync", "exe").await;
+        assert_eq!(writer.path(), dir.path().join("sync.exe"));
     }
 }

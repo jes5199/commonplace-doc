@@ -3072,7 +3072,8 @@ async fn run_directory_mode(
     let author = name.unwrap_or_else(|| "sync-client".to_string());
 
     // Write presence file to advertise sync agent (e.g., sync-client.exe)
-    let actor_io = ActorIOWriter::new(&directory, &author, "exe");
+    // Uses collision check so multiple agents in the same directory get suffixed names
+    let actor_io = ActorIOWriter::with_collision_check(&directory, &author, "exe").await;
     if let Err(e) = actor_io.write_status(ActorStatus::Starting).await {
         warn!("Failed to write actor IO document: {}", e);
     }
