@@ -36,6 +36,7 @@ use commonplace_doc::sync::{
 use commonplace_types::fs::ActorStatus;
 use commonplace_doc::workspace::is_process_running;
 use commonplace_doc::{DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
+use commonplace_types::config::{CommonplaceConfig, resolve_field};
 use reqwest::Client;
 use rumqttc::QoS;
 use std::any::Any;
@@ -2259,13 +2260,8 @@ async fn handle_file_deleted_crdt(
 #[command(trailing_var_arg = true)]
 struct Args {
     /// Server URL (also reads from COMMONPLACE_SERVER env var)
-    #[arg(
-        short,
-        long,
-        default_value = DEFAULT_SERVER_URL,
-        env = "COMMONPLACE_SERVER"
-    )]
-    server: String,
+    #[arg(short, long, env = "COMMONPLACE_SERVER")]
+    server: Option<String>,
 
     /// Node ID (UUID) to sync with (reads from COMMONPLACE_NODE env var; optional if --path or --fork-from is provided)
     #[arg(short, long, env = "COMMONPLACE_NODE")]
@@ -2368,8 +2364,8 @@ struct Args {
     mqtt_broker: String,
 
     /// MQTT workspace name for topic namespacing (also reads from COMMONPLACE_WORKSPACE env var)
-    #[arg(long, default_value = DEFAULT_WORKSPACE, env = "COMMONPLACE_WORKSPACE")]
-    workspace: String,
+    #[arg(long, env = "COMMONPLACE_WORKSPACE")]
+    workspace: Option<String>,
 
     /// Path to listen for stdout/stderr events from another process.
     /// When set, this sync process subscribes to events at the given path
@@ -2414,6 +2410,9 @@ async fn main() -> ExitCode {
     }
 
     let args = Args::parse();
+    let user_config = CommonplaceConfig::load().unwrap_or_default();
+    let server = resolve_field(args.server, user_config.server.as_deref(), DEFAULT_SERVER_URL);
+    let workspace = resolve_field(args.workspace, user_config.workspace.as_deref(), DEFAULT_WORKSPACE);
 
     // Validate that either --file, --directory, or --sandbox is provided
     if args.file.is_none() && args.directory.is_none() && !args.sandbox {
@@ -2443,12 +2442,12 @@ async fn main() -> ExitCode {
     let mqtt_config = MqttConfig {
         broker_url: args.mqtt_broker.clone(),
         client_id: format!("sync-{}", uuid::Uuid::new_v4()),
-        workspace: args.workspace.clone(),
+        workspace: workspace.clone(),
         ..Default::default()
     };
     let mqtt_client = match MqttClient::connect(mqtt_config).await {
         Ok(mqtt) => {
-            info!("Connected to MQTT broker, workspace: {}", args.workspace);
+            info!("Connected to MQTT broker, workspace: {}", workspace);
             Arc::new(mqtt)
         }
         Err(e) => {
@@ -2469,7 +2468,7 @@ async fn main() -> ExitCode {
     // Configure MQTT-backed ancestry checks for sync direction decisions.
     set_sync_ancestry_mqtt_context(Some(SyncAncestryMqttContext::new(
         mqtt_client.clone(),
-        args.workspace.clone(),
+        workspace.clone(),
     )));
 
     // Initialize local commit store if path provided
@@ -2502,7 +2501,7 @@ async fn main() -> ExitCode {
 
     // Initialize MQTT request/response client for startup operations (path resolution, fork).
     let mqtt_request =
-        match MqttRequestClient::new(mqtt_client.clone(), args.workspace.clone()).await {
+        match MqttRequestClient::new(mqtt_client.clone(), workspace.clone()).await {
             Ok(req) => req,
             Err(e) => {
                 error!("Failed to create MQTT request client: {}", e);
@@ -2668,7 +2667,7 @@ async fn main() -> ExitCode {
             // Log-listener mode: subscribe to events at another path and write to log file
             run_log_listener_mode(
                 client,
-                args.server,
+                server,
                 node_id,
                 sandbox_dir.clone(),
                 scan_options,
@@ -2679,7 +2678,7 @@ async fn main() -> ExitCode {
                 args.shadow_dir,
                 args.name,
                 mqtt_client,
-                args.workspace,
+                workspace,
                 listen_path.clone(),
             )
             .await
@@ -2690,7 +2689,7 @@ async fn main() -> ExitCode {
                 .expect("--sandbox requires --exec or --log-listener");
             run_exec_mode(
                 client,
-                args.server.clone(),
+                server.clone(),
                 node_id,
                 sandbox_dir.clone(),
                 scan_options,
@@ -2704,7 +2703,7 @@ async fn main() -> ExitCode {
                 args.shadow_dir,
                 args.name,
                 mqtt_client,
-                args.workspace,
+                workspace,
                 args.path.clone(),
                 args.sandbox_timeout,
                 args.mqtt_only_sync,
@@ -2763,7 +2762,7 @@ async fn main() -> ExitCode {
             // Exec mode: sync directory, run command, exit when command exits
             run_exec_mode(
                 client,
-                args.server,
+                server,
                 node_id,
                 directory,
                 scan_options,
@@ -2777,7 +2776,7 @@ async fn main() -> ExitCode {
                 args.shadow_dir,
                 args.name,
                 mqtt_client,
-                args.workspace,
+                workspace,
                 args.path.clone(),
                 args.sandbox_timeout,
                 args.mqtt_only_sync,
@@ -2790,7 +2789,7 @@ async fn main() -> ExitCode {
             loop {
                 let result = run_directory_mode(
                     client.clone(),
-                    args.server.clone(),
+                    server.clone(),
                     current_root.clone(),
                     directory.clone(),
                     scan_options.clone(),
@@ -2800,7 +2799,7 @@ async fn main() -> ExitCode {
                     args.pull_only,
                     args.shadow_dir.clone(),
                     mqtt_client.clone(),
-                    args.workspace.clone(),
+                    workspace.clone(),
                     args.name.clone(),
                     args.mqtt_only_sync,
                 )
@@ -2821,7 +2820,7 @@ async fn main() -> ExitCode {
     } else if let Some(file) = args.file {
         run_file_mode(
             client,
-            args.server,
+            server,
             node_id,
             file,
             args.push_only,
@@ -2829,7 +2828,7 @@ async fn main() -> ExitCode {
             args.shadow_dir,
             args.name.clone(),
             mqtt_client,
-            args.workspace,
+            workspace,
         )
         .await
         .map(|_| 0u8)

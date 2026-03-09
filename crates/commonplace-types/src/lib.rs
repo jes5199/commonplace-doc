@@ -2,6 +2,7 @@
 
 pub mod b64;
 pub mod commit;
+pub mod config;
 pub mod content_type;
 pub mod diff;
 pub mod fs;

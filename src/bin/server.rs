@@ -1,7 +1,9 @@
 use clap::Parser;
 use commonplace_doc::{
     cli::Args, create_router_with_config, mqtt::MqttConfig, store::CommitStore, RouterConfig,
+    DEFAULT_WORKSPACE,
 };
+use commonplace_types::config::{CommonplaceConfig, resolve_field};
 use std::net::SocketAddr;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -20,6 +22,9 @@ fn main() {
 async fn async_main() {
     // Parse CLI arguments
     let args = Args::parse();
+
+    let config = CommonplaceConfig::load().unwrap_or_default();
+    let workspace = resolve_field(args.workspace, config.workspace.as_deref(), DEFAULT_WORKSPACE);
 
     // Initialize tracing
     tracing_subscriber::registry()
@@ -50,7 +55,7 @@ async fn async_main() {
         MqttConfig {
             broker_url: broker_url.clone(),
             client_id,
-            workspace: args.workspace.clone(),
+            workspace: workspace.clone(),
             ..Default::default()
         }
     });

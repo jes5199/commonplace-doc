@@ -1,4 +1,3 @@
-use crate::{DEFAULT_MQTT_BROKER_URL, DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
 use clap::Parser;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -29,8 +28,8 @@ pub struct Args {
     pub mqtt_client_id: Option<String>,
 
     /// Workspace name for MQTT topic namespacing
-    #[clap(long, env = "MQTT_WORKSPACE", default_value = DEFAULT_WORKSPACE)]
-    pub workspace: String,
+    #[clap(long, env = "MQTT_WORKSPACE")]
+    pub workspace: Option<String>,
 
     /// Document paths to subscribe via MQTT (repeatable, requires --mqtt-broker)
     /// Paths must include file extensions (e.g., notes/todo.txt, config.json)
@@ -61,8 +60,8 @@ pub struct StoreArgs {
     pub mqtt_client_id: String,
 
     /// Workspace name for MQTT topic namespacing
-    #[clap(long, default_value = DEFAULT_WORKSPACE)]
-    pub workspace: String,
+    #[clap(long)]
+    pub workspace: Option<String>,
 }
 
 /// CLI arguments for commonplace-http (HTTP gateway via MQTT)
@@ -87,8 +86,8 @@ pub struct HttpArgs {
     pub mqtt_client_id: String,
 
     /// Workspace name for MQTT topic namespacing
-    #[clap(long, default_value = DEFAULT_WORKSPACE)]
-    pub workspace: String,
+    #[clap(long)]
+    pub workspace: Option<String>,
 }
 
 /// CLI arguments for the orchestrator binary
@@ -100,7 +99,7 @@ pub struct OrchestratorArgs {
     #[clap(long, default_value = "commonplace.json")]
     pub config: PathBuf,
 
-    /// Override MQTT broker address
+    /// Override MQTT broker URL
     #[clap(long, value_name = "URL")]
     pub mqtt_broker: Option<String>,
 
@@ -113,8 +112,8 @@ pub struct OrchestratorArgs {
     pub only: Option<String>,
 
     /// HTTP server URL for recursive process discovery
-    #[clap(long, value_name = "URL", default_value = DEFAULT_SERVER_URL)]
-    pub server: String,
+    #[clap(long, value_name = "URL")]
+    pub server: Option<String>,
 }
 
 /// CLI arguments for commonplace-cmd (send commands to paths)
@@ -133,16 +132,16 @@ pub struct CmdArgs {
     pub payload: String,
 
     /// MQTT broker URL
-    #[clap(long, default_value = DEFAULT_MQTT_BROKER_URL)]
-    pub mqtt_broker: String,
+    #[clap(long, env = "COMMONPLACE_BROKER")]
+    pub mqtt_broker: Option<String>,
 
     /// Source identifier for the command
     #[clap(long, default_value = "commonplace-cmd")]
     pub source: String,
 
-    /// Workspace name for MQTT topic namespacing (can also be set via MQTT_WORKSPACE env var)
-    #[clap(long, env = "MQTT_WORKSPACE", default_value = DEFAULT_WORKSPACE)]
-    pub workspace: String,
+    /// Workspace name for MQTT topic namespacing
+    #[clap(long, env = "MQTT_WORKSPACE")]
+    pub workspace: Option<String>,
 }
 
 /// CLI arguments for commonplace-link (create document aliases)
@@ -157,8 +156,8 @@ pub struct LinkArgs {
     pub target: PathBuf,
 
     /// Server URL to push schema changes to
-    #[clap(short, long, default_value = DEFAULT_SERVER_URL)]
-    pub server: String,
+    #[clap(short, long)]
+    pub server: Option<String>,
 }
 
 /// CLI arguments for commonplace-uuid (resolve path to UUID)
@@ -210,8 +209,8 @@ pub struct ReplayArgs {
     pub at: Option<String>,
 
     /// Server URL
-    #[clap(long, default_value = DEFAULT_SERVER_URL)]
-    pub server: String,
+    #[clap(long)]
+    pub server: Option<String>,
 
     /// Output in JSON format
     #[clap(long)]
@@ -280,8 +279,8 @@ pub struct LogArgs {
     pub reverse: bool,
 
     /// Server URL
-    #[clap(long, default_value = DEFAULT_SERVER_URL)]
-    pub server: String,
+    #[clap(long)]
+    pub server: Option<String>,
 
     /// Output in JSON format
     #[clap(long)]
@@ -308,8 +307,8 @@ pub struct ShowArgs {
     pub stat: bool,
 
     /// Server URL
-    #[clap(long, default_value = DEFAULT_SERVER_URL)]
-    pub server: String,
+    #[clap(long)]
+    pub server: Option<String>,
 
     /// Output in JSON format
     #[clap(long)]
@@ -477,8 +476,8 @@ pub fn compute_diff_stats(old: &str, new: &str) -> ChangeStats {
 #[clap(about = "Manage red event logs for synced files", long_about = None)]
 pub struct EventArgs {
     /// Server URL
-    #[clap(long, default_value = DEFAULT_SERVER_URL)]
-    pub server: String,
+    #[clap(long)]
+    pub server: Option<String>,
 
     /// Output in JSON format
     #[clap(long)]
@@ -538,12 +537,12 @@ pub enum EventCommand {
 #[command(name = "commonplace-status", about = "Show workspace sync status")]
 pub struct StatusArgs {
     /// MQTT broker URL
-    #[clap(long, env = "COMMONPLACE_BROKER", default_value = DEFAULT_MQTT_BROKER_URL)]
-    pub mqtt_broker: String,
+    #[clap(long, env = "COMMONPLACE_BROKER")]
+    pub mqtt_broker: Option<String>,
 
     /// Workspace name (MQTT topic namespace)
-    #[clap(long, short = 'w', env = "COMMONPLACE_WORKSPACE", default_value = DEFAULT_WORKSPACE)]
-    pub workspace: String,
+    #[clap(long, short = 'w', env = "COMMONPLACE_WORKSPACE")]
+    pub workspace: Option<String>,
 
     /// Workspace directory
     #[clap(long, short, default_value = ".")]
@@ -559,16 +558,16 @@ pub struct StatusArgs {
 #[command(name = "commonplace-branch", about = "Manage workspace branches")]
 pub struct BranchArgs {
     /// MQTT broker URL
-    #[clap(long, env = "COMMONPLACE_BROKER", default_value = DEFAULT_MQTT_BROKER_URL)]
-    pub mqtt_broker: String,
+    #[clap(long, env = "COMMONPLACE_BROKER")]
+    pub mqtt_broker: Option<String>,
 
     /// Workspace name (MQTT topic namespace)
-    #[clap(long, short = 'w', env = "COMMONPLACE_WORKSPACE", default_value = DEFAULT_WORKSPACE)]
-    pub workspace: String,
+    #[clap(long, short = 'w', env = "COMMONPLACE_WORKSPACE")]
+    pub workspace: Option<String>,
 
     /// Server URL (for schema updates)
-    #[clap(long, default_value = DEFAULT_SERVER_URL)]
-    pub server: String,
+    #[clap(long)]
+    pub server: Option<String>,
 
     /// Repo directory (e.g., workspace/myapp)
     #[clap(long, short, default_value = ".")]
@@ -612,16 +611,16 @@ pub enum BranchCommand {
 #[command(name = "commonplace-checkout", about = "Switch active branch")]
 pub struct CheckoutArgs {
     /// MQTT broker URL
-    #[clap(long, env = "COMMONPLACE_BROKER", default_value = DEFAULT_MQTT_BROKER_URL)]
-    pub mqtt_broker: String,
+    #[clap(long, env = "COMMONPLACE_BROKER")]
+    pub mqtt_broker: Option<String>,
 
     /// Workspace name (MQTT topic namespace)
-    #[clap(long, short = 'w', env = "COMMONPLACE_WORKSPACE", default_value = DEFAULT_WORKSPACE)]
-    pub workspace: String,
+    #[clap(long, short = 'w', env = "COMMONPLACE_WORKSPACE")]
+    pub workspace: Option<String>,
 
     /// Server URL (for schema lookups)
-    #[clap(long, default_value = DEFAULT_SERVER_URL)]
-    pub server: String,
+    #[clap(long)]
+    pub server: Option<String>,
 
     /// Workspace directory
     #[clap(long, short, default_value = ".")]
@@ -643,8 +642,8 @@ pub struct InitArgs {
     pub name: String,
 
     /// Server URL
-    #[clap(long, default_value = DEFAULT_SERVER_URL)]
-    pub server: String,
+    #[clap(long)]
+    pub server: Option<String>,
 
     /// Workspace directory (where sync materializes files)
     #[clap(long, short, default_value = ".")]
@@ -656,12 +655,12 @@ pub struct InitArgs {
 #[command(name = "commonplace-worktree", about = "Manage additional branch checkouts")]
 pub struct WorktreeArgs {
     /// MQTT broker URL
-    #[clap(long, env = "COMMONPLACE_BROKER", default_value = DEFAULT_MQTT_BROKER_URL)]
-    pub mqtt_broker: String,
+    #[clap(long, env = "COMMONPLACE_BROKER")]
+    pub mqtt_broker: Option<String>,
 
     /// Workspace name (MQTT topic namespace)
-    #[clap(long, short = 'w', env = "COMMONPLACE_WORKSPACE", default_value = DEFAULT_WORKSPACE)]
-    pub workspace: String,
+    #[clap(long, short = 'w', env = "COMMONPLACE_WORKSPACE")]
+    pub workspace: Option<String>,
 
     /// Workspace directory
     #[clap(long, short, default_value = ".")]

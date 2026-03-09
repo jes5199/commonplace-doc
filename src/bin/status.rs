@@ -6,6 +6,8 @@
 use clap::Parser;
 use commonplace_doc::cli::StatusArgs;
 use commonplace_doc::mqtt::{MqttClient, MqttConfig, MqttRequestClient};
+use commonplace_doc::{DEFAULT_MQTT_BROKER_URL, DEFAULT_WORKSPACE};
+use commonplace_types::config::{CommonplaceConfig, resolve_field};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +15,10 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = StatusArgs::parse();
+
+    let config = CommonplaceConfig::load().unwrap_or_default();
+    let mqtt_broker = resolve_field(args.mqtt_broker, config.mqtt_broker.as_deref(), DEFAULT_MQTT_BROKER_URL);
+    let workspace = resolve_field(args.workspace, config.workspace.as_deref(), DEFAULT_WORKSPACE);
 
     let directory = args.directory.canonicalize().unwrap_or(args.directory);
 
@@ -30,9 +36,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connect to MQTT broker
     let config = MqttConfig {
-        broker_url: args.mqtt_broker.clone(),
+        broker_url: mqtt_broker.clone(),
         client_id: format!("commonplace-status-{}", uuid::Uuid::new_v4()),
-        workspace: args.workspace.clone(),
+        workspace: workspace.clone(),
         ..Default::default()
     };
 
@@ -45,16 +51,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Brief delay for connection establishment
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let request_client = MqttRequestClient::new(client.clone(), args.workspace.clone()).await?;
+    let request_client = MqttRequestClient::new(client.clone(), workspace.clone()).await?;
 
     if args.json {
         let status =
-            build_status_json(&request_client, &args.mqtt_broker, &directory, &schema).await?;
+            build_status_json(&request_client, &mqtt_broker, &directory, &schema).await?;
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
         print_status(
             &request_client,
-            &args.mqtt_broker,
+            &mqtt_broker,
             &directory,
             &schema,
             &sync_state_path,

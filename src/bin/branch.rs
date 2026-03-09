@@ -12,6 +12,8 @@ use clap::Parser;
 use commonplace_doc::cli::{BranchArgs, BranchCommand};
 use commonplace_doc::mqtt::{MqttClient, MqttConfig, MqttRequestClient};
 use commonplace_doc::sync::client::{discover_fs_root, fetch_head, push_schema_to_server};
+use commonplace_doc::{DEFAULT_MQTT_BROKER_URL, DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
+use commonplace_types::config::{CommonplaceConfig, resolve_field};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,15 +22,20 @@ use std::time::Duration;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = BranchArgs::parse();
 
+    let config = CommonplaceConfig::load().unwrap_or_default();
+    let server = resolve_field(args.server, config.server.as_deref(), DEFAULT_SERVER_URL);
+    let mqtt_broker = resolve_field(args.mqtt_broker, config.mqtt_broker.as_deref(), DEFAULT_MQTT_BROKER_URL);
+    let workspace = resolve_field(args.workspace, config.workspace.as_deref(), DEFAULT_WORKSPACE);
+
     let directory = args.directory.canonicalize().unwrap_or(args.directory);
 
     match args.command {
         Some(BranchCommand::Create { name, from }) => {
             // Connect to MQTT for fork operation
             let config = MqttConfig {
-                broker_url: args.mqtt_broker.clone(),
+                broker_url: mqtt_broker.clone(),
                 client_id: format!("commonplace-branch-{}", uuid::Uuid::new_v4()),
-                workspace: args.workspace.clone(),
+                workspace: workspace.clone(),
                 ..Default::default()
             };
 
@@ -41,8 +48,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::sleep(Duration::from_millis(200)).await;
 
             let request_client =
-                MqttRequestClient::new(client.clone(), args.workspace.clone()).await?;
-            create_branch(&request_client, &args.server, &directory, &name, &from).await?;
+                MqttRequestClient::new(client.clone(), workspace.clone()).await?;
+            create_branch(&request_client, &server, &directory, &name, &from).await?;
 
             loop_handle.abort();
         }
@@ -50,13 +57,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             delete_branch(&directory, &name)?;
         }
         Some(BranchCommand::Activate { name }) => {
-            set_branch_sync(&args.server, &directory, &name, true).await?;
+            set_branch_sync(&server, &directory, &name, true).await?;
         }
         Some(BranchCommand::Deactivate { name }) => {
-            set_branch_sync(&args.server, &directory, &name, false).await?;
+            set_branch_sync(&server, &directory, &name, false).await?;
         }
         None => {
-            list_branches(&args.server, &directory).await?;
+            list_branches(&server, &directory).await?;
         }
     }
 

@@ -15,7 +15,9 @@ use commonplace_doc::{
     fs::{DocEntry, Entry, FsSchema},
     sync::{client::push_schema_to_server, SCHEMA_FILENAME},
     workspace::{find_workspace_root, normalize_path, split_path},
+    DEFAULT_SERVER_URL,
 };
+use commonplace_types::config::{resolve_field, CommonplaceConfig};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::fs;
@@ -37,6 +39,9 @@ struct ResolvedPath {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = LinkArgs::parse();
+
+    let config = CommonplaceConfig::load().unwrap_or_default();
+    let server = resolve_field(args.server.clone(), config.server.as_deref(), DEFAULT_SERVER_URL);
 
     // Find the workspace root by searching up for .commonplace.json
     let cwd = std::env::current_dir()?;
@@ -103,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (doc_id, schema_json) in &schemas_to_push {
         match push_schema_to_server(
             &client,
-            &args.server,
+            &server,
             doc_id,
             schema_json,
             "commonplace-link",

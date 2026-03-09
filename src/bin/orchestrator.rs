@@ -6,6 +6,8 @@
 use clap::Parser;
 use commonplace_doc::cli::OrchestratorArgs;
 use commonplace_doc::mqtt::{MqttClient, MqttConfig, MqttRequestClient};
+use commonplace_doc::DEFAULT_SERVER_URL;
+use commonplace_types::config::{CommonplaceConfig, resolve_field};
 use commonplace_doc::orchestrator::{
     prune_stale_status_files, DiscoveredProcessManager, OrchestratorConfig, ProcessManager,
 };
@@ -360,6 +362,10 @@ async fn wait_for_sync_via_mqtt(
 async fn main() {
     let args = OrchestratorArgs::parse();
 
+    let user_config = CommonplaceConfig::load().unwrap_or_default();
+    let server = resolve_field(args.server, user_config.server.as_deref(), DEFAULT_SERVER_URL);
+    let mqtt_broker = args.mqtt_broker.or(user_config.mqtt_broker.clone());
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -423,7 +429,7 @@ async fn main() {
         }
     };
 
-    let broker_raw = args.mqtt_broker.as_ref().unwrap_or(&config.mqtt_broker);
+    let broker_raw = mqtt_broker.as_ref().unwrap_or(&config.mqtt_broker);
 
     // Strip mqtt:// or tcp:// scheme if present (ToSocketAddrs only handles host:port)
     let broker = broker_raw
@@ -465,14 +471,14 @@ async fn main() {
     }
 
     // Start server and sync from commonplace.json, then discover processes recursively
-    tracing::info!("[orchestrator] Server: {}", args.server);
+    tracing::info!("[orchestrator] Server: {}", server);
 
     // First, start server and sync from commonplace.json using ProcessManager
     // This ensures the server is running before we try to discover processes
     let mut base_manager = ProcessManager::new(
         config.clone(),
         &args.config,
-        args.mqtt_broker.clone(),
+        mqtt_broker.clone(),
         args.disable.clone(),
     );
 
@@ -512,7 +518,7 @@ async fn main() {
 
     // Wait for server to be healthy
     let client = reqwest::Client::new();
-    let health_url = build_health_url(&args.server);
+    let health_url = build_health_url(&server);
     tracing::info!("[orchestrator] Waiting for server to be healthy...");
     let mut attempts = 0;
     loop {
@@ -536,7 +542,7 @@ async fn main() {
     }
 
     // Get fs-root ID from server (needed for sync wait polling)
-    let fs_root_id = match discover_fs_root(&client, &args.server).await {
+    let fs_root_id = match discover_fs_root(&client, &server).await {
         Ok(id) => id,
         Err(DiscoverFsRootError::NotConfigured) => {
             tracing::error!("[orchestrator] Server has no fs-root (is --database configured?)");
@@ -605,7 +611,7 @@ async fn main() {
                 .await
                 .is_some()
         } else {
-            wait_for_sync_initial_push(&client, &args.server, &fs_root_id, Duration::from_secs(120))
+            wait_for_sync_initial_push(&client, &server, &fs_root_id, Duration::from_secs(120))
                 .await
         };
 
@@ -644,7 +650,7 @@ async fn main() {
     // Now we can start recursive discovery
     let mut discovered_manager = DiscoveredProcessManager::new(
         broker_raw.to_string(),
-        args.server.clone(),
+        server.clone(),
         request_client.clone(),
         base_manager.status_file_path().to_path_buf(),
     );

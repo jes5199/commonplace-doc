@@ -13,10 +13,16 @@
 use clap::Parser;
 use commonplace_doc::cli::{WorktreeArgs, WorktreeCommand};
 use commonplace_doc::orchestrator::ProcessesConfig;
+use commonplace_doc::{DEFAULT_MQTT_BROKER_URL, DEFAULT_WORKSPACE};
+use commonplace_types::config::{CommonplaceConfig, resolve_field};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = WorktreeArgs::parse();
+
+    let config = CommonplaceConfig::load().unwrap_or_default();
+    let _mqtt_broker = resolve_field(args.mqtt_broker, config.mqtt_broker.as_deref(), DEFAULT_MQTT_BROKER_URL);
+    let _workspace = resolve_field(args.workspace, config.workspace.as_deref(), DEFAULT_WORKSPACE);
 
     let directory = args.directory.canonicalize().unwrap_or(args.directory);
 

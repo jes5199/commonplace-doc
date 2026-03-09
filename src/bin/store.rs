@@ -10,7 +10,9 @@ use commonplace_doc::{
     fs::FilesystemReconciler,
     mqtt::{MqttConfig, MqttService},
     store::CommitStore,
+    DEFAULT_WORKSPACE,
 };
+use commonplace_types::config::{CommonplaceConfig, resolve_field};
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -29,6 +31,10 @@ async fn main() {
         .init();
 
     tracing::info!("Starting commonplace-store");
+
+    // Resolve workspace from config
+    let config = CommonplaceConfig::load().unwrap_or_default();
+    let workspace = resolve_field(args.workspace.clone(), config.workspace.as_deref(), DEFAULT_WORKSPACE);
 
     // Create commit store (required for store binary)
     tracing::info!("Using database at: {}", args.database.display());
@@ -70,7 +76,7 @@ async fn main() {
     let mqtt_config = MqttConfig {
         broker_url: args.mqtt_broker.clone(),
         client_id: args.mqtt_client_id.clone(),
-        workspace: args.workspace.clone(),
+        workspace: workspace.clone(),
         ..Default::default()
     };
 

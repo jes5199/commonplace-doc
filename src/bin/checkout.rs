@@ -12,6 +12,8 @@ use clap::Parser;
 use commonplace_doc::cli::CheckoutArgs;
 use commonplace_doc::mqtt::{MqttClient, MqttConfig};
 use commonplace_doc::sync::client::{discover_fs_root, fetch_head};
+use commonplace_doc::{DEFAULT_MQTT_BROKER_URL, DEFAULT_SERVER_URL, DEFAULT_WORKSPACE};
+use commonplace_types::config::{CommonplaceConfig, resolve_field};
 use rumqttc::QoS;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +21,11 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = CheckoutArgs::parse();
+
+    let config = CommonplaceConfig::load().unwrap_or_default();
+    let server = resolve_field(args.server, config.server.as_deref(), DEFAULT_SERVER_URL);
+    let mqtt_broker = resolve_field(args.mqtt_broker, config.mqtt_broker.as_deref(), DEFAULT_MQTT_BROKER_URL);
+    let workspace = resolve_field(args.workspace, config.workspace.as_deref(), DEFAULT_WORKSPACE);
 
     let directory = args.directory.canonicalize().unwrap_or(args.directory);
 
@@ -30,11 +37,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Fetch schema from server instead of local files
     let http_client = reqwest::Client::new();
-    let root_id = discover_fs_root(&http_client, &args.server)
+    let root_id = discover_fs_root(&http_client, &server)
         .await
         .map_err(|e| format!("Cannot discover fs-root: {}. Is the server running?", e))?;
 
-    let root_head = fetch_head(&http_client, &args.server, &root_id, false)
+    let root_head = fetch_head(&http_client, &server, &root_id, false)
         .await
         .map_err(|e| format!("Cannot read root schema: {}", e))?
         .ok_or("Root schema is empty")?;
@@ -49,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|n| n.as_str())
         .ok_or_else(|| format!("Repo '{}' not found in root schema on server", repo_name))?;
 
-    let repo_head = fetch_head(&http_client, &args.server, repo_node_id, false)
+    let repo_head = fetch_head(&http_client, &server, repo_node_id, false)
         .await
         .map_err(|e| format!("Cannot read repo schema: {}", e))?
         .ok_or_else(|| format!("Repo '{}' schema is empty on server", repo_name))?;
@@ -91,9 +98,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connect to MQTT and send re-root command
     let config = MqttConfig {
-        broker_url: args.mqtt_broker.clone(),
+        broker_url: mqtt_broker.clone(),
         client_id: format!("commonplace-checkout-{}", uuid::Uuid::new_v4()),
-        workspace: args.workspace.clone(),
+        workspace: workspace.clone(),
         ..Default::default()
     };
 
@@ -108,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Publish re-root command
     let topic = format!(
         "{}/commands/__sync/{}/re-root",
-        args.workspace, sync_name
+        workspace, sync_name
     );
     let payload = serde_json::json!({
         "root_uuid": branch_uuid,

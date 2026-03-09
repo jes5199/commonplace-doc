@@ -12,6 +12,8 @@ use commonplace_doc::cli::{
 };
 use commonplace_doc::sync::build_head_at_commit_url;
 use commonplace_doc::workspace::{format_timestamp, resolve_path_to_uuid};
+use commonplace_doc::DEFAULT_SERVER_URL;
+use commonplace_types::config::{resolve_field, CommonplaceConfig};
 use reqwest::Client;
 use serde::Serialize;
 
@@ -31,13 +33,16 @@ struct ShowOutput {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = ShowArgs::parse();
 
+    let config = CommonplaceConfig::load().unwrap_or_default();
+    let server = resolve_field(args.server.clone(), config.server.as_deref(), DEFAULT_SERVER_URL);
+
     // Resolve file path to UUID
     let (uuid, _workspace_root, rel_path) = resolve_path_to_uuid(&args.path)?;
 
     let client = Client::new();
 
     // Fetch content (optionally at specific commit)
-    let head = match fetch_head(&client, &args.server, &uuid, args.commit.as_deref()).await {
+    let head = match fetch_head(&client, &server, &uuid, args.commit.as_deref()).await {
         Ok(h) => h,
         Err(e) => {
             eprintln!("{}", e);
@@ -48,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get commit info (timestamp, etc.)
     let commit_info: Option<CommitChange> = if let Some(ref cid) = head.cid {
         // Fetch changes to find timestamp for this commit
-        fetch_changes(&client, &args.server, &uuid)
+        fetch_changes(&client, &server, &uuid)
             .await
             .ok()
             .and_then(|changes| changes.changes.into_iter().find(|c| &c.commit_id == cid))
@@ -59,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Compute stats if requested
     let stats: Option<ChangeStats> = if args.stat {
         if let (Some(ref cid), Some(ref content)) = (&head.cid, &head.content) {
-            compute_stats(&client, &args.server, &uuid, cid, content).await?
+            compute_stats(&client, &server, &uuid, cid, content).await?
         } else {
             None
         }

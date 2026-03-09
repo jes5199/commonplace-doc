@@ -10,6 +10,8 @@ use commonplace_doc::cli::{fetch_changes, fetch_head, ReplayArgs};
 use commonplace_doc::workspace::{
     find_workspace_root, format_timestamp, normalize_path, resolve_uuid, split_path,
 };
+use commonplace_doc::DEFAULT_SERVER_URL;
+use commonplace_types::config::{resolve_field, CommonplaceConfig};
 use reqwest::Client;
 use serde::Serialize;
 
@@ -39,6 +41,9 @@ struct ContentOutput {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = ReplayArgs::parse();
 
+    let config = CommonplaceConfig::load().unwrap_or_default();
+    let server = resolve_field(args.server.clone(), config.server.as_deref(), DEFAULT_SERVER_URL);
+
     // Find workspace root and resolve UUID
     // Start from the file's parent directory, not cwd, so we work from anywhere
     let cwd = std::env::current_dir()?;
@@ -57,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.list {
         // Fetch commit history
-        let changes = match fetch_changes(&client, &args.server, &uuid).await {
+        let changes = match fetch_changes(&client, &server, &uuid).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("{}", e);
@@ -97,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         // Fetch content (optionally at specific commit)
-        let head = match fetch_head(&client, &args.server, &uuid, args.at.as_deref()).await {
+        let head = match fetch_head(&client, &server, &uuid, args.at.as_deref()).await {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("{}", e);
@@ -107,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Also fetch commit count for context (unless showing historical content)
         let commit_count = if args.at.is_none() {
-            fetch_changes(&client, &args.server, &uuid)
+            fetch_changes(&client, &server, &uuid)
                 .await
                 .ok()
                 .map(|c| c.changes.len())

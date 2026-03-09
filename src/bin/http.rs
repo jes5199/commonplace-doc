@@ -6,7 +6,8 @@
 
 use axum::{routing::get, Router};
 use clap::Parser;
-use commonplace_doc::{cli::HttpArgs, http_gateway, mqtt::MqttConfig};
+use commonplace_doc::{cli::HttpArgs, http_gateway, mqtt::MqttConfig, DEFAULT_WORKSPACE};
+use commonplace_types::config::{CommonplaceConfig, resolve_field};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
@@ -32,11 +33,15 @@ async fn main() {
 
     tracing::info!("Starting commonplace-http gateway");
 
+    // Resolve workspace from config
+    let config = CommonplaceConfig::load().unwrap_or_default();
+    let workspace = resolve_field(args.workspace.clone(), config.workspace.as_deref(), DEFAULT_WORKSPACE);
+
     // Create MQTT config
     let mqtt_config = MqttConfig {
         broker_url: args.mqtt_broker.clone(),
         client_id: args.mqtt_client_id.clone(),
-        workspace: args.workspace.clone(),
+        workspace: workspace.clone(),
         ..Default::default()
     };
 

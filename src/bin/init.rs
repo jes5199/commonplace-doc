@@ -14,11 +14,16 @@
 use clap::Parser;
 use commonplace_doc::cli::InitArgs;
 use commonplace_doc::sync::client::{discover_fs_root, fetch_head, push_schema_to_server};
+use commonplace_doc::DEFAULT_SERVER_URL;
+use commonplace_types::config::{resolve_field, CommonplaceConfig};
 use reqwest::Client;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = InitArgs::parse();
+
+    let config = CommonplaceConfig::load().unwrap_or_default();
+    let server = resolve_field(args.server.clone(), config.server.as_deref(), DEFAULT_SERVER_URL);
 
     // Validate repo name
     if args.name.is_empty()
@@ -32,20 +37,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let client = Client::new();
-    let server = &args.server;
 
     // 1. Discover the fs-root UUID
-    let root_id = discover_fs_root(&client, server).await.map_err(|e| {
+    let root_id = discover_fs_root(&client, &server).await.map_err(|e| {
         format!(
             "Cannot discover fs-root: {}. Is the server running at {}?",
-            e, server
+            e, &server
         )
     })?;
 
     println!("Found root: {}", root_id);
 
     // 2. Check if repo already exists in root schema
-    let root_head = fetch_head(&client, server, &root_id, false)
+    let root_head = fetch_head(&client, &server, &root_id, false)
         .await
         .map_err(|e| format!("Cannot read root schema: {}", e))?;
 
@@ -68,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 3. Create the main branch directory document
-    let main_branch_id = create_directory_doc(&client, server).await?;
+    let main_branch_id = create_directory_doc(&client, &server).await?;
     println!(
         "Created main branch doc: {}",
         &main_branch_id[..8.min(main_branch_id.len())]
@@ -84,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     push_schema_to_server(
         &client,
-        server,
+        &server,
         &main_branch_id,
         &main_schema.to_string(),
         "commonplace-init",
@@ -93,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|e| format!("Failed to set main branch schema: {}", e))?;
 
     // 5. Create the repo container directory document
-    let repo_id = create_directory_doc(&client, server).await?;
+    let repo_id = create_directory_doc(&client, &server).await?;
     println!(
         "Created repo doc: {}",
         &repo_id[..8.min(repo_id.len())]
@@ -114,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     push_schema_to_server(
         &client,
-        server,
+        &server,
         &repo_id,
         &repo_schema.to_string(),
         "commonplace-init",
@@ -137,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     push_schema_to_server(
         &client,
-        server,
+        &server,
         &root_id,
         &root_schema.to_string(),
         "commonplace-init",

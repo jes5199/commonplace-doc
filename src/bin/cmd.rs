@@ -16,7 +16,9 @@ use commonplace_doc::{
     cli::CmdArgs,
     mqtt::{CommandMessage, MqttClient, MqttConfig, Topic},
     sync::{state_file::SyncStateFile, SCHEMA_FILENAME},
+    DEFAULT_MQTT_BROKER_URL, DEFAULT_WORKSPACE,
 };
+use commonplace_types::config::{CommonplaceConfig, resolve_field};
 use rumqttc::QoS;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -137,6 +139,10 @@ fn find_sync_root(start: &Path) -> Result<Option<(PathBuf, PathBuf)>, Box<dyn st
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = CmdArgs::parse();
 
+    let config = CommonplaceConfig::load().unwrap_or_default();
+    let mqtt_broker = resolve_field(args.mqtt_broker, config.mqtt_broker.as_deref(), DEFAULT_MQTT_BROKER_URL);
+    let workspace = resolve_field(args.workspace, config.workspace.as_deref(), DEFAULT_WORKSPACE);
+
     // Resolve the path (handles relative paths in synced directories)
     let resolved_path = resolve_path(&args.path).await?;
 
@@ -151,14 +157,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Build the topic (workspace comes from CLI arg or MQTT_WORKSPACE env var)
-    let topic = Topic::commands(&args.workspace, &resolved_path, &args.verb);
+    let topic = Topic::commands(&workspace, &resolved_path, &args.verb);
     let topic_str = topic.to_topic_string();
 
     // Connect to MQTT
     let config = MqttConfig {
-        broker_url: args.mqtt_broker.clone(),
+        broker_url: mqtt_broker.clone(),
         client_id: format!("commonplace-cmd-{}", uuid::Uuid::new_v4()),
-        workspace: args.workspace.clone(),
+        workspace: workspace.clone(),
         ..Default::default()
     };
 

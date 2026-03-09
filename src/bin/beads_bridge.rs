@@ -10,12 +10,10 @@
 
 use clap::Parser;
 use commonplace_doc::DEFAULT_SERVER_URL;
+use commonplace_types::config::{CommonplaceConfig, resolve_field};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-/// Default server URL
-const DEFAULT_SERVER: &str = DEFAULT_SERVER_URL;
 
 #[derive(Parser)]
 #[command(
@@ -24,8 +22,8 @@ const DEFAULT_SERVER: &str = DEFAULT_SERVER_URL;
 )]
 struct Cli {
     /// Server URL
-    #[arg(long, default_value = DEFAULT_SERVER, env = "COMMONPLACE_SERVER")]
-    server: String,
+    #[arg(long, env = "COMMONPLACE_SERVER")]
+    server: Option<String>,
 
     /// Path in commonplace workspace (default: cbd/data/{repo-name}.issues.jsonl)
     #[arg(long)]
@@ -98,7 +96,7 @@ fn write_config(beads_file: &Path, commonplace_path: &str, server: &str) -> std:
         let config_path = root.join(".cbd.json");
         let config = CbdConfig {
             path: commonplace_path.to_string(),
-            server: if server != DEFAULT_SERVER {
+            server: if server != DEFAULT_SERVER_URL {
                 Some(server.to_string())
             } else {
                 None
@@ -112,6 +110,8 @@ fn write_config(beads_file: &Path, commonplace_path: &str, server: &str) -> std:
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let config = CommonplaceConfig::load().unwrap_or_default();
+    let server = resolve_field(cli.server, config.server.as_deref(), DEFAULT_SERVER_URL);
 
     // Find beads file
     let beads_file = cli
@@ -132,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write config file unless disabled
     if !cli.no_config {
-        if let Err(e) = write_config(&beads_file, &commonplace_path, &cli.server) {
+        if let Err(e) = write_config(&beads_file, &commonplace_path, &server) {
             eprintln!("Warning: Could not write .cbd.json: {}", e);
         }
     }
@@ -144,7 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| PathBuf::from("commonplace-sync"));
 
     let mut cmd = Command::new(&sync_binary);
-    cmd.arg("--server").arg(&cli.server);
+    cmd.arg("--server").arg(&server);
     cmd.arg("--path").arg(&commonplace_path);
     cmd.arg("--file").arg(&beads_file);
 

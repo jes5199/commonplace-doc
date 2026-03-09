@@ -9,6 +9,8 @@
 
 use clap::Parser;
 use commonplace_doc::cli::{EventArgs, EventCommand};
+use commonplace_doc::DEFAULT_SERVER_URL;
+use commonplace_types::config::{resolve_field, CommonplaceConfig};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +41,10 @@ struct JsonLogOutput {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = EventArgs::parse();
+
+    let config = CommonplaceConfig::load().unwrap_or_default();
+    let server = resolve_field(args.server.clone(), config.server.as_deref(), DEFAULT_SERVER_URL);
+
     let client = Client::new();
 
     match args.command {
@@ -52,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let payload_value: serde_json::Value = serde_json::from_str(&payload)
                 .map_err(|e| format!("Invalid JSON payload: {}", e))?;
 
-            let url = format!("{}/docs/{}/events", args.server, target_id);
+            let url = format!("{}/docs/{}/events", server, target_id);
             let resp = client
                 .post(&url)
                 .json(&serde_json::json!({
@@ -95,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let target_id = resolve_target(&target)?;
 
-            let mut url = format!("{}/docs/{}/events", args.server, target_id);
+            let mut url = format!("{}/docs/{}/events", server, target_id);
             let mut params = Vec::new();
             if let Some(s) = since {
                 params.push(format!("since={}", s));
@@ -152,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         EventCommand::Tail { target } => {
             let target_id = resolve_target(&target)?;
-            let url = format!("{}/sse/docs/{}/events", args.server, target_id);
+            let url = format!("{}/sse/docs/{}/events", server, target_id);
 
             eprintln!("Tailing events for {}... (Ctrl+C to stop)", target_id);
 

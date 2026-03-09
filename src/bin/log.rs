@@ -15,6 +15,8 @@ use commonplace_doc::sync::{build_commits_url, build_sse_url};
 use commonplace_doc::workspace::{
     format_timestamp, format_timestamp_short, parse_date, resolve_path_to_uuid,
 };
+use commonplace_doc::DEFAULT_SERVER_URL;
+use commonplace_types::config::{resolve_field, CommonplaceConfig};
 use futures::StreamExt;
 use reqwest::Client;
 use reqwest_eventsource::{Event as SseEvent, EventSource};
@@ -369,13 +371,16 @@ struct LogOutput {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = LogArgs::parse();
 
+    let config = CommonplaceConfig::load().unwrap_or_default();
+    let server = resolve_field(args.server.clone(), config.server.as_deref(), DEFAULT_SERVER_URL);
+
     // Resolve file path to UUID
     let (uuid, _workspace_root, rel_path) = resolve_path_to_uuid(&args.path)?;
 
     let client = Client::new();
 
     // Fetch commits with Yjs updates (single HTTP request)
-    let url = build_commits_url(&args.server, &uuid);
+    let url = build_commits_url(&server, &uuid);
     let resp = client.get(&url).send().await?;
 
     if !resp.status().is_success() {
@@ -433,7 +438,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // If --follow, subscribe to SSE and watch for new commits
     if args.follow {
-        follow_commits(&client, &args, &uuid, graph, decorate).await?;
+        follow_commits(&client, &args, &server, &uuid, graph, decorate).await?;
     }
 
     Ok(())
@@ -443,11 +448,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn follow_commits(
     client: &Client,
     args: &LogArgs,
+    server: &str,
     uuid: &str,
     graph: bool,
     decorate: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sse_url = build_sse_url(&args.server, uuid, false);
+    let sse_url = build_sse_url(server, uuid, false);
 
     eprintln!("Watching for new commits... (Ctrl+C to stop)");
 
