@@ -94,6 +94,7 @@ impl ActorIOWriter {
             capabilities: vec!["sync".to_string(), "edit".to_string()],
             metadata: None,
             docref: None,
+            heartbeat_timeout_seconds: None,
         };
 
         let json = serde_json::to_string_pretty(&io)
@@ -122,7 +123,8 @@ impl ActorIOWriter {
             pid: Some(self.pid),
             capabilities: vec!["sync".to_string(), "edit".to_string()],
             metadata: existing.as_ref().and_then(|e| e.metadata.clone()),
-            docref: existing.and_then(|e| e.docref),
+            docref: existing.as_ref().and_then(|e| e.docref.clone()),
+            heartbeat_timeout_seconds: existing.and_then(|e| e.heartbeat_timeout_seconds),
         };
 
         let json = serde_json::to_string_pretty(&io)
@@ -275,6 +277,7 @@ mod tests {
             capabilities: vec![],
             metadata: None,
             docref: None,
+            heartbeat_timeout_seconds: None,
         };
         let fake_json = serde_json::to_string_pretty(&fake_io).unwrap();
         fs::write(dir.path().join("sync.exe"), &fake_json).await.unwrap();
@@ -305,6 +308,7 @@ mod tests {
             capabilities: vec![],
             metadata: None,
             docref: None,
+            heartbeat_timeout_seconds: None,
         };
         let json = serde_json::to_string_pretty(&io).unwrap();
         fs::write(dir.path().join("sync.exe"), &json).await.unwrap();

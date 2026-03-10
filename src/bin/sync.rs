@@ -2394,6 +2394,12 @@ struct Args {
     /// Default: false (HTTP fallback enabled)
     #[arg(long, default_value = "false", env = "COMMONPLACE_MQTT_ONLY_SYNC")]
     mqtt_only_sync: bool,
+
+    /// Identity UUID for linked presence (from __identities/ registry).
+    /// When set, creates a hot presence entry linked to this UUID.
+    /// When absent, creates an ephemeral presence with a fresh UUID.
+    #[arg(long, env = "COMMONPLACE_IDENTITY_UUID")]
+    identity_uuid: Option<String>,
 }
 
 #[tokio::main]
@@ -2413,6 +2419,7 @@ async fn main() -> ExitCode {
     let user_config = CommonplaceConfig::load().unwrap_or_default();
     let server = resolve_field(args.server, user_config.server.as_deref(), DEFAULT_SERVER_URL);
     let workspace = resolve_field(args.workspace, user_config.workspace.as_deref(), DEFAULT_WORKSPACE);
+    let _identity_uuid = args.identity_uuid.or(user_config.identity_uuid.clone());
 
     // Validate that either --file, --directory, or --sandbox is provided
     if args.file.is_none() && args.directory.is_none() && !args.sandbox {

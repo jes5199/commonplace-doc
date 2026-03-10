@@ -35,6 +35,12 @@ pub struct CommonplaceConfig {
     /// Workspace name for MQTT topic namespacing
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+
+    /// Identity UUID for presence lifecycle.
+    /// When set, the sync agent creates a linked hot presence entry
+    /// pointing to this UUID (which should exist in __identities/).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_uuid: Option<String>,
 }
 
 impl CommonplaceConfig {
@@ -226,6 +232,13 @@ mod tests {
             Some(v) => std::env::set_var("COMMONPLACE_CONFIG", v),
             None => std::env::remove_var("COMMONPLACE_CONFIG"),
         }
+    }
+
+    #[test]
+    fn test_config_with_identity_uuid() {
+        let json = r#"{"identity_uuid": "abc-123-def"}"#;
+        let config: CommonplaceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.identity_uuid.as_deref(), Some("abc-123-def"));
     }
 
     #[test]

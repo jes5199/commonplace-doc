@@ -1,6 +1,7 @@
 mod config;
 mod config_reconciler;
 mod discovered_manager;
+pub mod identity;
 mod discovery;
 mod manager;
 mod mqtt_watcher;

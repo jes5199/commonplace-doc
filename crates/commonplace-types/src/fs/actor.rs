@@ -57,6 +57,12 @@ pub struct ActorIO {
     /// Set once the file's UUID is known (after sync assigns it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docref: Option<String>,
+
+    /// Heartbeat timeout in seconds. If the actor's red event stream
+    /// goes silent for longer than this, its hot presence file is eligible
+    /// for reaping. Defaults by extension: .exe=30, .usr=300, .bot=60, .who=60
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_timeout_seconds: Option<u64>,
 }
 
 /// Conventional filename for actor IO documents.
@@ -77,6 +83,7 @@ mod tests {
             capabilities: vec!["sync".to_string(), "edit".to_string()],
             metadata: None,
             docref: None,
+            heartbeat_timeout_seconds: None,
         };
 
         let json = serde_json::to_string_pretty(&io).unwrap();
@@ -145,6 +152,7 @@ mod tests {
                 "directory": "/workspace/main"
             })),
             docref: None,
+            heartbeat_timeout_seconds: None,
         };
 
         let json = serde_json::to_string(&io).unwrap();
@@ -153,6 +161,24 @@ mod tests {
             roundtrip.metadata.unwrap()["node_id"],
             "abc-123"
         );
+    }
+
+    #[test]
+    fn test_actor_io_with_heartbeat_timeout() {
+        let json = r#"{
+            "name": "sync",
+            "status": "active",
+            "heartbeat_timeout_seconds": 30
+        }"#;
+        let io: ActorIO = serde_json::from_str(json).unwrap();
+        assert_eq!(io.heartbeat_timeout_seconds, Some(30));
+    }
+
+    #[test]
+    fn test_actor_io_default_heartbeat_timeout() {
+        let json = r#"{"name": "sync", "status": "active"}"#;
+        let io: ActorIO = serde_json::from_str(json).unwrap();
+        assert_eq!(io.heartbeat_timeout_seconds, None);
     }
 
     #[test]
@@ -166,6 +192,7 @@ mod tests {
             capabilities: vec![],
             metadata: None,
             docref: Some("workspace/sync.exe:abc-def-123".to_string()),
+            heartbeat_timeout_seconds: None,
         };
 
         let json = serde_json::to_string_pretty(&io).unwrap();
@@ -187,6 +214,7 @@ mod tests {
             capabilities: vec![],
             metadata: None,
             docref: None,
+            heartbeat_timeout_seconds: None,
         };
 
         let json = serde_json::to_string(&io).unwrap();
