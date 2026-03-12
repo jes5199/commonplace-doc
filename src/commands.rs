@@ -102,7 +102,7 @@ fn parse_command_path(path: &str) -> Result<(String, String), CommandError> {
     match path.rsplit_once('/') {
         Some((doc_path, verb)) if !doc_path.is_empty() && !verb.is_empty() => {
             // Check for reserved prefix
-            if doc_path.starts_with("__") {
+            if doc_path.starts_with("__") && !doc_path.starts_with("__identities/") && doc_path != "__identities" {
                 return Err(CommandError::ReservedPath(format!(
                     "Paths starting with '__' are reserved: {}",
                     doc_path
@@ -207,5 +207,15 @@ mod tests {
             parse_command_path("__foo/bar"),
             Err(CommandError::ReservedPath(_))
         ));
+    }
+
+    #[test]
+    fn test_parse_command_path_identities_allowed() {
+        // __identities/ should be allowed through reserved path check
+        let result = parse_command_path("__identities/sync.exe.json/get-info");
+        assert!(result.is_ok());
+        let (doc_path, verb) = result.unwrap();
+        assert_eq!(doc_path, "__identities/sync.exe.json");
+        assert_eq!(verb, "get-info");
     }
 }

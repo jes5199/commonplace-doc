@@ -16,6 +16,8 @@ pub struct ActorIOWriter {
     name: String,
     /// Process ID
     pid: u32,
+    /// Identity UUID from __identities/ (None = ephemeral mode)
+    identity_uuid: Option<String>,
 }
 
 impl ActorIOWriter {
@@ -29,6 +31,7 @@ impl ActorIOWriter {
             path: directory.join(filename),
             name: name.to_string(),
             pid: std::process::id(),
+            identity_uuid: None,
         }
     }
 
@@ -62,12 +65,14 @@ impl ActorIOWriter {
                 path: directory.join(filename),
                 name: name.to_string(),
                 pid: our_pid,
+                identity_uuid: None,
             }
         } else {
             Self {
                 path: plain_path,
                 name: name.to_string(),
                 pid: our_pid,
+                identity_uuid: None,
             }
         }
     }
@@ -79,6 +84,22 @@ impl ActorIOWriter {
             path: directory.join(ACTOR_IO_FILENAME),
             name: name.to_string(),
             pid: std::process::id(),
+            identity_uuid: None,
+        }
+    }
+
+    /// Create an IO writer linked to an existing identity UUID.
+    ///
+    /// The hot presence file references the cold identity in `__identities/`
+    /// via the `docref` field. The schema-level UUID linking (making both
+    /// entries point to the same CRDT document) is handled separately.
+    pub fn new_linked(directory: &Path, name: &str, extension: &str, identity_uuid: String) -> Self {
+        let filename = format!("{}.{}", name, extension);
+        Self {
+            path: directory.join(filename),
+            name: name.to_string(),
+            pid: std::process::id(),
+            identity_uuid: Some(identity_uuid),
         }
     }
 
@@ -93,7 +114,7 @@ impl ActorIOWriter {
             pid: Some(self.pid),
             capabilities: vec!["sync".to_string(), "edit".to_string()],
             metadata: None,
-            docref: None,
+            docref: self.identity_uuid.clone(),
             heartbeat_timeout_seconds: None,
         };
 

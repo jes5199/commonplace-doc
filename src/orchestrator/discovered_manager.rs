@@ -92,6 +92,8 @@ pub struct DiscoveredProcessManager {
     mqtt_workspace: Option<String>,
     /// MQTT request client for fetching document content
     request_client: Arc<MqttRequestClient>,
+    /// Last time we checked for stale presence files
+    last_reap_check: Instant,
 }
 
 impl DiscoveredProcessManager {
@@ -118,6 +120,7 @@ impl DiscoveredProcessManager {
             mqtt_client: None,
             mqtt_workspace: None,
             request_client,
+            last_reap_check: Instant::now(),
         }
     }
 
@@ -416,6 +419,58 @@ impl DiscoveredProcessManager {
             ));
         };
 
+        // Ensure identity exists and pass identity path to sync agent
+        {
+            let http_client = reqwest::Client::new();
+            // Extract repo path from document_path (e.g., "/workspace/app" → "workspace")
+            let clean_path = document_path.trim_start_matches('/');
+            let repo_path = clean_path.split('/').next().unwrap_or(clean_path);
+            match crate::orchestrator::identity::ensure_identity_via_http(
+                &http_client,
+                &self.server_url,
+                repo_path,
+                name,
+                "exe",
+            )
+            .await
+            {
+                Ok(identity_path) => {
+                    // Resolve UUID via MQTT path traversal
+                    let fs_root_id = self.request_client.discover_fs_root().await.unwrap_or_default();
+                    match crate::orchestrator::identity::resolve_identity_uuid(
+                        &self.request_client,
+                        &fs_root_id,
+                        &identity_path,
+                    )
+                    .await
+                    {
+                        Ok(uuid) => {
+                            tracing::info!(
+                                "[identity] Ensured identity for '{}': {}",
+                                name,
+                                uuid
+                            );
+                            cmd.env("COMMONPLACE_IDENTITY_UUID", &uuid);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "[identity] Failed to resolve UUID for '{}': {}",
+                                name,
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[identity] Failed to ensure identity for '{}': {}",
+                        name,
+                        e
+                    );
+                }
+            }
+        }
+
         // Set environment variables for both modes
         cmd.env("COMMONPLACE_PATH", document_path);
         cmd.env("COMMONPLACE_MQTT", &mqtt_broker);
@@ -543,6 +598,67 @@ impl DiscoveredProcessManager {
         }
     }
 
+    /// Reap stale hot presence files for managed processes.
+    ///
+    /// Checks each managed process's presence file via HTTP. If the heartbeat
+    /// has expired and the process is not running locally, deletes the hot
+    /// presence file. The cold identity in `__identities/` is preserved.
+    async fn reap_stale_presence(&self) {
+        let http_client = reqwest::Client::new();
+
+        for (name, process) in &self.processes {
+            // Only reap if the process is not currently running
+            if process.handle.is_some() {
+                continue;
+            }
+
+            // Check for presence files matching {document_path}/{name}.exe
+            let presence_path = format!("{}/{}.exe", process.document_path.trim_start_matches('/'), name);
+            let url = format!("{}/files/{}", self.server_url, encode_path(&presence_path));
+
+            let content = match http_client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => match resp.text().await {
+                    Ok(text) => text,
+                    Err(_) => continue,
+                },
+                _ => continue, // File doesn't exist or error — nothing to reap
+            };
+
+            let io: commonplace_types::fs::actor::ActorIO = match serde_json::from_str(&content) {
+                Ok(io) => io,
+                Err(_) => continue,
+            };
+
+            if crate::orchestrator::identity::is_heartbeat_expired(&io) {
+                // Delete the stale hot presence file
+                let delete_url = format!("{}/files/{}", self.server_url, encode_path(&presence_path));
+                match http_client.delete(&delete_url).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        tracing::info!(
+                            "[reaper] Reaped stale presence file for '{}' at {}",
+                            name,
+                            presence_path
+                        );
+                    }
+                    Ok(resp) => {
+                        tracing::warn!(
+                            "[reaper] Failed to delete stale presence for '{}': HTTP {}",
+                            name,
+                            resp.status()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[reaper] Failed to delete stale presence for '{}': {}",
+                            name,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Run the manager loop, starting all processes and monitoring for restarts.
     pub async fn run(&mut self) -> Result<(), String> {
         self.start_all().await?;
@@ -550,6 +666,12 @@ impl DiscoveredProcessManager {
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             self.check_and_restart().await;
+
+            // Periodically reap stale presence files (every 30 seconds)
+            if self.last_reap_check.elapsed() > Duration::from_secs(30) {
+                self.last_reap_check = Instant::now();
+                self.reap_stale_presence().await;
+            }
         }
     }
 
@@ -957,6 +1079,12 @@ impl DiscoveredProcessManager {
                 // Periodic health check for process restarts
                 _ = monitor_interval.tick() => {
                     self.check_and_restart().await;
+
+                    // Periodically reap stale presence files (every 30 seconds)
+                    if self.last_reap_check.elapsed() > Duration::from_secs(30) {
+                        self.last_reap_check = Instant::now();
+                        self.reap_stale_presence().await;
+                    }
                 }
 
                 // Periodic re-discovery of __processes.json files

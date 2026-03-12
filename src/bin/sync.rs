@@ -2419,7 +2419,7 @@ async fn main() -> ExitCode {
     let user_config = CommonplaceConfig::load().unwrap_or_default();
     let server = resolve_field(args.server, user_config.server.as_deref(), DEFAULT_SERVER_URL);
     let workspace = resolve_field(args.workspace, user_config.workspace.as_deref(), DEFAULT_WORKSPACE);
-    let _identity_uuid = args.identity_uuid.or(user_config.identity_uuid.clone());
+    let identity_uuid = args.identity_uuid.or(user_config.identity_uuid.clone());
 
     // Validate that either --file, --directory, or --sandbox is provided
     if args.file.is_none() && args.directory.is_none() && !args.sandbox {
@@ -2809,6 +2809,7 @@ async fn main() -> ExitCode {
                     workspace.clone(),
                     args.name.clone(),
                     args.mqtt_only_sync,
+                    identity_uuid.clone(),
                 )
                 .await;
                 match result {
@@ -3073,6 +3074,7 @@ async fn run_directory_mode(
     workspace: String,
     name: Option<String>,
     mqtt_only_sync: bool,
+    identity_uuid: Option<String>,
 ) -> Result<SyncExitReason, Box<dyn std::error::Error + Send + Sync>> {
     // Derive author from name parameter, defaulting to "sync-client"
     let author = name.unwrap_or_else(|| "sync-client".to_string());
@@ -3085,7 +3087,11 @@ async fn run_directory_mode(
 
     // Write presence file to advertise sync agent (e.g., sync-client.exe)
     // Uses collision check so multiple agents in the same directory get suffixed names
-    let actor_io = ActorIOWriter::with_collision_check(&directory, &author, "exe").await;
+    let actor_io = if let Some(ref uuid) = identity_uuid {
+        ActorIOWriter::new_linked(&directory, &author, "exe", uuid.clone())
+    } else {
+        ActorIOWriter::with_collision_check(&directory, &author, "exe").await
+    };
     if let Err(e) = actor_io.write_status(ActorStatus::Starting).await {
         warn!("Failed to write actor IO document: {}", e);
     }
@@ -3791,10 +3797,18 @@ async fn run_directory_mode(
         }
     }
 
-    // Emit stopped lifecycle event and mark presence file as stopped (persistent)
+    // Emit stopped lifecycle event and clean up presence
     lifecycle.emit_stopped().await;
-    if let Err(e) = actor_io.shutdown().await {
-        warn!("Failed to update presence file to stopped: {}", e);
+    if identity_uuid.is_some() {
+        // Linked mode: remove hot presence file (cold identity persists in __identities/)
+        if let Err(e) = actor_io.remove().await {
+            warn!("Failed to remove hot presence file: {}", e);
+        }
+    } else {
+        // Ephemeral mode: mark as stopped (file persists)
+        if let Err(e) = actor_io.shutdown().await {
+            warn!("Failed to update presence file to stopped: {}", e);
+        }
     }
 
     match &exit_reason {

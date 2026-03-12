@@ -58,6 +58,73 @@ pub fn default_heartbeat_timeout(extension: &str) -> u64 {
     }
 }
 
+/// Ensure an identity exists in `__identities/` for the given actor.
+///
+/// Uses HTTP to create the identity document via `/files/path/replace?create=true`.
+/// Returns the identity path. The UUID can be resolved later via path resolution.
+///
+/// This is idempotent — if the identity already exists, it's a no-op (the replace
+/// only updates if content differs).
+pub async fn ensure_identity_via_http(
+    http_client: &reqwest::Client,
+    server: &str,
+    repo_path: &str,
+    name: &str,
+    extension: &str,
+) -> Result<String, String> {
+    let identity_filename = format!("{}.{}.json", name, extension);
+    let identity_path = format!(
+        "{}/__identities/{}",
+        repo_path.trim_start_matches('/'),
+        identity_filename
+    );
+
+    let timeout = default_heartbeat_timeout(extension);
+    let io = ActorIO {
+        name: name.to_string(),
+        status: ActorStatus::Stopped,
+        started_at: None,
+        last_heartbeat: None,
+        pid: None,
+        capabilities: vec![],
+        metadata: None,
+        docref: None,
+        heartbeat_timeout_seconds: Some(timeout),
+    };
+
+    let content = serde_json::to_string_pretty(&io)
+        .map_err(|e| format!("Failed to serialize identity: {}", e))?;
+
+    let url = format!("{}/files/{}/replace?create=true", server, identity_path);
+    let resp = http_client
+        .post(&url)
+        .body(content)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to create identity: {}", e))?;
+
+    if resp.status().is_success() {
+        Ok(identity_path)
+    } else {
+        Err(format!(
+            "Failed to create identity: HTTP {}",
+            resp.status()
+        ))
+    }
+}
+
+/// Resolve an identity path to its UUID via MQTT path traversal.
+pub async fn resolve_identity_uuid(
+    mqtt_client: &crate::mqtt::MqttRequestClient,
+    fs_root: &str,
+    identity_path: &str,
+) -> Result<String, String> {
+    mqtt_client
+        .resolve_path_to_uuid(fs_root, identity_path)
+        .await
+        .map_err(|e| format!("Failed to resolve identity UUID: {}", e))
+}
+
 /// Check if a presence file's heartbeat has expired.
 pub fn is_heartbeat_expired(io: &ActorIO) -> bool {
     let timeout = io.heartbeat_timeout_seconds.unwrap_or(60);
