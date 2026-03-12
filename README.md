@@ -111,6 +111,46 @@ commonplace-link source.txt target.txt
 
 After linking, changes to either file sync to the other through commonplace.
 
+### commonplace-checkout
+
+Switch a running sync agent's target directory. Accepts paths, UUIDs, or docrefs:
+
+```bash
+commonplace-checkout workspace/main/bartleby          # Path
+commonplace-checkout 0847bb0b-d991-43e3-a960-edc18fc01965  # UUID
+commonplace-checkout "path:uuid@cid"                   # Docref
+commonplace-checkout workspace                         # Repo level (branches become dirs)
+commonplace-checkout workspace/main/bartleby --sync-name my-sync  # Target specific agent
+```
+
+The target must be a directory. The command resolves the target to a UUID and sends a re-root command to the sync agent, which tears down and restarts pointing at the new location. Presence files follow the re-root automatically.
+
+## Presence Files
+
+Sync agents advertise their presence via files in the synced directory. The filename uses an honorific extension indicating actor type:
+
+| Extension | Meaning | Example |
+|-----------|---------|---------|
+| `.usr`    | Human user | `jes.usr` |
+| `.exe`    | Process/daemon | `sync-client.exe` |
+| `.bot`    | Bot/AI agent | `claude.bot` |
+| `.who`    | Unknown | `visitor.who` |
+
+Control the presence filename with `--presence`:
+
+```bash
+# Sync as a human user
+commonplace-sync --directory ~/workspace --presence jes.usr ...
+
+# Sync as a bot
+commonplace-sync --directory ~/workspace --presence claude.bot ...
+
+# Default (no --presence): creates {name}.exe
+commonplace-sync --directory ~/workspace ...
+```
+
+If a file with the same name exists for a different PID, a short hash suffix is appended (e.g., `jes-a1f.usr`). Presence files contain JSON with name, status, PID, heartbeat timestamp, and capabilities. The orchestrator's heartbeat reaper cleans up stale presence files automatically.
+
 ## API Endpoints
 
 See `docs/API.md` for detailed request/response examples.
