@@ -290,6 +290,56 @@ commonplace-event --json log <uuid>
 
 Link two files to share the same UUID (see "File Linking" section below).
 
+#### commonplace-checkout
+
+Switch a running sync agent's target directory. Accepts paths, UUIDs, or docrefs:
+
+```bash
+# Checkout a subdirectory by path
+commonplace-checkout workspace/main/bartleby
+
+# Checkout by UUID
+commonplace-checkout 0847bb0b-d991-43e3-a960-edc18fc01965
+
+# Checkout by docref
+commonplace-checkout "workspace/sync.exe:abc-def-123@commit-id"
+
+# Checkout the repo level (all branches become subdirectories)
+commonplace-checkout workspace
+
+# Target a specific sync agent (default: sync-client)
+commonplace-checkout workspace/main/bartleby --sync-name my-sync
+```
+
+The target must be a directory, not a single file. The command resolves the target to a UUID and sends a re-root MQTT command to the sync agent, which tears down and restarts pointing at the new location.
+
+### Presence Files
+
+Sync agents advertise their presence via files in the synced directory. The filename uses an honorific extension that indicates the actor type:
+
+- `.usr` — human user (e.g., `jes.usr`)
+- `.exe` — process/daemon (e.g., `sync-client.exe`)
+- `.bot` — bot/AI agent (e.g., `claude.bot`)
+- `.who` — unknown
+
+Control the presence filename with `--presence`:
+
+```bash
+# Human user syncing a directory
+commonplace-sync --directory ~/workspace --presence jes.usr --mqtt-broker mqtt://localhost:1883
+
+# Bot syncing
+commonplace-sync --directory ~/workspace --presence claude.bot --mqtt-broker mqtt://localhost:1883
+
+# Default (no --presence flag): uses {name}.exe
+commonplace-sync --directory ~/workspace --mqtt-broker mqtt://localhost:1883
+# Creates sync-client.exe
+```
+
+If a presence file with the same name already exists for a different PID, a short hash suffix is appended (e.g., `jes-a1f.usr`) to avoid collisions.
+
+Presence files contain JSON with name, status, PID, heartbeat timestamp, and capabilities. The orchestrator's heartbeat reaper cleans up stale presence files when the owning process is no longer running.
+
 ## Development Commands
 
 - `cargo build` - Build all binaries
