@@ -608,7 +608,7 @@ pub enum BranchCommand {
 
 /// Arguments for `commonplace-checkout`.
 #[derive(Parser)]
-#[command(name = "commonplace-checkout", about = "Switch active branch")]
+#[command(name = "commonplace-checkout", about = "Switch sync target (path, UUID, or docref)")]
 pub struct CheckoutArgs {
     /// MQTT broker URL
     #[clap(long, env = "COMMONPLACE_BROKER")]
@@ -626,12 +626,13 @@ pub struct CheckoutArgs {
     #[clap(long, short, default_value = ".")]
     pub directory: PathBuf,
 
-    /// Name of the sync agent to re-root (must match the --author used by the sync process)
+    /// Name of the sync agent to re-root (must match the --name used by the sync process)
     #[clap(long, env = "COMMONPLACE_SYNC_NAME", default_value = "sync-client")]
     pub sync_name: String,
 
-    /// Branch name to checkout
-    pub branch: String,
+    /// Target to checkout: a path (workspace/main/bartleby), UUID, or docref (path:uuid@cid).
+    /// Must resolve to a directory, not a single file.
+    pub target: String,
 }
 
 /// Arguments for `commonplace-init`.

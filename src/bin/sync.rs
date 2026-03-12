@@ -2400,6 +2400,14 @@ struct Args {
     /// When absent, creates an ephemeral presence with a fresh UUID.
     #[arg(long, env = "COMMONPLACE_IDENTITY_UUID")]
     identity_uuid: Option<String>,
+
+    /// Presence filename with honorific extension (e.g. "jes.usr", "claude.bot").
+    /// Controls the name and extension of the presence file created in the sync directory.
+    /// The extension carries semantic meaning: .usr (human), .exe (process), .bot (bot), .who (unknown).
+    /// If a file with this name already exists for a different PID, a short hash suffix is appended.
+    /// Falls back to {name}.exe if not provided.
+    #[arg(long, env = "COMMONPLACE_PRESENCE")]
+    presence: Option<String>,
 }
 
 #[tokio::main]
@@ -2810,6 +2818,7 @@ async fn main() -> ExitCode {
                     args.name.clone(),
                     args.mqtt_only_sync,
                     identity_uuid.clone(),
+                    args.presence.clone(),
                 )
                 .await;
                 match result {
@@ -3075,9 +3084,23 @@ async fn run_directory_mode(
     name: Option<String>,
     mqtt_only_sync: bool,
     identity_uuid: Option<String>,
+    presence: Option<String>,
 ) -> Result<SyncExitReason, Box<dyn std::error::Error + Send + Sync>> {
     // Derive author from name parameter, defaulting to "sync-client"
     let author = name.unwrap_or_else(|| "sync-client".to_string());
+
+    // Parse presence filename into (name, extension), or fall back to (author, "exe")
+    let (presence_name, presence_ext) = if let Some(ref p) = presence {
+        match p.rsplit_once('.') {
+            Some((n, ext)) if !n.is_empty() && !ext.is_empty() => (n.to_string(), ext.to_string()),
+            _ => {
+                warn!("Invalid --presence format '{}', expected 'name.ext' (e.g. 'jes.usr'). Using default.", p);
+                (author.clone(), "exe".to_string())
+            }
+        }
+    } else {
+        (author.clone(), "exe".to_string())
+    };
 
     // Register signal handlers early so SIGTERM is caught even during startup/initial sync.
     // The handler is registered here but the future is polled later in the main select! loop.
@@ -3085,12 +3108,12 @@ async fn run_directory_mode(
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("Failed to register SIGTERM handler");
 
-    // Write presence file to advertise sync agent (e.g., sync-client.exe)
+    // Write presence file (e.g., jes.usr, sync-client.exe)
     // Uses collision check so multiple agents in the same directory get suffixed names
     let actor_io = if let Some(ref uuid) = identity_uuid {
-        ActorIOWriter::new_linked(&directory, &author, "exe", uuid.clone())
+        ActorIOWriter::new_linked(&directory, &presence_name, &presence_ext, uuid.clone())
     } else {
-        ActorIOWriter::with_collision_check(&directory, &author, "exe").await
+        ActorIOWriter::with_collision_check(&directory, &presence_name, &presence_ext).await
     };
     if let Err(e) = actor_io.write_status(ActorStatus::Starting).await {
         warn!("Failed to write actor IO document: {}", e);
