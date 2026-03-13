@@ -174,7 +174,7 @@ pub async fn push_schema_to_server(
 }
 
 /// Check if two JSON strings are semantically equal (ignoring whitespace/formatting).
-fn json_content_equal(old: Option<&str>, new: &str) -> bool {
+pub(crate) fn json_content_equal(old: Option<&str>, new: &str) -> bool {
     if let Some(old) = old {
         let old_parsed: Result<serde_json::Value, _> = serde_json::from_str(old);
         let new_parsed: Result<serde_json::Value, _> = serde_json::from_str(new);

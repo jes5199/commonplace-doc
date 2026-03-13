@@ -1600,7 +1600,7 @@ async fn push_nested_schemas_recursive(
                                 "Pushing nested schema from {:?} to document {}",
                                 nested_schema_path, node_id
                             );
-                            if let Err(e) = push_schema_to_server(
+                            if let Err(e) = push_schema_prefer_mqtt(
                                 client,
                                 server,
                                 node_id,
@@ -2391,7 +2391,7 @@ async fn create_documents_for_null_entries(
                                     }
 
                                     // Push the subdirectory schema to server
-                                    if let Err(e) = push_schema_to_server(
+                                    if let Err(e) = push_schema_prefer_mqtt(
                                         client,
                                         server,
                                         node_id,
@@ -2524,7 +2524,7 @@ pub async fn sync_schema(
 
         // Push schema with UUIDs (no more nulls)
         info!("Pushing filesystem schema to server...");
-        push_schema_to_server(client, server, fs_root_id, &schema_json_with_uuids, author).await?;
+        push_schema_prefer_mqtt(client, server, fs_root_id, &schema_json_with_uuids, author).await?;
         info!("Schema pushed successfully");
 
         // Write the schema with UUIDs to local file
@@ -2657,6 +2657,99 @@ pub(crate) async fn fetch_head_prefer_mqtt(
     fetch_head(client, server, id, use_paths).await
 }
 
+/// Push a schema to the server, preferring MQTT when available, falling back to HTTP.
+///
+/// MQTT path: get_head → create_document (if needed) → edit_document
+/// HTTP fallback: push_schema_to_server (existing HTTP implementation)
+pub(crate) async fn push_schema_prefer_mqtt(
+    client: &reqwest::Client,
+    server: &str,
+    fs_root_id: &str,
+    schema_json: &str,
+    author: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::sync::schema_io::get_sync_schema_mqtt_request_client;
+    use crate::sync::create_yjs_json_merge;
+    use crate::sync::transport::client::json_content_equal;
+
+    if let Some(mqtt_request) = get_sync_schema_mqtt_request_client() {
+        // Fetch current content via MQTT
+        let (old_content, base_state) = match mqtt_request.get_head(fs_root_id).await {
+            Ok(Some(head)) => (Some(head.content), head.state),
+            Ok(None) => {
+                // Document doesn't exist, create it via MQTT
+                info!(
+                    "Creating document {} before pushing schema (MQTT)",
+                    fs_root_id
+                );
+                let resp = mqtt_request
+                    .create_document("application/json", Some(fs_root_id))
+                    .await;
+                match resp {
+                    Ok(r) if r.error.is_none() => {}
+                    Ok(r) => {
+                        return Err(format!(
+                            "MQTT create-document failed for {}: {}",
+                            fs_root_id,
+                            r.error.unwrap_or_default()
+                        )
+                        .into());
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "MQTT create-document failed for {}, falling back to HTTP: {}",
+                            fs_root_id,
+                            e
+                        );
+                        return push_schema_to_server(client, server, fs_root_id, schema_json, author).await;
+                    }
+                }
+                (None, None)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "MQTT get_head failed for {}, falling back to HTTP: {}",
+                    fs_root_id,
+                    e
+                );
+                return push_schema_to_server(client, server, fs_root_id, schema_json, author).await;
+            }
+        };
+
+        // Skip if unchanged
+        if json_content_equal(old_content.as_deref(), schema_json) {
+            debug!("Schema unchanged, skipping push to server");
+            return Ok(());
+        }
+
+        // Create Yjs merge update
+        let update = create_yjs_json_merge(schema_json, base_state.as_deref())
+            .map_err(|e| format!("Failed to create JSON update: {}", e))?;
+
+        // Publish edit via MQTT
+        match mqtt_request
+            .edit_document(
+                fs_root_id,
+                update,
+                author,
+                Some("Update filesystem schema".to_string()),
+            )
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    "MQTT edit_document failed for {}, falling back to HTTP: {}",
+                    fs_root_id,
+                    e
+                );
+            }
+        }
+    }
+
+    push_schema_to_server(client, server, fs_root_id, schema_json, author).await
+}
+
 pub async fn ensure_fs_root_exists_mqtt(
     mqtt_request: &crate::mqtt::MqttRequestClient,
     fs_root_id: &str,
@@ -2780,8 +2873,8 @@ pub async fn handle_schema_modified(
             .await
             .map_err(|e| format!("Failed to publish schema via MQTT: {}", e))?;
         } else {
-            info!("Pushing root schema via HTTP (fs_root_id: {})", fs_root_id);
-            push_schema_to_server(client, server, fs_root_id, content, author).await?;
+            info!("Pushing root schema via MQTT-preferred (fs_root_id: {})", fs_root_id);
+            push_schema_prefer_mqtt(client, server, fs_root_id, content, author).await?;
         }
         return Ok(());
     }
@@ -2875,11 +2968,11 @@ pub async fn handle_schema_modified(
         .map_err(|e| format!("Failed to publish nested schema via MQTT: {}", e))?;
     } else {
         info!(
-            "Pushing nested schema {} via HTTP (node_id: {})",
+            "Pushing nested schema {} via MQTT-preferred (node_id: {})",
             schema_path.display(),
             current_node_id
         );
-        push_schema_to_server(client, server, &current_node_id, content, author).await?;
+        push_schema_prefer_mqtt(client, server, &current_node_id, content, author).await?;
     }
 
     Ok(())

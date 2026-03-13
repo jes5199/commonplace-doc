@@ -541,26 +541,7 @@ async fn main() {
         }
     }
 
-    // Get fs-root ID from server (needed for sync wait polling)
-    let fs_root_id = match discover_fs_root(&client, &server).await {
-        Ok(id) => id,
-        Err(DiscoverFsRootError::NotConfigured) => {
-            tracing::error!("[orchestrator] Server has no fs-root (is --database configured?)");
-            base_manager.shutdown().await;
-            std::process::exit(1);
-        }
-        Err(e) => {
-            tracing::error!("[orchestrator] Failed to get fs-root: {}", e);
-            base_manager.shutdown().await;
-            std::process::exit(1);
-        }
-    };
-    tracing::info!(
-        "[orchestrator] Got fs-root ID: {}",
-        &fs_root_id[..8.min(fs_root_id.len())]
-    );
-
-    // Connect to MQTT if configured (for sync-complete event subscription)
+    // Connect to MQTT if configured (moved before fs-root discovery to enable MQTT-first)
     let mqtt_client: Option<Arc<MqttClient>> = if !broker_raw.is_empty() {
         let mqtt_config = MqttConfig {
             broker_url: broker_raw.to_string(),
@@ -594,6 +575,74 @@ async fn main() {
     } else {
         None
     };
+
+    // Get fs-root ID: prefer MQTT retained message, fall back to HTTP
+    let fs_root_id = if let Some(ref mqtt) = mqtt_client {
+        match MqttRequestClient::new(mqtt.clone(), config.workspace.clone()).await {
+            Ok(mqtt_req) => match mqtt_req.discover_fs_root().await {
+                Ok(id) => {
+                    tracing::info!("[orchestrator] Discovered fs-root via MQTT");
+                    id
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[orchestrator] MQTT fs-root discovery failed, falling back to HTTP: {}",
+                        e
+                    );
+                    match discover_fs_root(&client, &server).await {
+                        Ok(id) => id,
+                        Err(DiscoverFsRootError::NotConfigured) => {
+                            tracing::error!("[orchestrator] Server has no fs-root (is --database configured?)");
+                            base_manager.shutdown().await;
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            tracing::error!("[orchestrator] Failed to get fs-root: {}", e);
+                            base_manager.shutdown().await;
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "[orchestrator] Failed to create MQTT request client, falling back to HTTP: {}",
+                    e
+                );
+                match discover_fs_root(&client, &server).await {
+                    Ok(id) => id,
+                    Err(DiscoverFsRootError::NotConfigured) => {
+                        tracing::error!("[orchestrator] Server has no fs-root (is --database configured?)");
+                        base_manager.shutdown().await;
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        tracing::error!("[orchestrator] Failed to get fs-root: {}", e);
+                        base_manager.shutdown().await;
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    } else {
+        match discover_fs_root(&client, &server).await {
+            Ok(id) => id,
+            Err(DiscoverFsRootError::NotConfigured) => {
+                tracing::error!("[orchestrator] Server has no fs-root (is --database configured?)");
+                base_manager.shutdown().await;
+                std::process::exit(1);
+            }
+            Err(e) => {
+                tracing::error!("[orchestrator] Failed to get fs-root: {}", e);
+                base_manager.shutdown().await;
+                std::process::exit(1);
+            }
+        }
+    };
+    tracing::info!(
+        "[orchestrator] Got fs-root ID: {}",
+        &fs_root_id[..8.min(fs_root_id.len())]
+    );
 
     // Start sync if configured (to push initial content to server)
     if config.processes.contains_key("sync") {

@@ -509,6 +509,41 @@ impl MqttRequestClient {
         Ok(current_id)
     }
 
+    /// Publish an edit (Yjs update) to a document via MQTT.
+    ///
+    /// Publishes an `EditMessage` to `{workspace}/edits/{node_id}`.
+    /// This is fire-and-forget — the MQTT broker delivers it to the server
+    /// which applies the update and fans out via retained messages.
+    pub async fn edit_document(
+        &self,
+        node_id: &str,
+        update: String,
+        author: &str,
+        message: Option<String>,
+    ) -> Result<(), MqttError> {
+        use crate::mqtt::messages::EditMessage;
+
+        let edit_msg = EditMessage {
+            update,
+            parents: vec![],
+            author: author.to_string(),
+            message,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            req: None,
+        };
+
+        let payload =
+            serde_json::to_vec(&edit_msg).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+
+        let topic = format!("{}/edits/{}", self.workspace, node_id);
+        self.client
+            .publish(&topic, &payload, QoS::AtLeastOnce)
+            .await
+    }
+
     /// Get a reference to the underlying MQTT client.
     pub fn client(&self) -> &Arc<MqttClient> {
         &self.client
