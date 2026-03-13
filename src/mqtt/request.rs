@@ -389,6 +389,28 @@ impl MqttRequestClient {
         }
     }
 
+    /// Get document HEAD via MQTT (content, cid, state).
+    ///
+    /// MQTT equivalent of HTTP `GET /docs/{id}/head`. Returns `Ok(None)` if the
+    /// document doesn't exist, matching the semantics of `fetch_head`.
+    pub async fn get_head(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::sync::HeadResponse>, MqttError> {
+        let response = self.get_content(id).await?;
+
+        if response.error.is_some() {
+            return Ok(None);
+        }
+
+        let content = response.content.unwrap_or_default();
+        Ok(Some(crate::sync::HeadResponse {
+            cid: response.cid,
+            content,
+            state: response.state,
+        }))
+    }
+
     /// Resolve a path relative to fs-root to a UUID by traversing schema documents via MQTT.
     ///
     /// This is the MQTT equivalent of HTTP path traversal:

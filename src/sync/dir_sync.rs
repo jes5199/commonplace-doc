@@ -1068,7 +1068,7 @@ pub async fn handle_subdir_new_files(
         }
 
         // Fetch content from server
-        let fetch_result = fetch_head(client, server, &identifier, use_paths).await;
+        let fetch_result = fetch_head_prefer_mqtt(client, server, &identifier, use_paths).await;
 
         // Track if we have a valid UUID from MQTT schema for fallback when HTTP returns 404
         let has_mqtt_uuid = node_id.is_some() && crdt_context.is_some();
@@ -1501,7 +1501,7 @@ pub async fn create_subdir_nested_directories(
     subdir_directory: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Fetch the subdirectory's schema from server
-    let head = match fetch_head(client, server, subdir_node_id, false).await {
+    let head = match fetch_head_prefer_mqtt(client, server, subdir_node_id, false).await {
         Ok(Some(h)) => h,
         Ok(None) => return Err(format!("Subdir {} not found", subdir_node_id).into()),
         Err(e) => return Err(format!("Failed to fetch subdir schema: {}", e).into()),
@@ -1586,7 +1586,7 @@ async fn push_nested_schemas_recursive(
                     // Validate it's a proper schema
                     if let Ok(parsed_schema) = serde_json::from_str::<FsSchema>(&local_schema) {
                         // Check if server document is empty or has different content
-                        let should_push = match fetch_head(client, server, node_id, false).await {
+                        let should_push = match fetch_head_prefer_mqtt(client, server, node_id, false).await {
                             Ok(Some(head)) => {
                                 // Push if server is empty or has trivial content
                                 head.content.is_empty() || head.content == "{}"
@@ -1815,7 +1815,7 @@ pub async fn handle_schema_change(
             }
 
             // Fetch content from server
-            if let Ok(Some(file_head)) = fetch_head(client, server, &identifier, use_paths).await {
+            if let Ok(Some(file_head)) = fetch_head_prefer_mqtt(client, server, &identifier, use_paths).await {
                 // Skip writing if content is empty - the MQTT retained message
                 // will provide the actual content. Writing empty would clobber
                 // content that arrives via MQTT.
@@ -2468,7 +2468,7 @@ pub async fn sync_schema(
                         _ => None,
                     })
                     .unwrap_or(0);
-                let server_entry_count = match fetch_head(client, server, fs_root_id, false).await {
+                let server_entry_count = match fetch_head_prefer_mqtt(client, server, fs_root_id, false).await {
                     Ok(Some(head)) => serde_json::from_str::<FsSchema>(&head.content)
                         .ok()
                         .and_then(|s| s.root)
@@ -2503,7 +2503,7 @@ pub async fn sync_schema(
         // This prevents creating duplicate UUIDs for directories that already exist
         // on the server. See CP-7hmh.
         let mut schema = schema;
-        if let Ok(Some(head)) = fetch_head(client, server, fs_root_id, false).await {
+        if let Ok(Some(head)) = fetch_head_prefer_mqtt(client, server, fs_root_id, false).await {
             if let Ok(server_schema) = serde_json::from_str::<FsSchema>(&head.content) {
                 let merged = merge_server_node_ids(&mut schema, &server_schema);
                 if merged > 0 {
@@ -2544,7 +2544,7 @@ pub async fn sync_schema(
         // to the server's UUIDs ensures content reaches the right documents.
         let mut final_schema_json = schema_json.clone();
         let mut final_cid: Option<String> = None;
-        if let Ok(Some(head)) = fetch_head(client, server, fs_root_id, false).await {
+        if let Ok(Some(head)) = fetch_head_prefer_mqtt(client, server, fs_root_id, false).await {
             // Write server's schema (with UUIDs) to local file
             final_schema_json = head.content.clone();
             final_cid = head.cid.clone();
@@ -2585,7 +2585,7 @@ pub async fn sync_schema(
         let local_schema_exists = local_schema_path.exists();
 
         // Fetch server schema
-        if let Ok(Some(head)) = fetch_head(client, server, fs_root_id, false).await {
+        if let Ok(Some(head)) = fetch_head_prefer_mqtt(client, server, fs_root_id, false).await {
             // Parse the server schema for nested schema operations
             let server_schema: FsSchema = serde_json::from_str(&head.content)
                 .map_err(|e| format!("Failed to parse server schema: {}", e))?;
@@ -2623,7 +2623,7 @@ pub async fn sync_schema(
 ///
 /// Returns true if the server has non-empty, non-trivial content.
 pub async fn check_server_has_content(client: &Client, server: &str, fs_root_id: &str) -> bool {
-    if let Ok(Some(head)) = fetch_head(client, server, fs_root_id, false).await {
+    if let Ok(Some(head)) = fetch_head_prefer_mqtt(client, server, fs_root_id, false).await {
         return !head.content.is_empty() && head.content != "{}";
     }
     false
@@ -2633,6 +2633,30 @@ pub async fn check_server_has_content(client: &Client, server: &str, fs_root_id:
 ///
 /// MQTT equivalent of `ensure_fs_root_exists` - uses get-info and create-document
 /// commands instead of HTTP requests.
+/// Fetch HEAD for a document, preferring MQTT when available, falling back to HTTP.
+///
+/// Returns the same `Option<HeadResponse>` as HTTP `fetch_head`, but routes through
+/// MQTT `get_head` when the MQTT request client is registered.
+pub(crate) async fn fetch_head_prefer_mqtt(
+    client: &reqwest::Client,
+    server: &str,
+    id: &str,
+    use_paths: bool,
+) -> Result<Option<crate::sync::HeadResponse>, crate::sync::FetchHeadError> {
+    use crate::sync::schema_io::get_sync_schema_mqtt_request_client;
+
+    if let Some(mqtt_request) = get_sync_schema_mqtt_request_client() {
+        match mqtt_request.get_head(id).await as Result<Option<crate::sync::HeadResponse>, _> {
+            Ok(head) => return Ok(head),
+            Err(e) => {
+                tracing::warn!("MQTT get_head failed for {}, falling back to HTTP: {}", id, e);
+            }
+        }
+    }
+
+    fetch_head(client, server, id, use_paths).await
+}
+
 pub async fn ensure_fs_root_exists_mqtt(
     mqtt_request: &crate::mqtt::MqttRequestClient,
     fs_root_id: &str,

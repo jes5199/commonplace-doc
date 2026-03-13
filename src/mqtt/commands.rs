@@ -140,16 +140,36 @@ impl CommandsHandler {
         );
 
         let response = match self.document_store.get_document(&request.id).await {
-            Some(doc) => GetContentResponse {
-                req: request.req.clone(),
-                content: Some(doc.content.clone()),
-                content_type: Some(doc.content_type.to_mime().to_string()),
-                error: None,
-            },
+            Some(doc) => {
+                // Get CID from commit store (HEAD commit for this document)
+                let cid = if let Some(store) = &self.commit_store {
+                    store.get_document_head(&request.id).await.ok().flatten()
+                } else {
+                    None
+                };
+
+                // Get Yjs state at HEAD
+                let state = self
+                    .document_store
+                    .get_yjs_state(&request.id)
+                    .await
+                    .map(|bytes| b64::encode(&bytes));
+
+                GetContentResponse {
+                    req: request.req.clone(),
+                    content: Some(doc.content.clone()),
+                    content_type: Some(doc.content_type.to_mime().to_string()),
+                    cid,
+                    state,
+                    error: None,
+                }
+            }
             None => GetContentResponse {
                 req: request.req.clone(),
                 content: None,
                 content_type: None,
+                cid: None,
+                state: None,
                 error: Some(format!("Document '{}' not found", request.id)),
             },
         };

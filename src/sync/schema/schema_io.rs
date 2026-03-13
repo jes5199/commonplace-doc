@@ -28,7 +28,7 @@ fn mqtt_request_slot() -> &'static RwLock<Option<Arc<MqttRequestClient>>> {
     SYNC_SCHEMA_MQTT_REQUEST_CLIENT.get_or_init(|| RwLock::new(None))
 }
 
-fn get_sync_schema_mqtt_request_client() -> Option<Arc<MqttRequestClient>> {
+pub(crate) fn get_sync_schema_mqtt_request_client() -> Option<Arc<MqttRequestClient>> {
     let guard = mqtt_request_slot()
         .read()
         .expect("schema mqtt request client lock poisoned");
@@ -59,8 +59,7 @@ pub(crate) async fn fetch_schema_content_with_optional_cid(
                     return Err(format!("MQTT get-content failed for {}: {}", node_id, err));
                 }
                 if let Some(content) = resp.content {
-                    // get-content does not currently include commit metadata.
-                    return Ok(Some((content, None)));
+                    return Ok(Some((content, resp.cid)));
                 }
                 return Err(format!(
                     "MQTT get-content returned no content for {}",

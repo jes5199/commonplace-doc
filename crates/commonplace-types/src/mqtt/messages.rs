@@ -477,6 +477,12 @@ pub struct GetContentResponse {
     /// Content type (present on success)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+    /// HEAD commit ID (present on success, if commit store is available)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
+    /// Yjs state at HEAD (base64-encoded, present on success)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
     /// Error message (present on failure)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -1002,6 +1008,8 @@ mod tests {
             req: "r-001".to_string(),
             content: Some("Hello, world!".to_string()),
             content_type: Some("text/plain".to_string()),
+            cid: Some("abc123".to_string()),
+            state: Some("base64state".to_string()),
             error: None,
         };
 
@@ -1009,6 +1017,8 @@ mod tests {
         assert!(json.contains("\"req\":\"r-001\""));
         assert!(json.contains("\"content\":\"Hello, world!\""));
         assert!(json.contains("\"content_type\":\"text/plain\""));
+        assert!(json.contains("\"cid\":\"abc123\""));
+        assert!(json.contains("\"state\":\"base64state\""));
         // error should be omitted when None
         assert!(!json.contains("\"error\""));
     }
@@ -1019,6 +1029,8 @@ mod tests {
             req: "r-001".to_string(),
             content: None,
             content_type: None,
+            cid: None,
+            state: None,
             error: Some("Document not found".to_string()),
         };
 

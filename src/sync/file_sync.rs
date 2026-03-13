@@ -2031,7 +2031,7 @@ pub async fn receive_task_crdt(
                 file_path.display()
             );
         } else {
-            match crate::sync::client::fetch_head(&http_client, &server, &node_id_str, false).await
+            match crate::sync::dir_sync::fetch_head_prefer_mqtt(&http_client, &server, &node_id_str, false).await
             {
                 Ok(Some(head)) => {
                     if let Some(ref server_cid) = head.cid {
