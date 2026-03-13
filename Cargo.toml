@@ -48,6 +48,10 @@ name = "commonplace-whoami"
 path = "src/bin/whoami.rs"
 
 [[bin]]
+name = "commonplace-who"
+path = "src/bin/who.rs"
+
+[[bin]]
 name = "commonplace-uuid"
 path = "src/bin/uuid.rs"
 

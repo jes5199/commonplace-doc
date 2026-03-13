@@ -1,12 +1,12 @@
-//! commonplace-whoami: Show your sync identity
+//! commonplace-whoami: Print your sync identity
 //!
-//! Scans the workspace root for presence files (*.exe, *.usr, *.bot, *.who)
-//! and displays identity information. Matches by name or shows all.
+//! Like Unix `whoami` — prints a single name. Determines identity from:
+//! 1. COMMONPLACE_PRESENCE env var (set by --presence flag on sync)
+//! 2. If exactly one presence file exists, that's you
 //!
 //! Usage:
-//!   commonplace-whoami              # Show all presence files
-//!   commonplace-whoami -n jes       # Filter by name
-//!   commonplace-whoami --json       # JSON output
+//!   commonplace-whoami         # prints e.g. "jes.usr"
+//!   commonplace-whoami --json  # {"file":"jes.usr","name":"jes","type":"usr",...}
 
 use clap::Parser;
 use commonplace_doc::cli::WhoamiArgs;
@@ -19,100 +19,104 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
     let (workspace_root, _) = find_workspace_root(&cwd)?;
 
-    // Scan for presence files
-    let mut identities = Vec::new();
+    // Strategy 1: COMMONPLACE_PRESENCE env var
+    if let Ok(presence) = std::env::var("COMMONPLACE_PRESENCE") {
+        let path = workspace_root.join(&presence);
+        if path.exists() {
+            return print_identity(&presence, &path, args.json);
+        }
+        // Env var set but file doesn't exist — still use the name
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "file": presence,
+                    "name": presence.rsplit_once('.').map(|(n, _)| n).unwrap_or(&presence),
+                    "type": presence.rsplit_once('.').map(|(_, e)| e).unwrap_or("who"),
+                })
+            );
+        } else {
+            println!("{}", presence);
+        }
+        return Ok(());
+    }
+
+    // Strategy 2: exactly one presence file
+    let mut presence_files = Vec::new();
     for entry in std::fs::read_dir(&workspace_root)? {
         let entry = entry?;
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
-
-        let filename = match path.file_name().and_then(|f| f.to_str()) {
-            Some(f) => f.to_string(),
-            None => continue,
-        };
-
-        let ext = match path.extension().and_then(|e| e.to_str()) {
-            Some(e) => e,
-            None => continue,
-        };
-
-        if !matches!(ext, "exe" | "usr" | "bot" | "who") {
-            continue;
-        }
-
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let actor: ActorIO = match serde_json::from_str(&content) {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
-
-        // Filter by name if specified
-        if let Some(ref filter_name) = args.name {
-            if actor.name != *filter_name {
-                continue;
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if matches!(ext, "exe" | "usr" | "bot" | "who") {
+            if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+                presence_files.push((filename.to_string(), path.clone()));
             }
         }
-
-        identities.push((filename, actor));
     }
 
-    if identities.is_empty() {
-        if let Some(ref name) = args.name {
-            eprintln!("No presence file found for '{}'", name);
-        } else {
-            eprintln!("No presence files found in {}", workspace_root.display());
+    match presence_files.len() {
+        0 => {
+            eprintln!("No presence files found. Set COMMONPLACE_PRESENCE or start sync with --presence.");
+            std::process::exit(1);
         }
-        std::process::exit(1);
+        1 => {
+            let (filename, path) = &presence_files[0];
+            print_identity(filename, path, args.json)
+        }
+        _ => {
+            eprintln!(
+                "Multiple presence files found ({}). Set COMMONPLACE_PRESENCE to disambiguate:",
+                presence_files.len()
+            );
+            for (f, _) in &presence_files {
+                eprintln!("  {}", f);
+            }
+            std::process::exit(1);
+        }
     }
+}
 
-    identities.sort_by(|a, b| a.0.cmp(&b.0));
-
-    if args.json {
-        let json_out: Vec<serde_json::Value> = identities
-            .iter()
-            .map(|(filename, actor)| {
-                serde_json::json!({
-                    "file": filename,
-                    "name": actor.name,
-                    "status": actor.status,
-                    "pid": actor.pid,
-                    "docref": actor.docref,
-                    "started_at": actor.started_at,
-                    "last_heartbeat": actor.last_heartbeat,
-                    "capabilities": actor.capabilities,
-                })
+fn print_identity(
+    filename: &str,
+    path: &std::path::Path,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if json {
+        // Try to read full actor data
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(actor) = serde_json::from_str::<ActorIO>(&content) {
+                let ext = filename.rsplit_once('.').map(|(_, e)| e).unwrap_or("who");
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "file": filename,
+                        "name": actor.name,
+                        "type": ext,
+                        "status": actor.status,
+                        "pid": actor.pid,
+                        "docref": actor.docref,
+                        "started_at": actor.started_at,
+                        "last_heartbeat": actor.last_heartbeat,
+                        "capabilities": actor.capabilities,
+                    }))?
+                );
+                return Ok(());
+            }
+        }
+        // Fallback: just the filename
+        println!(
+            "{}",
+            serde_json::json!({
+                "file": filename,
+                "name": filename.rsplit_once('.').map(|(n, _)| n).unwrap_or(filename),
+                "type": filename.rsplit_once('.').map(|(_, e)| e).unwrap_or("who"),
             })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&json_out)?);
+        );
     } else {
-        for (filename, actor) in &identities {
-            println!("{}", filename);
-            println!("  name:      {}", actor.name);
-            println!("  status:    {:?}", actor.status);
-            if let Some(pid) = actor.pid {
-                println!("  pid:       {}", pid);
-            }
-            if let Some(ref docref) = actor.docref {
-                println!("  docref:    {}", docref);
-            }
-            if let Some(ref started) = actor.started_at {
-                println!("  started:   {}", started);
-            }
-            if let Some(ref heartbeat) = actor.last_heartbeat {
-                println!("  heartbeat: {}", heartbeat);
-            }
-            if !actor.capabilities.is_empty() {
-                println!("  caps:      {}", actor.capabilities.join(", "));
-            }
-            println!();
-        }
+        println!("{}", filename);
     }
-
     Ok(())
 }
