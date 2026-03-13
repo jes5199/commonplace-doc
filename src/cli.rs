@@ -173,6 +173,20 @@ pub struct UuidArgs {
     pub json: bool,
 }
 
+/// CLI arguments for commonplace-whoami (show sync identity)
+#[derive(Parser, Debug)]
+#[clap(name = "commonplace-whoami")]
+#[clap(about = "Show your sync identity (presence file and docref)", long_about = None)]
+pub struct WhoamiArgs {
+    /// Filter by name (e.g., "sync-client", "jes")
+    #[clap(short, long)]
+    pub name: Option<String>,
+
+    /// Output in JSON format
+    #[clap(long)]
+    pub json: bool,
+}
+
 /// CLI arguments for commonplace-ps (list orchestrator processes)
 #[derive(Parser, Debug)]
 #[clap(name = "commonplace-ps")]

@@ -35,6 +35,7 @@ const SUBCOMMANDS: &[(&str, &str)] = &[
     ("signal", "Send signal to orchestrator-managed process"),
     ("link", "Create a link to a commonplace document"),
     ("uuid", "Resolve a synced file path to its UUID"),
+    ("whoami", "Show your sync identity (presence file and docref)"),
     ("cmd", "Send commands to document paths via MQTT"),
     ("mcp", "MCP server for commonplace"),
     ("store", "Document store with MQTT transport"),
