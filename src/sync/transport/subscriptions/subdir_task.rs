@@ -90,8 +90,10 @@ pub fn spawn_subdir_mqtt_task(
     workspace: String,
     watched_subdirs: Arc<RwLock<HashSet<String>>>,
     crdt_context: Option<CrdtFileSyncContext>,
+    subdir_handles: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
 ) {
-    tokio::spawn(subdir_mqtt_task(
+    let handles_clone = subdir_handles.clone();
+    let handle = tokio::spawn(subdir_mqtt_task(
         http_client,
         server,
         fs_root_id,
@@ -110,7 +112,12 @@ pub fn spawn_subdir_mqtt_task(
         workspace,
         watched_subdirs,
         crdt_context,
+        handles_clone,
     ));
+    // Register handle asynchronously — spawn a small task to avoid blocking
+    tokio::spawn(async move {
+        subdir_handles.write().await.push(handle);
+    });
 }
 
 /// MQTT task for a node-backed subdirectory.
@@ -148,6 +155,7 @@ pub async fn subdir_mqtt_task(
     workspace: String,
     watched_subdirs: Arc<RwLock<HashSet<String>>>,
     crdt_context: Option<CrdtFileSyncContext>,
+    subdir_handles: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
 ) {
     // Ensure ancestry checks in this process use MQTT/cyan instead of HTTP.
     crate::sync::set_sync_ancestry_mqtt_context(Some(crate::sync::SyncAncestryMqttContext::new(
@@ -699,6 +707,7 @@ pub async fn subdir_mqtt_task(
                         workspace.clone(),
                         watched_subdirs.clone(),
                         crdt_context.clone(),
+                        subdir_handles.clone(),
                     );
                 }
             }

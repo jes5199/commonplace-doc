@@ -126,6 +126,7 @@ pub async fn spawn_subdir_watchers(
                     workspace.clone(),
                     params.watched_subdirs.clone(),
                     params.crdt_context.clone(),
+                    params.subdir_handles.clone(),
                 ));
                 params.subdir_handles.write().await.push(handle);
             }
@@ -204,6 +205,7 @@ pub async fn spawn_subdir_watchers_from_schema(
                     workspace.clone(),
                     params.watched_subdirs.clone(),
                     params.crdt_context.clone(),
+                    params.subdir_handles.clone(),
                 ));
                 params.subdir_handles.write().await.push(handle);
             }
