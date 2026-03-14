@@ -492,15 +492,54 @@ pub async fn file_watcher_task(file_path: PathBuf, tx: mpsc::Sender<FileEvent>) 
                 };
                 #[cfg(not(unix))]
                 let content = {
-                    // On non-Unix, just wait for stability and read
-                    match tokio::fs::read(&file_path).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            warn!("Failed to read file for upload: {}", e);
-                            continue;
+                    // On non-Unix, read with post-read metadata recheck to detect
+                    // concurrent writes. If the file's metadata changes between the
+                    // pre-read check and post-read check, retry up to 3 times.
+                    const MAX_RETRIES: usize = 3;
+                    let mut retries = 0;
+                    loop {
+                        let pre_meta = tokio::fs::metadata(&file_path).await.ok();
+                        let read_result = tokio::fs::read(&file_path).await;
+                        let post_meta = tokio::fs::metadata(&file_path).await.ok();
+
+                        // Check if file changed during read
+                        let changed = match (&pre_meta, &post_meta) {
+                            (Some(pre), Some(post)) => {
+                                pre.len() != post.len()
+                                    || pre.modified().ok() != post.modified().ok()
+                            }
+                            _ => false, // Can't verify, proceed with what we have
+                        };
+
+                        match read_result {
+                            Ok(c) if !changed => break c,
+                            Ok(_) if retries < MAX_RETRIES => {
+                                retries += 1;
+                                debug!(
+                                    "File {} changed during read, retrying ({}/{})",
+                                    file_path.display(), retries, MAX_RETRIES
+                                );
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                continue;
+                            }
+                            Ok(c) => {
+                                debug!(
+                                    "File {} still changing after {} retries, using last read",
+                                    file_path.display(), MAX_RETRIES
+                                );
+                                break c;
+                            }
+                            Err(e) => {
+                                warn!("Failed to read file for upload: {}", e);
+                                break vec![];
+                            }
                         }
                     }
                 };
+                #[cfg(not(unix))]
+                if content.is_empty() {
+                    continue;
+                }
 
                 trace!(
                     "[WATCHER-TRACE] Sending FileEvent::Modified for {} ({} bytes, content={:?})",
