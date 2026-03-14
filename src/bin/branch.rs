@@ -233,8 +233,25 @@ async fn create_branch(
                 } else {
                     eprintln!("Branch not in schema. Cleaning up forked document...");
                     let delete_url = format!("{}/docs/{}", server, new_id);
-                    let _ = http_client.delete(&delete_url).send().await;
-                    return Err("Branch create failed: schema update error (orphan cleaned up)".into());
+                    match http_client.delete(&delete_url).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            return Err("Branch create failed: schema update error (orphan cleaned up)".into());
+                        }
+                        Ok(resp) => {
+                            return Err(format!(
+                                "Branch create failed: schema update error, and cleanup DELETE returned HTTP {}. \
+                                 Document {} may be orphaned — check manually.",
+                                resp.status(), new_id
+                            ).into());
+                        }
+                        Err(del_err) => {
+                            return Err(format!(
+                                "Branch create failed: schema update error, and cleanup DELETE failed ({}). \
+                                 Document {} may be orphaned — check manually.",
+                                del_err, new_id
+                            ).into());
+                        }
+                    }
                 }
             }
             Err(verify_err) => {
