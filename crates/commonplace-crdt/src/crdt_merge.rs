@@ -233,7 +233,7 @@ pub async fn process_received_edit(
                 let topic = edits_topic(workspace, node_id);
                 let payload = serde_json::to_vec(&publish_msg)?;
 
-                mqtt.publish_retained(&topic, &payload).await.map_err(|e| {
+                mqtt.publish(&topic, &payload).await.map_err(|e| {
                     SyncError::mqtt(format!("Failed to publish merge commit: {}", e))
                 })?;
 
@@ -686,7 +686,7 @@ pub async fn create_and_publish_merge_commit(
         let topic = edits_topic(workspace, node_id);
         let payload = serde_json::to_vec(&publish_msg)?;
 
-        mqtt.publish_retained(&topic, &payload)
+        mqtt.publish(&topic, &payload)
             .await
             .map_err(|e| SyncError::mqtt(format!("Failed to publish merge commit: {}", e)))?;
 

@@ -571,7 +571,7 @@ async fn push_local_schemas_via_mqtt(
             )
         })?;
 
-        handle_schema_modified(
+        match handle_schema_modified(
             client,
             server,
             fs_root_id,
@@ -583,15 +583,21 @@ async fn push_local_schemas_via_mqtt(
             Some(crdt_context),
         )
         .await
-        .map_err(|e| {
-            format!(
-                "Failed to publish local schema {} via MQTT: {}",
-                schema_path.display(),
-                e
-            )
-        })?;
-
-        published += 1;
+        {
+            Ok(()) => {
+                published += 1;
+            }
+            Err(e) => {
+                // Skip orphaned subdirs whose .commonplace.json isn't in the parent
+                // schema (CP-awto). This is non-fatal — the subdir will be picked up
+                // when it's properly registered in the parent schema.
+                warn!(
+                    "Skipping local schema {} (not in parent schema): {}",
+                    schema_path.display(),
+                    e
+                );
+            }
+        }
     }
 
     Ok(published)

@@ -6,12 +6,13 @@
 
 use crate::commit::Commit;
 
-/// Abstraction for publishing retained MQTT messages.
+/// Abstraction for publishing MQTT messages (non-retained).
 ///
-/// All usages in crdt/ call `publish_retained` with `QoS::AtLeastOnce`,
-/// so QoS is not part of the trait interface.
+/// All usages in crdt/ call `publish` with `QoS::AtLeastOnce`,
+/// so QoS is not part of the trait interface. Messages are NOT retained
+/// because sync clients bootstrap state via CYAN-SYNC (CP-4t5a).
 pub trait MqttPublisher: Send + Sync {
-    fn publish_retained(
+    fn publish(
         &self,
         topic: &str,
         payload: &[u8],

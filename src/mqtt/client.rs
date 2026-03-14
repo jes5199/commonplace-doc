@@ -45,8 +45,10 @@ impl MqttClient {
         // Create client and event loop
         let (client, event_loop) = AsyncClient::new(options, 256);
 
-        // Create broadcast channel for incoming messages
-        let (message_tx, _) = broadcast::channel(1024);
+        // Create broadcast channel for incoming messages.
+        // Capacity must be large enough to handle retained message bursts on startup
+        // when subscribing to many topics at once (CP-4t5a).
+        let (message_tx, _) = broadcast::channel(65536);
 
         // Create broadcast channel for ConnAck notifications (reconnection detection)
         let (connack_tx, _) = broadcast::channel(16);

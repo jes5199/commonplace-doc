@@ -7,7 +7,7 @@ use commonplace_types::traits::{CommitPersistence, MqttPublisher};
 pub struct NoOpPublisher;
 
 impl MqttPublisher for NoOpPublisher {
-    async fn publish_retained(&self, _topic: &str, _payload: &[u8]) -> Result<(), String> {
+    async fn publish(&self, _topic: &str, _payload: &[u8]) -> Result<(), String> {
         Ok(())
     }
 }

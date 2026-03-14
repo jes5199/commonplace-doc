@@ -290,6 +290,30 @@ pub async fn subdir_mqtt_task(
         subscribed_uuids.len()
     );
 
+    // Clear stale retained messages on subdir edit topics (CP-4t5a).
+    let mut cleared = 0u32;
+    for uuid in &subscribed_uuids {
+        let topic = Topic::edits(&workspace, uuid).to_topic_string();
+        if mqtt_client
+            .publish_retained(&topic, &[], QoS::AtLeastOnce)
+            .await
+            .is_ok()
+        {
+            cleared += 1;
+        }
+    }
+    // Also clear the subdir schema topic
+    let _ = mqtt_client
+        .publish_retained(&schema_topic_str, &[], QoS::AtLeastOnce)
+        .await;
+    if cleared > 0 {
+        info!(
+            "Subdir {}: Cleared retained messages on {} edit topics",
+            subdir_path,
+            cleared + 1
+        );
+    }
+
     // Process incoming MQTT messages with lag detection
     let context = format!("MQTT subdir {} receiver", subdir_path);
     info!(

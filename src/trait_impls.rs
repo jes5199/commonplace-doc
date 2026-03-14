@@ -10,8 +10,8 @@ use commonplace_types::traits::{CommitPersistence, MqttPublisher};
 use rumqttc::QoS;
 
 impl MqttPublisher for MqttClient {
-    async fn publish_retained(&self, topic: &str, payload: &[u8]) -> Result<(), String> {
-        MqttClient::publish_retained(self, topic, payload, QoS::AtLeastOnce)
+    async fn publish(&self, topic: &str, payload: &[u8]) -> Result<(), String> {
+        MqttClient::publish(self, topic, payload, QoS::AtLeastOnce)
             .await
             .map_err(|e| e.to_string())
     }

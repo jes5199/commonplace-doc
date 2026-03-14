@@ -167,7 +167,7 @@ pub async fn publish_text_change_with_parent(
     // This is critical for sync: subscribers may join after messages are published,
     // and the retained message ensures they receive the current content.
     mqtt_client
-        .publish_retained(&topic, &payload)
+        .publish(&topic, &payload)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish edit: {}", e)))?;
 
@@ -271,7 +271,7 @@ pub async fn publish_yjs_update_with_parent(
 
     // Use retained message so new subscribers get the latest content immediately.
     mqtt_client
-        .publish_retained(&topic, &payload)
+        .publish(&topic, &payload)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish edit: {}", e)))?;
 
@@ -401,7 +401,7 @@ mod tests {
     }
 
     impl MqttPublisher for MockPublisher {
-        async fn publish_retained(&self, _topic: &str, payload: &[u8]) -> Result<(), String> {
+        async fn publish(&self, _topic: &str, payload: &[u8]) -> Result<(), String> {
             self.payloads.lock().unwrap().push(payload.to_vec());
             Ok(())
         }

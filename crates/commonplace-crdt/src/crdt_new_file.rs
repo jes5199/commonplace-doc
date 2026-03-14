@@ -217,7 +217,7 @@ async fn update_schema_with_new_file(
     // This is critical for sync: subscribers may join after schema updates are published,
     // and the retained message ensures they receive the current file mappings.
     mqtt_client
-        .publish_retained(&topic, &payload)
+        .publish(&topic, &payload)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
 
@@ -294,7 +294,7 @@ async fn publish_file_content(
     // after the content edit is published, and the retained message ensures
     // it still receives the content.
     mqtt_client
-        .publish_retained(&topic, &payload)
+        .publish(&topic, &payload)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish file edit: {}", e)))?;
 
@@ -398,7 +398,7 @@ pub async fn remove_file_from_schema(
     // This is critical for sync: subscribers may join after schema updates are published,
     // and the retained message ensures they receive the current file mappings.
     mqtt_client
-        .publish_retained(&topic, &payload)
+        .publish(&topic, &payload)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
 
@@ -504,7 +504,7 @@ pub async fn rename_file_in_schema(
     let payload = serde_json::to_vec(&edit_msg)?;
 
     mqtt_client
-        .publish_retained(&topic, &payload)
+        .publish(&topic, &payload)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
 
@@ -597,7 +597,7 @@ pub async fn add_file_to_schema(
     let payload = serde_json::to_vec(&edit_msg)?;
 
     mqtt_client
-        .publish_retained(&topic, &payload)
+        .publish(&topic, &payload)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
 
@@ -703,7 +703,7 @@ pub async fn publish_schema_via_mqtt_with_topic(
     let payload = serde_json::to_vec(&edit_msg)?;
 
     mqtt_client
-        .publish_retained(&topic, &payload)
+        .publish(&topic, &payload)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
 
@@ -787,7 +787,7 @@ pub async fn add_directory_to_schema(
     let payload = serde_json::to_vec(&edit_msg)?;
 
     mqtt_client
-        .publish_retained(&topic, &payload)
+        .publish(&topic, &payload)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to publish schema edit: {}", e)))?;
 
@@ -811,7 +811,7 @@ mod tests {
     }
 
     impl MqttPublisher for CapturePublisher {
-        async fn publish_retained(&self, _topic: &str, payload: &[u8]) -> Result<(), String> {
+        async fn publish(&self, _topic: &str, payload: &[u8]) -> Result<(), String> {
             *self
                 .payload
                 .lock()
