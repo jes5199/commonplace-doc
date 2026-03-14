@@ -136,7 +136,7 @@ pub async fn process_received_edit(
 
             // Apply the update (merges with our local state)
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         } else {
             debug!("Received merge commit {} with empty update", received_cid);
         }
@@ -550,7 +550,7 @@ pub fn create_merge_commit(input: MergeCommitInput) -> SyncResult<MergeCommitRes
             SyncError::yjs_decode(format!("Failed to decode local Y.Doc state: {}", e))
         })?;
         let mut txn = merge_doc.transact_mut();
-        txn.apply_update(local_update);
+        let _ = txn.apply_update(local_update);
     }
 
     // Apply server state to merge (Yjs CRDT semantics handle conflict resolution)
@@ -559,7 +559,7 @@ pub fn create_merge_commit(input: MergeCommitInput) -> SyncResult<MergeCommitRes
             SyncError::yjs_decode(format!("Failed to decode server Y.Doc state: {}", e))
         })?;
         let mut txn = merge_doc.transact_mut();
-        txn.apply_update(server_update);
+        let _ = txn.apply_update(server_update);
     }
 
     // Get the merged content
@@ -744,7 +744,7 @@ pub fn apply_commits_to_doc(commits: &[Commit]) -> SyncResult<Vec<u8>> {
         })?;
 
         let mut txn = doc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
     }
 
     let txn = doc.transact();
@@ -1279,7 +1279,7 @@ mod tests {
             // Apply first update
             let update = Update::decode_v1(&STANDARD.decode(&msg1.update).unwrap()).unwrap();
             let mut txn = doc2.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         let update2 = {
             let mut txn = doc2.transact_mut();
@@ -1590,7 +1590,7 @@ mod tests {
         {
             let update = Update::decode_v1(&result_state).unwrap();
             let mut txn = verify_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         let content = get_doc_text_content(&verify_doc);
         assert_eq!(content, "hello world");
@@ -1627,7 +1627,7 @@ mod tests {
         {
             let update = Update::decode_v1(&result_state).unwrap();
             let mut txn = verify_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         let content = get_doc_text_content(&verify_doc);
         assert_eq!(content, "content");
@@ -1730,7 +1730,7 @@ mod tests {
         {
             let update = Update::decode_v1(&update_bytes).unwrap();
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // get_doc_text_content should return valid JSONL
@@ -1772,7 +1772,7 @@ mod tests {
         {
             let update = Update::decode_v1(&update_bytes).unwrap();
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Extract via doc_to_json_array_value (as match_doc_structured_content does)
@@ -1813,7 +1813,7 @@ mod tests {
         {
             let update = Update::decode_v1(&initial_bytes).unwrap();
             let mut txn = ws_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Step 2: Sandbox receives it
@@ -1821,7 +1821,7 @@ mod tests {
         {
             let update = Update::decode_v1(&initial_bytes).unwrap();
             let mut txn = sandbox_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         let sandbox_state = {
             let txn = sandbox_doc.transact();
@@ -1851,7 +1851,7 @@ mod tests {
         {
             let update = Update::decode_v1(&sandbox_update_bytes).unwrap();
             let mut txn = ws_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Step 5: Workspace reads content

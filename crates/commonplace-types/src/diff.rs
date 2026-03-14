@@ -96,7 +96,7 @@ pub fn compute_diff_update(old_content: &str, new_content: &str) -> Result<DiffR
         let update = yrs::Update::decode_v1(&base_state)
             .map_err(|e| DiffError::YrsOperationFailed(e.to_string()))?;
         let mut txn = target_doc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
     }
 
     // Compute character-level diff
@@ -154,7 +154,7 @@ pub fn compute_diff_update_with_base(
         let update = yrs::Update::decode_v1(base_state_bytes)
             .map_err(|e| DiffError::YrsOperationFailed(e.to_string()))?;
         let mut txn = target_doc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
     }
 
     // Compute character-level diff
@@ -262,7 +262,7 @@ pub fn compute_xml_diff_update(
         let update = yrs::Update::decode_v1(&base_state)
             .map_err(|e| DiffError::YrsOperationFailed(e.to_string()))?;
         let mut txn = target_doc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
     }
 
     // Compute summary from text diff (for statistics)
@@ -337,7 +337,7 @@ pub fn compute_xml_diff_update_with_base(
         let update = yrs::Update::decode_v1(base_state_bytes)
             .map_err(|e| DiffError::YrsOperationFailed(e.to_string()))?;
         let mut txn = target_doc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
     }
 
     // Compute summary from text diff (for statistics)
@@ -541,7 +541,7 @@ mod tests {
         {
             let update = yrs::Update::decode_v1(&result.update_bytes).unwrap();
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         let txn = doc.transact();
         assert_eq!(text.get_string(&txn), new);
@@ -588,7 +588,7 @@ mod tests {
         {
             let update = yrs::Update::decode_v1(&result.update_bytes).unwrap();
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Verify result
@@ -615,7 +615,7 @@ mod tests {
         {
             let update = yrs::Update::decode_v1(&result.update_bytes).unwrap();
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         let txn = doc.transact();
@@ -640,7 +640,7 @@ mod tests {
         {
             let update = yrs::Update::decode_v1(&result.update_bytes).unwrap();
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         let txn = doc.transact();
@@ -665,7 +665,7 @@ mod tests {
         {
             let update = yrs::Update::decode_v1(&result.update_bytes).unwrap();
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         let txn = doc.transact();
@@ -709,7 +709,7 @@ mod tests {
         {
             let update = yrs::Update::decode_v1(&result.update_bytes).unwrap();
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         let txn = doc.transact();
         assert_eq!(fragment.get_string(&txn), "<hello>rust</hello>");
@@ -768,7 +768,7 @@ mod tests {
         {
             let update = yrs::Update::decode_v1(&result.update_bytes).unwrap();
             let mut txn = server_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Step 4: Read content back
@@ -798,7 +798,7 @@ mod tests {
         {
             let update = yrs::Update::decode_v1(&result.update_bytes).unwrap();
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         let txn = doc.transact();
@@ -824,7 +824,7 @@ mod tests {
         {
             let update = yrs::Update::decode_v1(&result.update_bytes).unwrap();
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         let txn = doc.transact();

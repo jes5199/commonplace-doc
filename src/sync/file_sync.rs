@@ -1317,7 +1317,7 @@ pub async fn resync_crdt_state_via_cyan_with_pending(
         };
 
         let mut txn = doc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
     }
 
     let content = get_doc_text_content(&doc);

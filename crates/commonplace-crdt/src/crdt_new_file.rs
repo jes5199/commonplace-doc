@@ -257,7 +257,7 @@ async fn publish_file_content(
                 SyncError::crdt_state(format!("Failed to decode Yjs update: {}", e))
             })?;
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         decoded
     } else {
@@ -938,7 +938,7 @@ mod tests {
         {
             let update = Update::decode_v1(&update_a).expect("Should decode update");
             let mut txn = doc_b.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Client B should see the new file with the same UUID
@@ -976,7 +976,7 @@ mod tests {
         {
             let update = Update::decode_v1(&initial_update).expect("Should decode");
             let mut txn = doc_a.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Sync initial state to Client B
@@ -984,7 +984,7 @@ mod tests {
         {
             let update = Update::decode_v1(&initial_update).expect("Should decode");
             let mut txn = doc_b.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Verify both clients have the file
@@ -1009,7 +1009,7 @@ mod tests {
         {
             let update = Update::decode_v1(&delete_update).expect("Should decode");
             let mut txn = doc_b.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Client B should no longer see the file
@@ -1067,7 +1067,7 @@ mod tests {
         {
             let mut txn = peer_doc.transact_mut();
             let update = Update::decode_v1(&update_bytes).expect("valid yrs update");
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         assert!(
@@ -1109,14 +1109,14 @@ mod tests {
         {
             let update = Update::decode_v1(&update_b).expect("Should decode");
             let mut txn = doc_a.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Client B receives Client A's update
         {
             let update = Update::decode_v1(&update_a).expect("Should decode");
             let mut txn = doc_b.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Both should have the file with the same UUID (CRDT convergence)
@@ -1220,7 +1220,7 @@ mod tests {
             use yrs::updates::decoder::Decode;
             let update = yrs::Update::decode_v1(&update_bytes).expect("Should decode Yjs update");
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Verify get_text returns empty (YArray items aren't string chunks)

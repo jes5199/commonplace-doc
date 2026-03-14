@@ -227,7 +227,7 @@ pub fn create_yjs_jsonl_append(
         if !state_bytes.is_empty() {
             let update = yrs::Update::decode_v1(&state_bytes)?;
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
     }
 
@@ -297,8 +297,8 @@ mod tests {
             let bytes1 = base64_decode(&state1).unwrap();
             let bytes2 = base64_decode(&state2).unwrap();
             let mut txn = doc.transact_mut();
-            txn.apply_update(yrs::Update::decode_v1(&bytes1).unwrap());
-            txn.apply_update(yrs::Update::decode_v1(&bytes2).unwrap());
+            let _ = txn.apply_update(yrs::Update::decode_v1(&bytes1).unwrap());
+            let _ = txn.apply_update(yrs::Update::decode_v1(&bytes2).unwrap());
         }
         let txn = doc.transact();
         let array = txn.get_array(TEXT_ROOT_NAME).unwrap();

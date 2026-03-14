@@ -82,8 +82,8 @@ fn get_or_create_entries<'a>(txn: &mut TransactionMut<'a>) -> MapRef {
     // Phase 1: Check if "root" needs migration from Any::Map to YMap.
     // We must release the immutable borrow before doing mutable inserts.
     let root_migration_data = match content.get(txn, "root") {
-        Some(yrs::Value::YMap(_)) => None, // Already a YMap, no migration needed
-        Some(yrs::Value::Any(Any::Map(any_map))) => {
+        Some(yrs::Out::YMap(_)) => None, // Already a YMap, no migration needed
+        Some(yrs::Out::Any(Any::Map(any_map))) => {
             // Extract data for migration: entries Any::Map
             Some(any_map.get("entries").and_then(|e| {
                 if let Any::Map(entries) = e {
@@ -98,19 +98,19 @@ fn get_or_create_entries<'a>(txn: &mut TransactionMut<'a>) -> MapRef {
 
     // Phase 2: Create/migrate "root" if needed
     let schema_root = if let Some(existing_entries_data) = root_migration_data {
-        let root_map = content.insert(txn, "root", yrs::MapPrelim::<Any>::new());
+        let root_map = content.insert(txn, "root", yrs::MapPrelim::default());
         root_map.insert(txn, "type", "dir");
 
         // Migrate entries from Any::Map to YMap
         if let Some(entries_any) = existing_entries_data {
-            let entries_map = root_map.insert(txn, "entries", yrs::MapPrelim::<Any>::new());
+            let entries_map = root_map.insert(txn, "entries", yrs::MapPrelim::default());
             migrate_any_map_entries(txn, &entries_map, &entries_any);
         }
         root_map
     } else {
         // Already a YMap, retrieve it
         match content.get(txn, "root") {
-            Some(yrs::Value::YMap(map)) => map,
+            Some(yrs::Out::YMap(map)) => map,
             _ => unreachable!("checked above"),
         }
     };
@@ -122,21 +122,21 @@ fn get_or_create_entries<'a>(txn: &mut TransactionMut<'a>) -> MapRef {
 
     // Phase 3: Check if "entries" needs migration from Any::Map to YMap
     let entries_migration_data = match schema_root.get(txn, "entries") {
-        Some(yrs::Value::YMap(_)) => None,
-        Some(yrs::Value::Any(Any::Map(any_map))) => Some(Some(any_map.clone())),
+        Some(yrs::Out::YMap(_)) => None,
+        Some(yrs::Out::Any(Any::Map(any_map))) => Some(Some(any_map.clone())),
         _ => Some(None),
     };
 
     // Phase 4: Create/migrate "entries" if needed
     if let Some(existing_data) = entries_migration_data {
-        let entries_map = schema_root.insert(txn, "entries", yrs::MapPrelim::<Any>::new());
+        let entries_map = schema_root.insert(txn, "entries", yrs::MapPrelim::default());
         if let Some(entries_any) = existing_data {
             migrate_any_map_entries(txn, &entries_map, &entries_any);
         }
         entries_map
     } else {
         match schema_root.get(txn, "entries") {
-            Some(yrs::Value::YMap(map)) => map,
+            Some(yrs::Out::YMap(map)) => map,
             _ => unreachable!("checked above"),
         }
     }
@@ -153,7 +153,7 @@ fn migrate_any_map_entries(
 ) {
     for (key, value) in source.as_ref() {
         if let Any::Map(entry_map) = value {
-            let entry = entries_map.insert(txn, key.as_str(), yrs::MapPrelim::<Any>::new());
+            let entry = entries_map.insert(txn, key.as_str(), yrs::MapPrelim::default());
             for (entry_key, entry_value) in entry_map.as_ref() {
                 entry.insert(txn, entry_key.as_str(), entry_value.clone());
             }
@@ -165,11 +165,11 @@ fn migrate_any_map_entries(
 fn get_entries<T: ReadTxn>(txn: &T) -> Option<MapRef> {
     let content = txn.get_map("content")?;
     let schema_root = match content.get(txn, "root") {
-        Some(yrs::Value::YMap(map)) => map,
+        Some(yrs::Out::YMap(map)) => map,
         _ => return None,
     };
     match schema_root.get(txn, "entries") {
-        Some(yrs::Value::YMap(map)) => Some(map),
+        Some(yrs::Out::YMap(map)) => Some(map),
         _ => None,
     }
 }
@@ -181,7 +181,7 @@ fn get_entries<T: ReadTxn>(txn: &T) -> Option<MapRef> {
 fn get_entries_any<T: ReadTxn>(txn: &T) -> Option<Arc<HashMap<String, Any>>> {
     let content = txn.get_map("content")?;
     let root_map = match content.get(txn, "root") {
-        Some(yrs::Value::Any(Any::Map(map))) => map,
+        Some(yrs::Out::Any(Any::Map(map))) => map,
         _ => return None,
     };
     match root_map.get("entries") {
@@ -213,7 +213,7 @@ pub fn add_file(doc: &Doc, filename: &str, node_id: &str) {
     let entries = get_or_create_entries(&mut txn);
 
     // Create the entry map for this file
-    let entry_map = entries.insert(&mut txn, filename, yrs::MapPrelim::<Any>::new());
+    let entry_map = entries.insert(&mut txn, filename, yrs::MapPrelim::default());
     entry_map.insert(&mut txn, "type", "doc");
     entry_map.insert(&mut txn, "node_id", node_id);
 }
@@ -230,11 +230,11 @@ pub fn add_directory(doc: &Doc, dirname: &str, node_id: Option<&str>) {
     // If node_id is None and entry already exists with a node_id, preserve it
     let existing_node_id = if node_id.is_none() {
         match entries.get(&txn, dirname) {
-            Some(yrs::Value::YMap(existing)) => match existing.get(&txn, "node_id") {
-                Some(yrs::Value::Any(Any::String(s))) => Some(s.to_string()),
+            Some(yrs::Out::YMap(existing)) => match existing.get(&txn, "node_id") {
+                Some(yrs::Out::Any(Any::String(s))) => Some(s.to_string()),
                 _ => None,
             },
-            Some(yrs::Value::Any(Any::Map(existing))) => match existing.get("node_id") {
+            Some(yrs::Out::Any(Any::Map(existing))) => match existing.get("node_id") {
                 Some(Any::String(s)) => Some(s.to_string()),
                 _ => None,
             },
@@ -247,7 +247,7 @@ pub fn add_directory(doc: &Doc, dirname: &str, node_id: Option<&str>) {
     let effective_node_id = node_id.map(|s| s.to_string()).or(existing_node_id);
 
     // Create the entry map for this directory
-    let entry_map = entries.insert(&mut txn, dirname, yrs::MapPrelim::<Any>::new());
+    let entry_map = entries.insert(&mut txn, dirname, yrs::MapPrelim::default());
     entry_map.insert(&mut txn, "type", "dir");
     if let Some(ref id) = effective_node_id {
         entry_map.insert(&mut txn, "node_id", id.as_str());
@@ -262,18 +262,18 @@ pub fn rename_entry(doc: &Doc, old_name: &str, new_name: &str) -> Option<String>
 
     // Read old entry properties
     let (entry_type_str, node_id) = match entries.get(&txn, old_name) {
-        Some(yrs::Value::YMap(entry_map)) => {
+        Some(yrs::Out::YMap(entry_map)) => {
             let t = match entry_map.get(&txn, "type") {
-                Some(yrs::Value::Any(Any::String(s))) => s.to_string(),
+                Some(yrs::Out::Any(Any::String(s))) => s.to_string(),
                 _ => return None,
             };
             let n = match entry_map.get(&txn, "node_id") {
-                Some(yrs::Value::Any(Any::String(s))) => s.to_string(),
+                Some(yrs::Out::Any(Any::String(s))) => s.to_string(),
                 _ => return None,
             };
             (t, n)
         }
-        Some(yrs::Value::Any(Any::Map(map))) => {
+        Some(yrs::Out::Any(Any::Map(map))) => {
             let t = match map.get("type") {
                 Some(Any::String(s)) => s.to_string(),
                 _ => return None,
@@ -288,7 +288,7 @@ pub fn rename_entry(doc: &Doc, old_name: &str, new_name: &str) -> Option<String>
     };
 
     entries.remove(&mut txn, old_name);
-    let new_entry = entries.insert(&mut txn, new_name, yrs::MapPrelim::<Any>::new());
+    let new_entry = entries.insert(&mut txn, new_name, yrs::MapPrelim::default());
     new_entry.insert(&mut txn, "type", entry_type_str.as_str());
     new_entry.insert(&mut txn, "node_id", node_id.as_str());
 
@@ -311,14 +311,14 @@ pub fn get_entry(doc: &Doc, name: &str) -> Option<SchemaEntry> {
     // Try YMap path first
     if let Some(entries) = get_entries(&txn) {
         match entries.get(&txn, name) {
-            Some(yrs::Value::YMap(entry_map)) => {
+            Some(yrs::Out::YMap(entry_map)) => {
                 let entry_type = match entry_map.get(&txn, "type") {
-                    Some(yrs::Value::Any(Any::String(s))) => SchemaEntryType::from_str(s.as_ref())?,
+                    Some(yrs::Out::Any(Any::String(s))) => SchemaEntryType::from_str(s.as_ref())?,
                     _ => return None,
                 };
 
                 let node_id = match entry_map.get(&txn, "node_id") {
-                    Some(yrs::Value::Any(Any::String(s))) => Some(s.to_string()),
+                    Some(yrs::Out::Any(Any::String(s))) => Some(s.to_string()),
                     _ => None,
                 };
 
@@ -327,7 +327,7 @@ pub fn get_entry(doc: &Doc, name: &str) -> Option<SchemaEntry> {
                     node_id,
                 });
             }
-            Some(yrs::Value::Any(Any::Map(entry_map))) => {
+            Some(yrs::Out::Any(Any::Map(entry_map))) => {
                 return schema_entry_from_any_map(&entry_map);
             }
             _ => {}
@@ -353,9 +353,9 @@ pub fn list_entries(doc: &Doc) -> HashMap<String, SchemaEntry> {
     if let Some(entries) = get_entries(&txn) {
         for (key, value) in entries.iter(&txn) {
             match value {
-                yrs::Value::YMap(entry_map) => {
+                yrs::Out::YMap(entry_map) => {
                     let entry_type = match entry_map.get(&txn, "type") {
-                        Some(yrs::Value::Any(Any::String(s))) => {
+                        Some(yrs::Out::Any(Any::String(s))) => {
                             match SchemaEntryType::from_str(s.as_ref()) {
                                 Some(t) => t,
                                 None => continue,
@@ -365,7 +365,7 @@ pub fn list_entries(doc: &Doc) -> HashMap<String, SchemaEntry> {
                     };
 
                     let node_id = match entry_map.get(&txn, "node_id") {
-                        Some(yrs::Value::Any(Any::String(s))) => Some(s.to_string()),
+                        Some(yrs::Out::Any(Any::String(s))) => Some(s.to_string()),
                         _ => None,
                     };
 
@@ -377,7 +377,7 @@ pub fn list_entries(doc: &Doc) -> HashMap<String, SchemaEntry> {
                         },
                     );
                 }
-                yrs::Value::Any(Any::Map(entry_map)) => {
+                yrs::Out::Any(Any::Map(entry_map)) => {
                     if let Some(entry) = schema_entry_from_any_map(&entry_map) {
                         result.insert(key.to_string(), entry);
                     }
@@ -435,7 +435,7 @@ pub fn is_ymap_format(doc: &Doc) -> bool {
     if let Some(content) = txn.get_map("content") {
         matches!(
             content.get(&txn, "root"),
-            Some(yrs::Value::YMap(_)) | Some(yrs::Value::Any(Any::Map(_)))
+            Some(yrs::Out::YMap(_)) | Some(yrs::Out::Any(Any::Map(_)))
         )
     } else {
         false
@@ -676,9 +676,9 @@ mod tests {
             let mut txn = initial_doc.transact_mut();
             let content = txn.get_or_insert_map("content");
             content.insert(&mut txn, "version", 1_i64);
-            let schema_root = content.insert(&mut txn, "root", yrs::MapPrelim::<Any>::new());
+            let schema_root = content.insert(&mut txn, "root", yrs::MapPrelim::default());
             schema_root.insert(&mut txn, "type", "dir");
-            schema_root.insert(&mut txn, "entries", yrs::MapPrelim::<Any>::new());
+            schema_root.insert(&mut txn, "entries", yrs::MapPrelim::default());
         }
         let initial_state = {
             let txn = initial_doc.transact();
@@ -690,7 +690,7 @@ mod tests {
         {
             let update = yrs::Update::decode_v1(&initial_state).unwrap();
             let mut txn = doc1.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Client 2 starts from same initial state
@@ -698,7 +698,7 @@ mod tests {
         {
             let update = yrs::Update::decode_v1(&initial_state).unwrap();
             let mut txn = doc2.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Get state vectors before concurrent edits
@@ -723,12 +723,12 @@ mod tests {
         {
             let update = yrs::Update::decode_v1(&update2).unwrap();
             let mut txn = doc1.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         {
             let update = yrs::Update::decode_v1(&update1).unwrap();
             let mut txn = doc2.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Both docs should have both files
@@ -934,7 +934,7 @@ fn test_root_refs_after_update() {
     {
         let update = Update::decode_v1(&update_bytes).expect("decode update");
         let mut txn = doc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
     }
 
     // Now check root_refs
@@ -952,7 +952,7 @@ fn test_root_refs_after_update() {
         .map(|(_, value)| value);
 
     match content_root {
-        Some(yrs::types::Value::YMap(map)) => {
+        Some(yrs::Out::YMap(map)) => {
             let any = map.to_json(&txn);
             let json = serde_json::to_string_pretty(&any).unwrap();
             eprintln!("Found YMap, JSON:\n{}", &json[..json.len().min(500)]);

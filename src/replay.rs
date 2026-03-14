@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use tracing::debug;
 use yrs::types::ToJson;
 use yrs::updates::decoder::Decode;
-use yrs::{Doc, GetString, ReadTxn, Transact, Value};
+use yrs::{Doc, GetString, Out, ReadTxn, Transact};
 
 /// Text root name used in Yrs documents (must match DocumentNode)
 const TEXT_ROOT_NAME: &str = "content";
@@ -186,7 +186,7 @@ pub fn compact_updates(
             .map_err(|e| ReplayError::InvalidUpdate(format!("invalid update at {}: {}", i, e)))?;
 
         let mut txn = ydoc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
         debug!("  [{}]: applied {} bytes", i, update_bytes.len());
     }
 
@@ -340,7 +340,7 @@ impl<'a> CommitReplayer<'a> {
                 .map_err(|e| ReplayError::InvalidUpdate(e.to_string()))?;
 
             let mut txn = ydoc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Extract final content and state based on content type
@@ -359,7 +359,7 @@ impl<'a> CommitReplayer<'a> {
                     .map(|(_, value)| value);
 
                 match root {
-                    Some(Value::YMap(map)) => {
+                    Some(Out::YMap(map)) => {
                         let any = map.to_json(&txn);
                         serde_json::to_string(&any).map_err(|e| {
                             ReplayError::InvalidUpdate(format!("JSON serialization: {}", e))
@@ -375,7 +375,7 @@ impl<'a> CommitReplayer<'a> {
                     .map(|(_, value)| value);
 
                 match root {
-                    Some(Value::YArray(array)) => {
+                    Some(Out::YArray(array)) => {
                         let any = array.to_json(&txn);
                         serde_json::to_string(&any).map_err(|e| {
                             ReplayError::InvalidUpdate(format!("JSON serialization: {}", e))
@@ -391,7 +391,7 @@ impl<'a> CommitReplayer<'a> {
                     .map(|(_, value)| value);
 
                 match root {
-                    Some(Value::YArray(array)) => {
+                    Some(Out::YArray(array)) => {
                         let any = array.to_json(&txn);
                         let json_value = serde_json::to_value(&any).map_err(|e| {
                             ReplayError::InvalidUpdate(format!("JSON serialization: {}", e))
@@ -401,7 +401,7 @@ impl<'a> CommitReplayer<'a> {
                                 .iter()
                                 .map(serde_json::to_string)
                                 .collect::<Result<Vec<_>, _>>()
-                                .map(|lines| lines.join("\n"))
+                                .map(|lines: Vec<String>| lines.join("\n"))
                                 .map_err(|e| {
                                     ReplayError::InvalidUpdate(format!(
                                         "JSONL serialization: {}",
@@ -817,7 +817,7 @@ mod tests {
             let update_bytes = b64::decode(&u1).unwrap();
             let update = yrs::Update::decode_v1(&update_bytes).unwrap();
             let mut txn = doc2.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         let text2 = doc2.get_or_insert_text(TEXT_ROOT_NAME);
         let u2 = {
@@ -837,7 +837,7 @@ mod tests {
             let update_bytes = b64::decode(&u1).unwrap();
             let update = yrs::Update::decode_v1(&update_bytes).unwrap();
             let mut txn = doc3.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         let text3 = doc3.get_or_insert_text(TEXT_ROOT_NAME);
         let u3 = {
@@ -948,7 +948,7 @@ mod tests {
             let update_bytes = b64::decode(&compacted).unwrap();
             let update = yrs::Update::decode_v1(&update_bytes).unwrap();
             let mut txn = verify_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         let txn = verify_doc.transact();
@@ -995,7 +995,7 @@ mod tests {
             let update_bytes = b64::decode(&compacted).unwrap();
             let update = yrs::Update::decode_v1(&update_bytes).unwrap();
             let mut txn = verify_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         let txn = verify_doc.transact();
@@ -1025,7 +1025,7 @@ mod tests {
             let update_bytes = b64::decode(&compacted).unwrap();
             let update = yrs::Update::decode_v1(&update_bytes).unwrap();
             let mut txn = verify_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         let txn = verify_doc.transact();
@@ -1052,7 +1052,7 @@ mod tests {
             let update_bytes = b64::decode(&compacted).unwrap();
             let update = yrs::Update::decode_v1(&update_bytes).unwrap();
             let mut txn = verify_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         let txn = verify_doc.transact();
@@ -1105,7 +1105,7 @@ mod tests {
             let update_bytes = b64::decode(&compacted).unwrap();
             let update = yrs::Update::decode_v1(&update_bytes).unwrap();
             let mut txn = verify_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         let txn = verify_doc.transact();

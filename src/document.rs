@@ -6,7 +6,7 @@ use yrs::updates::decoder::Decode;
 use yrs::GetString;
 use yrs::ReadTxn;
 use yrs::Transact;
-use yrs::Value;
+use yrs::Out;
 use yrs::WriteTxn;
 
 // Re-export ContentType for backward compatibility
@@ -226,7 +226,7 @@ impl DocumentStore {
 
         let mut txn = ydoc.transact_mut();
         let content_type = doc.content_type;
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
 
         // Detect all root variants for "content". Yrs can retain multiple types with
         // the same name if a document was pre-initialized with one type and later
@@ -239,22 +239,22 @@ impl DocumentStore {
                 continue;
             }
             match value {
-                Value::YMap(map) => {
+                Out::YMap(map) => {
                     if root_map.is_none() {
                         root_map = Some(map);
                     }
                 }
-                Value::YArray(array) => {
+                Out::YArray(array) => {
                     if root_array.is_none() {
                         root_array = Some(array);
                     }
                 }
-                Value::YText(text) => {
+                Out::YText(text) => {
                     if root_text.is_none() {
                         root_text = Some(text);
                     }
                 }
-                Value::UndefinedRef(branch_ptr) => {
+                Out::UndefinedRef(branch_ptr) => {
                     // When a Y.Doc is created without pre-inserting root types
                     // (uninit), incoming CRDT updates create roots that appear
                     // as UndefinedRef. Check the branch's actual type_ref to
@@ -466,7 +466,7 @@ impl DocumentStore {
             .map_err(|e| ApplyError::InvalidUpdate(e.to_string()))?;
 
         let mut txn = ydoc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
 
         // Update content
         doc.content = new_content.to_string();
@@ -508,8 +508,8 @@ fn jsonl_content_from_array(
             .iter()
             .map(serde_json::to_string)
             .collect::<Result<Vec<_>, _>>()
-            .map(|lines| lines.join("\n"))
-            .map_err(|e| ApplyError::Serialization(e.to_string()))?;
+            .map(|lines: Vec<String>| lines.join("\n"))
+            .map_err(|e: serde_json::Error| ApplyError::Serialization(e.to_string()))?;
         if !content.is_empty() {
             content.push('\n');
         }

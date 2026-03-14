@@ -120,7 +120,7 @@ pub async fn publish_text_change_with_parent(
         let update = Update::decode_v1(&update_bytes)
             .map_err(|e| SyncError::yjs_decode(format!("Invalid Yjs update: {}", e)))?;
         let mut txn = doc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
     }
 
     // Create commit
@@ -226,7 +226,7 @@ pub async fn publish_yjs_update_with_parent(
         let update = Update::decode_v1(&update_bytes)
             .map_err(|e| SyncError::yjs_decode(format!("Invalid Yjs update: {}", e)))?;
         let mut txn = doc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
     }
 
     // Create commit
@@ -330,7 +330,7 @@ pub fn apply_received_commit(
     let doc = state.to_doc()?;
     {
         let mut txn = doc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
     }
 
     // Update state
@@ -513,12 +513,12 @@ mod tests {
         {
             let update = Update::decode_v1(&base_state).unwrap();
             let mut txn = apply_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         {
             let update = Update::decode_v1(&update).unwrap();
             let mut txn = apply_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         let content = get_doc_text_content(&apply_doc);
@@ -550,12 +550,12 @@ mod tests {
         {
             let update = Update::decode_v1(&base_state).unwrap();
             let mut txn = apply_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         {
             let update = Update::decode_v1(&update).unwrap();
             let mut txn = apply_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         let content = get_doc_text_content(&apply_doc);
@@ -589,12 +589,12 @@ mod tests {
         {
             let update = Update::decode_v1(&base_state).unwrap();
             let mut txn = apply_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         {
             let update = Update::decode_v1(&update).unwrap();
             let mut txn = apply_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         let content = get_doc_text_content(&apply_doc);

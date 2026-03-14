@@ -82,7 +82,7 @@ pub fn decode_schema_from_mqtt_payload(payload: &[u8]) -> Option<(FsSchema, Stri
         let mut txn = doc.transact_mut();
         match Update::decode_v1(&update_bytes) {
             Ok(update) => {
-                txn.apply_update(update);
+                let _ = txn.apply_update(update);
             }
             Err(e) => {
                 debug!("Failed to decode Yrs update: {:?}", e);
@@ -178,7 +178,7 @@ pub fn apply_schema_update_to_state(
         let mut txn = doc.transact_mut();
         match Update::decode_v1(&update_bytes) {
             Ok(update) => {
-                txn.apply_update(update);
+                let _ = txn.apply_update(update);
             }
             Err(e) => {
                 debug!("Failed to decode Yrs update: {:?}", e);

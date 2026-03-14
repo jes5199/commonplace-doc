@@ -103,7 +103,7 @@ pub fn create_yjs_json_delete_key(
     })?;
     {
         let mut txn = doc.transact_mut();
-        txn.apply_update(update_result);
+        let _ = txn.apply_update(update_result);
     }
 
     let update = {
@@ -137,7 +137,7 @@ fn delete_nested_entry(txn: &mut yrs::TransactionMut, map: yrs::MapRef, path: &s
         return;
     }
 
-    if let Some(yrs::types::Value::Any(Any::Map(root_map))) = map.get(txn, "root") {
+    if let Some(yrs::Out::Any(Any::Map(root_map))) = map.get(txn, "root") {
         if let Some(Any::Map(entries_map)) = root_map.get("entries") {
             // Clone entries for modification
             let new_entries = delete_from_entries_recursive(&parts, entries_map);
@@ -207,7 +207,7 @@ fn create_yjs_json_update_impl(
             if !state_bytes.is_empty() {
                 if let Ok(update) = Update::decode_v1(&state_bytes) {
                     let mut txn = doc.transact_mut();
-                    txn.apply_update(update);
+                    let _ = txn.apply_update(update);
                 }
             }
         }
@@ -371,7 +371,7 @@ pub fn create_yjs_text_diff_update(
         let update = Update::decode_v1(&base_state_bytes)
             .map_err(|e| format!("Failed to decode base state: {}", e))?;
         let mut txn = doc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
     }
 
     // Compute character-level diff
@@ -422,7 +422,7 @@ pub fn create_yjs_jsonl_update(
             if !state_bytes.is_empty() {
                 if let Ok(update) = Update::decode_v1(&state_bytes) {
                     let mut txn = doc.transact_mut();
-                    txn.apply_update(update);
+                    let _ = txn.apply_update(update);
                 }
             }
         }
@@ -465,7 +465,7 @@ pub fn yjs_array_to_jsonl(
     if !state_bytes.is_empty() {
         let update = Update::decode_v1(&state_bytes)?;
         let mut txn = doc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
     }
 
     let txn = doc.transact();
@@ -849,7 +849,7 @@ mod tests {
             {
                 let update = Update::decode_v1(&sync_update).expect("Should decode update");
                 let mut txn = server_doc.transact_mut();
-                txn.apply_update(update);
+                let _ = txn.apply_update(update);
             }
 
             // Step 5: Server reads back content (like document.rs does for ContentType::Json)
@@ -861,7 +861,7 @@ mod tests {
                     .map(|(_, value)| value);
 
                 match root {
-                    Some(yrs::types::Value::YMap(map)) => {
+                    Some(yrs::Out::YMap(map)) => {
                         let any = map.to_json(&txn);
                         serde_json::to_string(&any).expect("Should serialize")
                     }
@@ -918,7 +918,7 @@ mod tests {
             {
                 let update = Update::decode_v1(&update1).expect("decode");
                 let mut txn = doc2.transact_mut();
-                txn.apply_update(update);
+                let _ = txn.apply_update(update);
             }
 
             // Read from doc2
@@ -966,7 +966,7 @@ mod tests {
             {
                 let update = Update::decode_v1(&update).expect("decode update");
                 let mut txn = server_doc.transact_mut();
-                txn.apply_update(update);
+                let _ = txn.apply_update(update);
             }
 
             // Read result from Y.Map (what server returns)

@@ -257,8 +257,7 @@ async fn ensure_directory_in_schema(
     }
 
     // Create each missing directory level
-    for i in existing_depth..dir_segments.len() {
-        let dir_name = dir_segments[i];
+    for dir_name in &dir_segments[existing_depth..] {
 
         // Create a new document for the directory's schema
         let new_dir_id = state

@@ -670,7 +670,7 @@ pub(super) async fn sync_schema_via_cyan(
         };
 
         let mut txn = doc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
     }
 
     // Step 8: Encode final state and initialize CRDT

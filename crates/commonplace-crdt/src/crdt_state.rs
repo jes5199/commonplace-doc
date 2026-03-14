@@ -365,7 +365,7 @@ impl CrdtPeerState {
             })?;
 
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         Ok(doc)
@@ -1429,7 +1429,7 @@ mod tests {
         {
             let update = Update::decode_v1(&delete_update).unwrap();
             let mut txn = client_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         // Verify client doc is now empty

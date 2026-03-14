@@ -547,7 +547,7 @@ fn precompute_commits(
 
         if let Ok(update) = Update::decode_v1(&raw_update) {
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
 
         let current_content = text.get_string(&doc.transact());
