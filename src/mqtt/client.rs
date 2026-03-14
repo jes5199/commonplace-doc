@@ -16,6 +16,8 @@ pub struct IncomingMessage {
     pub topic: String,
     /// Message payload
     pub payload: Vec<u8>,
+    /// Whether this was a retained message replayed by the broker on subscribe.
+    pub retain: bool,
 }
 
 /// MQTT client wrapper.
@@ -167,6 +169,7 @@ impl MqttClient {
                     let msg = IncomingMessage {
                         topic: publish.topic.clone(),
                         payload: publish.payload.to_vec(),
+                        retain: publish.retain,
                     };
                     // Broadcast to all receivers (ignore if no receivers)
                     let _ = self.message_tx.send(msg);

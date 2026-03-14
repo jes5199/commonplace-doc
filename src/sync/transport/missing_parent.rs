@@ -306,9 +306,10 @@ async fn rebroadcast_current_state(
     let topic = Topic::edits(workspace, path).to_topic_string();
     let payload = serde_json::to_vec(&edit_msg)?;
 
-    // Use retained message so it's immediately available
+    // Publish as non-retained — sync clients bootstrap via CYAN-SYNC, not retained edits.
+    // Retained edits caused message floods on startup (CP-4t5a).
     mqtt_client
-        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
+        .publish(&topic, &payload, QoS::AtLeastOnce)
         .await
         .map_err(|e| SyncError::mqtt(format!("Failed to rebroadcast: {}", e)))?;
 

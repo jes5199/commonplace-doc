@@ -244,16 +244,16 @@ impl DocumentService {
             match serde_json::to_vec(&edit_msg) {
                 Ok(payload) => {
                     if let Err(e) = mqtt
-                        .publish_retained(&topic, &payload, QoS::AtLeastOnce)
+                        .publish(&topic, &payload, QoS::AtLeastOnce)
                         .await
                     {
                         tracing::warn!(
-                            "Failed to publish retained commit to MQTT topic {}: {}",
+                            "Failed to publish commit to MQTT topic {}: {}",
                             topic,
                             e
                         );
                     } else {
-                        tracing::debug!("Published retained commit to MQTT topic: {}", topic);
+                        tracing::debug!("Published commit to MQTT topic: {}", topic);
                     }
                 }
                 Err(e) => {

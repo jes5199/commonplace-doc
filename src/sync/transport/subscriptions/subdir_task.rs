@@ -384,6 +384,17 @@ pub async fn subdir_mqtt_task(
             BroadcastRecvResult::Closed => break,
         };
 
+        // Skip retained messages — stale replays from the broker (CP-4t5a).
+        if msg.retain {
+            debug!(
+                "Subdir {}: skipping retained message on topic {} ({} bytes)",
+                subdir_path,
+                msg.topic,
+                msg.payload.len()
+            );
+            continue;
+        }
+
         // Parse the topic to extract the document ID
         let doc_id = match Topic::parse(&msg.topic, &workspace) {
             Ok(parsed) => parsed.path,

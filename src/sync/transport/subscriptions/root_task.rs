@@ -187,6 +187,33 @@ pub async fn directory_mqtt_task(
         subscribed_uuids.len()
     );
 
+    // Clear stale retained messages on edit topics (CP-4t5a).
+    // Publishing an empty retained message tells the broker to discard any
+    // previously retained payload for that topic, preventing floods on future
+    // subscribes.
+    let mut cleared = 0u32;
+    for uuid in &subscribed_uuids {
+        let topic = Topic::edits(&workspace, uuid).to_topic_string();
+        if mqtt_client
+            .publish_retained(&topic, &[], QoS::AtLeastOnce)
+            .await
+            .is_ok()
+        {
+            cleared += 1;
+        }
+    }
+    // Also clear the fs-root edits topic (schema edits were never retained,
+    // but clear defensively in case stale retained messages exist).
+    let _ = mqtt_client
+        .publish_retained(&fs_root_topic, &[], QoS::AtLeastOnce)
+        .await;
+    if cleared > 0 {
+        info!(
+            "Cleared retained messages on {} edit topics",
+            cleared + 1
+        );
+    }
+
     // Write a readiness marker to indicate MQTT subscriptions are established.
     // Gated behind COMMONPLACE_MQTT_READY_MARKER=1 to avoid side effects in production.
     // Tests should set this env var to enable waiting on the marker.
@@ -313,6 +340,17 @@ pub async fn directory_mqtt_task(
             }
             BroadcastRecvResult::Closed => break,
         };
+
+        // Skip retained messages — they are stale replays from the broker.
+        // Sync bootstraps via CYAN-SYNC, so retained edits are redundant (CP-4t5a).
+        if msg.retain {
+            debug!(
+                "Skipping retained message on topic {} ({} bytes)",
+                msg.topic,
+                msg.payload.len()
+            );
+            continue;
+        }
 
         // Parse the topic to extract the document ID
         let doc_id = match Topic::parse(&msg.topic, &workspace) {
