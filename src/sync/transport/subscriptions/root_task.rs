@@ -188,15 +188,18 @@ pub async fn directory_mqtt_task(
     );
 
     // Write a readiness marker to indicate MQTT subscriptions are established.
-    // This allows tests to wait for the sandbox to be fully ready to receive messages.
-    let ready_marker = directory.join(".mqtt-ready");
-    if let Err(e) = std::fs::write(
-        &ready_marker,
-        format!("ready at {:?}", std::time::SystemTime::now()),
-    ) {
-        warn!("Failed to write MQTT readiness marker: {}", e);
-    } else {
-        debug!("Wrote MQTT readiness marker to {}", ready_marker.display());
+    // Gated behind COMMONPLACE_MQTT_READY_MARKER=1 to avoid side effects in production.
+    // Tests should set this env var to enable waiting on the marker.
+    if std::env::var("COMMONPLACE_MQTT_READY_MARKER").unwrap_or_default() == "1" {
+        let ready_marker = directory.join(".mqtt-ready");
+        if let Err(e) = std::fs::write(
+            &ready_marker,
+            format!("ready at {:?}", std::time::SystemTime::now()),
+        ) {
+            warn!("Failed to write MQTT readiness marker: {}", e);
+        } else {
+            debug!("Wrote MQTT readiness marker to {}", ready_marker.display());
+        }
     }
 
     // Bootstrap schema CRDT state via cyan sync channel before entering MQTT loop.

@@ -583,6 +583,7 @@ fn test_sandbox_process_runs_in_sandbox_cwd() {
             "--server",
             &server_url,
         ])
+        .env("COMMONPLACE_MQTT_READY_MARKER", "1")
         .current_dir(temp_dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -755,6 +756,7 @@ fn test_processes_json_add_remove_starts_stops_processes() {
             "--server",
             &server_url,
         ])
+        .env("COMMONPLACE_MQTT_READY_MARKER", "1")
         .current_dir(temp_dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -957,6 +959,7 @@ fn test_process_config_change_triggers_restart() {
             "--server",
             &server_url,
         ])
+        .env("COMMONPLACE_MQTT_READY_MARKER", "1")
         .current_dir(temp_dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1365,6 +1368,7 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
             "--server",
             &server_url,
         ])
+        .env("COMMONPLACE_MQTT_READY_MARKER", "1")
         .current_dir(temp_dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1654,6 +1658,7 @@ fn test_commonplace_link_schema_push_updates_server() {
             "--server",
             &server_url,
         ])
+        .env("COMMONPLACE_MQTT_READY_MARKER", "1")
         .current_dir(temp_dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -2602,6 +2607,7 @@ fn test_uuid_linked_files_sync_bidirectionally() {
             "--server",
             &server_url,
         ])
+        .env("COMMONPLACE_MQTT_READY_MARKER", "1")
         .current_dir(temp_dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
