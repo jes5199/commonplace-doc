@@ -222,13 +222,122 @@ async fn resolve_path(state: &FileApiState, path: &str) -> Result<String, PathRe
     Err(PathResolveError::PathNotFound)
 }
 
+/// Ensure a directory exists in the schema, creating it (and any missing ancestors)
+/// if necessary. Returns the document ID of the directory.
+async fn ensure_directory_in_schema(
+    state: &FileApiState,
+    dir_segments: &[&str],
+) -> Result<String, PathResolveError> {
+    let fs_root_id = state.fs_root.as_ref().ok_or(PathResolveError::NoFsRoot)?;
+
+    if dir_segments.is_empty() {
+        return Ok(fs_root_id.clone());
+    }
+
+    // Try to resolve the full directory path first (fast path)
+    let dir_path = dir_segments.join("/");
+    if let Ok(id) = resolve_path(state, &dir_path).await {
+        return Ok(id);
+    }
+
+    // Find the deepest ancestor that exists, then create missing directories
+    let mut existing_depth = 0;
+    let mut current_id = fs_root_id.clone();
+
+    for i in 0..dir_segments.len() {
+        let partial_path = dir_segments[..=i].join("/");
+        match resolve_path(state, &partial_path).await {
+            Ok(id) => {
+                existing_depth = i + 1;
+                current_id = id;
+            }
+            Err(PathResolveError::PathNotFound) => break,
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Create each missing directory level
+    for i in existing_depth..dir_segments.len() {
+        let dir_name = dir_segments[i];
+
+        // Create a new document for the directory's schema
+        let new_dir_id = state
+            .service
+            .create_document(ContentType::Json)
+            .await;
+
+        // Initialize the new directory with an empty schema
+        let empty_schema = serde_json::json!({
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {}
+            }
+        });
+        let empty_schema_str = serde_json::to_string(&empty_schema)
+            .map_err(|_| PathResolveError::PathNotFound)?;
+        state
+            .service
+            .replace_content(&new_dir_id, &empty_schema_str, None, Some("create-dir".to_string()))
+            .await
+            .map_err(|_| PathResolveError::PathNotFound)?;
+
+        // Add directory entry to parent schema
+        let parent_head = state
+            .service
+            .get_head(&current_id, None)
+            .await
+            .map_err(|_| PathResolveError::FsRootNotFound)?;
+
+        let mut parent_schema: serde_json::Value = serde_json::from_str(&parent_head.content)
+            .map_err(|_| PathResolveError::PathNotFound)?;
+
+        let entries = parent_schema
+            .get_mut("root")
+            .and_then(|r| r.get_mut("entries"))
+            .and_then(|e| e.as_object_mut())
+            .ok_or(PathResolveError::PathNotFound)?;
+
+        entries.insert(
+            dir_name.to_string(),
+            serde_json::json!({
+                "type": "dir",
+                "node_id": new_dir_id
+            }),
+        );
+
+        let updated_parent = serde_json::to_string(&parent_schema)
+            .map_err(|_| PathResolveError::PathNotFound)?;
+        state
+            .service
+            .replace_content(
+                &current_id,
+                &updated_parent,
+                parent_head.cid,
+                Some("create-dir".to_string()),
+            )
+            .await
+            .map_err(|_| PathResolveError::PathNotFound)?;
+
+        tracing::info!(
+            "Created directory '{}' (doc {}) in parent {}",
+            dir_name,
+            new_dir_id,
+            current_id
+        );
+        current_id = new_dir_id;
+    }
+
+    Ok(current_id)
+}
+
 /// Create a new file entry in the parent directory's schema.
 ///
 /// This adds an entry with `node_id: null` to the parent schema, which triggers
 /// the filesystem reconciler to create a document and assign a UUID.
+///
+/// If parent directories don't exist, they are created recursively.
 async fn create_file_in_schema(state: &FileApiState, path: &str) -> Result<(), PathResolveError> {
-    let fs_root_id = state.fs_root.as_ref().ok_or(PathResolveError::NoFsRoot)?;
-
     // Split path into parent and filename
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     if segments.is_empty() {
@@ -238,13 +347,8 @@ async fn create_file_in_schema(state: &FileApiState, path: &str) -> Result<(), P
     let filename = segments.last().unwrap();
     let parent_segments = &segments[..segments.len() - 1];
 
-    // Get parent document ID (fs-root if no parent segments)
-    let parent_id = if parent_segments.is_empty() {
-        fs_root_id.clone()
-    } else {
-        let parent_path = parent_segments.join("/");
-        resolve_path(state, &parent_path).await?
-    };
+    // Ensure parent directory exists (creates missing ancestors recursively)
+    let parent_id = ensure_directory_in_schema(state, parent_segments).await?;
 
     // Fetch parent schema via service (for proper HEAD/CID handling)
     let head = state
