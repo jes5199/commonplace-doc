@@ -588,7 +588,7 @@ async fn test_fork_directory() {
     assert_eq!(manifest.forked_from, dir_id);
 
     // Each forked doc should have different UUID but reference originals
-    for (_new_uuid, entry) in &manifest.document_map {
+    for entry in manifest.document_map.values() {
         assert!(entry.original_uuid == file1_id || entry.original_uuid == file2_id);
         assert!(!entry.fork_point_commit.is_empty());
     }

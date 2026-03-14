@@ -331,8 +331,6 @@ pub async fn all_are_ancestors(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::Client;
-
     #[test]
     fn direction_from_ancestry_checks_push_when_server_is_ancestor_of_local() {
         let direction = direction_from_ancestry_checks(true, false);

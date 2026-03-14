@@ -327,7 +327,7 @@ async fn test_ws_two_clients_bidirectional_sync() {
     let text_b = ydoc_b.get_or_insert_text("content");
     {
         let mut txn = ydoc_b.transact_mut();
-        txn.apply_update(Update::decode_v1(&payload).unwrap());
+        let _ = txn.apply_update(Update::decode_v1(&payload).unwrap());
     }
     let content_b = {
         let txn = ydoc_b.transact();
@@ -357,7 +357,7 @@ async fn test_ws_two_clients_bidirectional_sync() {
     // Apply update to client A's doc and verify
     {
         let mut txn = ydoc_a.transact_mut();
-        txn.apply_update(Update::decode_v1(&payload2).unwrap());
+        let _ = txn.apply_update(Update::decode_v1(&payload2).unwrap());
     }
     let content_a = {
         let txn = ydoc_a.transact();
@@ -420,7 +420,7 @@ async fn test_ws_reconnect_receives_missed_updates() {
     let text_http = ydoc_http.get_or_insert_text("content");
     {
         let mut txn = ydoc_http.transact_mut();
-        txn.apply_update(Update::decode_v1(&update1).unwrap());
+        let _ = txn.apply_update(Update::decode_v1(&update1).unwrap());
     }
     let update_http = {
         let mut txn = ydoc_http.transact_mut();
@@ -460,7 +460,7 @@ async fn test_ws_reconnect_receives_missed_updates() {
     let text_final = ydoc_final.get_or_insert_text("content");
     {
         let mut txn = ydoc_final.transact_mut();
-        txn.apply_update(Update::decode_v1(&state).unwrap());
+        let _ = txn.apply_update(Update::decode_v1(&state).unwrap());
     }
     let content = {
         let txn = ydoc_final.transact();

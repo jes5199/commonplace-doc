@@ -8,7 +8,7 @@ use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update, WriteTxn
 fn apply_update(doc: &Doc, update: &[u8]) {
     let update = Update::decode_v1(update).expect("update decode failed");
     let mut txn = doc.transact_mut();
-    txn.apply_update(update);
+    let _ = txn.apply_update(update);
 }
 
 fn doc_text(doc: &Doc) -> String {
@@ -306,7 +306,7 @@ mod no_echo_tests {
                 yrs::updates::decoder::Decode::decode_v1(&STANDARD.decode(&msg1.update).unwrap())
                     .unwrap();
             let mut txn = doc2.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         let update2 = {
             let mut txn = doc2.transact_mut();
@@ -957,7 +957,7 @@ mod edit_buffering_tests {
             )
             .unwrap();
             let mut txn = remote_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         let remote_update = {
             let mut txn = remote_doc.transact_mut();
@@ -1193,7 +1193,7 @@ mod edit_buffering_tests {
             // Remote builds on server state
             let update = yrs::updates::decoder::Decode::decode_v1(&server_state).unwrap();
             let mut txn = remote_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         let remote_update = {
             let mut txn = remote_doc.transact_mut();
@@ -2217,7 +2217,7 @@ mod crdt_merge_tests {
         {
             let update = Update::decode_v1(base_state).unwrap();
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         let update = {
             let mut txn = doc.transact_mut();
@@ -2241,7 +2241,7 @@ mod crdt_merge_tests {
     fn apply_update(doc: &Doc, update: &[u8]) {
         let u = Update::decode_v1(update).expect("update decode failed");
         let mut txn = doc.transact_mut();
-        txn.apply_update(u);
+        let _ = txn.apply_update(u);
     }
 
     /// Helper to get full state from a doc as base64.
@@ -2948,7 +2948,7 @@ mod receive_pipeline_tests {
         {
             let update = Update::decode_v1(base_state).expect("decode base state");
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
         }
         let mut txn = doc.transact_mut();
         let ytext = txn.get_or_insert_text("content");
@@ -3538,7 +3538,7 @@ mod receive_pipeline_tests {
         {
             let update = Update::decode_v1(&base_state).unwrap();
             let mut txn = local_doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
             let text = txn.get_or_insert_text("content");
             text.insert(&mut txn, 6, " local_edit");
         }
@@ -3756,7 +3756,7 @@ mod receive_pipeline_tests {
             let update_bytes = STANDARD.decode(&update_b64).unwrap();
             let u = Update::decode_v1(&update_bytes).unwrap();
             let mut txn = current_doc.transact_mut();
-            txn.apply_update(u);
+            let _ = txn.apply_update(u);
         }
 
         // Verify final state has all digits

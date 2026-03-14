@@ -239,6 +239,6 @@ mod tests {
     fn test_script_watch_map_empty() {
         let map: ScriptWatchMap = HashMap::new();
         assert!(map.is_empty());
-        assert!(map.get("any-uuid").is_none());
+        assert!(!map.contains_key("any-uuid"));
     }
 }

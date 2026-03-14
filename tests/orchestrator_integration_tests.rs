@@ -1425,7 +1425,7 @@ fn test_workspace_sandbox_file_sync_create_edit_delete() {
     while debug_start.elapsed() < Duration::from_secs(15) {
         // Check via files API
         let resp = client
-            .get(&format!("{}/files/sync-test/test-file.txt", server_url))
+            .get(format!("{}/files/sync-test/test-file.txt", server_url))
             .send();
         if let Ok(resp) = resp {
             if resp.status().is_success() {

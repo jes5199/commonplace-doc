@@ -626,7 +626,7 @@ async fn test_head_at_commit_returns_historical_state() {
     let text2 = ydoc2.get_or_insert_text("content");
     {
         let mut txn = ydoc2.transact_mut();
-        txn.apply_update(Update::decode_v1(&update1).unwrap());
+        let _ = txn.apply_update(Update::decode_v1(&update1).unwrap());
     }
     let mut txn2 = ydoc2.transact_mut();
     text2.push(&mut txn2, " world");
