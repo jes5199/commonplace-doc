@@ -14,7 +14,7 @@
     },
     "sync": {
       "command": "/home/jes/commonplace/target/release/commonplace-sync",
-      "args": ["--server", "http://localhost:5199", "--node", "workspace/main", "--directory", "./workspace", "--initial-sync", "local"],
+      "args": ["--server", "http://localhost:5199", "--node", "948b3c3f-f3ce-4d02-bfb0-e49e34ceb0a1", "--directory", "./workspace", "--initial-sync", "local"],
       "restart": {
         "policy": "always",
         "backoff_ms": 500,
