@@ -773,6 +773,8 @@ async fn handle_dir_event(
             // Use CRDT path if available
             if let Some(crdt) = crdt_params {
                 handle_file_deleted_crdt(
+                    client,
+                    server,
                     &path,
                     directory,
                     fs_root_id,
@@ -1962,6 +1964,8 @@ async fn handle_file_renamed(
 /// 2. Loading the appropriate DirectorySyncState for that directory
 /// 3. Removing the file from the correct schema
 async fn handle_file_deleted_crdt(
+    client: &Client,
+    server: &str,
     path: &std::path::Path,
     directory: &std::path::Path,
     fs_root_id: &str,
@@ -2207,6 +2211,22 @@ async fn handle_file_deleted_crdt(
                         );
                     }
                 }
+
+                // Also persist the deletion to the server so it survives cyan resyncs (CP-37oh).
+                if let Err(e) = commonplace_doc::sync::delete_schema_entry(
+                    client,
+                    server,
+                    &owning_doc.document_id,
+                    &owning_doc.relative_path,
+                    author,
+                )
+                .await
+                {
+                    warn!(
+                        "Failed to persist schema deletion to server for '{}': {}",
+                        owning_doc.relative_path, e
+                    );
+                }
             }
             Err(e) => {
                 // File might not be in schema (e.g., temp file, already deleted)
@@ -2250,6 +2270,22 @@ async fn handle_file_deleted_crdt(
                     "Removed file '{}' from schema via CRDT: cid={}",
                     filename, cid
                 );
+
+                // Also persist the deletion to the server so it survives cyan resyncs (CP-37oh).
+                if let Err(e) = commonplace_doc::sync::delete_schema_entry(
+                    client,
+                    server,
+                    fs_root_id,
+                    &filename,
+                    author,
+                )
+                .await
+                {
+                    warn!(
+                        "Failed to persist schema deletion to server for '{}': {}",
+                        filename, e
+                    );
+                }
             }
             Err(e) => {
                 // File might not be in schema (e.g., temp file, already deleted)
