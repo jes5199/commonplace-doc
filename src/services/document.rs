@@ -970,19 +970,21 @@ impl DocumentService {
                 );
                 let replayer = CommitReplayer::new(commit_store);
 
-                // Verify the commit belongs to this document's history
+                // Verify the commit belongs to this document's history.
+                // Return Conflict (409) not NotFound (404) — the document
+                // exists but the specified parent commit does not.
                 if !replayer
                     .verify_commit_in_history(id, parent)
                     .await
-                    .map_err(|_| ServiceError::NotFound)?
+                    .map_err(|_| ServiceError::Conflict)?
                 {
-                    return Err(ServiceError::NotFound);
+                    return Err(ServiceError::Conflict);
                 }
 
                 let (old_content, base_state_bytes) = replayer
                     .get_content_and_state_at_commit(id, parent, &doc.content_type)
                     .await
-                    .map_err(|_| ServiceError::NotFound)?;
+                    .map_err(|_| ServiceError::Conflict)?;
 
                 debug!(
                     "MERGE: parent content = {:?} ({} bytes), new content = {:?} ({} bytes), base_state = {} bytes",
