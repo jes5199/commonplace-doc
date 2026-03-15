@@ -109,11 +109,11 @@ async fn create_doc(
     // Support both Content-Type header and JSON body for content_type
     // Priority: JSON body content_type > HTTP Content-Type header
     let content_type = if let Some(Json(ref req)) = body {
-        // Check JSON body content_type field first
-        if let Some(ct) = req.content_type.as_deref().and_then(ContentType::from_mime) {
-            ct
+        if let Some(ref ct_str) = req.content_type {
+            // Explicit content_type in body — must be valid or reject
+            ContentType::from_mime(ct_str).ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?
         } else {
-            // Fall back to Content-Type header
+            // No content_type field — fall back to Content-Type header
             let content_type_str = headers
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
