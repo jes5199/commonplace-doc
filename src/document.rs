@@ -356,11 +356,42 @@ impl DocumentStore {
             }
             ContentType::Json => {
                 if let Some(map) = root_map {
-                    json_content_from_map(&txn, &map)?
+                    let map_content = json_content_from_map(&txn, &map)?;
+                    // If the map is empty (pre-initialized default), check whether
+                    // a YArray root also exists with actual content. This happens
+                    // when a ContentType::Json doc receives array content via
+                    // replace — the write path creates a YArray but the
+                    // pre-initialized YMap persists as an empty root.
+                    if map_content == ContentType::Json.default_content() {
+                        if let Some(array) =
+                            root_array.or_else(|| txn.get_array(Self::TEXT_ROOT_NAME))
+                        {
+                            let any = array.to_json(&txn);
+                            let array_content = serde_json::to_string(&any)
+                                .map_err(|e| ApplyError::Serialization(e.to_string()))?;
+                            if array_content != ContentType::JsonArray.default_content() {
+                                doc.content_type = ContentType::JsonArray;
+                                array_content
+                            } else {
+                                map_content
+                            }
+                        } else {
+                            map_content
+                        }
+                    } else {
+                        map_content
+                    }
+                } else if let Some(array) =
+                    root_array.or_else(|| txn.get_array(Self::TEXT_ROOT_NAME))
+                {
+                    // No map root but array exists — upgrade to JsonArray
+                    doc.content_type = ContentType::JsonArray;
+                    let any = array.to_json(&txn);
+                    serde_json::to_string(&any)
+                        .map_err(|e| ApplyError::Serialization(e.to_string()))?
                 } else if let Some(text) = root_text {
                     // Handle YText in case document was created as JSON but contains text content
                     // This happens when CRDT edits arrive before the document type is known
-                    // Update content_type to reflect the actual type
                     doc.content_type = ContentType::Text;
                     text.get_string(&txn)
                 } else {
@@ -377,8 +408,34 @@ impl DocumentStore {
             ContentType::JsonArray => {
                 if let Some(array) = root_array.or_else(|| txn.get_array(Self::TEXT_ROOT_NAME)) {
                     let any = array.to_json(&txn);
-                    serde_json::to_string(&any)
-                        .map_err(|e| ApplyError::Serialization(e.to_string()))?
+                    let array_content = serde_json::to_string(&any)
+                        .map_err(|e| ApplyError::Serialization(e.to_string()))?;
+                    // If the array is empty, check whether a YMap root has
+                    // content. This handles the array→object transition where
+                    // the write path cleared the array but populated the map.
+                    if array_content == ContentType::JsonArray.default_content() {
+                        if let Some(map) =
+                            root_map.or_else(|| txn.get_map(Self::TEXT_ROOT_NAME))
+                        {
+                            let map_content = json_content_from_map(&txn, &map)?;
+                            if map_content != ContentType::Json.default_content() {
+                                doc.content_type = ContentType::Json;
+                                map_content
+                            } else {
+                                array_content
+                            }
+                        } else {
+                            array_content
+                        }
+                    } else {
+                        array_content
+                    }
+                } else if let Some(map) =
+                    root_map.or_else(|| txn.get_map(Self::TEXT_ROOT_NAME))
+                {
+                    // No array root but map exists — downgrade to Json
+                    doc.content_type = ContentType::Json;
+                    json_content_from_map(&txn, &map)?
                 } else {
                     ContentType::JsonArray.default_content()
                 }
@@ -760,5 +817,89 @@ mod tests {
         assert!(doc.content.contains("first line"));
         assert!(doc.content.contains("second line"));
         assert!(doc.content.contains("third line from sandbox"));
+    }
+
+    #[tokio::test]
+    async fn test_apply_yjs_update_json_doc_handles_array_content() {
+        // Reproduces CP-hd61: a ContentType::Json doc receives array content
+        // via replace. The pre-initialized YMap root causes the YArray data
+        // to be silently lost — content stays "{}" despite a successful write.
+        let store = DocumentStore::new();
+        let id = "json-array-replace-doc";
+        store
+            .create_document_with_id(id.to_string(), ContentType::Json)
+            .await;
+
+        // Get the base state (which includes the pre-initialized empty YMap)
+        let base_state = store.get_yjs_state(id).await.unwrap();
+        let base_state_b64 = crate::sync::yjs::base64_encode(&base_state);
+
+        // Create a Yjs update with array content
+        let update_b64 =
+            crate::sync::yjs::create_yjs_json_update("[1,2,3]", Some(&base_state_b64)).unwrap();
+        let update_bytes = crate::sync::yjs::base64_decode(&update_b64).unwrap();
+
+        store.apply_yjs_update(id, &update_bytes).await.unwrap();
+        let doc = store.get_document(id).await.unwrap();
+
+        // Content should be the array, not the empty map default "{}"
+        assert_eq!(doc.content_type, ContentType::JsonArray);
+        let parsed: serde_json::Value = serde_json::from_str(&doc.content).unwrap();
+        assert!(
+            parsed.is_array(),
+            "content should be a JSON array, got: {}",
+            doc.content
+        );
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0], 1);
+        assert_eq!(arr[2], 3);
+    }
+
+    #[tokio::test]
+    async fn test_apply_yjs_update_json_object_to_array_transition() {
+        // Verify that replacing object content with array content works,
+        // and vice versa. The write path must clear the opposite root type
+        // so the read path doesn't see stale data.
+        let store = DocumentStore::new();
+        let id = "json-transition-doc";
+        store
+            .create_document_with_id(id.to_string(), ContentType::Json)
+            .await;
+
+        // Step 1: Replace with an object
+        let base1 = store.get_yjs_state(id).await.unwrap();
+        let b64_1 = crate::sync::yjs::base64_encode(&base1);
+        let upd1 =
+            crate::sync::yjs::create_yjs_json_update(r#"{"step":1}"#, Some(&b64_1)).unwrap();
+        let bytes1 = crate::sync::yjs::base64_decode(&upd1).unwrap();
+        store.apply_yjs_update(id, &bytes1).await.unwrap();
+        let doc1 = store.get_document(id).await.unwrap();
+        assert_eq!(doc1.content, r#"{"step":1}"#);
+
+        // Step 2: Replace with an array
+        let base2 = store.get_yjs_state(id).await.unwrap();
+        let b64_2 = crate::sync::yjs::base64_encode(&base2);
+        let upd2 =
+            crate::sync::yjs::create_yjs_json_update("[10,20,30]", Some(&b64_2)).unwrap();
+        let bytes2 = crate::sync::yjs::base64_decode(&upd2).unwrap();
+        store.apply_yjs_update(id, &bytes2).await.unwrap();
+        let doc2 = store.get_document(id).await.unwrap();
+        assert_eq!(doc2.content_type, ContentType::JsonArray);
+        let parsed: serde_json::Value = serde_json::from_str(&doc2.content).unwrap();
+        assert!(parsed.is_array(), "should be array after transition, got: {}", doc2.content);
+        assert_eq!(parsed.as_array().unwrap().len(), 3);
+
+        // Step 3: Replace back with an object
+        let base3 = store.get_yjs_state(id).await.unwrap();
+        let b64_3 = crate::sync::yjs::base64_encode(&base3);
+        let upd3 =
+            crate::sync::yjs::create_yjs_json_update(r#"{"step":3}"#, Some(&b64_3)).unwrap();
+        let bytes3 = crate::sync::yjs::base64_decode(&upd3).unwrap();
+        store.apply_yjs_update(id, &bytes3).await.unwrap();
+        let doc3 = store.get_document(id).await.unwrap();
+        let parsed3: serde_json::Value = serde_json::from_str(&doc3.content).unwrap();
+        assert!(parsed3.is_object(), "should be object after transition back, got: {}", doc3.content);
+        assert_eq!(parsed3["step"], 3);
     }
 }

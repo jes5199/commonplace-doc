@@ -1197,13 +1197,21 @@ fn compute_json_diff(
     let update_bytes = base64_decode(&update_b64)
         .map_err(|e| ServiceError::Internal(format!("Base64 decode failed: {}", e)))?;
 
-    // Estimate changes based on content length difference
+    // Estimate changes based on content comparison.
+    // Must compare actual strings, not just lengths — same-length content
+    // with different structure (e.g. {"step":1} vs [10,20,30]) would otherwise
+    // be falsely reported as zero changes and skipped entirely.
     let old_len = old_content.len();
     let new_len = new_content.len();
-    let (chars_inserted, chars_deleted) = if new_len > old_len {
+    let (chars_inserted, chars_deleted) = if old_content == new_content {
+        (0, 0)
+    } else if new_len > old_len {
         (new_len - old_len, 0)
-    } else {
+    } else if new_len < old_len {
         (0, old_len - new_len)
+    } else {
+        // Same length, different content — report as full replace
+        (new_len, old_len)
     };
 
     Ok(diff::DiffResult {

@@ -244,6 +244,16 @@ fn create_yjs_json_update_impl(
                     for key in existing_keys.difference(&new_keys) {
                         map.remove(&mut txn, key.as_str());
                     }
+
+                    // Clear any stale array root from a previous array replace.
+                    // Without this, switching from array→object leaves orphan
+                    // array data that confuses the read path.
+                    if let Some(array) = txn.get_array(TEXT_ROOT_NAME) {
+                        let len = array.len(&txn);
+                        if len > 0 {
+                            array.remove_range(&mut txn, 0, len);
+                        }
+                    }
                 }
 
                 for (key, val) in obj {
@@ -259,6 +269,17 @@ fn create_yjs_json_update_impl(
                     let len = array.len(&txn);
                     if len > 0 {
                         array.remove_range(&mut txn, 0, len);
+                    }
+
+                    // Clear any stale map root from a previous object replace.
+                    // Without this, switching from object→array leaves orphan
+                    // map data that the read path would prefer over the array.
+                    if let Some(map) = txn.get_map(TEXT_ROOT_NAME) {
+                        let keys: Vec<String> =
+                            map.keys(&txn).map(|k| k.to_string()).collect();
+                        for key in keys {
+                            map.remove(&mut txn, key.as_str());
+                        }
                     }
                 }
 
