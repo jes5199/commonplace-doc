@@ -544,8 +544,6 @@ fn collect_local_schema_paths(directory: &Path) -> Vec<PathBuf> {
 
 #[allow(clippy::too_many_arguments)]
 async fn push_local_schemas_via_mqtt(
-    client: &Client,
-    server: &str,
     fs_root_id: &str,
     directory: &Path,
     author: &str,
@@ -572,8 +570,6 @@ async fn push_local_schemas_via_mqtt(
         })?;
 
         match handle_schema_modified(
-            client,
-            server,
             fs_root_id,
             directory,
             &schema_path,
@@ -617,8 +613,6 @@ async fn prepare_startup_uuid_map(
 ) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
     if decision.push_local_schemas {
         let published = push_local_schemas_via_mqtt(
-            client,
-            server,
             fs_root_id,
             directory,
             author,
@@ -773,8 +767,6 @@ async fn handle_dir_event(
             // Use CRDT path if available
             if let Some(crdt) = crdt_params {
                 handle_file_deleted_crdt(
-                    client,
-                    server,
                     &path,
                     directory,
                     fs_root_id,
@@ -815,8 +807,6 @@ async fn handle_dir_event(
                 mqtt_only_config: p.mqtt_only_config,
             });
             if let Err(e) = handle_schema_modified(
-                client,
-                server,
                 fs_root_id,
                 directory,
                 &path,
@@ -1388,8 +1378,6 @@ async fn handle_file_created_crdt(
                 let states_snapshot = file_states.read().await;
                 let handles = spawn_file_sync_tasks_crdt(
                     crdt.mqtt_client.clone(),
-                    client.clone(),
-                    server.to_string(),
                     crdt.workspace.clone(),
                     new_file.uuid,
                     file_path,
@@ -1397,7 +1385,6 @@ async fn handle_file_created_crdt(
                     owning_doc.relative_path.clone(),
                     false, // pull_only = false for new files
                     author.to_string(),
-                    crdt.mqtt_only_config,
                     crdt.inode_tracker.clone(),
                     Some(&*states_snapshot),
                     Some(&relative_path),
@@ -1537,8 +1524,6 @@ async fn handle_file_created_crdt(
                 let states_snapshot = file_states.read().await;
                 let handles = spawn_file_sync_tasks_crdt(
                     crdt.mqtt_client.clone(),
-                    client.clone(),
-                    server.to_string(),
                     crdt.workspace.clone(),
                     new_file.uuid,
                     file_path,
@@ -1546,7 +1531,6 @@ async fn handle_file_created_crdt(
                     filename.clone(),
                     false, // pull_only = false for new files
                     author.to_string(),
-                    crdt.mqtt_only_config,
                     crdt.inode_tracker.clone(),
                     Some(&*states_snapshot),
                     Some(&filename),
@@ -1916,8 +1900,6 @@ async fn handle_file_renamed(
     let states_snapshot = file_states.read().await;
     let handles = spawn_file_sync_tasks_crdt(
         crdt.mqtt_client.clone(),
-        client.clone(),
-        server.to_string(),
         crdt.workspace.clone(),
         file_uuid,
         file_path,
@@ -1925,7 +1907,6 @@ async fn handle_file_renamed(
         file_key.clone(),
         pull_only,
         author.to_string(),
-        crdt.mqtt_only_config,
         crdt.inode_tracker.clone(),
         Some(&*states_snapshot),
         Some(&relative_path),
@@ -1964,8 +1945,6 @@ async fn handle_file_renamed(
 /// 2. Loading the appropriate DirectorySyncState for that directory
 /// 3. Removing the file from the correct schema
 async fn handle_file_deleted_crdt(
-    client: &Client,
-    server: &str,
     path: &std::path::Path,
     directory: &std::path::Path,
     fs_root_id: &str,
@@ -2212,10 +2191,8 @@ async fn handle_file_deleted_crdt(
                     }
                 }
 
-                // Also persist the deletion to the server so it survives cyan resyncs (CP-37oh).
-                if let Err(e) = commonplace_doc::sync::delete_schema_entry(
-                    client,
-                    server,
+                // Persist the deletion to the server via MQTT (CP-93ix).
+                if let Err(e) = commonplace_doc::sync::delete_schema_entry_mqtt(
                     &owning_doc.document_id,
                     &owning_doc.relative_path,
                     author,
@@ -2271,10 +2248,8 @@ async fn handle_file_deleted_crdt(
                     filename, cid
                 );
 
-                // Also persist the deletion to the server so it survives cyan resyncs (CP-37oh).
-                if let Err(e) = commonplace_doc::sync::delete_schema_entry(
-                    client,
-                    server,
+                // Persist the deletion to the server via MQTT (CP-93ix).
+                if let Err(e) = commonplace_doc::sync::delete_schema_entry_mqtt(
                     fs_root_id,
                     &filename,
                     author,
@@ -3081,8 +3056,6 @@ async fn run_file_mode(
     let mqtt_only_config = MqttOnlySyncConfig::mqtt_only();
     let task_handles = spawn_file_sync_tasks_crdt(
         mqtt_client.clone(),
-        client.clone(),
-        server.clone(),
         workspace.clone(),
         node_id_uuid,
         file.clone(),
@@ -3090,7 +3063,6 @@ async fn run_file_mode(
         filename,
         pull_only,
         author.clone(),
-        mqtt_only_config,
         inode_tracker,
         None, // file_states: no deduplication needed
         None, // relative_path
@@ -3629,8 +3601,6 @@ async fn run_directory_mode(
             );
             file_state.task_handles = spawn_file_sync_tasks_crdt(
                 mqtt_client.clone(),
-                client.clone(),
-                server.clone(),
                 workspace.clone(),
                 node_id,
                 file_path,
@@ -3638,7 +3608,6 @@ async fn run_directory_mode(
                 filename,
                 pull_only,
                 author.clone(),
-                mqtt_only_config,
                 inode_tracker.clone(),
                 None, // file_states - initial setup, not needed
                 None, // relative_path
@@ -4366,8 +4335,6 @@ async fn run_exec_mode(
             );
             file_state.task_handles = spawn_file_sync_tasks_crdt(
                 mqtt_client.clone(),
-                client.clone(),
-                server.clone(),
                 workspace.clone(),
                 node_id,
                 file_path,
@@ -4375,7 +4342,6 @@ async fn run_exec_mode(
                 filename,
                 pull_only,
                 author.clone(),
-                mqtt_only_config,
                 inode_tracker.clone(),
                 None, // file_states - initial setup, not needed
                 None, // relative_path

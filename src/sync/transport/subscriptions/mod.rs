@@ -206,8 +206,6 @@ pub async fn handle_subdir_edit(
     // Sync NEW files using CRDT context or MQTT schema data.
     let mqtt_schema_for_new_files = mqtt_schema.clone();
     match handle_subdir_new_files(
-        client,
-        server,
         subdir_node_id,
         subdir_path,
         subdir_full_path,

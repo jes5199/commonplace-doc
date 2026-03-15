@@ -269,8 +269,6 @@ pub async fn directory_mqtt_task(
             let bootstrap_schema = load_root_schema_from_state(ctx).await
                 .map(|(schema, json, _cid)| (schema, json));
             if let Err(e) = handle_subdir_new_files(
-                &http_client,
-                &server,
                 &fs_root_id,
                 "", // root directory = empty subdir_path
                 &directory,
@@ -478,8 +476,6 @@ pub async fn directory_mqtt_task(
                                 // CP-dk9l: Always attempt file materialization — handle_subdir_new_files
                                 // handles mqtt_only mode internally via CRDT fallback path.
                                 if let Err(e) = handle_subdir_new_files(
-                                    &http_client,
-                                    &server,
                                     &fs_root_id,
                                     "", // root directory = empty subdir_path
                                     &directory,
@@ -904,8 +900,6 @@ async fn ensure_crdt_tasks_for_files(
         // The deduplication check is for preventing concurrent spawns from different code paths.
         let handles = spawn_file_sync_tasks_crdt(
             context.mqtt_client.clone(),
-            http_client.clone(),
-            server.to_string(),
             context.workspace.clone(),
             node_id,
             file_path,
@@ -913,7 +907,6 @@ async fn ensure_crdt_tasks_for_files(
             filename,
             pull_only,
             author.to_string(),
-            context.mqtt_only_config,
             inode_tracker.clone(),
             None, // file_states - not needed, old tasks already aborted above
             None, // relative_path

@@ -20,7 +20,6 @@ use crate::sync::{
     error::{SyncError, SyncResult},
     file_watcher_task, is_binary_content, trace_timeline, FileEvent, SyncState, TimelineMilestone,
 };
-use reqwest::Client;
 use rumqttc::QoS;
 use serde_json::Value;
 use std::io;
@@ -1838,8 +1837,6 @@ async fn handle_pending_edits_with_flock(
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_file_sync_tasks_crdt(
     mqtt_client: Arc<MqttClient>,
-    http_client: Client,
-    server: String,
     workspace: String,
     node_id: Uuid,
     file_path: PathBuf,
@@ -1847,7 +1844,6 @@ pub fn spawn_file_sync_tasks_crdt(
     filename: String,
     pull_only: bool,
     author: String,
-    mqtt_only_config: crate::sync::MqttOnlySyncConfig,
     inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     file_states: Option<&std::collections::HashMap<String, crate::sync::FileSyncState>>,
     relative_path: Option<&str>,
@@ -1909,15 +1905,12 @@ pub fn spawn_file_sync_tasks_crdt(
     // Spawn CRDT receive task for incoming changes
     handles.push(tokio::spawn(receive_task_crdt(
         mqtt_client,
-        http_client,
-        server,
         workspace,
         node_id,
         file_path,
         crdt_state,
         filename,
         author,
-        mqtt_only_config,
         inode_tracker,
         message_rx,
     )));
@@ -1935,15 +1928,12 @@ pub fn spawn_file_sync_tasks_crdt(
 #[allow(clippy::too_many_arguments)]
 pub async fn receive_task_crdt(
     mqtt_client: Arc<MqttClient>,
-    http_client: Client,
-    server: String,
     workspace: String,
     node_id: Uuid,
     file_path: PathBuf,
     crdt_state: Arc<RwLock<DirectorySyncState>>,
     filename: String,
     author: String,
-    mqtt_only_config: crate::sync::MqttOnlySyncConfig,
     inode_tracker: Option<Arc<RwLock<crate::sync::InodeTracker>>>,
     message_rx: broadcast::Receiver<IncomingMessage>,
 ) {
@@ -2024,14 +2014,9 @@ pub async fn receive_task_crdt(
                 .and_then(|f| f.head_cid.clone())
         };
 
-        // Fetch current server HEAD (skipped in MQTT-only mode).
-        if mqtt_only_config.mqtt_only {
-            debug!(
-                "CRDT receive_task: skipping HTTP HEAD check for {} (MQTT-only mode)",
-                file_path.display()
-            );
-        } else {
-            match crate::sync::dir_sync::fetch_head_prefer_mqtt(&http_client, &server, &node_id_str, false).await
+        // Fetch current server HEAD via MQTT.
+        {
+            match crate::sync::dir_sync::fetch_head_mqtt(&node_id_str).await
             {
                 Ok(Some(head)) => {
                     if let Some(ref server_cid) = head.cid {

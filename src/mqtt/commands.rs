@@ -9,12 +9,13 @@ use crate::document::{ContentType, DocumentStore};
 use crate::mqtt::client::MqttClient;
 use crate::mqtt::messages::{
     CreateDocumentRequest, CreateDocumentResponse, DeleteDocumentRequest, DeleteDocumentResponse,
-    ForkDocumentRequest, ForkDocumentResponse, GetContentRequest, GetContentResponse,
-    GetInfoRequest, GetInfoResponse,
+    DeleteSchemaEntryRequest, DeleteSchemaEntryResponse, ForkDocumentRequest,
+    ForkDocumentResponse, GetContentRequest, GetContentResponse, GetInfoRequest, GetInfoResponse,
 };
 use crate::mqtt::{encode_json, parse_json, MqttError};
 use crate::replay::CommitReplayer;
 use crate::store::CommitStore;
+use crate::sync::create_yjs_json_delete_key;
 use rumqttc::QoS;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -372,6 +373,101 @@ impl CommandsHandler {
                 head: None,
                 error: Some(format!("Failed to store commit: {}", e)),
             },
+        };
+
+        self.publish_response(&response).await
+    }
+
+    /// Handle delete-schema-entry command.
+    /// Topic: {workspace}/commands/__system/delete-schema-entry
+    pub async fn handle_delete_schema_entry(&self, payload: &[u8]) -> Result<(), MqttError> {
+        let request: DeleteSchemaEntryRequest = parse_json(payload)?;
+
+        debug!(
+            "Received delete-schema-entry command: req={}, id={}, entry={}",
+            request.req, request.id, request.entry_name
+        );
+
+        // Get Yjs state from document store
+        let state = self
+            .document_store
+            .get_yjs_state(&request.id)
+            .await
+            .map(|bytes| b64::encode(&bytes));
+
+        // Create key path for the entry
+        let key_path = format!("root.entries.{}", request.entry_name);
+
+        // Create Yjs delete update
+        let update = match create_yjs_json_delete_key(&key_path, state.as_deref()) {
+            Ok(update) => update,
+            Err(e) => {
+                warn!(
+                    "Failed to create delete update for entry '{}': {}",
+                    request.entry_name, e
+                );
+                let response = DeleteSchemaEntryResponse {
+                    req: request.req,
+                    error: Some(format!("Failed to create delete update: {}", e)),
+                };
+                return self.publish_response(&response).await;
+            }
+        };
+
+        // Apply the update to the in-memory document
+        let update_bytes = b64::decode(&update).map_err(|e| {
+            MqttError::InvalidMessage(format!("Failed to decode update: {}", e))
+        })?;
+        if let Err(e) = self
+            .document_store
+            .apply_yjs_update(&request.id, &update_bytes)
+            .await
+        {
+            let response = DeleteSchemaEntryResponse {
+                req: request.req,
+                error: Some(format!("Failed to apply delete update: {:?}", e)),
+            };
+            return self.publish_response(&response).await;
+        }
+
+        // Persist to commit store
+        if let Some(store) = &self.commit_store {
+            let parents = match store.get_document_head(&request.id).await {
+                Ok(Some(head)) => vec![head],
+                _ => vec![],
+            };
+
+            let commit = Commit::new(
+                parents,
+                update,
+                request.author.clone(),
+                Some(format!("Delete schema entry: {}", request.entry_name)),
+            );
+
+            if let Err(e) = store
+                .store_commit_with_head_advancement(&request.id, &commit)
+                .await
+            {
+                warn!(
+                    "Failed to persist delete commit for entry '{}': {}",
+                    request.entry_name, e
+                );
+                let response = DeleteSchemaEntryResponse {
+                    req: request.req,
+                    error: Some(format!("Failed to persist commit: {}", e)),
+                };
+                return self.publish_response(&response).await;
+            }
+        }
+
+        info!(
+            "Deleted schema entry '{}' from document {}",
+            request.entry_name, request.id
+        );
+
+        let response = DeleteSchemaEntryResponse {
+            req: request.req,
+            error: None,
         };
 
         self.publish_response(&response).await

@@ -19,6 +19,8 @@ pub enum FetchHeadError {
     Parse(reqwest::Error),
     /// Server returned error status (not 404)
     Status(reqwest::StatusCode, String),
+    /// MQTT request failed
+    Mqtt(String),
 }
 
 impl std::fmt::Display for FetchHeadError {
@@ -27,6 +29,7 @@ impl std::fmt::Display for FetchHeadError {
             Self::Request(e) => write!(f, "HEAD request failed: {}", e),
             Self::Parse(e) => write!(f, "Failed to parse HEAD response: {}", e),
             Self::Status(code, body) => write!(f, "HEAD failed with {}: {}", code, body),
+            Self::Mqtt(e) => write!(f, "MQTT HEAD failed: {}", e),
         }
     }
 }
@@ -146,6 +149,7 @@ pub async fn push_schema_to_server(
             )
             .into());
         }
+        Err(FetchHeadError::Mqtt(e)) => return Err(e.into()),
     };
 
     // Skip update if schema hasn't changed (prevents feedback loops)
@@ -211,6 +215,7 @@ pub async fn delete_schema_entry(
             )
             .into());
         }
+        Err(FetchHeadError::Mqtt(e)) => return Err(e.into()),
     };
 
     // Create an update that deletes just this entry

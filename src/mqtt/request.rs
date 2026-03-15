@@ -10,8 +10,9 @@
 use crate::fs::{Entry, FsSchema};
 use crate::mqtt::client::MqttClient;
 use crate::mqtt::messages::{
-    CreateDocumentRequest, CreateDocumentResponse, ForkDocumentRequest, ForkDocumentResponse,
-    GetContentRequest, GetContentResponse, GetInfoRequest, GetInfoResponse,
+    CreateDocumentRequest, CreateDocumentResponse, DeleteSchemaEntryRequest,
+    DeleteSchemaEntryResponse, ForkDocumentRequest, ForkDocumentResponse, GetContentRequest,
+    GetContentResponse, GetInfoRequest, GetInfoResponse,
 };
 use crate::mqtt::MqttError;
 use rumqttc::QoS;
@@ -507,6 +508,74 @@ impl MqttRequestClient {
         }
 
         Ok(current_id)
+    }
+
+    /// Delete a schema entry via MQTT command.
+    ///
+    /// Publishes a `DeleteSchemaEntryRequest` to
+    /// `{workspace}/commands/__system/delete-schema-entry`
+    /// and waits for the matching `DeleteSchemaEntryResponse`.
+    pub async fn delete_schema_entry(
+        &self,
+        id: &str,
+        entry_name: &str,
+        author: &str,
+    ) -> Result<DeleteSchemaEntryResponse, MqttError> {
+        let topic = format!(
+            "{}/commands/__system/delete-schema-entry",
+            self.workspace
+        );
+        for attempt in 1..=DEFAULT_MAX_ATTEMPTS {
+            let req_id = uuid::Uuid::new_v4().to_string();
+            let request = DeleteSchemaEntryRequest {
+                req: req_id.clone(),
+                id: id.to_string(),
+                entry_name: entry_name.to_string(),
+                author: author.to_string(),
+            };
+            let payload = serde_json::to_vec(&request)
+                .map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+
+            let rx = self.register_pending_request(req_id.clone()).await;
+
+            self.client
+                .publish(&topic, &payload, QoS::AtLeastOnce)
+                .await?;
+
+            match tokio::time::timeout(self.timeout, rx).await {
+                Ok(Ok(response_bytes)) => {
+                    return serde_json::from_slice(&response_bytes)
+                        .map_err(|e| MqttError::InvalidMessage(e.to_string()));
+                }
+                Ok(Err(_)) => {
+                    return Err(MqttError::InvalidMessage(
+                        "Response channel closed unexpectedly".to_string(),
+                    ));
+                }
+                Err(_) => {
+                    self.remove_pending_request(&req_id).await;
+
+                    if attempt == DEFAULT_MAX_ATTEMPTS {
+                        return Err(MqttError::Connection(format!(
+                            "Timeout waiting for delete-schema-entry response for {} after {} attempts",
+                            id, DEFAULT_MAX_ATTEMPTS
+                        )));
+                    }
+
+                    let delay = Self::retry_delay(attempt);
+                    warn!(
+                        "Timeout waiting for delete-schema-entry response for {} (attempt {}/{}), retrying in {}ms",
+                        id,
+                        attempt,
+                        DEFAULT_MAX_ATTEMPTS,
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+
+        unreachable!("retry loop should always return or error");
     }
 
     /// Publish an edit (Yjs update) to a document via MQTT.

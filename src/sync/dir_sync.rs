@@ -5,7 +5,6 @@
 
 use crate::commit::Commit;
 use crate::fs::{Entry, FsSchema};
-use crate::sync::client::fetch_head;
 use crate::sync::crdt_merge::parse_edit_message;
 use crate::sync::crdt_new_file::publish_schema_via_mqtt;
 use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
@@ -24,7 +23,7 @@ use crate::sync::uuid_map::{
 use crate::sync::ymap_schema;
 use crate::sync::{
     build_info_url, detect_from_path, is_allowed_extension,
-    is_binary_content, looks_like_base64_binary, push_schema_to_server,
+    is_binary_content, looks_like_base64_binary,
     remove_file_state_and_abort, spawn_file_sync_tasks_crdt, FileSyncState, SyncState,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -743,8 +742,6 @@ pub async fn apply_explicit_deletions(
 /// This enables file edits to be published via MQTT instead of HTTP.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_subdir_new_files(
-    client: &Client,
-    server: &str,
     subdir_node_id: &str,
     subdir_path: &str,
     _subdir_directory: &Path,
@@ -1038,8 +1035,6 @@ pub async fn handle_subdir_new_files(
                     // Spawn CRDT sync tasks
                     let handles = spawn_file_sync_tasks_crdt(
                         ctx.mqtt_client.clone(),
-                        client.clone(),
-                        server.to_string(),
                         ctx.workspace.clone(),
                         node_uuid,
                         file_path.clone(),
@@ -1047,7 +1042,6 @@ pub async fn handle_subdir_new_files(
                         filename,
                         pull_only,
                         author.to_string(),
-                        ctx.mqtt_only_config,
                         inode_tracker.clone(),
                         None,
                         None,
@@ -1068,7 +1062,7 @@ pub async fn handle_subdir_new_files(
         }
 
         // Fetch content from server
-        let fetch_result = fetch_head_prefer_mqtt(client, server, &identifier, use_paths).await;
+        let fetch_result = fetch_head_mqtt(&identifier).await;
 
         // Track if we have a valid UUID from MQTT schema for fallback when HTTP returns 404
         let has_mqtt_uuid = node_id.is_some() && crdt_context.is_some();
@@ -1226,8 +1220,6 @@ pub async fn handle_subdir_new_files(
                     // Pass None for file_states since we already registered
                     spawn_file_sync_tasks_crdt(
                         ctx.mqtt_client.clone(),
-                        client.clone(),
-                        server.to_string(),
                         ctx.workspace.clone(),
                         node_uuid,
                         file_path.clone(),
@@ -1235,7 +1227,6 @@ pub async fn handle_subdir_new_files(
                         filename,
                         pull_only,
                         author.to_string(),
-                        ctx.mqtt_only_config,
                         inode_tracker.clone(),
                         None, // Already registered, no need to check
                         None,
@@ -1407,8 +1398,6 @@ pub async fn handle_subdir_new_files(
                     let states_snapshot = file_states.read().await;
                     let handles = spawn_file_sync_tasks_crdt(
                         ctx.mqtt_client.clone(),
-                        client.clone(),
-                        server.to_string(),
                         ctx.workspace.clone(),
                         node_uuid,
                         file_path.clone(),
@@ -1416,7 +1405,6 @@ pub async fn handle_subdir_new_files(
                         filename,
                         pull_only,
                         author.to_string(),
-                        ctx.mqtt_only_config,
                         inode_tracker.clone(),
                         Some(&*states_snapshot),
                         Some(root_relative_path),
@@ -1495,13 +1483,11 @@ fn collect_schema_directories(schema: &FsSchema) -> std::collections::HashSet<St
 /// for any node-backed child directories that don't exist locally yet.
 /// It's called from the subdir SSE task when a subdirectory schema changes.
 pub async fn create_subdir_nested_directories(
-    client: &Client,
-    server: &str,
     subdir_node_id: &str,
     subdir_directory: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Fetch the subdirectory's schema from server
-    let head = match fetch_head_prefer_mqtt(client, server, subdir_node_id, false).await {
+    let head = match fetch_head_mqtt(subdir_node_id).await {
         Ok(Some(h)) => h,
         Ok(None) => return Err(format!("Subdir {} not found", subdir_node_id).into()),
         Err(e) => return Err(format!("Failed to fetch subdir schema: {}", e).into()),
@@ -1586,7 +1572,7 @@ async fn push_nested_schemas_recursive(
                     // Validate it's a proper schema
                     if let Ok(parsed_schema) = serde_json::from_str::<FsSchema>(&local_schema) {
                         // Check if server document is empty or has different content
-                        let should_push = match fetch_head_prefer_mqtt(client, server, node_id, false).await {
+                        let should_push = match fetch_head_mqtt(node_id).await {
                             Ok(Some(head)) => {
                                 // Push if server is empty or has trivial content
                                 head.content.is_empty() || head.content == "{}"
@@ -1600,9 +1586,7 @@ async fn push_nested_schemas_recursive(
                                 "Pushing nested schema from {:?} to document {}",
                                 nested_schema_path, node_id
                             );
-                            if let Err(e) = push_schema_prefer_mqtt(
-                                client,
-                                server,
+                            if let Err(e) = push_schema_mqtt(
                                 node_id,
                                 &local_schema,
                                 author,
@@ -1815,7 +1799,7 @@ pub async fn handle_schema_change(
             }
 
             // Fetch content from server
-            if let Ok(Some(file_head)) = fetch_head_prefer_mqtt(client, server, &identifier, use_paths).await {
+            if let Ok(Some(file_head)) = fetch_head_mqtt(&identifier).await {
                 // Skip writing if content is empty - the MQTT retained message
                 // will provide the actual content. Writing empty would clobber
                 // content that arrives via MQTT.
@@ -1968,8 +1952,6 @@ pub async fn handle_schema_change(
                             let states_snapshot = file_states.read().await;
                             let handles = spawn_file_sync_tasks_crdt(
                                 ctx.mqtt_client.clone(),
-                                client.clone(),
-                                server.to_string(),
                                 ctx.workspace.clone(),
                                 node_uuid,
                                 file_path.clone(),
@@ -1977,7 +1959,6 @@ pub async fn handle_schema_change(
                                 filename,
                                 pull_only,
                                 author.to_string(),
-                                ctx.mqtt_only_config,
                                 inode_tracker.clone(),
                                 Some(&*states_snapshot),
                                 Some(path),
@@ -2391,9 +2372,7 @@ async fn create_documents_for_null_entries(
                                     }
 
                                     // Push the subdirectory schema to server
-                                    if let Err(e) = push_schema_prefer_mqtt(
-                                        client,
-                                        server,
+                                    if let Err(e) = push_schema_mqtt(
                                         node_id,
                                         &sub_schema_json,
                                         "sync-client",
@@ -2468,7 +2447,7 @@ pub async fn sync_schema(
                         _ => None,
                     })
                     .unwrap_or(0);
-                let server_entry_count = match fetch_head_prefer_mqtt(client, server, fs_root_id, false).await {
+                let server_entry_count = match fetch_head_mqtt(fs_root_id).await {
                     Ok(Some(head)) => serde_json::from_str::<FsSchema>(&head.content)
                         .ok()
                         .and_then(|s| s.root)
@@ -2503,7 +2482,7 @@ pub async fn sync_schema(
         // This prevents creating duplicate UUIDs for directories that already exist
         // on the server. See CP-7hmh.
         let mut schema = schema;
-        if let Ok(Some(head)) = fetch_head_prefer_mqtt(client, server, fs_root_id, false).await {
+        if let Ok(Some(head)) = fetch_head_mqtt(fs_root_id).await {
             if let Ok(server_schema) = serde_json::from_str::<FsSchema>(&head.content) {
                 let merged = merge_server_node_ids(&mut schema, &server_schema);
                 if merged > 0 {
@@ -2524,7 +2503,7 @@ pub async fn sync_schema(
 
         // Push schema with UUIDs (no more nulls)
         info!("Pushing filesystem schema to server...");
-        push_schema_prefer_mqtt(client, server, fs_root_id, &schema_json_with_uuids, author).await?;
+        push_schema_mqtt(fs_root_id, &schema_json_with_uuids, author).await?;
         info!("Schema pushed successfully");
 
         // Write the schema with UUIDs to local file
@@ -2544,7 +2523,7 @@ pub async fn sync_schema(
         // to the server's UUIDs ensures content reaches the right documents.
         let mut final_schema_json = schema_json.clone();
         let mut final_cid: Option<String> = None;
-        if let Ok(Some(head)) = fetch_head_prefer_mqtt(client, server, fs_root_id, false).await {
+        if let Ok(Some(head)) = fetch_head_mqtt(fs_root_id).await {
             // Write server's schema (with UUIDs) to local file
             final_schema_json = head.content.clone();
             final_cid = head.cid.clone();
@@ -2585,7 +2564,7 @@ pub async fn sync_schema(
         let local_schema_exists = local_schema_path.exists();
 
         // Fetch server schema
-        if let Ok(Some(head)) = fetch_head_prefer_mqtt(client, server, fs_root_id, false).await {
+        if let Ok(Some(head)) = fetch_head_mqtt(fs_root_id).await {
             // Parse the server schema for nested schema operations
             let server_schema: FsSchema = serde_json::from_str(&head.content)
                 .map_err(|e| format!("Failed to parse server schema: {}", e))?;
@@ -2622,8 +2601,8 @@ pub async fn sync_schema(
 /// Check if the server has existing schema content.
 ///
 /// Returns true if the server has non-empty, non-trivial content.
-pub async fn check_server_has_content(client: &Client, server: &str, fs_root_id: &str) -> bool {
-    if let Ok(Some(head)) = fetch_head_prefer_mqtt(client, server, fs_root_id, false).await {
+pub async fn check_server_has_content(fs_root_id: &str) -> bool {
+    if let Ok(Some(head)) = fetch_head_mqtt(fs_root_id).await {
         return !head.content.is_empty() && head.content != "{}";
     }
     false
@@ -2633,37 +2612,31 @@ pub async fn check_server_has_content(client: &Client, server: &str, fs_root_id:
 ///
 /// MQTT equivalent of `ensure_fs_root_exists` - uses get-info and create-document
 /// commands instead of HTTP requests.
-/// Fetch HEAD for a document, preferring MQTT when available, falling back to HTTP.
+/// Fetch HEAD for a document via MQTT.
 ///
 /// Returns the same `Option<HeadResponse>` as HTTP `fetch_head`, but routes through
-/// MQTT `get_head` when the MQTT request client is registered.
-pub(crate) async fn fetch_head_prefer_mqtt(
-    client: &reqwest::Client,
-    server: &str,
+/// MQTT `get_head` command.
+pub(crate) async fn fetch_head_mqtt(
     id: &str,
-    use_paths: bool,
 ) -> Result<Option<crate::sync::HeadResponse>, crate::sync::FetchHeadError> {
     use crate::sync::schema_io::get_sync_schema_mqtt_request_client;
 
-    if let Some(mqtt_request) = get_sync_schema_mqtt_request_client() {
-        match mqtt_request.get_head(id).await as Result<Option<crate::sync::HeadResponse>, _> {
-            Ok(head) => return Ok(head),
-            Err(e) => {
-                tracing::warn!("MQTT get_head failed for {}, falling back to HTTP: {}", id, e);
-            }
-        }
-    }
+    let mqtt_request = get_sync_schema_mqtt_request_client().ok_or_else(|| {
+        crate::sync::FetchHeadError::Mqtt(
+            "MQTT request client not available for fetch_head".to_string(),
+        )
+    })?;
 
-    fetch_head(client, server, id, use_paths).await
+    mqtt_request
+        .get_head(id)
+        .await
+        .map_err(|e| crate::sync::FetchHeadError::Mqtt(e.to_string()))
 }
 
-/// Push a schema to the server, preferring MQTT when available, falling back to HTTP.
+/// Push a schema to the server via MQTT.
 ///
 /// MQTT path: get_head → create_document (if needed) → edit_document
-/// HTTP fallback: push_schema_to_server (existing HTTP implementation)
-pub(crate) async fn push_schema_prefer_mqtt(
-    client: &reqwest::Client,
-    server: &str,
+pub(crate) async fn push_schema_mqtt(
     fs_root_id: &str,
     schema_json: &str,
     author: &str,
@@ -2672,82 +2645,80 @@ pub(crate) async fn push_schema_prefer_mqtt(
     use crate::sync::create_yjs_json_merge;
     use crate::sync::transport::client::json_content_equal;
 
-    if let Some(mqtt_request) = get_sync_schema_mqtt_request_client() {
-        // Fetch current content via MQTT
-        let (old_content, base_state) = match mqtt_request.get_head(fs_root_id).await {
-            Ok(Some(head)) => (Some(head.content), head.state),
-            Ok(None) => {
-                // Document doesn't exist, create it via MQTT
-                info!(
-                    "Creating document {} before pushing schema (MQTT)",
-                    fs_root_id
-                );
-                let resp = mqtt_request
-                    .create_document("application/json", Some(fs_root_id))
-                    .await;
-                match resp {
-                    Ok(r) if r.error.is_none() => {}
-                    Ok(r) => {
-                        return Err(format!(
-                            "MQTT create-document failed for {}: {}",
-                            fs_root_id,
-                            r.error.unwrap_or_default()
-                        )
-                        .into());
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "MQTT create-document failed for {}, falling back to HTTP: {}",
-                            fs_root_id,
-                            e
-                        );
-                        return push_schema_to_server(client, server, fs_root_id, schema_json, author).await;
-                    }
-                }
-                (None, None)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "MQTT get_head failed for {}, falling back to HTTP: {}",
-                    fs_root_id,
-                    e
-                );
-                return push_schema_to_server(client, server, fs_root_id, schema_json, author).await;
-            }
-        };
+    let mqtt_request = get_sync_schema_mqtt_request_client()
+        .ok_or("MQTT request client not available for push_schema")?;
 
-        // Skip if unchanged
-        if json_content_equal(old_content.as_deref(), schema_json) {
-            debug!("Schema unchanged, skipping push to server");
-            return Ok(());
+    // Fetch current content via MQTT
+    let (old_content, base_state) = match mqtt_request.get_head(fs_root_id).await? {
+        Some(head) => (Some(head.content), head.state),
+        None => {
+            // Document doesn't exist, create it via MQTT
+            info!(
+                "Creating document {} before pushing schema (MQTT)",
+                fs_root_id
+            );
+            let resp = mqtt_request
+                .create_document("application/json", Some(fs_root_id))
+                .await?;
+            if let Some(err) = resp.error {
+                return Err(format!(
+                    "MQTT create-document failed for {}: {}",
+                    fs_root_id, err
+                )
+                .into());
+            }
+            (None, None)
         }
+    };
 
-        // Create Yjs merge update
-        let update = create_yjs_json_merge(schema_json, base_state.as_deref())
-            .map_err(|e| format!("Failed to create JSON update: {}", e))?;
-
-        // Publish edit via MQTT
-        match mqtt_request
-            .edit_document(
-                fs_root_id,
-                update,
-                author,
-                Some("Update filesystem schema".to_string()),
-            )
-            .await
-        {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                tracing::warn!(
-                    "MQTT edit_document failed for {}, falling back to HTTP: {}",
-                    fs_root_id,
-                    e
-                );
-            }
-        }
+    // Skip if unchanged
+    if json_content_equal(old_content.as_deref(), schema_json) {
+        debug!("Schema unchanged, skipping push to server");
+        return Ok(());
     }
 
-    push_schema_to_server(client, server, fs_root_id, schema_json, author).await
+    // Create Yjs merge update
+    let update = create_yjs_json_merge(schema_json, base_state.as_deref())
+        .map_err(|e| format!("Failed to create JSON update: {}", e))?;
+
+    // Publish edit via MQTT
+    mqtt_request
+        .edit_document(
+            fs_root_id,
+            update,
+            author,
+            Some("Update filesystem schema".to_string()),
+        )
+        .await?;
+
+    Ok(())
+}
+
+/// Delete a schema entry via MQTT.
+pub async fn delete_schema_entry_mqtt(
+    fs_root_id: &str,
+    entry_name: &str,
+    author: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::sync::schema_io::get_sync_schema_mqtt_request_client;
+
+    let mqtt_request = get_sync_schema_mqtt_request_client()
+        .ok_or("MQTT request client not available for delete_schema_entry")?;
+
+    let resp = mqtt_request
+        .delete_schema_entry(fs_root_id, entry_name, author)
+        .await?;
+
+    if let Some(err) = resp.error {
+        return Err(format!("delete_schema_entry failed for '{}': {}", entry_name, err).into());
+    }
+
+    tracing::info!(
+        "Deleted schema entry '{}' from {} via MQTT",
+        entry_name,
+        fs_root_id
+    );
+    Ok(())
 }
 
 pub async fn ensure_fs_root_exists_mqtt(
@@ -2807,8 +2778,6 @@ pub async fn check_server_has_content_mqtt(
 /// * `crdt_context` - Optional CRDT context for MQTT publishing
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_schema_modified(
-    client: &Client,
-    server: &str,
     fs_root_id: &str,
     base_directory: &Path,
     schema_path: &Path,
@@ -2874,7 +2843,7 @@ pub async fn handle_schema_modified(
             .map_err(|e| format!("Failed to publish schema via MQTT: {}", e))?;
         } else {
             info!("Pushing root schema via MQTT-preferred (fs_root_id: {})", fs_root_id);
-            push_schema_prefer_mqtt(client, server, fs_root_id, content, author).await?;
+            push_schema_mqtt(fs_root_id, content, author).await?;
         }
         return Ok(());
     }
@@ -2972,7 +2941,7 @@ pub async fn handle_schema_modified(
             schema_path.display(),
             current_node_id
         );
-        push_schema_prefer_mqtt(client, server, &current_node_id, content, author).await?;
+        push_schema_mqtt(&current_node_id, content, author).await?;
     }
 
     Ok(())

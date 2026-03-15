@@ -27,8 +27,9 @@ use thiserror::Error;
 pub use client::{IncomingMessage, MqttClient};
 pub use messages::{
     CommandMessage, CreateDocumentRequest, CreateDocumentResponse, DeleteDocumentRequest,
-    DeleteDocumentResponse, EditMessage, EventMessage, ForkDocumentRequest, ForkDocumentResponse,
-    GetContentRequest, GetContentResponse, GetInfoRequest, GetInfoResponse, SyncMessage,
+    DeleteDocumentResponse, DeleteSchemaEntryRequest, DeleteSchemaEntryResponse, EditMessage,
+    EventMessage, ForkDocumentRequest, ForkDocumentResponse, GetContentRequest,
+    GetContentResponse, GetInfoRequest, GetInfoResponse, SyncMessage,
 };
 pub use request::MqttRequestClient;
 pub use topics::{Port, Topic};
@@ -198,6 +199,12 @@ impl MqttService {
         format!("{}/commands/__system/fork-document", self.workspace)
     }
 
+    /// Get the store commands topic for delete-schema-entry.
+    /// Uses `__system` prefix to avoid conflicts with document paths.
+    fn delete_schema_entry_topic(&self) -> String {
+        format!("{}/commands/__system/delete-schema-entry", self.workspace)
+    }
+
     /// Subscribe to store-level commands.
     /// This subscribes to document management command topics.
     pub async fn subscribe_store_commands(&self) -> Result<(), MqttError> {
@@ -232,6 +239,15 @@ impl MqttService {
         tracing::debug!(
             "Subscribed to fork-document commands: {}",
             fork_document_topic
+        );
+
+        let delete_schema_entry_topic = self.delete_schema_entry_topic();
+        self.client
+            .subscribe(&delete_schema_entry_topic, QoS::AtLeastOnce)
+            .await?;
+        tracing::debug!(
+            "Subscribed to delete-schema-entry commands: {}",
+            delete_schema_entry_topic
         );
 
         Ok(())
@@ -421,6 +437,12 @@ impl MqttService {
         }
         if topic_str == self.fork_document_topic() {
             return self.commands_handler.handle_fork_document(payload).await;
+        }
+        if topic_str == self.delete_schema_entry_topic() {
+            return self
+                .commands_handler
+                .handle_delete_schema_entry(payload)
+                .await;
         }
 
         // Parse the topic

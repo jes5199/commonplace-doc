@@ -588,6 +588,29 @@ pub struct ForkDocumentResponse {
     pub error: Option<String>,
 }
 
+/// Request to delete a schema entry from a document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteSchemaEntryRequest {
+    /// Request ID for correlation
+    pub req: String,
+    /// Document ID (schema document, e.g., fs-root UUID)
+    pub id: String,
+    /// Entry name to delete (e.g., "filename.txt")
+    pub entry_name: String,
+    /// Author of the deletion
+    pub author: String,
+}
+
+/// Response to delete schema entry request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteSchemaEntryResponse {
+    /// Request ID for correlation
+    pub req: String,
+    /// Error message (present on failure)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 impl SyncMessage {
     /// Get the request ID from any sync message.
     pub fn req(&self) -> &str {
