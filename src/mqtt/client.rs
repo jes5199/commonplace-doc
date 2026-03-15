@@ -143,27 +143,17 @@ impl MqttClient {
     /// This should be spawned as a background task. It processes incoming
     /// messages and broadcasts them to subscribers.
     ///
-    /// Uses a timeout on `poll()` to prevent indefinite hangs. When poll()
-    /// stalls (e.g., due to network issues), the timeout ensures the loop
-    /// continues and can detect/recover from connection problems.
+    /// IMPORTANT: poll() must NOT be wrapped in tokio::time::timeout().
+    /// Dropping a poll() future mid-execution corrupts rumqttc's internal
+    /// state (partial packet reads, pending keep-alive state), permanently
+    /// breaking the event loop. rumqttc handles connection health internally
+    /// via keep-alive pings (configured via keep_alive_secs).
     pub async fn run_event_loop(&self) -> Result<(), MqttError> {
         let mut connack_count: u64 = 0;
         loop {
-            // Timeout prevents poll() from hanging indefinitely.
-            // rumqttc's poll() can stall when the network connection degrades,
-            // which blocks keep-alive pings and causes broker disconnection.
             let notification = {
                 let mut event_loop = self.event_loop.lock().await;
-                match tokio::time::timeout(Duration::from_secs(10), event_loop.poll()).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        warn!(
-                            "MQTT poll() timed out after 10s, client_id={}",
-                            self.client_id
-                        );
-                        continue;
-                    }
-                }
+                event_loop.poll().await
             };
 
             match notification {
