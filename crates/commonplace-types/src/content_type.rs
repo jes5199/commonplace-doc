@@ -56,6 +56,11 @@ impl ContentType {
             "application/xml" | "text/xml" | "application/xhtml+xml" => Some(ContentType::Xml),
             // Handle all text/* types as Text (text/plain, text/typescript, text/x-rust, etc.)
             _ if base.starts_with("text/") => Some(ContentType::Text),
+            // Shorthand names for API convenience (e.g. {"content_type": "text"})
+            "text" => Some(ContentType::Text),
+            "json" => Some(ContentType::Json),
+            "xml" => Some(ContentType::Xml),
+            "jsonl" | "ndjson" => Some(ContentType::Jsonl),
             _ => None,
         }
     }
@@ -200,5 +205,15 @@ mod tests {
     #[test]
     fn test_jsonl_default_content() {
         assert_eq!(ContentType::Jsonl.default_content(), "");
+    }
+
+    #[test]
+    fn test_from_mime_shorthand_names() {
+        // API users send {"content_type": "text"} not {"content_type": "text/plain"}
+        assert_eq!(ContentType::from_mime("text"), Some(ContentType::Text));
+        assert_eq!(ContentType::from_mime("json"), Some(ContentType::Json));
+        assert_eq!(ContentType::from_mime("xml"), Some(ContentType::Xml));
+        assert_eq!(ContentType::from_mime("jsonl"), Some(ContentType::Jsonl));
+        assert_eq!(ContentType::from_mime("ndjson"), Some(ContentType::Jsonl));
     }
 }
