@@ -263,3 +263,4 @@
 {"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-15T08:12:02Z","event_type":"closed","id":263,"issue_id":"CP-93ix","new_value":"Implemented MQTT delete_schema_entry command: message types, server handler, client request, and sync wiring with HTTP fallback","old_value":""}
 {"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-15T15:42:49Z","event_type":"closed","id":264,"issue_id":"CP-5fj0","new_value":"HTTP fallback eliminated in 395f97c — push_schema and delete_schema_entry are now MQTT-only in the sync client","old_value":""}
 {"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-15T15:42:50Z","event_type":"closed","id":265,"issue_id":"CP-9ukx","new_value":"HTTP fallback eliminated in 395f97c — push_schema and delete_schema_entry are now MQTT-only in the sync client","old_value":""}
+{"actor":"Jes Wolfe!","comment":null,"created_at":"2026-03-15T16:22:03Z","event_type":"created","id":266,"issue_id":"CP-v9td","new_value":"","old_value":""}
