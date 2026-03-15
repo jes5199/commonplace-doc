@@ -262,13 +262,14 @@ struct DocInfoResponse {
     id: String,
     #[serde(rename = "type")]
     doc_type: String,
+    content_type: String,
 }
 
 async fn get_doc_info(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<DocInfoResponse>, StatusCode> {
-    let _doc = state
+    let doc = state
         .doc_store
         .get_document(&id)
         .await
@@ -277,6 +278,7 @@ async fn get_doc_info(
     Ok(Json(DocInfoResponse {
         id: id.clone(),
         doc_type: "document".to_string(),
+        content_type: doc.content_type.to_mime().to_string(),
     }))
 }
 
