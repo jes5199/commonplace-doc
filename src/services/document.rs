@@ -676,14 +676,48 @@ impl DocumentService {
 
         // Get target commit (specified or HEAD)
         let target_cid = if let Some(cid) = at_commit {
-            cid
+            Some(cid)
         } else {
             commit_store
                 .get_document_head(source_id)
                 .await
                 .map_err(|e| ServiceError::Internal(e.to_string()))?
-                .ok_or(ServiceError::NotFound)?
         };
+
+        // If no commits exist, fork from the current Yjs state directly
+        if target_cid.is_none() {
+            let state_bytes = self
+                .doc_store
+                .get_yjs_state(source_id)
+                .await
+                .unwrap_or_default();
+
+            if !state_bytes.is_empty() {
+                self.doc_store
+                    .apply_yjs_update(&new_id, &state_bytes)
+                    .await?;
+            }
+
+            let update_b64 = b64::encode(&state_bytes);
+            let commit = Commit::new(
+                vec![],
+                update_b64,
+                "fork".to_string(),
+                Some(format!("Forked from {} (no commit history)", source_id)),
+            );
+
+            let (new_cid, _timestamp) = commit_store
+                .store_commit_and_set_head(&new_id, &commit)
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+            return Ok(ForkResult {
+                id: new_id,
+                head: new_cid,
+            });
+        }
+
+        let target_cid = target_cid.unwrap();
 
         // Replay commits to build state
         let replayer = CommitReplayer::new(commit_store);
